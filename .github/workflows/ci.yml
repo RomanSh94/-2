@@ -1,0 +1,54 @@
+name: CI
+
+# Минимальный smoke-гейт для X20.
+# Ловит: краши на импорте (включая C1 в readiness_engine), синтаксис во всех
+# модулях, поломку SQL-схемы. НЕ ловит логические баги (например C2 — для них
+# нужны настоящие тесты). Используется как required-check перед merge в main.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    env:
+      # Заглушки, чтобы импорт прошёл дальше конструкторов Bot()/AsyncOpenAI().
+      # Это НЕ настоящие секреты — просто формат-валидные значения для CI.
+      # aiogram проверяет ФОРМАТ токена при создании Bot(), поэтому он
+      # выглядит как настоящий, но им не является.
+      BOT_TOKEN: "123456789:AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRR"
+      OPENAI_API_KEY: "sk-ci-dummy-not-a-real-key"
+      ADMIN_PASSWORD: "ci-dummy"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check (byte-compile all modules)
+        run: python -m compileall -q .
+
+      - name: Import smoke test (ловит краши на импорте, в т.ч. C1)
+        run: python -c "import bot; print('import bot: OK')"
+
+      - name: DB schema smoke test (ловит поломку SCHEMA)
+        run: |
+          python -c "import asyncio, database; asyncio.run(database.init_db()); print('init_db: OK')"

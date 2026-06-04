@@ -1,0 +1,7 @@
+aiogram==3.7.0
+openai==1.35.10
+httpx>=0.23,<0.28
+python-dotenv==1.0.1
+aiosqlite==0.20.0
+apscheduler==3.10.4
+flask==3.0.3
