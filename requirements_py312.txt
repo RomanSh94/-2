@@ -1,0 +1,12 @@
+# X20 Bot — Requirements for Python 3.12 или 3.13 (РЕКОМЕНДУЕТСЯ)
+# Эта версия requirements.txt работает со всеми зависимостями
+
+aiogram==3.7.0
+openai==1.35.10
+python-dotenv==1.0.1
+aiosqlite==0.20.0
+apscheduler==3.10.4
+flask==3.0.3
+aiofiles==23.2.1
+aiosmtplib==3.0.1
+langdetect==1.0.9
