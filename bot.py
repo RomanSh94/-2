@@ -7,6 +7,17 @@ X20 Bot — Основной файл
   Notifications → OutcomeTracking → User
 """
 import asyncio
+import sys
+
+# Windows consoles default to a legacy codepage (e.g. cp1251) that cannot encode
+# the emoji used in our log/print statements, which crashes startup with
+# UnicodeEncodeError. Force UTF-8 on stdout/stderr before anything prints.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from html import escape as _he
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
