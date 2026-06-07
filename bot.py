@@ -167,10 +167,18 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     
     # 15. LLM call
     await bot.send_chat_action(message.chat.id, "typing")
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini", messages=messages, temperature=0.65, max_tokens=300,
-    )
-    answer = response.choices[0].message.content
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini", messages=messages, temperature=0.65, max_tokens=300,
+        )
+        answer = response.choices[0].message.content
+    except Exception as e:
+        print(f"[LLM] error uid={uid}: {type(e).__name__}: {e}")
+        await message.answer(
+            "Я временно недоступен, попробуй чуть позже." if lang == "ru"
+            else "I'm temporarily unavailable, please try again shortly."
+        )
+        return
     
     # 16. Safety validator
     is_safe, reason = validate_response(answer, lang)
