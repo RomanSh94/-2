@@ -29,6 +29,7 @@ from openai import AsyncOpenAI
 
 from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION
 from prompts import get_system_prompt, get_crisis_text, get_onboarding
+from crisis_protocol import classify, crisis_keyboard, admin_alert_text, RED
 from risk_detector import detect_risk
 from language_detector import detect_language
 from stage_detector import detect_stage
@@ -52,6 +53,7 @@ from database import (
     start_intervention, finish_intervention,
     get_user_language,
     set_checkin, get_checkin_users, update_last_checkin,
+    log_crisis_event, set_crisis_response,
 )
 
 class InterventionStates(StatesGroup):
@@ -94,21 +96,24 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         await log_moderation(uid, username, first_name, risk["level"], risk["score"],
                               risk["categories"], user_text, "pending", risk["implicit"])
     
-    # 4. Crisis override
+    # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here)
     if "aggression" in risk["categories"]:
         await push_alert("Aggression Detected", uid, username, risk["level"],
                          risk["score"], risk["categories"], user_text)
 
-    if "suicide" in risk["categories"] or "self_harm" in risk["categories"]:
+    if classify(risk) == RED:
+        await log_crisis_event(uid, RED, risk["score"], risk["categories"],
+                               user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
         await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
                          risk["categories"], user_text)
+        alert = admin_alert_text(uid, username, RED, risk, user_text)
         for admin_id in ADMIN_USER_IDS:
             try:
-                await bot.send_message(admin_id,
-                    f"🚨 Critical:\nUser {uid}\nLevel: {risk['level']}\nScore: {risk['score']}\nMsg: {user_text[:200]}")
+                await bot.send_message(admin_id, alert)
             except Exception:
                 pass
-        await message.answer(get_crisis_text(lang), parse_mode="HTML")
+        await message.answer(get_crisis_text(lang), parse_mode="HTML",
+                             reply_markup=crisis_keyboard(lang))
         return
     
     # 3.5 Dependency monitor
@@ -201,6 +206,27 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                              reply_markup=score_kb(f"before:{practice['id']}:{scenario}:{lang}"))
 
 # ────────────────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("crisis:"))
+async def cb_crisis(callback: CallbackQuery):
+    """User self-report after a crisis message: 'safe' resolves the event and
+    stops follow-ups; 'still' keeps it open and re-surfaces crisis resources."""
+    uid = callback.from_user.id
+    action = callback.data.split(":")[1]   # 'safe' | 'still'
+    lang = await get_user_language(uid)
+    await set_crisis_response(uid, action)
+    if action == "safe":
+        await callback.message.answer(
+            "Рад, что ты в безопасности. Я рядом, если что." if lang == "ru"
+            else "Glad you're safe. I'm here if you need me.")
+    else:
+        await callback.message.answer(
+            ("Ты не один в этом. Пожалуйста, свяжись с теми, кто может помочь прямо сейчас."
+             if lang == "ru"
+             else "You're not alone in this. Please reach out to someone who can help right now."),
+            reply_markup=crisis_keyboard(lang))
+    await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("before:"))
 async def cb_before(callback: CallbackQuery, fsm_state: FSMContext):

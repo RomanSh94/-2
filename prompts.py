@@ -139,6 +139,23 @@ def get_crisis_text(lang: str = "ru") -> str:
 def get_dependency_text(lang: str = "ru") -> str:
     return DEPENDENCY_TEXT_EN if lang == "en" else DEPENDENCY_TEXT_RU
 
+CRISIS_FOLLOWUP_RU = {
+    "1h":  "Я думал(а) о тебе. Как ты сейчас?",
+    "24h": "Прошёл день. Хотел(а) спросить — как ты держишься?",
+    "7d":  "Прошла неделя с того тяжёлого момента. Как ты сейчас?",
+}
+CRISIS_FOLLOWUP_EN = {
+    "1h":  "I've been thinking of you. How are you right now?",
+    "24h": "A day has passed. I wanted to ask — how are you holding up?",
+    "7d":  "It's been a week since that hard moment. How are you now?",
+}
+
+
+def get_crisis_followup(lang: str = "ru", tag: str = "1h") -> str:
+    table = CRISIS_FOLLOWUP_EN if lang == "en" else CRISIS_FOLLOWUP_RU
+    return table.get(tag, table["1h"])
+
+
 def get_onboarding(lang: str = "ru") -> tuple[str, list]:
     if lang == "en":
         return ONBOARDING_TEXT_EN, ONBOARDING_BUTTONS_EN

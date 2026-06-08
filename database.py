@@ -139,6 +139,21 @@ CREATE TABLE IF NOT EXISTS validator_blocks (
     created_at   TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS crisis_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    level           TEXT NOT NULL,
+    risk_score      INTEGER,
+    categories      TEXT,
+    message_excerpt TEXT,
+    lang            TEXT DEFAULT 'ru',
+    admin_notified  INTEGER DEFAULT 0,
+    user_response   TEXT,
+    resolved        INTEGER DEFAULT 0,
+    followups_json  TEXT DEFAULT '[]',
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS response_quality (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id         INTEGER,
@@ -371,6 +386,63 @@ async def log_validator_block(uid: int, reason: str, blocked_text: str):
             (uid, reason, blocked_text))
         await db.commit()
 
+# ── Crisis Events (Epic 1) ────────────────────────────────────────────────────
+
+async def log_crisis_event(uid: int, level: str, risk_score: int,
+                            categories: list, message_excerpt: str,
+                            lang: str = "ru", admin_notified: bool = False) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO crisis_events
+               (user_id,level,risk_score,categories,message_excerpt,lang,admin_notified)
+               VALUES (?,?,?,?,?,?,?)""",
+            (uid, level, risk_score, ",".join(categories), message_excerpt,
+             lang, int(admin_notified)))
+        await db.commit(); return cur.lastrowid
+
+
+async def set_crisis_response(uid: int, response: str) -> None:
+    """Record the user's self-report on their most recent unresolved event.
+
+    'safe'  → resolved (stop follow-ups). 'still' → stays open (keep following up).
+    """
+    resolved = 1 if response == "safe" else 0
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id FROM crisis_events WHERE user_id=? AND resolved=0"
+            " ORDER BY id DESC LIMIT 1", (uid,))
+        row = await cur.fetchone()
+        if not row:
+            return
+        await db.execute(
+            "UPDATE crisis_events SET user_response=?, resolved=? WHERE id=?",
+            (response, resolved, row[0]))
+        await db.commit()
+
+
+async def get_active_crisis_events() -> list:
+    """Unresolved events: (id, user_id, lang, created_at, followups[list])."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id,user_id,lang,created_at,followups_json"
+            " FROM crisis_events WHERE resolved=0")
+        rows = await cur.fetchall()
+    return [(r[0], r[1], r[2], r[3], json.loads(r[4] or "[]")) for r in rows]
+
+
+async def mark_crisis_followup_sent(event_id: int, tag: str) -> None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT followups_json FROM crisis_events WHERE id=?", (event_id,))
+        row = await cur.fetchone()
+        sent = json.loads(row[0] or "[]") if row else []
+        if tag not in sent:
+            sent.append(tag)
+        await db.execute(
+            "UPDATE crisis_events SET followups_json=? WHERE id=?",
+            (json.dumps(sent), event_id))
+        await db.commit()
+
 # ── Response Quality (👍/👎) ──────────────────────────────────────────────────
 
 async def save_response_quality(uid: int, message_id: int,
@@ -551,7 +623,7 @@ def sync_quality_stats() -> list:
 _EXPORT_ALLOWED_TABLES = {
     "intervention_results", "router_decision_logs", "adverse_events",
     "moderation_logs", "response_quality", "validator_blocks",
-    "weekly_progress_snapshots",
+    "weekly_progress_snapshots", "crisis_events",
 }
 
 def sync_export_query_safe(table: str) -> tuple:
