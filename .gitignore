@@ -14,3 +14,4 @@ x20.db-shm
 
 # Local tooling
 .claude/
+settings.local.json
