@@ -30,6 +30,9 @@ from openai import AsyncOpenAI
 from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION
 from prompts import get_system_prompt, get_crisis_text, get_onboarding
 from crisis_protocol import classify, crisis_keyboard, admin_alert_text, RED
+from humanization import (
+    pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
+)
 from risk_detector import detect_risk
 from language_detector import detect_language
 from stage_detector import detect_stage
@@ -54,6 +57,7 @@ from database import (
     get_user_language,
     set_checkin, get_checkin_users, update_last_checkin,
     log_crisis_event, set_crisis_response,
+    get_memory_overview, forget_all,
 )
 
 class InterventionStates(StatesGroup):
@@ -177,6 +181,17 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             model="gpt-4o-mini", messages=messages, temperature=0.65, max_tokens=300,
         )
         answer = response.choices[0].message.content
+        # 15.1 Anti-robot (§7.4): one retry if the reply leans on burned-out clichés
+        if has_robotic_phrase(answer, lang):
+            retry_messages = messages + [
+                {"role": "assistant", "content": answer},
+                {"role": "system", "content": rephrase_instruction(lang)},
+            ]
+            retry = await client.chat.completions.create(
+                model="gpt-4o-mini", messages=retry_messages,
+                temperature=0.8, max_tokens=300,
+            )
+            answer = retry.choices[0].message.content
     except Exception as e:
         print(f"[LLM] error uid={uid}: {type(e).__name__}: {e}")
         await message.answer(
@@ -184,16 +199,17 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             else "I'm temporarily unavailable, please try again shortly."
         )
         return
-    
+
     # 16. Safety validator
     is_safe, reason = validate_response(answer, lang)
     if not is_safe:
         await log_validator_block(uid, reason, answer)
         answer = get_fallback(lang)
-    
-    # 17. Save & send
+
+    # 17. Save & send (with a human-feeling typing pause, §7.2)
     await save_message(uid, "user", user_text, scenario, lang)
     await save_message(uid, "assistant", answer, scenario, lang)
+    await asyncio.sleep(typing_delay(answer))
     await message.answer(answer)
     
     # 18. Start outcome tracking (if appropriate scenario)
@@ -306,19 +322,86 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    from datetime import datetime
     uid = message.from_user.id
+    overview = await get_memory_overview(uid)          # before upsert: 0 msgs == first time
+    is_first = overview["message_count"] == 0
     await upsert_user(uid, message.from_user.username or "", message.from_user.first_name or "")
     lang = await get_user_language(uid)
     text, buttons = get_onboarding(lang)
+    # §7.1 returning users get a time-varied greeting instead of the fixed intro line
+    if not is_first:
+        text = pick_greeting(False, datetime.now().hour, lang)
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=b)] for b in buttons], resize_keyboard=True, one_time_keyboard=True)
-    await message.answer(text + "\n\n⚠️ " + ("Я не терапевт." if lang == "ru" else "I'm not a therapist."), 
+    await message.answer(text + "\n\n⚠️ " + ("Я не терапевт." if lang == "ru" else "I'm not a therapist."),
                          reply_markup=kb)
+
+
+@dp.message(Command("memory"))
+async def cmd_memory(message: Message):
+    """GDPR §6.3 — show the user what the bot remembers about them."""
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    o = await get_memory_overview(uid)
+    if lang == "en":
+        lines = [
+            "<b>What I remember</b>",
+            f"• Messages stored: {o['message_count']}",
+            f"• Sessions: {o['total_sessions']}",
+            f"• Running emotional state: {'yes' if o['has_state'] else 'no'}",
+        ]
+        if o["summary"]:
+            lines.append(f"• Summary: {_he(o['summary'])}")
+        lines.append("\nTo erase everything: /forget_all")
+    else:
+        lines = [
+            "<b>Что я помню</b>",
+            f"• Сохранённых сообщений: {o['message_count']}",
+            f"• Сессий: {o['total_sessions']}",
+            f"• Текущее эмоц. состояние: {'есть' if o['has_state'] else 'нет'}",
+        ]
+        if o["summary"]:
+            lines.append(f"• Резюме: {_he(o['summary'])}")
+        lines.append("\nСтереть всё: /forget_all")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("forget_all"))
+async def cmd_forget_all(message: Message):
+    """GDPR right-to-erasure — ask for explicit confirmation first."""
+    lang = await get_user_language(message.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=("🗑 Да, стереть всё" if lang == "ru" else "🗑 Yes, erase everything"),
+            callback_data="forget:yes"),
+        InlineKeyboardButton(
+            text=("Отмена" if lang == "ru" else "Cancel"),
+            callback_data="forget:no"),
+    ]])
+    await message.answer(
+        ("Это удалит всю переписку, резюме и профиль безвозвратно. Продолжить?"
+         if lang == "ru"
+         else "This permanently deletes all your messages, summary and profile. Continue?"),
+        reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("forget:"))
+async def cb_forget(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if callback.data.split(":")[1] == "yes":
+        await forget_all(uid)
+        msg = "Готово. Я всё стёр." if lang == "ru" else "Done. Everything is erased."
+    else:
+        msg = "Отменено." if lang == "ru" else "Cancelled."
+    await callback.message.answer(msg)
+    await callback.answer()
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     lang = await get_user_language(message.from_user.id)
     await message.answer(
-        ("/start • /checkin • /help" if lang == "en" else "/start • /checkin • /help"),
+        ("/start • /checkin • /memory • /forget_all • /help"),
         reply_markup=ReplyKeyboardRemove())
 
 @dp.message(Command("checkin"))

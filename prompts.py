@@ -127,10 +127,11 @@ CHECKIN_EN = ["Hey. How are you today?","Just checking in — how are you?","How
 
 
 def get_system_prompt(scenario: str, lang: str = "ru") -> str:
+    from humanization import persona_voice
     p = PROMPTS.get(scenario, PROMPTS["open_chat"])
     rules = BASE_RULES_EN if lang == "en" else BASE_RULES_RU
     template = p.get(lang, p.get("ru", ""))
-    return template.replace("{BASE_RULES}", rules)
+    return template.replace("{BASE_RULES}", rules) + persona_voice(lang)
 
 
 def get_crisis_text(lang: str = "ru") -> str:
