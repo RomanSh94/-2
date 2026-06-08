@@ -386,6 +386,42 @@ async def log_validator_block(uid: int, reason: str, blocked_text: str):
             (uid, reason, blocked_text))
         await db.commit()
 
+# ── GDPR memory (Epic 2) ──────────────────────────────────────────────────────
+
+async def get_memory_overview(uid: int) -> dict:
+    """What the bot currently remembers about a user (for /memory)."""
+    async with aiosqlite.connect(DB) as db:
+        msg_cnt = (await (await db.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_id=?", (uid,))).fetchone())[0]
+        summ = await (await db.execute(
+            "SELECT content FROM summaries WHERE user_id=? ORDER BY id DESC LIMIT 1",
+            (uid,))).fetchone()
+        has_state = (await (await db.execute(
+            "SELECT COUNT(*) FROM user_states WHERE user_id=?", (uid,))).fetchone())[0]
+        profile = await (await db.execute(
+            "SELECT primary_issue,total_sessions FROM user_profiles WHERE user_id=?",
+            (uid,))).fetchone()
+    return {
+        "message_count": msg_cnt,
+        "summary": summ[0] if summ else None,
+        "has_state": bool(has_state),
+        "primary_issue": profile[0] if profile else None,
+        "total_sessions": profile[1] if profile else 0,
+    }
+
+
+async def forget_all(uid: int) -> None:
+    """GDPR right-to-erasure: wipe conversational memory for a user.
+
+    Deletes messages, summaries, rolling state and the learned profile.
+    crisis_events are intentionally kept (safety/duty-of-care record), not
+    conversational content."""
+    async with aiosqlite.connect(DB) as db:
+        for table in ("messages", "summaries", "user_states", "user_profiles"):
+            await db.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
+        await db.commit()
+
+
 # ── Crisis Events (Epic 1) ────────────────────────────────────────────────────
 
 async def log_crisis_event(uid: int, level: str, risk_score: int,
