@@ -152,6 +152,26 @@ CRISIS_FOLLOWUP_EN = {
 }
 
 
+PUSH_MSGS_RU = {
+    "12h": ["Эй. Просто проверяю — как ты?", "Привет. Я тут, если что."],
+    "3d":  ["Давно не виделись. Всё ок?", "Привет. Как ты эти дни?"],
+    "7d":  ["Прошла неделя. Я здесь.", "Привет. Если захочешь — я рядом."],
+    "30d": ["Месяц молчания. Если захочешь — я тут.", "Привет. Просто напоминаю: я рядом."],
+}
+PUSH_MSGS_EN = {
+    "12h": ["Hey. Just checking in — how are you?", "Hi. I'm here if you need it."],
+    "3d":  ["Haven't seen you in a bit. All okay?", "Hi. How have these days been?"],
+    "7d":  ["It's been a week. I'm here.", "Hi. Whenever you want — I'm around."],
+    "30d": ["A month of quiet. If you ever want, I'm here.", "Hi. Just a reminder: I'm around."],
+}
+
+
+def get_push_msg(lang: str = "ru", tier: str = "12h") -> str:
+    import random
+    table = PUSH_MSGS_EN if lang == "en" else PUSH_MSGS_RU
+    return random.choice(table.get(tier, table["12h"]))
+
+
 def get_crisis_followup(lang: str = "ru", tag: str = "1h") -> str:
     table = CRISIS_FOLLOWUP_EN if lang == "en" else CRISIS_FOLLOWUP_RU
     return table.get(tag, table["1h"])
