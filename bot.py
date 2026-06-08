@@ -58,6 +58,7 @@ from database import (
     set_checkin, get_checkin_users, update_last_checkin,
     log_crisis_event, set_crisis_response,
     get_memory_overview, forget_all,
+    set_mute, reset_unanswered,
 )
 
 class InterventionStates(StatesGroup):
@@ -91,6 +92,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # 1. Detect language
     lang = detect_language(user_text)
     await upsert_user(uid, username, first_name, lang)
+    await reset_unanswered(uid)   # user re-engaged → clear ignored-push backoff
     
     # 2. Risk detection
     risk = detect_risk(user_text, lang)
@@ -397,11 +399,45 @@ async def cb_forget(callback: CallbackQuery):
     await callback.message.answer(msg)
     await callback.answer()
 
+@dp.message(Command("mute"))
+async def cmd_mute(message: Message):
+    lang = await get_user_language(message.from_user.id)
+    await set_mute(message.from_user.id, "forever")
+    await message.answer("Пуши отключены. /unmute — включить обратно." if lang == "ru"
+                         else "Pushes off. /unmute to turn them back on.")
+
+
+@dp.message(Command("mute_today"))
+async def cmd_mute_today(message: Message):
+    from datetime import datetime, timezone, timedelta
+    lang = await get_user_language(message.from_user.id)
+    until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    await set_mute(message.from_user.id, "until", until.strftime("%Y-%m-%d %H:%M:%S"))
+    await message.answer("Тихо до конца дня." if lang == "ru" else "Quiet for the rest of today.")
+
+
+@dp.message(Command("mute_week"))
+async def cmd_mute_week(message: Message):
+    from datetime import datetime, timezone, timedelta
+    lang = await get_user_language(message.from_user.id)
+    until = datetime.now(timezone.utc) + timedelta(days=7)
+    await set_mute(message.from_user.id, "until", until.strftime("%Y-%m-%d %H:%M:%S"))
+    await message.answer("Тихо на неделю." if lang == "ru" else "Quiet for a week.")
+
+
+@dp.message(Command("unmute"))
+async def cmd_unmute(message: Message):
+    lang = await get_user_language(message.from_user.id)
+    await set_mute(message.from_user.id, "none")
+    await message.answer("Пуши снова включены." if lang == "ru" else "Pushes back on.")
+
+
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     lang = await get_user_language(message.from_user.id)
     await message.answer(
-        ("/start • /checkin • /memory • /forget_all • /help"),
+        ("/start • /checkin • /memory • /forget_all • /mute • /unmute • /help"),
         reply_markup=ReplyKeyboardRemove())
 
 @dp.message(Command("checkin"))

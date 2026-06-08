@@ -139,6 +139,21 @@ CREATE TABLE IF NOT EXISTS validator_blocks (
     created_at   TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS push_settings (
+    user_id                INTEGER PRIMARY KEY,
+    mute_mode              TEXT DEFAULT 'none',   -- none | forever | until
+    mute_until             TEXT,
+    consecutive_unanswered INTEGER DEFAULT 0,
+    updated_at             TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS push_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    tier       TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS crisis_events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id         INTEGER NOT NULL,
@@ -385,6 +400,74 @@ async def log_validator_block(uid: int, reason: str, blocked_text: str):
             "INSERT INTO validator_blocks (user_id,reason,blocked_text) VALUES (?,?,?)",
             (uid, reason, blocked_text))
         await db.commit()
+
+# ── Silence Engine push state (Epic 3) ────────────────────────────────────────
+
+async def set_mute(uid: int, mode: str, until_iso: str | None = None) -> None:
+    """mode: 'none' | 'forever' | 'until' (with until_iso UTC 'YYYY-MM-DD HH:MM:SS')."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            """INSERT INTO push_settings (user_id,mute_mode,mute_until)
+               VALUES (?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   mute_mode=excluded.mute_mode, mute_until=excluded.mute_until,
+                   updated_at=datetime('now')""",
+            (uid, mode, until_iso))
+        await db.commit()
+
+
+async def reset_unanswered(uid: int) -> None:
+    """Called when the user sends a message — clears the ignored-push counter."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE push_settings SET consecutive_unanswered=0 WHERE user_id=?", (uid,))
+        await db.commit()
+
+
+async def record_push(uid: int, tier: str) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO push_log (user_id,tier) VALUES (?,?)", (uid, tier))
+        await db.execute(
+            """INSERT INTO push_settings (user_id,consecutive_unanswered)
+               VALUES (?,1)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   consecutive_unanswered=consecutive_unanswered+1,
+                   updated_at=datetime('now')""",
+            (uid,))
+        await db.commit()
+
+
+async def get_push_candidates() -> list:
+    """Users inactive ≥12h who aren't permanently muted: (uid, last_seen, lang)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """SELECT u.id, u.last_seen, u.language
+               FROM users u
+               LEFT JOIN push_settings p ON p.user_id = u.id
+               WHERE u.last_seen <= datetime('now','-12 hours')
+                 AND COALESCE(p.mute_mode,'none') != 'forever'""")
+        return await cur.fetchall()
+
+
+async def get_push_context(uid: int) -> dict:
+    """Everything decide_push() needs for one user (raw strings; caller parses)."""
+    async with aiosqlite.connect(DB) as db:
+        ps = await (await db.execute(
+            "SELECT mute_mode,mute_until,consecutive_unanswered"
+            " FROM push_settings WHERE user_id=?", (uid,))).fetchone()
+        crisis = await (await db.execute(
+            "SELECT MAX(created_at) FROM crisis_events WHERE user_id=?", (uid,))).fetchone()
+        logs = await (await db.execute(
+            "SELECT tier,created_at FROM push_log WHERE user_id=?"
+            " AND created_at >= datetime('now','-90 days')", (uid,))).fetchall()
+    return {
+        "mute_mode": ps[0] if ps else "none",
+        "mute_until": ps[1] if ps else None,
+        "consecutive_unanswered": ps[2] if ps else 0,
+        "last_crisis_at": crisis[0] if crisis else None,
+        "push_log": [(r[0], r[1]) for r in logs],
+    }
+
 
 # ── GDPR memory (Epic 2) ──────────────────────────────────────────────────────
 
