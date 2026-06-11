@@ -51,5 +51,5 @@ jobs:
         run: |
           python -c "import asyncio, database; asyncio.run(database.init_db()); print('init_db: OK')"
 
-      - name: Unit tests (детерминированная логика: risk, safety, dependency)
+      - name: "Unit tests (детерминированная логика: risk, safety, dependency)"
         run: python -m pytest -q
