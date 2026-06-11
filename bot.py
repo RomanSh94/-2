@@ -20,7 +20,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from html import escape as _he
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -85,9 +85,14 @@ def quality_kb() -> InlineKeyboardMarkup:
 
 # ────────────────────────────────────────────────────────────────────────────
 
-async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None) -> None:
-    """Complete X20 pipeline"""
-    uid, username, first_name = message.from_user.id, message.from_user.username or "", message.from_user.first_name or ""
+async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
+                   tg_user=None) -> None:
+    """Complete X20 pipeline.
+
+    tg_user: при вызове из callback-кнопки message.from_user — это бот,
+    поэтому реальный пользователь передаётся явно (callback.from_user)."""
+    u = tg_user or message.from_user
+    uid, username, first_name = u.id, u.username or "", u.first_name or ""
     
     # 1. Detect language
     lang = detect_language(user_text)
@@ -334,9 +339,33 @@ async def cmd_start(message: Message):
     # §7.1 returning users get a time-varied greeting instead of the fixed intro line
     if not is_first:
         text = pick_greeting(False, datetime.now().hour, lang)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=b)] for b in buttons], resize_keyboard=True, one_time_keyboard=True)
+    # Inline-кнопки вместо reply-клавиатуры: iOS прячет reply-клавиатуру за
+    # иконкой у поля ввода, и пользователи её не видят. Inline видна везде.
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=b, callback_data=f"mood:{i}")]
+        for i, b in enumerate(buttons)
+    ])
     await message.answer(text + "\n\n⚠️ " + ("Я не терапевт." if lang == "ru" else "I'm not a therapist."),
                          reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("mood:"))
+async def cb_mood(callback: CallbackQuery, state: FSMContext):
+    """Кнопка состояния из онбординга → обычный проход по pipeline."""
+    lang = await get_user_language(callback.from_user.id)
+    _, buttons = get_onboarding(lang)
+    try:
+        choice = buttons[int(callback.data.split(":")[1])]
+    except (ValueError, IndexError):
+        await callback.answer()
+        return
+    await callback.answer()
+    # Убираем кнопки, чтобы не нажали повторно; текст приветствия оставляем.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await pipeline(callback.message, choice, state, tg_user=callback.from_user)
 
 
 @dp.message(Command("memory"))
