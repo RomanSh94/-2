@@ -20,7 +20,9 @@ User=root
 WorkingDirectory=/root/-2
 EnvironmentFile=/root/-2/.env
 ExecStart=/root/-2/venv/bin/python bot.py
-Restart=on-failure
+# always, не on-failure: aiogram при SIGTERM выходит с кодом 0,
+# и on-failure такой выход не перезапустил бы.
+Restart=always
 RestartSec=5
 
 [Install]

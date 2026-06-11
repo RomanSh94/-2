@@ -54,7 +54,7 @@ User=x20
 WorkingDirectory=/opt/x20
 EnvironmentFile=/opt/x20/.env
 ExecStart=/opt/x20/venv/bin/python bot.py
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
@@ -73,7 +73,7 @@ systemctl status x20
 
 Сейчас: код в `/root/-2`, запуск через crontab `@reboot`, логи в
 `/var/log/x20.log`. Проблема crontab: если бот упал в процессе работы, он
-лежит мёртвый до перезагрузки сервера. systemd с `Restart=on-failure`
+лежит мёртвый до перезагрузки сервера. systemd с `Restart=always`
 перезапускает сам через 5 секунд.
 
 ### 1. Убрать запуск из crontab
