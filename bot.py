@@ -7,6 +7,17 @@ X20 Bot — Основной файл
   Notifications → OutcomeTracking → User
 """
 import asyncio
+import sys
+
+# Windows consoles default to a legacy codepage (e.g. cp1251) that cannot encode
+# the emoji used in our log/print statements, which crashes startup with
+# UnicodeEncodeError. Force UTF-8 on stdout/stderr before anything prints.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from html import escape as _he
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -18,6 +29,10 @@ from openai import AsyncOpenAI
 
 from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION
 from prompts import get_system_prompt, get_crisis_text, get_onboarding
+from crisis_protocol import classify, crisis_keyboard, admin_alert_text, RED
+from humanization import (
+    pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
+)
 from risk_detector import detect_risk
 from language_detector import detect_language
 from stage_detector import detect_stage
@@ -41,6 +56,9 @@ from database import (
     start_intervention, finish_intervention,
     get_user_language,
     set_checkin, get_checkin_users, update_last_checkin,
+    log_crisis_event, set_crisis_response,
+    get_memory_overview, forget_all,
+    set_mute, reset_unanswered,
 )
 
 class InterventionStates(StatesGroup):
@@ -74,6 +92,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # 1. Detect language
     lang = detect_language(user_text)
     await upsert_user(uid, username, first_name, lang)
+    await reset_unanswered(uid)   # user re-engaged → clear ignored-push backoff
     
     # 2. Risk detection
     risk = detect_risk(user_text, lang)
@@ -83,28 +102,33 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         await log_moderation(uid, username, first_name, risk["level"], risk["score"],
                               risk["categories"], user_text, "pending", risk["implicit"])
     
-    # 4. Crisis override
+    # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here)
     if "aggression" in risk["categories"]:
         await push_alert("Aggression Detected", uid, username, risk["level"],
                          risk["score"], risk["categories"], user_text)
 
-    if "suicide" in risk["categories"] or "self_harm" in risk["categories"]:
+    if classify(risk) == RED:
+        await log_crisis_event(uid, RED, risk["score"], risk["categories"],
+                               user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
         await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
                          risk["categories"], user_text)
+        alert = admin_alert_text(uid, username, RED, risk, user_text)
         for admin_id in ADMIN_USER_IDS:
             try:
-                await bot.send_message(admin_id,
-                    f"🚨 Critical:\nUser {uid}\nLevel: {risk['level']}\nScore: {risk['score']}\nMsg: {user_text[:200]}")
+                await bot.send_message(admin_id, alert)
             except Exception:
                 pass
-        await message.answer(get_crisis_text(lang), parse_mode="HTML")
+        await message.answer(get_crisis_text(lang), parse_mode="HTML",
+                             reply_markup=crisis_keyboard(lang))
         return
     
     # 3.5 Dependency monitor
+    # record_message MUST come first so the current message is counted
+    # before the threshold check — otherwise the 100th message never triggers.
+    await dependency_monitor.record_message(uid)
     dep_msg = await dependency_monitor.check_dependency(uid, lang)
     if dep_msg:
         await message.answer(dep_msg)
-    await dependency_monitor.record_message(uid)
 
     # 5. Update state
     state = await load_state(uid) or dict(DEFAULT_STATE)
@@ -154,20 +178,40 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     
     # 15. LLM call
     await bot.send_chat_action(message.chat.id, "typing")
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini", messages=messages, temperature=0.65, max_tokens=300,
-    )
-    answer = response.choices[0].message.content
-    
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini", messages=messages, temperature=0.65, max_tokens=300,
+        )
+        answer = response.choices[0].message.content
+        # 15.1 Anti-robot (§7.4): one retry if the reply leans on burned-out clichés
+        if has_robotic_phrase(answer, lang):
+            retry_messages = messages + [
+                {"role": "assistant", "content": answer},
+                {"role": "system", "content": rephrase_instruction(lang)},
+            ]
+            retry = await client.chat.completions.create(
+                model="gpt-4o-mini", messages=retry_messages,
+                temperature=0.8, max_tokens=300,
+            )
+            answer = retry.choices[0].message.content
+    except Exception as e:
+        print(f"[LLM] error uid={uid}: {type(e).__name__}: {e}")
+        await message.answer(
+            "Я временно недоступен, попробуй чуть позже." if lang == "ru"
+            else "I'm temporarily unavailable, please try again shortly."
+        )
+        return
+
     # 16. Safety validator
     is_safe, reason = validate_response(answer, lang)
     if not is_safe:
         await log_validator_block(uid, reason, answer)
         answer = get_fallback(lang)
-    
-    # 17. Save & send
+
+    # 17. Save & send (with a human-feeling typing pause, §7.2)
     await save_message(uid, "user", user_text, scenario, lang)
     await save_message(uid, "assistant", answer, scenario, lang)
+    await asyncio.sleep(typing_delay(answer))
     await message.answer(answer)
     
     # 18. Start outcome tracking (if appropriate scenario)
@@ -180,6 +224,27 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                              reply_markup=score_kb(f"before:{practice['id']}:{scenario}:{lang}"))
 
 # ────────────────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("crisis:"))
+async def cb_crisis(callback: CallbackQuery):
+    """User self-report after a crisis message: 'safe' resolves the event and
+    stops follow-ups; 'still' keeps it open and re-surfaces crisis resources."""
+    uid = callback.from_user.id
+    action = callback.data.split(":")[1]   # 'safe' | 'still'
+    lang = await get_user_language(uid)
+    await set_crisis_response(uid, action)
+    if action == "safe":
+        await callback.message.answer(
+            "Рад, что ты в безопасности. Я рядом, если что." if lang == "ru"
+            else "Glad you're safe. I'm here if you need me.")
+    else:
+        await callback.message.answer(
+            ("Ты не один в этом. Пожалуйста, свяжись с теми, кто может помочь прямо сейчас."
+             if lang == "ru"
+             else "You're not alone in this. Please reach out to someone who can help right now."),
+            reply_markup=crisis_keyboard(lang))
+    await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("before:"))
 async def cb_before(callback: CallbackQuery, fsm_state: FSMContext):
@@ -259,19 +324,120 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    from datetime import datetime
     uid = message.from_user.id
+    overview = await get_memory_overview(uid)          # before upsert: 0 msgs == first time
+    is_first = overview["message_count"] == 0
     await upsert_user(uid, message.from_user.username or "", message.from_user.first_name or "")
     lang = await get_user_language(uid)
     text, buttons = get_onboarding(lang)
+    # §7.1 returning users get a time-varied greeting instead of the fixed intro line
+    if not is_first:
+        text = pick_greeting(False, datetime.now().hour, lang)
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=b)] for b in buttons], resize_keyboard=True, one_time_keyboard=True)
-    await message.answer(text + "\n\n⚠️ " + ("Я не терапевт." if lang == "ru" else "I'm not a therapist."), 
+    await message.answer(text + "\n\n⚠️ " + ("Я не терапевт." if lang == "ru" else "I'm not a therapist."),
                          reply_markup=kb)
+
+
+@dp.message(Command("memory"))
+async def cmd_memory(message: Message):
+    """GDPR §6.3 — show the user what the bot remembers about them."""
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    o = await get_memory_overview(uid)
+    if lang == "en":
+        lines = [
+            "<b>What I remember</b>",
+            f"• Messages stored: {o['message_count']}",
+            f"• Sessions: {o['total_sessions']}",
+            f"• Running emotional state: {'yes' if o['has_state'] else 'no'}",
+        ]
+        if o["summary"]:
+            lines.append(f"• Summary: {_he(o['summary'])}")
+        lines.append("\nTo erase everything: /forget_all")
+    else:
+        lines = [
+            "<b>Что я помню</b>",
+            f"• Сохранённых сообщений: {o['message_count']}",
+            f"• Сессий: {o['total_sessions']}",
+            f"• Текущее эмоц. состояние: {'есть' if o['has_state'] else 'нет'}",
+        ]
+        if o["summary"]:
+            lines.append(f"• Резюме: {_he(o['summary'])}")
+        lines.append("\nСтереть всё: /forget_all")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("forget_all"))
+async def cmd_forget_all(message: Message):
+    """GDPR right-to-erasure — ask for explicit confirmation first."""
+    lang = await get_user_language(message.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=("🗑 Да, стереть всё" if lang == "ru" else "🗑 Yes, erase everything"),
+            callback_data="forget:yes"),
+        InlineKeyboardButton(
+            text=("Отмена" if lang == "ru" else "Cancel"),
+            callback_data="forget:no"),
+    ]])
+    await message.answer(
+        ("Это удалит всю переписку, резюме и профиль безвозвратно. Продолжить?"
+         if lang == "ru"
+         else "This permanently deletes all your messages, summary and profile. Continue?"),
+        reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("forget:"))
+async def cb_forget(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if callback.data.split(":")[1] == "yes":
+        await forget_all(uid)
+        msg = "Готово. Я всё стёр." if lang == "ru" else "Done. Everything is erased."
+    else:
+        msg = "Отменено." if lang == "ru" else "Cancelled."
+    await callback.message.answer(msg)
+    await callback.answer()
+
+@dp.message(Command("mute"))
+async def cmd_mute(message: Message):
+    lang = await get_user_language(message.from_user.id)
+    await set_mute(message.from_user.id, "forever")
+    await message.answer("Пуши отключены. /unmute — включить обратно." if lang == "ru"
+                         else "Pushes off. /unmute to turn them back on.")
+
+
+@dp.message(Command("mute_today"))
+async def cmd_mute_today(message: Message):
+    from datetime import datetime, timezone, timedelta
+    lang = await get_user_language(message.from_user.id)
+    until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    await set_mute(message.from_user.id, "until", until.strftime("%Y-%m-%d %H:%M:%S"))
+    await message.answer("Тихо до конца дня." if lang == "ru" else "Quiet for the rest of today.")
+
+
+@dp.message(Command("mute_week"))
+async def cmd_mute_week(message: Message):
+    from datetime import datetime, timezone, timedelta
+    lang = await get_user_language(message.from_user.id)
+    until = datetime.now(timezone.utc) + timedelta(days=7)
+    await set_mute(message.from_user.id, "until", until.strftime("%Y-%m-%d %H:%M:%S"))
+    await message.answer("Тихо на неделю." if lang == "ru" else "Quiet for a week.")
+
+
+@dp.message(Command("unmute"))
+async def cmd_unmute(message: Message):
+    lang = await get_user_language(message.from_user.id)
+    await set_mute(message.from_user.id, "none")
+    await message.answer("Пуши снова включены." if lang == "ru" else "Pushes back on.")
+
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     lang = await get_user_language(message.from_user.id)
     await message.answer(
-        ("/start • /checkin • /help" if lang == "en" else "/start • /checkin • /help"),
+        ("/start • /checkin • /memory • /forget_all • /mute • /unmute • /help"),
         reply_markup=ReplyKeyboardRemove())
 
 @dp.message(Command("checkin"))

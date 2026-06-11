@@ -13,12 +13,10 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Без matrix — имя проверки должно оставаться ровно "smoke",
+  # чтобы совпадать с required status check в защите ветки main.
   smoke:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12", "3.13"]
 
     env:
       # Заглушки, чтобы импорт прошёл дальше конструкторов Bot()/AsyncOpenAI().
@@ -33,22 +31,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install dependencies (runtime + dev/test)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Syntax check (byte-compile all modules)
         run: python -m compileall -q .
 
       - name: Import smoke test (ловит краши на импорте, в т.ч. C1)
-        run: python -c "import bot; print('import bot: OK')"
+        run: |
+          python -c "import bot; print('import bot: OK')"
 
       - name: DB schema smoke test (ловит поломку SCHEMA)
         run: |
           python -c "import asyncio, database; asyncio.run(database.init_db()); print('init_db: OK')"
+
+      - name: "Unit tests (детерминированная логика: risk, safety, dependency)"
+        run: python -m pytest -q

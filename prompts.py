@@ -127,10 +127,11 @@ CHECKIN_EN = ["Hey. How are you today?","Just checking in — how are you?","How
 
 
 def get_system_prompt(scenario: str, lang: str = "ru") -> str:
+    from humanization import persona_voice
     p = PROMPTS.get(scenario, PROMPTS["open_chat"])
     rules = BASE_RULES_EN if lang == "en" else BASE_RULES_RU
     template = p.get(lang, p.get("ru", ""))
-    return template.replace("{BASE_RULES}", rules)
+    return template.replace("{BASE_RULES}", rules) + persona_voice(lang)
 
 
 def get_crisis_text(lang: str = "ru") -> str:
@@ -138,6 +139,43 @@ def get_crisis_text(lang: str = "ru") -> str:
 
 def get_dependency_text(lang: str = "ru") -> str:
     return DEPENDENCY_TEXT_EN if lang == "en" else DEPENDENCY_TEXT_RU
+
+CRISIS_FOLLOWUP_RU = {
+    "1h":  "Я думал(а) о тебе. Как ты сейчас?",
+    "24h": "Прошёл день. Хотел(а) спросить — как ты держишься?",
+    "7d":  "Прошла неделя с того тяжёлого момента. Как ты сейчас?",
+}
+CRISIS_FOLLOWUP_EN = {
+    "1h":  "I've been thinking of you. How are you right now?",
+    "24h": "A day has passed. I wanted to ask — how are you holding up?",
+    "7d":  "It's been a week since that hard moment. How are you now?",
+}
+
+
+PUSH_MSGS_RU = {
+    "12h": ["Эй. Просто проверяю — как ты?", "Привет. Я тут, если что."],
+    "3d":  ["Давно не виделись. Всё ок?", "Привет. Как ты эти дни?"],
+    "7d":  ["Прошла неделя. Я здесь.", "Привет. Если захочешь — я рядом."],
+    "30d": ["Месяц молчания. Если захочешь — я тут.", "Привет. Просто напоминаю: я рядом."],
+}
+PUSH_MSGS_EN = {
+    "12h": ["Hey. Just checking in — how are you?", "Hi. I'm here if you need it."],
+    "3d":  ["Haven't seen you in a bit. All okay?", "Hi. How have these days been?"],
+    "7d":  ["It's been a week. I'm here.", "Hi. Whenever you want — I'm around."],
+    "30d": ["A month of quiet. If you ever want, I'm here.", "Hi. Just a reminder: I'm around."],
+}
+
+
+def get_push_msg(lang: str = "ru", tier: str = "12h") -> str:
+    import random
+    table = PUSH_MSGS_EN if lang == "en" else PUSH_MSGS_RU
+    return random.choice(table.get(tier, table["12h"]))
+
+
+def get_crisis_followup(lang: str = "ru", tag: str = "1h") -> str:
+    table = CRISIS_FOLLOWUP_EN if lang == "en" else CRISIS_FOLLOWUP_RU
+    return table.get(tag, table["1h"])
+
 
 def get_onboarding(lang: str = "ru") -> tuple[str, list]:
     if lang == "en":

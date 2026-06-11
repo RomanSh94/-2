@@ -139,6 +139,36 @@ CREATE TABLE IF NOT EXISTS validator_blocks (
     created_at   TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS push_settings (
+    user_id                INTEGER PRIMARY KEY,
+    mute_mode              TEXT DEFAULT 'none',   -- none | forever | until
+    mute_until             TEXT,
+    consecutive_unanswered INTEGER DEFAULT 0,
+    updated_at             TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS push_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    tier       TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS crisis_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    level           TEXT NOT NULL,
+    risk_score      INTEGER,
+    categories      TEXT,
+    message_excerpt TEXT,
+    lang            TEXT DEFAULT 'ru',
+    admin_notified  INTEGER DEFAULT 0,
+    user_response   TEXT,
+    resolved        INTEGER DEFAULT 0,
+    followups_json  TEXT DEFAULT '[]',
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS response_quality (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id         INTEGER,
@@ -371,6 +401,167 @@ async def log_validator_block(uid: int, reason: str, blocked_text: str):
             (uid, reason, blocked_text))
         await db.commit()
 
+# ── Silence Engine push state (Epic 3) ────────────────────────────────────────
+
+async def set_mute(uid: int, mode: str, until_iso: str | None = None) -> None:
+    """mode: 'none' | 'forever' | 'until' (with until_iso UTC 'YYYY-MM-DD HH:MM:SS')."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            """INSERT INTO push_settings (user_id,mute_mode,mute_until)
+               VALUES (?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   mute_mode=excluded.mute_mode, mute_until=excluded.mute_until,
+                   updated_at=datetime('now')""",
+            (uid, mode, until_iso))
+        await db.commit()
+
+
+async def reset_unanswered(uid: int) -> None:
+    """Called when the user sends a message — clears the ignored-push counter."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE push_settings SET consecutive_unanswered=0 WHERE user_id=?", (uid,))
+        await db.commit()
+
+
+async def record_push(uid: int, tier: str) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO push_log (user_id,tier) VALUES (?,?)", (uid, tier))
+        await db.execute(
+            """INSERT INTO push_settings (user_id,consecutive_unanswered)
+               VALUES (?,1)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   consecutive_unanswered=consecutive_unanswered+1,
+                   updated_at=datetime('now')""",
+            (uid,))
+        await db.commit()
+
+
+async def get_push_candidates() -> list:
+    """Users inactive ≥12h who aren't permanently muted: (uid, last_seen, lang)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """SELECT u.id, u.last_seen, u.language
+               FROM users u
+               LEFT JOIN push_settings p ON p.user_id = u.id
+               WHERE u.last_seen <= datetime('now','-12 hours')
+                 AND COALESCE(p.mute_mode,'none') != 'forever'""")
+        return await cur.fetchall()
+
+
+async def get_push_context(uid: int) -> dict:
+    """Everything decide_push() needs for one user (raw strings; caller parses)."""
+    async with aiosqlite.connect(DB) as db:
+        ps = await (await db.execute(
+            "SELECT mute_mode,mute_until,consecutive_unanswered"
+            " FROM push_settings WHERE user_id=?", (uid,))).fetchone()
+        crisis = await (await db.execute(
+            "SELECT MAX(created_at) FROM crisis_events WHERE user_id=?", (uid,))).fetchone()
+        logs = await (await db.execute(
+            "SELECT tier,created_at FROM push_log WHERE user_id=?"
+            " AND created_at >= datetime('now','-90 days')", (uid,))).fetchall()
+    return {
+        "mute_mode": ps[0] if ps else "none",
+        "mute_until": ps[1] if ps else None,
+        "consecutive_unanswered": ps[2] if ps else 0,
+        "last_crisis_at": crisis[0] if crisis else None,
+        "push_log": [(r[0], r[1]) for r in logs],
+    }
+
+
+# ── GDPR memory (Epic 2) ──────────────────────────────────────────────────────
+
+async def get_memory_overview(uid: int) -> dict:
+    """What the bot currently remembers about a user (for /memory)."""
+    async with aiosqlite.connect(DB) as db:
+        msg_cnt = (await (await db.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_id=?", (uid,))).fetchone())[0]
+        summ = await (await db.execute(
+            "SELECT content FROM summaries WHERE user_id=? ORDER BY id DESC LIMIT 1",
+            (uid,))).fetchone()
+        has_state = (await (await db.execute(
+            "SELECT COUNT(*) FROM user_states WHERE user_id=?", (uid,))).fetchone())[0]
+        profile = await (await db.execute(
+            "SELECT primary_issue,total_sessions FROM user_profiles WHERE user_id=?",
+            (uid,))).fetchone()
+    return {
+        "message_count": msg_cnt,
+        "summary": summ[0] if summ else None,
+        "has_state": bool(has_state),
+        "primary_issue": profile[0] if profile else None,
+        "total_sessions": profile[1] if profile else 0,
+    }
+
+
+async def forget_all(uid: int) -> None:
+    """GDPR right-to-erasure: wipe conversational memory for a user.
+
+    Deletes messages, summaries, rolling state and the learned profile.
+    crisis_events are intentionally kept (safety/duty-of-care record), not
+    conversational content."""
+    async with aiosqlite.connect(DB) as db:
+        for table in ("messages", "summaries", "user_states", "user_profiles"):
+            await db.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
+        await db.commit()
+
+
+# ── Crisis Events (Epic 1) ────────────────────────────────────────────────────
+
+async def log_crisis_event(uid: int, level: str, risk_score: int,
+                            categories: list, message_excerpt: str,
+                            lang: str = "ru", admin_notified: bool = False) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO crisis_events
+               (user_id,level,risk_score,categories,message_excerpt,lang,admin_notified)
+               VALUES (?,?,?,?,?,?,?)""",
+            (uid, level, risk_score, ",".join(categories), message_excerpt,
+             lang, int(admin_notified)))
+        await db.commit(); return cur.lastrowid
+
+
+async def set_crisis_response(uid: int, response: str) -> None:
+    """Record the user's self-report on their most recent unresolved event.
+
+    'safe'  → resolved (stop follow-ups). 'still' → stays open (keep following up).
+    """
+    resolved = 1 if response == "safe" else 0
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id FROM crisis_events WHERE user_id=? AND resolved=0"
+            " ORDER BY id DESC LIMIT 1", (uid,))
+        row = await cur.fetchone()
+        if not row:
+            return
+        await db.execute(
+            "UPDATE crisis_events SET user_response=?, resolved=? WHERE id=?",
+            (response, resolved, row[0]))
+        await db.commit()
+
+
+async def get_active_crisis_events() -> list:
+    """Unresolved events: (id, user_id, lang, created_at, followups[list])."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id,user_id,lang,created_at,followups_json"
+            " FROM crisis_events WHERE resolved=0")
+        rows = await cur.fetchall()
+    return [(r[0], r[1], r[2], r[3], json.loads(r[4] or "[]")) for r in rows]
+
+
+async def mark_crisis_followup_sent(event_id: int, tag: str) -> None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT followups_json FROM crisis_events WHERE id=?", (event_id,))
+        row = await cur.fetchone()
+        sent = json.loads(row[0] or "[]") if row else []
+        if tag not in sent:
+            sent.append(tag)
+        await db.execute(
+            "UPDATE crisis_events SET followups_json=? WHERE id=?",
+            (json.dumps(sent), event_id))
+        await db.commit()
+
 # ── Response Quality (👍/👎) ──────────────────────────────────────────────────
 
 async def save_response_quality(uid: int, message_id: int,
@@ -551,7 +742,7 @@ def sync_quality_stats() -> list:
 _EXPORT_ALLOWED_TABLES = {
     "intervention_results", "router_decision_logs", "adverse_events",
     "moderation_logs", "response_quality", "validator_blocks",
-    "weekly_progress_snapshots",
+    "weekly_progress_snapshots", "crisis_events",
 }
 
 def sync_export_query_safe(table: str) -> tuple:

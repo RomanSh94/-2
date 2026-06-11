@@ -1,0 +1,29 @@
+# X20 systemd unit — текущий прод-деплой (/root/-2, под root).
+#
+# ВНИМАНИЕ: User=root и /root/-2 — это унаследованный деплой (вариант B в
+# DEPLOY.md). Технический долг: при переезде на новый сервер ставить по
+# варианту A (/opt/x20 + отдельный пользователь x20 без root).
+#
+# Установка:
+#   cp x20.service /etc/systemd/system/x20.service
+#   systemctl daemon-reload
+#   systemctl enable --now x20
+
+[Unit]
+Description=X20 Telegram support bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/-2
+EnvironmentFile=/root/-2/.env
+ExecStart=/root/-2/venv/bin/python bot.py
+# always, не on-failure: aiogram при SIGTERM выходит с кодом 0,
+# и on-failure такой выход не перезапустил бы.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
