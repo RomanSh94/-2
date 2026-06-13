@@ -177,6 +177,78 @@ def get_crisis_followup(lang: str = "ru", tag: str = "1h") -> str:
     return table.get(tag, table["1h"])
 
 
+# ── v3 hotfix: disambiguation templates ───────────────────────────────────────
+# Deterministic clarifying questions for ambiguous phrases. These are sent
+# INSTEAD of an LLM reply, so the bot can never endorse a dangerous reading.
+DISAMBIGUATION_TEMPLATES_RU = {
+    "выйти в окно": (
+        "Я хочу убедиться, что правильно тебя понял(а). "
+        "Когда ты говоришь «выйти в окно» — ты имеешь в виду подышать свежим воздухом, "
+        "или ты думаешь о том, чтобы причинить себе вред?\n\n"
+        "Спрашиваю прямо, потому что это важно. Без осуждения."
+    ),
+    "пора заканчивать": (
+        "Когда ты говоришь «пора заканчивать» — что именно ты имеешь в виду? "
+        "Закончить день, разговор, какой-то этап? Или что-то более серьёзное?"
+    ),
+    "больше не могу": (
+        "Слышу, что тебе очень тяжело. "
+        "«Больше не могу» — это про усталость и желание отдохнуть, "
+        "или ты сейчас думаешь о том, чтобы причинить себе вред?"
+    ),
+    "хочу всё бросить": (
+        "«Бросить всё» — это про работу, отношения, какой-то проект, "
+        "или ты думаешь о том, чтобы уйти из жизни? "
+        "Спрашиваю прямо, потому что хочу понять, как тебе помочь."
+    ),
+    "не хочу продолжать": (
+        "Когда ты говоришь «не хочу продолжать» — что именно? "
+        "Конкретное дело, отношения, разговор? Или жизнь в целом?"
+    ),
+    "не вижу выхода": (
+        "Слышу, что сейчас всё кажется безвыходным. "
+        "Когда ты говоришь «не вижу выхода» — это про конкретную ситуацию, "
+        "или ты думаешь о том, чтобы причинить себе вред?"
+    ),
+    "_default": (
+        "Я хочу убедиться, что правильно тебя понял(а). "
+        "Можешь немного подробнее объяснить, что ты сейчас имеешь в виду? "
+        "Спрашиваю не из любопытства — мне важно понять."
+    ),
+}
+DISAMBIGUATION_TEMPLATES_EN = {
+    "выйти в окно": (
+        "I want to make sure I understand you correctly. "
+        "When you say you want to go to the window — do you mean to get fresh air, "
+        "or are you thinking about hurting yourself?\n\n"
+        "I'm asking directly because it matters. No judgment."
+    ),
+    "_default": (
+        "I want to make sure I understand you correctly. "
+        "Could you say a little more about what you mean right now? "
+        "I'm not asking out of curiosity — it matters to me to understand."
+    ),
+}
+
+# Gentle hotline line appended only on the "force_crisis" path (ambiguous + risk).
+DISAMBIGUATION_HOTLINE_RU = (
+    "\n\nИ ещё — если тебе сейчас правда очень тяжело, "
+    "есть бесплатный телефон доверия 8-800-2000-122. Это анонимно, 24/7."
+)
+DISAMBIGUATION_HOTLINE_EN = (
+    "\n\nAnd — if things are really hard right now, please reach out to a "
+    "crisis line near you. You don't have to go through this alone."
+)
+
+
+def get_disambiguation_message(phrase: str, lang: str = "ru", with_hotline: bool = False) -> str:
+    table = DISAMBIGUATION_TEMPLATES_EN if lang == "en" else DISAMBIGUATION_TEMPLATES_RU
+    msg = table.get((phrase or "").lower(), table["_default"])
+    if with_hotline:
+        msg += DISAMBIGUATION_HOTLINE_EN if lang == "en" else DISAMBIGUATION_HOTLINE_RU
+    return msg
+
+
 def get_onboarding(lang: str = "ru") -> tuple[str, list]:
     if lang == "en":
         return ONBOARDING_TEXT_EN, ONBOARDING_BUTTONS_EN

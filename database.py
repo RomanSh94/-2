@@ -139,6 +139,15 @@ CREATE TABLE IF NOT EXISTS validator_blocks (
     created_at   TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS disambiguation_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER,
+    message_text TEXT,
+    phrase       TEXT,
+    mode         TEXT,            -- force_disambiguation | force_crisis
+    created_at   TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS push_settings (
     user_id                INTEGER PRIMARY KEY,
     mute_mode              TEXT DEFAULT 'none',   -- none | forever | until
@@ -399,6 +408,15 @@ async def log_validator_block(uid: int, reason: str, blocked_text: str):
         await db.execute(
             "INSERT INTO validator_blocks (user_id,reason,blocked_text) VALUES (?,?,?)",
             (uid, reason, blocked_text))
+        await db.commit()
+
+async def log_disambiguation(uid: int, message_text: str, phrase: str, mode: str):
+    """Record an ambiguity-triggered clarifying question (v3 hotfix monitoring)."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO disambiguation_events (user_id,message_text,phrase,mode)"
+            " VALUES (?,?,?,?)",
+            (uid, message_text[:500], phrase, mode))
         await db.commit()
 
 # ── Silence Engine push state (Epic 3) ────────────────────────────────────────
@@ -742,7 +760,7 @@ def sync_quality_stats() -> list:
 _EXPORT_ALLOWED_TABLES = {
     "intervention_results", "router_decision_logs", "adverse_events",
     "moderation_logs", "response_quality", "validator_blocks",
-    "weekly_progress_snapshots", "crisis_events",
+    "weekly_progress_snapshots", "crisis_events", "disambiguation_events",
 }
 
 def sync_export_query_safe(table: str) -> tuple:

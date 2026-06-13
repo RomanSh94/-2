@@ -33,7 +33,7 @@ from crisis_protocol import classify, crisis_keyboard, admin_alert_text, RED
 from humanization import (
     pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
 )
-from risk_detector import detect_risk
+from risk_detector import detect_risk, amplify_ambiguity_by_context
 from language_detector import detect_language
 from stage_detector import detect_stage
 from state_engine import DEFAULT_STATE, update_state, choose_scenario
@@ -41,7 +41,11 @@ from readiness_engine import assess_readiness
 from cognitive_capacity import get_capacity
 from relationship_monitor import monitor_relationship
 from practice_registry import select_practice, get_practice_by_id
-from safety_validator import validate_response, get_fallback
+from safety_validator import (
+    validate_response, get_fallback,
+    validate_response_with_context, get_safe_fallback_high_risk,
+)
+from prompts import get_disambiguation_message
 from memory import maybe_summarize, build_context
 from voice import transcribe_voice
 from notifications import push_alert
@@ -59,6 +63,7 @@ from database import (
     log_crisis_event, set_crisis_response,
     get_memory_overview, forget_all,
     set_mute, reset_unanswered,
+    get_recent_messages, log_disambiguation,
 )
 
 class InterventionStates(StatesGroup):
@@ -126,7 +131,24 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         await message.answer(get_crisis_text(lang), parse_mode="HTML",
                              reply_markup=crisis_keyboard(lang))
         return
-    
+
+    # 4.5 Ambiguity check (v3 hotfix) — runs BEFORE any LLM call.
+    # A double-meaning phrase ("выйти в окно") must trigger a deterministic
+    # clarifying question, never an LLM guess. With recent risk history we also
+    # surface the hotline. This is the direct fix for the endorsement incident.
+    if risk.get("ambiguous_phrases"):
+        recent = await get_recent_messages(uid, limit=10)
+        signal = amplify_ambiguity_by_context(risk["ambiguous_phrases"], recent)
+        if signal:
+            phrase = risk["ambiguous_phrases"][0]
+            disambig = get_disambiguation_message(
+                phrase, lang, with_hotline=(signal == "force_crisis"))
+            await save_message(uid, "user", user_text, "disambiguation", lang)
+            await save_message(uid, "assistant", disambig, "disambiguation", lang)
+            await message.answer(disambig)
+            await log_disambiguation(uid, user_text, phrase, signal)
+            return
+
     # 3.5 Dependency monitor
     # record_message MUST come first so the current message is counted
     # before the threshold check — otherwise the 100th message never triggers.
@@ -207,11 +229,17 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         )
         return
 
-    # 16. Safety validator
-    is_safe, reason = validate_response(answer, lang)
+    # 16. Safety validator (context-aware — blocks approval/risky-suggestion
+    # replies given the user's last message and risk level; v3 hotfix).
+    is_safe, reason = validate_response_with_context(answer, user_text, risk, lang)
     if not is_safe:
         await log_validator_block(uid, reason, answer)
-        answer = get_fallback(lang)
+        # At elevated risk use the deterministic high-risk fallback; otherwise
+        # the neutral fallback. NEVER re-prompt the LLM here.
+        answer = (get_safe_fallback_high_risk(lang)
+                  if risk.get("level") in ("medium", "high", "critical")
+                  or risk.get("ambiguous_phrases")
+                  else get_fallback(lang))
 
     # 17. Save & send (with a human-feeling typing pause, §7.2)
     await save_message(uid, "user", user_text, scenario, lang)
