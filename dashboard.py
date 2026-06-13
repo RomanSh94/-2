@@ -9,6 +9,7 @@ from database import (
     sync_user_summary, sync_moderation, sync_risk_breakdown,
     sync_outcome_stats, sync_ab_stats, sync_quality_stats,
     sync_adverse_events, sync_validator_blocks, sync_export_query_safe,
+    sync_get_profile, sync_get_profile_history,
     _EXPORT_ALLOWED_TABLES,
 )
 
@@ -119,11 +120,83 @@ def user_detail(uid):
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 </head><body><div class="container-fluid p-4">
 <a href="/users" class="btn btn-secondary mb-3">← Back</a>
+<a href="/profile/{user['id']}" class="btn btn-outline-info mb-3">📊 Psychology profile</a>
 <h4>User {user['id']}: {_e(user['first_name'] or '')}</h4>
 {f'<div class="alert alert-info"><b>Memory Summary:</b><br>{_e(summary)}</div>' if summary else ''}
 <h6>Recent Messages ({len(msgs)})</h6>
 <div>{''.join(f"<div style='margin:5px 0;padding:8px;background:#f0f0f0;border-radius:4px'><b>{_e(m['role'].upper())}</b> [{_e(m['scenario'])}]<br>{_e(m['content'][:200])}</div>" for m in msgs)}</div>
 </div></body></html>"""
+
+@app.route("/profile/<int:uid>")
+@auth
+def admin_profile(uid):
+    import json
+    p = sync_get_profile(uid)
+    if not p:
+        return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Profile {uid}</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+</head><body><div class="container-fluid p-4">
+<a href="/user/{uid}" class="btn btn-secondary mb-3">← Back</a>
+<div class="alert alert-secondary">No psychology profile yet for user {uid}.</div>
+</div></body></html>"""
+
+    dims = [
+        ("Loneliness", "loneliness_value", "loneliness_confidence"),
+        ("Hopelessness", "hopelessness_value", "hopelessness_confidence"),
+        ("Anxiety", "anxiety_value", "anxiety_confidence"),
+        ("Self-criticism", "self_criticism_value", "self_criticism_confidence"),
+        ("Social support", "social_support_value", "social_support_confidence"),
+        ("Future orientation", "future_orientation_value", "future_orientation_confidence"),
+        ("Energy", "energy_value", "energy_confidence"),
+        ("Sleep problems", "sleep_problems_value", "sleep_problems_confidence"),
+    ]
+    def bar(v, c):
+        pct = round((v or 0) * 100)
+        col = "secondary" if (c or 0) < 0.3 else ("danger" if pct >= 66 else "warning" if pct >= 33 else "success")
+        lab = f"{pct}%" + (" (low data)" if (c or 0) < 0.3 else "")
+        return (f"<div class='progress' style='height:20px'>"
+                f"<div class='progress-bar bg-{col}' style='width:{pct}%'>{lab}</div></div>")
+    rows = "".join(
+        f"<tr><td>{name}</td><td style='width:60%'>{bar(p[v], p[c])}</td>"
+        f"<td>conf {round((p[c] or 0)*100)}%</td></tr>" for name, v, c in dims)
+
+    trend = p.get("mood_trend", "stable")
+    trend_badge = {"deteriorating": "danger", "improving": "success"}.get(trend, "secondary")
+    alert = ""
+    if trend == "deteriorating" and (p.get("crisis_risk") or 0) >= 0.7:
+        alert = ("<div class='alert alert-danger'><b>⚠️ Attention:</b> deteriorating trend "
+                 "with elevated crisis risk. Consider manual outreach.</div>")
+    themes = ", ".join(json.loads(p.get("main_themes") or "[]")) or "—"
+
+    hist = sync_get_profile_history(uid, 30)
+    hist_rows = ""
+    for snap_json, created in hist:
+        try:
+            s = json.loads(snap_json)
+            hist_rows += (f"<tr><td>{created[:16]}</td>"
+                          f"<td>{round((s.get('hopelessness_value') or 0)*100)}%</td>"
+                          f"<td>{round((s.get('loneliness_value') or 0)*100)}%</td>"
+                          f"<td>{round((s.get('anxiety_value') or 0)*100)}%</td>"
+                          f"<td>{_e(s.get('mood_trend',''))}</td></tr>")
+        except Exception:
+            continue
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Profile {uid}</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+</head><body><div class="container-fluid p-4">
+<a href="/user/{uid}" class="btn btn-secondary mb-3">← Back</a>
+<h4>Psychology profile — user {uid}</h4>
+<p class="text-muted">Deterministic aggregate of risk signals — not a diagnosis. Based on {p.get('messages_analyzed',0)} messages. Trend: <span class="badge bg-{trend_badge}">{_e(trend)}</span> · crisis_risk {round((p.get('crisis_risk') or 0)*100)}%</p>
+{alert}
+<p><b>Themes:</b> {_e(themes)}</p>
+<table class="table table-sm"><tbody>{rows}</tbody></table>
+<h6 class="mt-4">History (last {len(hist)} snapshots)</h6>
+<div class="table-responsive"><table class="table table-striped table-sm">
+<tr><th>Time</th><th>Hopelessness</th><th>Loneliness</th><th>Anxiety</th><th>Trend</th></tr>
+{hist_rows}
+</table></div>
+</div></body></html>"""
+
 
 @app.route("/moderation")
 @auth

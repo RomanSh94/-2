@@ -36,7 +36,8 @@ from humanization import (
 from risk_detector import detect_risk, amplify_ambiguity_by_context
 from language_detector import detect_language
 from stage_detector import detect_stage
-from state_engine import DEFAULT_STATE, update_state, choose_scenario
+from state_engine import DEFAULT_STATE, update_state, choose_scenario, get_emotional_trajectory
+from psychology_profile import maybe_update_profile, format_profile_for_user
 from readiness_engine import assess_readiness
 from cognitive_capacity import get_capacity
 from relationship_monitor import monitor_relationship
@@ -64,6 +65,7 @@ from database import (
     get_memory_overview, forget_all,
     set_mute, reset_unanswered,
     get_recent_messages, log_disambiguation,
+    get_user_message_count, get_profile, delete_profile,
 )
 
 class InterventionStates(StatesGroup):
@@ -120,6 +122,11 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     if classify(risk) == RED:
         await log_crisis_event(uid, RED, risk["score"], risk["categories"],
                                user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
+        # Persist the crisis message's risk snapshot + force a profile refresh
+        # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
+        await save_message(uid, "user", user_text, "crisis", lang,
+                           risk["score"], risk["categories"])
+        await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
         await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
                          risk["categories"], user_text)
         alert = admin_alert_text(uid, username, RED, risk, user_text)
@@ -132,6 +139,10 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                              reply_markup=crisis_keyboard(lang))
         return
 
+    # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
+    # (current one not saved yet). Used to amplify ambiguity and bias routing.
+    trajectory = await get_emotional_trajectory(uid, window_hours=24)
+
     # 4.5 Ambiguity check (v3 hotfix) — runs BEFORE any LLM call.
     # A double-meaning phrase ("выйти в окно") must trigger a deterministic
     # clarifying question, never an LLM guess. With recent risk history we also
@@ -139,11 +150,19 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     if risk.get("ambiguous_phrases"):
         recent = await get_recent_messages(uid, limit=10)
         signal = amplify_ambiguity_by_context(risk["ambiguous_phrases"], recent)
+        # §4: trajectory upgrades a soft "force_disambiguation" to "force_crisis"
+        # when aggregated dynamics show deterioration or a chronic risk streak —
+        # closing the gap where raw last-message scanning would miss it.
+        if signal and (trajectory.trend == "deteriorating"
+                       or trajectory.hopelessness_streak >= 3
+                       or trajectory.yellow_plus_streak >= 5):
+            signal = "force_crisis"
         if signal:
             phrase = risk["ambiguous_phrases"][0]
             disambig = get_disambiguation_message(
                 phrase, lang, with_hotline=(signal == "force_crisis"))
-            await save_message(uid, "user", user_text, "disambiguation", lang)
+            await save_message(uid, "user", user_text, "disambiguation", lang,
+                               risk["score"], risk["categories"])
             await save_message(uid, "assistant", disambig, "disambiguation", lang)
             await message.answer(disambig)
             await log_disambiguation(uid, user_text, phrase, signal)
@@ -173,7 +192,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     
     # 9. Select scenario
     variant = get_variant(uid)
-    scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity, variant)
+    scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
+                               variant, trajectory=trajectory)
     
     # 10. Check dependency
     dep_resp = monitor_relationship(user_text, lang)
@@ -241,11 +261,16 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                   or risk.get("ambiguous_phrases")
                   else get_fallback(lang))
 
-    # 17. Save & send (with a human-feeling typing pause, §7.2)
-    await save_message(uid, "user", user_text, scenario, lang)
+    # 17. Save & send (with a human-feeling typing pause, §7.2). The user
+    # message carries its risk snapshot — the deterministic source for §4/§5.
+    await save_message(uid, "user", user_text, scenario, lang,
+                       risk["score"], risk["categories"])
     await save_message(uid, "assistant", answer, scenario, lang)
     await asyncio.sleep(typing_delay(answer))
     await message.answer(answer)
+
+    # 17.5 Profile refresh (§5) — deterministic, every 5th user message.
+    await maybe_update_profile(uid, await get_user_message_count(uid))
     
     # 18. Start outcome tracking (if appropriate scenario)
     if scenario not in ("crisis", "open_chat"):
@@ -396,6 +421,49 @@ async def cb_mood(callback: CallbackQuery, state: FSMContext):
     await pipeline(callback.message, choice, state, tg_user=callback.from_user)
 
 
+@dp.message(Command("profile"))
+async def cmd_profile(message: Message):
+    """§5 — show the user the deterministic profile the bot has built (no diagnoses)."""
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    prof = await get_profile(uid)
+    if not prof:
+        await message.answer(
+            "У меня пока нет профиля по тебе — давай поговорим побольше." if lang == "ru"
+            else "I don't have a profile for you yet — let's talk a bit more.")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("🗑 Стереть профиль" if lang == "ru" else "🗑 Erase profile"),
+            callback_data="profile:reset")],
+    ])
+    # format_profile_for_user is RU plain-language; keep as-is for both for now.
+    await message.answer(format_profile_for_user(prof), reply_markup=kb)
+
+
+@dp.message(Command("profile_reset"))
+async def cmd_profile_reset(message: Message):
+    lang = await get_user_language(message.from_user.id)
+    await delete_profile(message.from_user.id)
+    await message.answer(
+        "Готово. Профиль стёрт — начнём с чистого листа." if lang == "ru"
+        else "Done. Your profile is erased — fresh start.")
+
+
+@dp.callback_query(F.data == "profile:reset")
+async def cb_profile_reset(callback: CallbackQuery):
+    lang = await get_user_language(callback.from_user.id)
+    await delete_profile(callback.from_user.id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        "Готово. Профиль стёрт — начнём с чистого листа." if lang == "ru"
+        else "Done. Your profile is erased — fresh start.")
+    await callback.answer()
+
+
 @dp.message(Command("memory"))
 async def cmd_memory(message: Message):
     """GDPR §6.3 — show the user what the bot remembers about them."""
@@ -494,7 +562,7 @@ async def cmd_unmute(message: Message):
 async def cmd_help(message: Message):
     lang = await get_user_language(message.from_user.id)
     await message.answer(
-        ("/start • /checkin • /memory • /forget_all • /mute • /unmute • /help"),
+        ("/start • /checkin • /memory • /profile • /forget_all • /mute • /unmute • /help"),
         reply_markup=ReplyKeyboardRemove())
 
 @dp.message(Command("checkin"))

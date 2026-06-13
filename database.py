@@ -187,11 +187,68 @@ CREATE TABLE IF NOT EXISTS response_quality (
     rating          INTEGER,
     created_at      TEXT DEFAULT (datetime('now'))
 );
+
+-- Deterministic psychology profile (§5). Every value is an aggregate of
+-- already-computed risk signals; NO LLM, NO diagnoses. value+confidence pairs.
+CREATE TABLE IF NOT EXISTS user_psychology_profile (
+    user_id                      INTEGER PRIMARY KEY,
+    loneliness_value             REAL DEFAULT 0.0,
+    loneliness_confidence        REAL DEFAULT 0.0,
+    hopelessness_value           REAL DEFAULT 0.0,
+    hopelessness_confidence      REAL DEFAULT 0.0,
+    self_criticism_value         REAL DEFAULT 0.0,
+    self_criticism_confidence    REAL DEFAULT 0.0,
+    anxiety_value                REAL DEFAULT 0.0,
+    anxiety_confidence           REAL DEFAULT 0.0,
+    social_support_value         REAL DEFAULT 0.5,
+    social_support_confidence    REAL DEFAULT 0.0,
+    future_orientation_value     REAL DEFAULT 0.5,
+    future_orientation_confidence REAL DEFAULT 0.0,
+    energy_value                 REAL DEFAULT 0.5,
+    energy_confidence            REAL DEFAULT 0.0,
+    sleep_problems_value         REAL DEFAULT 0.0,
+    sleep_problems_confidence    REAL DEFAULT 0.0,
+    crisis_risk                  REAL DEFAULT 0.0,
+    mood_trend                   TEXT DEFAULT 'stable',
+    main_themes                  TEXT DEFAULT '[]',
+    coping_strategies_used       TEXT DEFAULT '[]',
+    messages_analyzed            INTEGER DEFAULT 0,
+    last_updated                 TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS psychology_profile_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at    TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_profile_history_user
+    ON psychology_profile_history(user_id, created_at DESC);
 """
+
+# Additive column migrations (no migration system in this repo; ADD COLUMN is
+# non-destructive and safe to run on the production DB every boot).
+_MIGRATIONS = [
+    # messages: per-message risk snapshot — the deterministic source for
+    # trajectory/profile. moderation_logs only stores medium+ risk, so it
+    # cannot be the source (it's blind to the calm majority of messages).
+    ("messages", "risk_score", "INTEGER DEFAULT 0"),
+    ("messages", "risk_categories", "TEXT DEFAULT ''"),
+]
+
+
+async def _apply_migrations(db) -> None:
+    for table, column, decl in _MIGRATIONS:
+        cur = await db.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in await cur.fetchall()]
+        if column not in cols:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
 
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.executescript(SCHEMA)
+        await _apply_migrations(db)
         await db.commit()
 
 # ── Users ─────────────────────────────────────────────────────────────────────
@@ -215,12 +272,32 @@ async def get_user_language(uid: int) -> str:
 # ── Messages ──────────────────────────────────────────────────────────────────
 
 async def save_message(uid: int, role: str, content: str,
-                        scenario: str = "open_chat", lang: str = "ru"):
+                        scenario: str = "open_chat", lang: str = "ru",
+                        risk_score: int = 0, risk_categories=None):
+    cats = ",".join(risk_categories) if risk_categories else ""
     async with aiosqlite.connect(DB) as db:
         await db.execute(
-            "INSERT INTO messages (user_id,role,content,scenario,lang) VALUES (?,?,?,?,?)",
-            (uid, role, content, scenario, lang))
+            "INSERT INTO messages (user_id,role,content,scenario,lang,risk_score,risk_categories)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (uid, role, content, scenario, lang, int(risk_score), cats))
         await db.commit()
+
+async def get_user_messages_with_risk(uid: int, window_hours: int = 24) -> list:
+    """User messages in the last N hours WITH their per-message risk snapshot.
+
+    Returns oldest-first list of dicts. Deterministic source for trajectory and
+    profile — NO recomputation, NO LLM. Reads the risk_score/risk_categories
+    columns persisted on every inbound message."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT content, risk_score, risk_categories, created_at"
+            " FROM messages WHERE user_id=? AND role='user'"
+            f"  AND created_at > datetime('now', '-{int(window_hours)} hours')"
+            " ORDER BY id", (uid,))
+        rows = await cur.fetchall()
+    return [{"content": r[0], "risk_score": r[1] or 0,
+             "risk_categories": [c for c in (r[2] or "").split(",") if c],
+             "created_at": r[3]} for r in rows]
 
 async def get_recent_messages(uid: int, limit: int = 8) -> list:
     async with aiosqlite.connect(DB) as db:
@@ -418,6 +495,81 @@ async def log_disambiguation(uid: int, message_text: str, phrase: str, mode: str
             " VALUES (?,?,?,?)",
             (uid, message_text[:500], phrase, mode))
         await db.commit()
+
+# ── Trajectory / profile support (§4/§5) ──────────────────────────────────────
+
+async def get_user_message_count(uid: int) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT message_count FROM users WHERE id=?", (uid,))
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+async def get_last_crisis_at(uid: int, window_hours: int = 24) -> str | None:
+    """ISO timestamp of the most recent crisis event within the window, or None."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT created_at FROM crisis_events WHERE user_id=?"
+            f"  AND created_at > datetime('now', '-{int(window_hours)} hours')"
+            " ORDER BY id DESC LIMIT 1", (uid,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+_PROFILE_COLUMNS = [
+    "loneliness_value","loneliness_confidence","hopelessness_value","hopelessness_confidence",
+    "self_criticism_value","self_criticism_confidence","anxiety_value","anxiety_confidence",
+    "social_support_value","social_support_confidence","future_orientation_value",
+    "future_orientation_confidence","energy_value","energy_confidence","sleep_problems_value",
+    "sleep_problems_confidence","crisis_risk","mood_trend","main_themes",
+    "coping_strategies_used","messages_analyzed","last_updated",
+]
+
+async def save_profile(uid: int, fields: dict) -> None:
+    """Upsert a profile row + append a history snapshot. `fields` keys == columns."""
+    import json
+    cols = ["user_id"] + _PROFILE_COLUMNS
+    vals = [uid] + [fields.get(c) for c in _PROFILE_COLUMNS]
+    placeholders = ",".join("?" for _ in cols)
+    updates = ",".join(f"{c}=excluded.{c}" for c in _PROFILE_COLUMNS)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            f"INSERT INTO user_psychology_profile ({','.join(cols)}) VALUES ({placeholders})"
+            f" ON CONFLICT(user_id) DO UPDATE SET {updates}", vals)
+        await db.execute(
+            "INSERT INTO psychology_profile_history (user_id,snapshot_json) VALUES (?,?)",
+            (uid, json.dumps(fields, ensure_ascii=False)))
+        await db.commit()
+
+async def get_profile(uid: int) -> dict | None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"SELECT {','.join(_PROFILE_COLUMNS)} FROM user_psychology_profile WHERE user_id=?",
+            (uid,))
+        row = await cur.fetchone()
+    if not row:
+        return None
+    return dict(zip(_PROFILE_COLUMNS, row))
+
+async def delete_profile(uid: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM user_psychology_profile WHERE user_id=?", (uid,))
+        await db.execute("DELETE FROM psychology_profile_history WHERE user_id=?", (uid,))
+        await db.commit()
+
+def sync_get_profile(uid: int) -> dict | None:
+    conn = _conn()
+    cur = conn.execute(
+        f"SELECT {','.join(_PROFILE_COLUMNS)} FROM user_psychology_profile WHERE user_id=?",
+        (uid,))
+    row = cur.fetchone(); conn.close()
+    return dict(zip(_PROFILE_COLUMNS, row)) if row else None
+
+def sync_get_profile_history(uid: int, limit: int = 30) -> list:
+    conn = _conn()
+    cur = conn.execute(
+        "SELECT snapshot_json, created_at FROM psychology_profile_history"
+        " WHERE user_id=? ORDER BY id DESC LIMIT ?", (uid, limit))
+    rows = cur.fetchall(); conn.close()
+    return [(r[0], r[1]) for r in rows]
 
 # ── Silence Engine push state (Epic 3) ────────────────────────────────────────
 
