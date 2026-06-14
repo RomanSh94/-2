@@ -33,10 +33,13 @@ from crisis_protocol import classify, crisis_keyboard, admin_alert_text, RED
 from humanization import (
     pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
 )
-from risk_detector import detect_risk, amplify_ambiguity_by_context
+from risk_detector import detect_risk, amplify_ambiguity_by_context, detect_protective_factors
 from language_detector import detect_language
 from stage_detector import detect_stage
-from state_engine import DEFAULT_STATE, update_state, choose_scenario, get_emotional_trajectory
+from state_engine import (
+    DEFAULT_STATE, update_state, choose_scenario, get_emotional_trajectory,
+    check_sudden_improvement,
+)
 from psychology_profile import maybe_update_profile, format_profile_for_user
 from readiness_engine import assess_readiness
 from cognitive_capacity import get_capacity
@@ -61,11 +64,12 @@ from database import (
     start_intervention, finish_intervention,
     get_user_language,
     set_checkin, get_checkin_users, update_last_checkin,
-    log_crisis_event, set_crisis_response,
+    log_crisis_event, set_crisis_response, set_crisis_protective_factors,
     get_memory_overview, forget_all,
     set_mute, reset_unanswered,
     get_recent_messages, log_disambiguation,
     get_user_message_count, get_profile, delete_profile,
+    log_review_flag, log_toxic_validation_block,
 )
 
 class InterventionStates(StatesGroup):
@@ -76,6 +80,14 @@ bot                = Bot(token=BOT_TOKEN)
 dp                 = Dispatcher(storage=MemoryStorage())
 client             = AsyncOpenAI(api_key=OPENAI_API_KEY)
 dependency_monitor = DependencyMonitor()
+
+# Human-readable RU labels for protective-factor categories (admin alert).
+_PF_LABELS = {
+    "children": "дети", "pets": "питомцы", "close_people": "близкие",
+    "future_plans": "планы на будущее", "responsibility": "обязательства",
+    "meaning_faith": "смысл/вера", "reasons_to_live": "причины жить",
+}
+
 
 def score_kb(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -120,16 +132,25 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                          risk["score"], risk["categories"], user_text)
 
     if classify(risk) == RED:
-        await log_crisis_event(uid, RED, risk["score"], risk["categories"],
-                               user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
+        eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
+                                     user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
         # Persist the crisis message's risk snapshot + force a profile refresh
         # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
         await save_message(uid, "user", user_text, "crisis", lang,
                            risk["score"], risk["categories"])
         await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
+        # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
+        # the crisis flow is committed; never alters risk or the user's message.
+        recent_for_pf = await get_recent_messages(uid, limit=10)
+        pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
+        protective = detect_protective_factors(pf_text)
+        if protective:
+            await set_crisis_protective_factors(eid, protective)
         await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
                          risk["categories"], user_text)
         alert = admin_alert_text(uid, username, RED, risk, user_text)
+        if protective:
+            alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
         for admin_id in ADMIN_USER_IDS:
             try:
                 await bot.send_message(admin_id, alert)
@@ -252,7 +273,28 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # 16. Safety validator (context-aware — blocks approval/risky-suggestion
     # replies given the user's last message and risk level; v3 hotfix).
     is_safe, reason = validate_response_with_context(answer, user_text, risk, lang)
-    if not is_safe:
+    if not is_safe and reason and reason.startswith("toxic validation"):
+        # Epic C: the reply confirmed an absolutist distortion. ONE regeneration
+        # asking to validate the feeling but NOT the distortion; else fallback.
+        await log_toxic_validation_block(uid, reason, answer)
+        instr = ("В прошлом ответе ты подтвердил искажение («все/никто/никогда»). "
+                 "Подтверди чувство, но НЕ искажение. Например: вместо «да, все тебя бросают» "
+                 "→ «то, что ты сейчас так одинок — это правда тяжело»." if lang == "ru" else
+                 "Your previous reply confirmed an absolutist distortion. Validate the "
+                 "feeling but NOT the distortion.")
+        try:
+            retry = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages + [{"role": "assistant", "content": answer},
+                                     {"role": "system", "content": instr}],
+                temperature=0.7, max_tokens=300)
+            candidate = retry.choices[0].message.content
+            ok2, _ = validate_response_with_context(candidate, user_text, risk, lang)
+            answer = candidate if ok2 else get_fallback(lang)
+        except Exception as e:
+            print(f"[anti-toxic] retry failed uid={uid}: {type(e).__name__}: {e}")
+            answer = get_fallback(lang)
+    elif not is_safe:
         await log_validator_block(uid, reason, answer)
         # At elevated risk use the deterministic high-risk fallback; otherwise
         # the neutral fallback. NEVER re-prompt the LLM here.
@@ -271,6 +313,22 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
 
     # 17.5 Profile refresh (§5) — deterministic, every 5th user message.
     await maybe_update_profile(uid, await get_user_message_count(uid))
+
+    # 17.6 Sudden-improvement review flag (Epic B) — quiet signal for a human,
+    # NOT a crisis. Never changes the user's experience; rate-limited to 1/week.
+    try:
+        if await check_sudden_improvement(uid):
+            if await log_review_flag(uid, "sudden_improvement",
+                                     "Резкий переход от длительной безнадёжности к спокойствию."):
+                note = (f"🟦 На ревью: пользователь {uid} (@{username or '—'}) — резкий переход "
+                        f"от длительной безнадёжности к спокойствию. Стоит глянуть.")
+                for admin_id in ADMIN_USER_IDS:
+                    try:
+                        await bot.send_message(admin_id, note)
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"[review-flag] uid={uid}: {type(e).__name__}: {e}")
     
     # 18. Start outcome tracking (if appropriate scenario)
     if scenario not in ("crisis", "open_chat"):

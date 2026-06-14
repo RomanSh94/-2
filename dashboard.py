@@ -10,6 +10,8 @@ from database import (
     sync_outcome_stats, sync_ab_stats, sync_quality_stats,
     sync_adverse_events, sync_validator_blocks, sync_export_query_safe,
     sync_get_profile, sync_get_profile_history,
+    sync_unreviewed_flags, sync_mark_flag_reviewed, sync_toxic_blocks,
+    sync_crisis_with_protective,
     _EXPORT_ALLOWED_TABLES,
 )
 
@@ -90,6 +92,7 @@ body{{background:#f4f6fb}}
   <div class="mt-4">
     <a href="/users" class="btn btn-primary">👥 Users</a>
     <a href="/moderation" class="btn btn-warning">🛡️ Moderation</a>
+    <a href="/safety" class="btn btn-danger">🆘 Safety review</a>
     <a href="/research" class="btn btn-info">🔬 Research</a>
   </div>
 </div>
@@ -126,6 +129,68 @@ def user_detail(uid):
 <h6>Recent Messages ({len(msgs)})</h6>
 <div>{''.join(f"<div style='margin:5px 0;padding:8px;background:#f0f0f0;border-radius:4px'><b>{_e(m['role'].upper())}</b> [{_e(m['scenario'])}]<br>{_e(m['content'][:200])}</div>" for m in msgs)}</div>
 </div></body></html>"""
+
+@app.route("/safety/review/<int:flag_id>")
+@auth
+def safety_mark_reviewed(flag_id):
+    sync_mark_flag_reviewed(flag_id)
+    return redirect("/safety")
+
+
+@app.route("/safety")
+@auth
+def safety_review():
+    import json
+    pf = sync_crisis_with_protective(50)
+    flags = sync_unreviewed_flags(50)
+    toxic = sync_toxic_blocks(50)
+
+    def pf_row(r):
+        uid, level, pj, excerpt, created = r
+        try:
+            anchors = ", ".join(json.loads(pj or "[]"))
+        except Exception:
+            anchors = ""
+        return (f"<tr><td>{created[:16]}</td><td><a href='/profile/{uid}'>{uid}</a></td>"
+                f"<td><span class='badge bg-danger'>{_e(level)}</span></td>"
+                f"<td>{_e(anchors)}</td><td>{_e((excerpt or '')[:80])}</td></tr>")
+
+    def flag_row(r):
+        fid, uid, ftype, ctx, created = r
+        return (f"<tr><td>{created[:16]}</td><td><a href='/profile/{uid}'>{uid}</a></td>"
+                f"<td>{_e(ftype)}</td><td>{_e(ctx or '')}</td>"
+                f"<td><a class='btn btn-sm btn-outline-success' href='/safety/review/{fid}'>✓ просмотрено</a></td></tr>")
+
+    def toxic_row(r):
+        uid, matched, original, created = r
+        return (f"<tr><td>{created[:16]}</td><td><a href='/profile/{uid}'>{uid}</a></td>"
+                f"<td>{_e(matched or '')}</td><td>{_e((original or '')[:100])}</td></tr>")
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Safety review</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+</head><body><div class="container-fluid p-4">
+<a href="/" class="btn btn-secondary mb-3">← Back</a>
+<h4>Безопасность — на проверку</h4>
+
+<h6 class="mt-4">🟦 Резкое улучшение — на ревью ({len(flags)})</h6>
+<div class="table-responsive"><table class="table table-sm table-striped">
+<tr><th>Время</th><th>User</th><th>Тип</th><th>Контекст</th><th></th></tr>
+{''.join(flag_row(r) for r in flags) or '<tr><td colspan=5 class="text-muted">пусто</td></tr>'}
+</table></div>
+
+<h6 class="mt-4">🛟 Кризисы с опорами ({len(pf)})</h6>
+<div class="table-responsive"><table class="table table-sm table-striped">
+<tr><th>Время</th><th>User</th><th>Уровень</th><th>Опоры</th><th>Сообщение</th></tr>
+{''.join(pf_row(r) for r in pf) or '<tr><td colspan=5 class="text-muted">пусто</td></tr>'}
+</table></div>
+
+<h6 class="mt-4">🚫 Блоки токсичной валидации ({len(toxic)})</h6>
+<div class="table-responsive"><table class="table table-sm table-striped">
+<tr><th>Время</th><th>User</th><th>Сработало</th><th>Заблокированный ответ</th></tr>
+{''.join(toxic_row(r) for r in toxic) or '<tr><td colspan=4 class="text-muted">пусто</td></tr>'}
+</table></div>
+</div></body></html>"""
+
 
 @app.route("/profile/<int:uid>")
 @auth

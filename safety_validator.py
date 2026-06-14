@@ -89,6 +89,51 @@ def get_safe_fallback_high_risk(lang: str = "ru") -> str:
     return SAFE_FALLBACK_HIGH_RISK_EN if lang == "en" else SAFE_FALLBACK_HIGH_RISK_RU
 
 
+# ── Epic C: anti-toxic-validation ─────────────────────────────────────────────
+# A "safe" reply can still be harmful if it CONFIRMS an absolutist cognitive
+# distortion ("да, тебя все ненавидят"). Rule: validate the FEELING, never the
+# distortion. Kept deliberately narrow — bias toward fewer false positives, and
+# never block genuine emotion validation or a negation ("не все тебя ненавидят").
+CONFIRMING_TOKENS = ["да,", "да ", "действительно", "ты прав", "ты права",
+                     "это правда", "так и есть", "согласен", "согласна",
+                     "верно", "и вправду", "и правда"]
+ABSOLUTIST_MARKERS = ["все", "всех", "всем", "никто", "никому", "никогда",
+                      "всегда", "ничего", "ничто", "никак", "вечно"]
+NEGATIONS = ["не ", "ни ", "вряд ли", "неправда", "это не так", "на самом деле не"]
+EMOTION_VALIDATION_ALLOWLIST = ["больно", "тяжело", "это реально", "твои чувства",
+                                "имеешь право чувствовать", "понимаю, что чувствуешь",
+                                "понимаю что чувствуешь", "то, что ты чувствуешь",
+                                "то что ты чувствуешь"]
+
+_WORD_RE = re.compile(r"[а-яёa-z]+", re.IGNORECASE)
+
+
+def check_toxic_validation(text: str) -> tuple[bool, str | None]:
+    """Return (is_toxic, matched). is_toxic=True → the reply confirms a
+    distortion (a confirming token near a non-negated absolutist marker, and not
+    a feeling-validation)."""
+    low = text.lower()
+    # Allowlist: if the reply is validating a feeling, lean to PASS.
+    if any(a in low for a in EMOTION_VALIDATION_ALLOWLIST):
+        return False, None
+    if not any(c in low for c in CONFIRMING_TOKENS):
+        return False, None
+    # Examine each sentence so confirmation + marker must be in close proximity.
+    for sentence in re.split(r"[.!?\n]", low):
+        if not any(c in sentence for c in CONFIRMING_TOKENS):
+            continue
+        words = _WORD_RE.findall(sentence)
+        for i, w in enumerate(words):
+            if w in ABSOLUTIST_MARKERS:
+                window = " ".join(words[max(0, i - 2):i])
+                if any(neg.strip() in window.split() or neg.strip() == window
+                       for neg in ("не", "ни")) or "вряд" in sentence \
+                        or "неправда" in sentence or "не так" in sentence:
+                    continue  # negated → countering the distortion, allow
+                return True, w
+    return False, None
+
+
 def validate_response_with_context(response_text: str,
                                    user_last_message: str,
                                    risk_result: dict,
@@ -117,5 +162,10 @@ def validate_response_with_context(response_text: str,
         for sugg in RISKY_SUGGESTIONS_AT_RISK:
             if sugg in rl:
                 return False, f"risky suggestion '{sugg}' at risk level {risk_result['level']}"
+
+    # Epic C: don't confirm absolutist cognitive distortions.
+    is_toxic, matched = check_toxic_validation(response_text)
+    if is_toxic:
+        return False, f"toxic validation: confirmed distortion '{matched}'"
 
     return True, None
