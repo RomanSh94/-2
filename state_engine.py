@@ -162,6 +162,55 @@ def build_trajectory(user_id: int, window_hours: int, messages_with_risk: list,
     )
 
 
+# ── Epic B: sudden-improvement detector (review flag, not a crisis) ───────────
+# Clinically, an abrupt calm after sustained distress can precede a suicide
+# attempt ("the decision is made"). In ~9/10 cases it's just normal recovery, so
+# this is NOT a block and NOT a crisis — it raises a quiet review flag for a
+# human. Fully deterministic, built from the per-message risk already logged.
+RELIEF_MARKERS = [
+    "всё хорошо", "все хорошо", "всё наладилось", "все наладилось",
+    "мне намного лучше", "мне легче", "отпустило", "теперь спокойно",
+    "я спокоен", "я спокойна", "я решил", "я решила", "приняла решение",
+    "принял решение", "я в порядке теперь", "больше не переживаю",
+    "i'm fine now", "i feel much better", "i've decided", "made my decision",
+]
+
+
+def _has_relief(msg: dict) -> bool:
+    low = msg["content"].lower()
+    return any(m in low for m in RELIEF_MARKERS)
+
+
+def is_sudden_improvement(messages_with_risk: list) -> bool:
+    """Pure detector. True iff a sustained distress phase is followed by an
+    ABRUPT relief (relief words + ~zero risk) right after a still-high point.
+    Gradual improvement (descending risk, no sharp drop) is NOT flagged."""
+    msgs = messages_with_risk
+    if len(msgs) < 5:
+        return False
+    # Relief must be in the last 1-2 messages with near-zero risk.
+    relief_idxs = [i for i in range(max(0, len(msgs) - 2), len(msgs))
+                   if _has_relief(msgs[i]) and (msgs[i]["risk_score"] or 0) <= 10]
+    if not relief_idxs:
+        return False
+    prior = msgs[:min(relief_idxs)]
+    if len(prior) < 4:
+        return False
+    # Sustained distress earlier in the window.
+    sustained = (sum(1 for x in prior if (x["risk_score"] or 0) >= 40) >= 3
+                 or any((x["risk_score"] or 0) >= 70 for x in prior))
+    # Abrupt: risk was still high in the messages immediately before the drop.
+    recent_high = any((x["risk_score"] or 0) >= 70 for x in prior[-3:])
+    return sustained and recent_high
+
+
+async def check_sudden_improvement(user_id: int, window_hours: int = 168) -> bool:
+    """DB-backed wrapper over is_sudden_improvement (7-day window). No LLM."""
+    from database import get_user_messages_with_risk
+    msgs = await get_user_messages_with_risk(user_id, window_hours)
+    return is_sudden_improvement(msgs)
+
+
 async def get_emotional_trajectory(user_id: int, window_hours: int = 24) -> EmotionalTrajectory:
     """Deterministic trajectory over the last N hours. NO LLM, NO re-scoring —
     reads per-message risk snapshots persisted on the messages table."""
