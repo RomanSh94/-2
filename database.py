@@ -234,6 +234,8 @@ _MIGRATIONS = [
     # cannot be the source (it's blind to the calm majority of messages).
     ("messages", "risk_score", "INTEGER DEFAULT 0"),
     ("messages", "risk_categories", "TEXT DEFAULT ''"),
+    # Protective factors (Columbia) — context attached to a crisis event.
+    ("crisis_events", "protective_factors_json", "TEXT DEFAULT '[]'"),
 ]
 
 
@@ -688,6 +690,17 @@ async def log_crisis_event(uid: int, level: str, risk_score: int,
             (uid, level, risk_score, ",".join(categories), message_excerpt,
              lang, int(admin_notified)))
         await db.commit(); return cur.lastrowid
+
+
+async def set_crisis_protective_factors(event_id: int, factors: list) -> None:
+    """Attach detected protective-factor categories to a crisis event (context
+    only — never affects risk). Stored as a JSON array string."""
+    import json
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE crisis_events SET protective_factors_json=? WHERE id=?",
+            (json.dumps(factors, ensure_ascii=False), event_id))
+        await db.commit()
 
 
 async def set_crisis_response(uid: int, response: str) -> None:

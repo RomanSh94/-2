@@ -33,7 +33,7 @@ from crisis_protocol import classify, crisis_keyboard, admin_alert_text, RED
 from humanization import (
     pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
 )
-from risk_detector import detect_risk, amplify_ambiguity_by_context
+from risk_detector import detect_risk, amplify_ambiguity_by_context, detect_protective_factors
 from language_detector import detect_language
 from stage_detector import detect_stage
 from state_engine import DEFAULT_STATE, update_state, choose_scenario, get_emotional_trajectory
@@ -61,7 +61,7 @@ from database import (
     start_intervention, finish_intervention,
     get_user_language,
     set_checkin, get_checkin_users, update_last_checkin,
-    log_crisis_event, set_crisis_response,
+    log_crisis_event, set_crisis_response, set_crisis_protective_factors,
     get_memory_overview, forget_all,
     set_mute, reset_unanswered,
     get_recent_messages, log_disambiguation,
@@ -76,6 +76,14 @@ bot                = Bot(token=BOT_TOKEN)
 dp                 = Dispatcher(storage=MemoryStorage())
 client             = AsyncOpenAI(api_key=OPENAI_API_KEY)
 dependency_monitor = DependencyMonitor()
+
+# Human-readable RU labels for protective-factor categories (admin alert).
+_PF_LABELS = {
+    "children": "дети", "pets": "питомцы", "close_people": "близкие",
+    "future_plans": "планы на будущее", "responsibility": "обязательства",
+    "meaning_faith": "смысл/вера", "reasons_to_live": "причины жить",
+}
+
 
 def score_kb(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -120,16 +128,25 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                          risk["score"], risk["categories"], user_text)
 
     if classify(risk) == RED:
-        await log_crisis_event(uid, RED, risk["score"], risk["categories"],
-                               user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
+        eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
+                                     user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
         # Persist the crisis message's risk snapshot + force a profile refresh
         # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
         await save_message(uid, "user", user_text, "crisis", lang,
                            risk["score"], risk["categories"])
         await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
+        # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
+        # the crisis flow is committed; never alters risk or the user's message.
+        recent_for_pf = await get_recent_messages(uid, limit=10)
+        pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
+        protective = detect_protective_factors(pf_text)
+        if protective:
+            await set_crisis_protective_factors(eid, protective)
         await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
                          risk["categories"], user_text)
         alert = admin_alert_text(uid, username, RED, risk, user_text)
+        if protective:
+            alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
         for admin_id in ADMIN_USER_IDS:
             try:
                 await bot.send_message(admin_id, alert)

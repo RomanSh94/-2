@@ -304,6 +304,47 @@ def amplify_ambiguity_by_context(ambiguous_phrases: List[str],
     return "force_disambiguation"
 
 
+# ── Protective factors (Columbia-style) — CONTEXT ONLY ────────────────────────
+# Reasons-to-live / connectedness / responsibility / future. These are surfaced
+# to the admin alongside a crisis event so a human doing follow-up knows the
+# user's anchor points. They are PURELY informational: they NEVER lower the risk
+# level, never suppress Crisis Protocol, never change the user-facing message.
+# The "burden frame" ("всем без меня лучше") is the OPPOSITE of a protective
+# factor (it's a risk signal, caught by self-blame) — it must NOT match here.
+PROTECTIVE_FACTOR_PATTERNS = {
+    "children": ["сын", "дочь", "дочка", "дети", "детей", "ребёнок", "ребенок",
+                 "ради детей", "ради дочери", "ради сына",
+                 "my son", "my daughter", "my kids", "my children"],
+    "pets": ["моя собака", "мой кот", "моя кошка", "мой пёс", "мой пес", "питомец",
+             "некому покормить", "кто покормит кота", "my dog", "my cat", "my pet"],
+    "close_people": ["ради мамы", "что будет с мамой", "не могу так с мамой",
+                     "ради родителей", "на мне держится", "не могу их оставить",
+                     "что будет с ними", "ради близких",
+                     "for my mom", "can't do that to my"],
+    "future_plans": ["завтра у меня", "через неделю", "хочу успеть", "мечтаю",
+                     "моя цель", "планирую", "скоро поездка", "впереди экзамен",
+                     "свадьба", "хочу дожить до", "i dream", "my goal", "i plan"],
+    "responsibility": ["работа держит", "на работе ждут", "проект надо",
+                       "обещал доделать", "обещала доделать"],
+    "meaning_faith": ["для меня важна вера", "это грех", "молюсь",
+                      "смысл для меня в", "my faith"],
+    "reasons_to_live": ["меня держит", "единственное что держит",
+                        "ради чего жить", "reason to live"],
+}
+
+
+def detect_protective_factors(text: str) -> List[str]:
+    """Return the list of protective-factor categories found (empty if none).
+
+    CONTEXT ONLY — never used to alter risk scoring or the crisis path."""
+    t = text.lower()
+    found = []
+    for category, phrases in PROTECTIVE_FACTOR_PATTERNS.items():
+        if any(p in t for p in phrases):
+            found.append(category)
+    return found
+
+
 def detect_risk(text: str, lang: str = "ru") -> Dict:
     t = text.lower()
     categories: List[str] = []
