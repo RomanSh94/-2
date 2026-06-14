@@ -148,6 +148,25 @@ CREATE TABLE IF NOT EXISTS disambiguation_events (
     created_at   TEXT DEFAULT (datetime('now'))
 );
 
+-- Epic B: quiet review flags for a human (NOT crisis, NOT user-facing).
+CREATE TABLE IF NOT EXISTS review_flags (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    flag_type   TEXT NOT NULL,        -- e.g. 'sudden_improvement'
+    context     TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    reviewed    INTEGER DEFAULT 0
+);
+
+-- Epic C: blocked responses that confirmed a cognitive distortion.
+CREATE TABLE IF NOT EXISTS toxic_validation_blocks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
+    matched       TEXT,
+    original_text TEXT,
+    created_at    TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS push_settings (
     user_id                INTEGER PRIMARY KEY,
     mute_mode              TEXT DEFAULT 'none',   -- none | forever | until
@@ -690,6 +709,61 @@ async def log_crisis_event(uid: int, level: str, risk_score: int,
             (uid, level, risk_score, ",".join(categories), message_excerpt,
              lang, int(admin_notified)))
         await db.commit(); return cur.lastrowid
+
+
+async def log_review_flag(uid: int, flag_type: str, context: str,
+                          rate_limit_days: int = 7) -> bool:
+    """Insert a review flag unless the same type was raised for this user within
+    the rate-limit window. Returns True if inserted, False if rate-limited."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM review_flags WHERE user_id=? AND flag_type=?"
+            f"  AND created_at > datetime('now', '-{int(rate_limit_days)} days')",
+            (uid, flag_type))
+        if (await cur.fetchone())[0] > 0:
+            return False
+        await db.execute(
+            "INSERT INTO review_flags (user_id,flag_type,context) VALUES (?,?,?)",
+            (uid, flag_type, context[:500]))
+        await db.commit()
+        return True
+
+def sync_unreviewed_flags(limit: int = 50) -> list:
+    conn = _conn()
+    cur = conn.execute(
+        "SELECT id,user_id,flag_type,context,created_at FROM review_flags"
+        " WHERE reviewed=0 ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cur.fetchall(); conn.close()
+    return [tuple(r) for r in rows]
+
+def sync_mark_flag_reviewed(flag_id: int) -> None:
+    conn = _conn()
+    conn.execute("UPDATE review_flags SET reviewed=1 WHERE id=?", (flag_id,))
+    conn.commit(); conn.close()
+
+async def log_toxic_validation_block(uid: int, matched: str, original_text: str) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO toxic_validation_blocks (user_id,matched,original_text)"
+            " VALUES (?,?,?)", (uid, matched, original_text[:500]))
+        await db.commit()
+
+def sync_toxic_blocks(limit: int = 50) -> list:
+    conn = _conn()
+    cur = conn.execute(
+        "SELECT user_id,matched,original_text,created_at FROM toxic_validation_blocks"
+        " ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cur.fetchall(); conn.close()
+    return [tuple(r) for r in rows]
+
+def sync_crisis_with_protective(limit: int = 50) -> list:
+    conn = _conn()
+    cur = conn.execute(
+        "SELECT user_id,level,protective_factors_json,message_excerpt,created_at"
+        " FROM crisis_events WHERE protective_factors_json IS NOT NULL"
+        "   AND protective_factors_json != '[]' ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cur.fetchall(); conn.close()
+    return [tuple(r) for r in rows]
 
 
 async def set_crisis_protective_factors(event_id: int, factors: list) -> None:

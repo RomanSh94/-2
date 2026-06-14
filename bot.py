@@ -36,7 +36,10 @@ from humanization import (
 from risk_detector import detect_risk, amplify_ambiguity_by_context, detect_protective_factors
 from language_detector import detect_language
 from stage_detector import detect_stage
-from state_engine import DEFAULT_STATE, update_state, choose_scenario, get_emotional_trajectory
+from state_engine import (
+    DEFAULT_STATE, update_state, choose_scenario, get_emotional_trajectory,
+    check_sudden_improvement,
+)
 from psychology_profile import maybe_update_profile, format_profile_for_user
 from readiness_engine import assess_readiness
 from cognitive_capacity import get_capacity
@@ -66,6 +69,7 @@ from database import (
     set_mute, reset_unanswered,
     get_recent_messages, log_disambiguation,
     get_user_message_count, get_profile, delete_profile,
+    log_review_flag, log_toxic_validation_block,
 )
 
 class InterventionStates(StatesGroup):
@@ -269,7 +273,28 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # 16. Safety validator (context-aware — blocks approval/risky-suggestion
     # replies given the user's last message and risk level; v3 hotfix).
     is_safe, reason = validate_response_with_context(answer, user_text, risk, lang)
-    if not is_safe:
+    if not is_safe and reason and reason.startswith("toxic validation"):
+        # Epic C: the reply confirmed an absolutist distortion. ONE regeneration
+        # asking to validate the feeling but NOT the distortion; else fallback.
+        await log_toxic_validation_block(uid, reason, answer)
+        instr = ("В прошлом ответе ты подтвердил искажение («все/никто/никогда»). "
+                 "Подтверди чувство, но НЕ искажение. Например: вместо «да, все тебя бросают» "
+                 "→ «то, что ты сейчас так одинок — это правда тяжело»." if lang == "ru" else
+                 "Your previous reply confirmed an absolutist distortion. Validate the "
+                 "feeling but NOT the distortion.")
+        try:
+            retry = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages + [{"role": "assistant", "content": answer},
+                                     {"role": "system", "content": instr}],
+                temperature=0.7, max_tokens=300)
+            candidate = retry.choices[0].message.content
+            ok2, _ = validate_response_with_context(candidate, user_text, risk, lang)
+            answer = candidate if ok2 else get_fallback(lang)
+        except Exception as e:
+            print(f"[anti-toxic] retry failed uid={uid}: {type(e).__name__}: {e}")
+            answer = get_fallback(lang)
+    elif not is_safe:
         await log_validator_block(uid, reason, answer)
         # At elevated risk use the deterministic high-risk fallback; otherwise
         # the neutral fallback. NEVER re-prompt the LLM here.
@@ -288,6 +313,22 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
 
     # 17.5 Profile refresh (§5) — deterministic, every 5th user message.
     await maybe_update_profile(uid, await get_user_message_count(uid))
+
+    # 17.6 Sudden-improvement review flag (Epic B) — quiet signal for a human,
+    # NOT a crisis. Never changes the user's experience; rate-limited to 1/week.
+    try:
+        if await check_sudden_improvement(uid):
+            if await log_review_flag(uid, "sudden_improvement",
+                                     "Резкий переход от длительной безнадёжности к спокойствию."):
+                note = (f"🟦 На ревью: пользователь {uid} (@{username or '—'}) — резкий переход "
+                        f"от длительной безнадёжности к спокойствию. Стоит глянуть.")
+                for admin_id in ADMIN_USER_IDS:
+                    try:
+                        await bot.send_message(admin_id, note)
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"[review-flag] uid={uid}: {type(e).__name__}: {e}")
     
     # 18. Start outcome tracking (if appropriate scenario)
     if scenario not in ("crisis", "open_chat"):
