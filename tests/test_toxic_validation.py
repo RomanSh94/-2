@@ -27,3 +27,14 @@ def test_neutral_response_NOT_blocked():
 
 def test_plain_validation_without_absolutist_NOT_blocked():
     assert check_toxic_validation("да, это звучит непросто")[0] is False
+
+
+def test_da_inside_pravda_does_not_confirm():
+    # "да" must not match inside "неправда"/"правда" (word-boundary fix).
+    assert check_toxic_validation("неправда, что тебя все ненавидят")[0] is False
+
+
+def test_validation_plus_distortion_still_blocked():
+    # Allowlist is per-sentence: a separate confirming sentence is still caught.
+    text = "то, что тебе больно — это правда тяжело. да, тебя все ненавидят."
+    assert check_toxic_validation(text)[0] is True

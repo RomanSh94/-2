@@ -94,12 +94,13 @@ def get_safe_fallback_high_risk(lang: str = "ru") -> str:
 # distortion ("да, тебя все ненавидят"). Rule: validate the FEELING, never the
 # distortion. Kept deliberately narrow — bias toward fewer false positives, and
 # never block genuine emotion validation or a negation ("не все тебя ненавидят").
-CONFIRMING_TOKENS = ["да,", "да ", "действительно", "ты прав", "ты права",
-                     "это правда", "так и есть", "согласен", "согласна",
-                     "верно", "и вправду", "и правда"]
+# Confirming language. "да" is matched on a WORD boundary so it does NOT fire
+# inside "правда"/"неправда" (bug fix); phrase tokens stay as-is.
+_CONFIRMING_RE = re.compile(
+    r"\b(?:да|действительно|ты прав|ты права|это правда|так и есть|"
+    r"согласен|согласна|верно|и вправду|и правда)\b", re.IGNORECASE)
 ABSOLUTIST_MARKERS = ["все", "всех", "всем", "никто", "никому", "никогда",
                       "всегда", "ничего", "ничто", "никак", "вечно"]
-NEGATIONS = ["не ", "ни ", "вряд ли", "неправда", "это не так", "на самом деле не"]
 EMOTION_VALIDATION_ALLOWLIST = ["больно", "тяжело", "это реально", "твои чувства",
                                 "имеешь право чувствовать", "понимаю, что чувствуешь",
                                 "понимаю что чувствуешь", "то, что ты чувствуешь",
@@ -108,26 +109,32 @@ EMOTION_VALIDATION_ALLOWLIST = ["больно", "тяжело", "это реал
 _WORD_RE = re.compile(r"[а-яёa-z]+", re.IGNORECASE)
 
 
+def _has_confirm(s: str) -> bool:
+    return bool(_CONFIRMING_RE.search(s))
+
+
 def check_toxic_validation(text: str) -> tuple[bool, str | None]:
     """Return (is_toxic, matched). is_toxic=True → the reply confirms a
     distortion (a confirming token near a non-negated absolutist marker, and not
-    a feeling-validation)."""
+    a feeling-validation).
+
+    The feeling-validation allowlist is applied PER SENTENCE, not globally, so a
+    reply that both validates a feeling AND confirms a distortion in a separate
+    sentence is still caught (bug fix)."""
     low = text.lower()
-    # Allowlist: if the reply is validating a feeling, lean to PASS.
-    if any(a in low for a in EMOTION_VALIDATION_ALLOWLIST):
+    if not _has_confirm(low):
         return False, None
-    if not any(c in low for c in CONFIRMING_TOKENS):
-        return False, None
-    # Examine each sentence so confirmation + marker must be in close proximity.
     for sentence in re.split(r"[.!?\n]", low):
-        if not any(c in sentence for c in CONFIRMING_TOKENS):
+        # A sentence that validates a feeling is allowed — but only that sentence.
+        if any(a in sentence for a in EMOTION_VALIDATION_ALLOWLIST):
+            continue
+        if not _has_confirm(sentence):
             continue
         words = _WORD_RE.findall(sentence)
         for i, w in enumerate(words):
             if w in ABSOLUTIST_MARKERS:
-                window = " ".join(words[max(0, i - 2):i])
-                if any(neg.strip() in window.split() or neg.strip() == window
-                       for neg in ("не", "ни")) or "вряд" in sentence \
+                window = words[max(0, i - 2):i]
+                if "не" in window or "ни" in window or "вряд" in sentence \
                         or "неправда" in sentence or "не так" in sentence:
                     continue  # negated → countering the distortion, allow
                 return True, w
