@@ -43,11 +43,12 @@ async def _send_crisis_followups(bot: Bot) -> None:
                     print(f"[scheduler] crisis followup {tag} failed {uid}: {e}")
 
 async def _send_checkins(bot: Bot) -> None:
-    hour = datetime.now(timezone.utc).hour
+    utc_hour = datetime.now(timezone.utc).hour
     users = await get_checkin_users()
     sent = 0
-    for uid, _, checkin_hour, lang in users:
-        if checkin_hour != hour:
+    for uid, _, checkin_hour, lang, tz in users:
+        # checkin_hour is the user's LOCAL hour; compare in local time.
+        if checkin_hour != (utc_hour + (tz or 0)) % 24:
             continue
         try:
             msg = get_checkin_msg(lang)
@@ -57,17 +58,18 @@ async def _send_checkins(bot: Bot) -> None:
         except Exception as e:
             print(f"[scheduler] checkin failed {uid}: {e}")
     if sent:
-        print(f"[scheduler] Sent {sent} check-in(s) at UTC {hour}:00")
+        print(f"[scheduler] Sent {sent} check-in(s) at UTC {utc_hour}:00")
 
 async def _send_silence_pushes(bot: Bot) -> None:
     """Re-engagement pushes (§8). All antispam logic lives in decide_push();
     here we just gather context, ask, and send."""
     now = datetime.now(timezone.utc)
-    for uid, last_seen, lang in await get_push_candidates():
+    for uid, last_seen, lang, tz in await get_push_candidates():
         try:
             last_activity = _parse_utc(last_seen)
         except (ValueError, TypeError):
             continue
+        local_now = now + timedelta(hours=tz or 0)   # for quiet-hours only
         ctx = await get_push_context(uid)
         muted_until = None
         if ctx["mute_mode"] == "until" and ctx["mute_until"]:
@@ -94,6 +96,7 @@ async def _send_silence_pushes(bot: Bot) -> None:
             last_crisis_at=last_crisis_at,
             consecutive_unanswered=ctx["consecutive_unanswered"],
             tier_push_times=tier_push_times,
+            quiet_now=local_now,
         )
         if not tier:
             continue

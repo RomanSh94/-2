@@ -680,10 +680,11 @@ async def record_push(uid: int, tier: str) -> None:
 
 
 async def get_push_candidates() -> list:
-    """Users inactive ≥12h who aren't permanently muted: (uid, last_seen, lang)."""
+    """Users inactive ≥12h who aren't permanently muted:
+    (uid, last_seen, lang, tz_offset)."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            """SELECT u.id, u.last_seen, u.language
+            """SELECT u.id, u.last_seen, u.language, COALESCE(u.tz_offset,0)
                FROM users u
                LEFT JOIN push_settings p ON p.user_id = u.id
                WHERE u.last_seen <= datetime('now','-12 hours')
@@ -1025,7 +1026,9 @@ async def set_checkin(uid: int, username: str, first_name: str,
 async def get_checkin_users() -> list:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            "SELECT user_id,first_name,checkin_hour,language FROM checkins WHERE enabled=1")
+            "SELECT c.user_id,c.first_name,c.checkin_hour,c.language,"
+            " COALESCE(u.tz_offset,0)"
+            " FROM checkins c LEFT JOIN users u ON u.id=c.user_id WHERE c.enabled=1")
         return await cur.fetchall()
 
 async def update_last_checkin(uid: int):
