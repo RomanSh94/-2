@@ -68,11 +68,15 @@ def decide_push(now: datetime, last_activity: datetime, *,
                 consecutive_unanswered: int = 0,
                 tier_push_times: dict | None = None,
                 quiet_start: int = QUIET_START,
-                quiet_end: int = QUIET_END) -> str | None:
+                quiet_end: int = QUIET_END,
+                quiet_now: datetime | None = None) -> str | None:
     """Return the tier to push now, or None if any antispam rule vetoes it.
 
     `tier_push_times` maps tier -> list[datetime] of past sends (used for both
     the once-per-day rule and per-tier frequency limits).
+    `quiet_now`: if given, quiet-hours are evaluated against THIS time (the
+    user's LOCAL time) instead of `now` (UTC) — fixes the tz-shift so we don't
+    ping people in the middle of their night. All other logic still uses `now`.
     """
     tier_push_times = tier_push_times or {}
 
@@ -80,8 +84,8 @@ def decide_push(now: datetime, last_activity: datetime, *,
     if muted_until is not None and now < muted_until:
         return None
 
-    # (2) quiet hours
-    if is_quiet_hours(now, quiet_start, quiet_end):
+    # (2) quiet hours — evaluated in the user's local time when provided.
+    if is_quiet_hours(quiet_now or now, quiet_start, quiet_end):
         return None
 
     # (4) within 24h of a crisis event

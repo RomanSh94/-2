@@ -51,6 +51,22 @@ def test_quiet_hours_vetoes():
     assert decide_push(night, night - timedelta(days=2)) is None
 
 
+def test_quiet_now_uses_local_time_veto():
+    # UTC 20:00 is fine, but the user's local time (UTC+5 → 01:00) is quiet → veto.
+    utc8pm = NOON.replace(hour=20)
+    local1am = utc8pm + timedelta(hours=5)
+    assert decide_push(utc8pm, _ago(days=2)) == "12h"            # without tz: allowed
+    assert decide_push(utc8pm, _ago(days=2), quiet_now=local1am) is None  # local night: veto
+
+
+def test_quiet_now_local_daytime_allows():
+    # UTC 04:00 is quiet, but the user's local time (UTC+6 → 10:00) is daytime.
+    utc4am = NOON.replace(hour=4)
+    local10am = utc4am + timedelta(hours=6)
+    assert decide_push(utc4am, _ago(days=2)) is None                       # UTC night: veto
+    assert decide_push(utc4am, _ago(days=2), quiet_now=local10am) == "12h"  # local day: allowed
+
+
 def test_crisis_within_24h_vetoes():
     assert decide_push(NOON, _ago(days=2), last_crisis_at=_ago(hours=5)) is None
 
