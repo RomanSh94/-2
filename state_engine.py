@@ -220,9 +220,43 @@ async def get_emotional_trajectory(user_id: int, window_hours: int = 24) -> Emot
     return build_trajectory(user_id, window_hours, msgs, last_crisis)
 
 
+# Clinically-ordered fallback when the picked scenario is blocked for the stage.
+# All of these are de-escalating / always-safe; the filter walks this list and
+# returns the first one NOT blocked for the current stage.
+_FALLBACK_PREF = ["stabilization", "somatic", "reflective", "open_chat"]
+
+
+def apply_stage_restrictions(scenario: str, stage: str) -> str:
+    """Hard stage gate: if `scenario` is blocked for `stage`, swap it for the
+    first clinically-safe allowed fallback. `crisis` is never downgraded."""
+    from stage_detector import get_stage_restrictions
+    if scenario == "crisis":
+        return scenario
+    blocked = get_stage_restrictions(stage).get("blocked", [])
+    if scenario not in blocked:
+        return scenario
+    for cand in _FALLBACK_PREF:
+        if cand not in blocked:
+            return cand
+    return "open_chat"
+
+
 def choose_scenario(state: Dict, risk_cats: list, stage: str,
                     readiness: str, capacity: float, variant: str = "control",
                     trajectory: "EmotionalTrajectory | None" = None) -> str:
+    """Pick a scenario, then enforce the stage hard-filter (STAGE_RESTRICTIONS).
+
+    The selection heuristics live in _select_scenario; this wrapper guarantees
+    the result is allowed for the user's stage (e.g. GROWTH no longer drops to
+    grounding on a panic spike — it falls back to a safe allowed scenario)."""
+    scenario = _select_scenario(state, risk_cats, stage, readiness, capacity,
+                                variant, trajectory)
+    return apply_stage_restrictions(scenario, stage)
+
+
+def _select_scenario(state: Dict, risk_cats: list, stage: str,
+                     readiness: str, capacity: float, variant: str = "control",
+                     trajectory: "EmotionalTrajectory | None" = None) -> str:
     """
     Routes to psychological scenario.
     Respects Stage restrictions, Readiness, and Cognitive Capacity.
