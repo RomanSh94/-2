@@ -256,6 +256,28 @@ AMBIGUOUS_PHRASES = [
 ]
 
 
+# Suicide REGEX layer — catches verb/word-order variants and negated
+# "смысл жить" that plain substrings miss. Anything matching here is RED. The
+# action-metaphor regexes require an EXIT verb, so benign "смотрю в окно" never
+# matches. Window-exit ("выйти в окно") is RED here (the crisis screen + phone
+# must show directly), not merely "ambiguous".
+_SUICIDE_REGEXES = [
+    re.compile(r"(спрыгн|прыгн|шагн|выйти|выйду|выпрыгн|выброс|сигану|сигн)\w*"
+               r"\s+(в|с|из|на)\s+(?:\w+\s+)?(окн|балкон|крыш|мост|высот)"),
+    re.compile(r"(спрыгн|прыгн|шагн)\w*\s+вниз"),
+    re.compile(r"хочу\s+(спрыгнуть|прыгнуть|повеситься|удавиться|броситься)"),
+    re.compile(r"(не вижу|нет|без|никакого)\s+смысла\s+(жить|существовать|продолжать)"),
+    re.compile(r"смысла\s+(жить|существовать)\s+нет"),
+    re.compile(r"жить\s+незачем|незачем\s+жить"),
+    re.compile(r"(не\s+хочу|больше\s+не\s+хочу)\s+(больше\s+)?жить"),
+    re.compile(r"зачем\s+мне\s+(дальше\s+)?жить"),
+]
+
+
+def _suicide_regex_hit(text_lower: str) -> bool:
+    return any(rx.search(text_lower) for rx in _SUICIDE_REGEXES)
+
+
 def detect_ambiguity(text: str) -> List[str]:
     """Return the list of ambiguous phrases/patterns found (empty if none).
 
@@ -366,6 +388,11 @@ def detect_risk(text: str, lang: str = "ru") -> Dict:
             categories.append(cat); score += WEIGHTS[cat]; has_explicit = True
         elif hit_i:
             categories.append(cat); score += WEIGHTS[cat] * IMPLICIT_MULT; has_implicit = True
+
+    # Suicide regex layer — verb/word-order variants + negated "смысл жить" +
+    # window/balcony/height action metaphors that substrings miss.
+    if "suicide" not in categories and _suicide_regex_hit(t):
+        categories.append("suicide"); score += WEIGHTS["suicide"]; has_explicit = True
 
     if "hopelessness" in categories and "burnout" in categories: score += 20
     if "loneliness" in categories and "hopelessness" in categories: score += 15

@@ -94,19 +94,19 @@ PROMPTS = {
 }
 
 CRISIS_TEXT_RU = (
-    "Похоже, тебе сейчас очень тяжело.\n\n"
-    "Ты не обязан(а) справляться с этим в одиночку.\n\n"
-    "Если есть риск причинить вред себе — пожалуйста, свяжись прямо сейчас:\n\n"
-    "🇷🇺 <b>8-800-2000-122</b> — бесплатно, 24/7\n"
-    "Или напиши близкому человеку, которому доверяешь."
+    "Сейчас мне важно, чтобы ты не оставался(ась) с этим один(одна).\n\n"
+    "Пожалуйста, позвони — это бесплатно, анонимно и круглосуточно:\n\n"
+    "📞 <b>8-800-2000-122</b> — телефон доверия (Россия)\n"
+    "📞 <b>112</b> — единый номер экстренной помощи\n\n"
+    "И если рядом есть близкий человек, которому ты доверяешь — напиши ему прямо сейчас."
 )
 CRISIS_TEXT_EN = (
-    "It sounds like things are very heavy right now.\n\n"
-    "You don't have to handle this alone.\n\n"
-    "If there's any risk of hurting yourself, please reach out now:\n\n"
-    "🌍 International Association for Suicide Prevention: "
-    "<b>https://www.iasp.info/resources/Crisis_Centres/</b>\n"
-    "Or contact someone you trust."
+    "Right now it matters to me that you're not alone with this.\n\n"
+    "Please reach out — it's free, anonymous, around the clock:\n\n"
+    "📞 <b>112</b> — emergency number\n"
+    "🌍 Find a crisis line near you: "
+    "<b>https://www.iasp.info/resources/Crisis_Centres/</b>\n\n"
+    "And if there's someone you trust nearby — message them right now."
 )
 DEPENDENCY_TEXT_RU = (
     "Я рад, что этот разговор помогает.\n\n"
