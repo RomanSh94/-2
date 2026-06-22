@@ -73,3 +73,99 @@ HOTLINE_NUDGE_EN = ("\n\nAnd — if things are really hard right now, please rea
 
 def hotline_nudge(lang: str = "ru") -> str:
     return HOTLINE_NUDGE_EN if lang == "en" else HOTLINE_NUDGE_RU
+
+
+# ── CBT journal: user reframes their OWN thought; bot never interprets ─────────
+CBT_STEPS = [
+    ("situation",         "Опиши ситуацию: что случилось?",            "Describe the situation: what happened?"),
+    ("automatic_thought", "Какая мысль автоматически пришла в голову?", "What thought came automatically?"),
+    ("emotion",           "Какую эмоцию это вызвало?",                  "What emotion did it cause?"),
+    ("intensity",         "Насколько сильно, от 1 до 10?",             "How strong, 1 to 10?"),
+    ("evidence_for",      "Какие факты ЗА эту мысль?",                  "What facts support this thought?"),
+    ("evidence_against",  "Какие факты ПРОТИВ этой мысли?",            "What facts go against it?"),
+    ("realistic_thought", "Как можно сформулировать мысль более реалистично — твоими словами?",
+                          "How could you put the thought more realistically — in your own words?"),
+    ("change",            "Что изменилось в эмоции сейчас?",           "What changed in the emotion now?"),
+]
+CBT_FIELDS = [k for k, _, _ in CBT_STEPS]
+
+
+def cbt_prompt(step_key: str, lang: str = "ru") -> str:
+    for k, ru, en in CBT_STEPS:
+        if k == step_key:
+            return en if lang == "en" else ru
+    return ""
+
+
+# ── Check-in button labels (mood marks) ───────────────────────────────────────
+MORNING_OPTIONS = [("calm", "😌 спокойно"), ("neutral", "😐 нейтрально"),
+                   ("anxious", "😰 тревожно"), ("sad", "😔 грустно"),
+                   ("irritated", "😤 раздражён"), ("no_energy", "😴 нет сил")]
+EVENING_OPTIONS = [("emotion_journal", "📝 дневник эмоций"),
+                   ("cbt_journal", "📘 КПТ"), ("skip", "⏭ пропустить")]
+
+
+# ── Weekly report (DETERMINISTIC — NO LLM, no causality, no diagnoses) ─────────
+def _hour_of(ts: str) -> int:
+    try:
+        return int(ts[11:13])
+    except Exception:
+        return 12
+
+
+def _bucket(hour: int) -> str:
+    if hour < 12:
+        return "утром"
+    if hour < 18:
+        return "днём"
+    return "вечером"
+
+
+def build_weekly_report(emotion_entries: list, checkin_logs: list,
+                        lang: str = "ru", min_entries: int = 3) -> str:
+    """Deterministic 7-day summary built ONLY from what the user literally
+    recorded: counts, averages, time-of-day. No interpretation, no causality, no
+    diagnoses. Ends with an invitation question, not a conclusion.
+
+    emotion_entries: list of dicts with 'feeling','intensity','created_at'.
+    checkin_logs:    list of dicts with 'value','created_at'.
+    """
+    total = len(emotion_entries)
+    if total < min_entries:
+        return ("📊 Пока мало записей, чтобы что-то заметить. "
+                "Позаполняй дневник на этой неделе — и вернёмся к сводке."
+                if lang == "ru" else
+                "📊 Not enough entries yet to notice anything. Keep journaling this "
+                "week and we'll look again.")
+
+    # Most frequent feelings (user's own words, exact strings).
+    feelings = {}
+    for e in emotion_entries:
+        f = (e.get("feeling") or "").strip().lower()
+        if f:
+            feelings[f] = feelings.get(f, 0) + 1
+    top = sorted(feelings.items(), key=lambda x: -x[1])[:3]
+    top_feeling = top[0][0] if top else "—"
+
+    # Average intensity overall and by time-of-day.
+    vals = [(e.get("intensity"), _bucket(_hour_of(e.get("created_at") or "")))
+            for e in emotion_entries if e.get("intensity")]
+    overall = round(sum(v for v, _ in vals) / len(vals), 1) if vals else None
+    by_bucket = {}
+    for v, b in vals:
+        by_bucket.setdefault(b, []).append(v)
+    bucket_avg = {b: round(sum(xs) / len(xs), 1) for b, xs in by_bucket.items()}
+
+    lines = [f"📊 Сводка за неделю ({total} записей):", ""]
+    lines.append("Чаще всего ты отмечал(а): " + ", ".join(f"{f} ×{n}" for f, n in top))
+    if overall is not None:
+        lines.append(f"Средняя интенсивность: {overall} из 10")
+    if len(bucket_avg) >= 2:
+        hi = max(bucket_avg.items(), key=lambda x: x[1])
+        lines.append(f"Выше всего в среднем — {hi[0]} ({hi[1]}).")
+    if checkin_logs:
+        lines.append(f"Отметок настроения за неделю: {len(checkin_logs)}.")
+    lines.append("")
+    lines.append(f"Хочешь на следующей неделе понаблюдать за тем, что стоит за «{top_feeling}»?")
+    return "\n".join(lines)
+

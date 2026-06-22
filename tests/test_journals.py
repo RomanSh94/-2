@@ -73,3 +73,54 @@ def test_save_emotion_entry_roundtrip(tmp_db):
             return await cur.fetchone()
     row = asyncio.run(go())
     assert row == ("поспорил с другом", "обида", 7, None, "легче")
+
+
+def test_save_cbt_entry_roundtrip(tmp_db):
+    async def go():
+        await tmp_db.upsert_user(1, "u", "U")
+        await tmp_db.save_cbt_entry(1, {
+            "situation": "встреча", "automatic_thought": "я провалюсь",
+            "emotion": "тревога", "intensity": 8, "evidence_for": "—",
+            "evidence_against": "раньше справлялся", "realistic_thought": "будет непросто, но ок",
+            "change": "чуть легче"})
+        return await tmp_db.get_emotion_entries_since(1, 7)  # different table → empty
+    assert asyncio.run(go()) == []
+
+
+# ── Weekly report (deterministic, no diagnoses) ───────────────────────────────
+_BANNED = ["депресс", "птср", "диагноз", "расстройств", "травма", "потому что", "из-за того"]
+
+
+def test_report_low_data():
+    txt = journals.build_weekly_report([], [], "ru")
+    assert "мало" in txt.lower()
+
+
+def test_report_has_counts_and_no_diagnosis():
+    entries = [
+        {"feeling": "тревога", "intensity": 8, "created_at": "2026-06-10 21:00:00"},
+        {"feeling": "тревога", "intensity": 7, "created_at": "2026-06-11 20:00:00"},
+        {"feeling": "грусть", "intensity": 4, "created_at": "2026-06-11 10:00:00"},
+    ]
+    txt = journals.build_weekly_report(entries, [], "ru").lower()
+    assert "тревога" in txt
+    assert "?" in txt                       # ends with an invitation question
+    assert not any(b in txt for b in _BANNED)
+
+
+def test_cbt_prompts_present():
+    assert journals.cbt_prompt("situation") == "Опиши ситуацию: что случилось?"
+    assert journals.CBT_FIELDS[0] == "situation" and journals.CBT_FIELDS[-1] == "change"
+
+
+# ── GDPR ──────────────────────────────────────────────────────────────────────
+def test_forget_all_wipes_journals(tmp_db):
+    async def go():
+        await tmp_db.upsert_user(5, "u", "U")
+        await tmp_db.save_emotion_entry(5, {"event": "x", "feeling": "грусть", "intensity": 3})
+        await tmp_db.save_cbt_entry(5, {"situation": "y", "emotion": "тревога"})
+        await tmp_db.forget_all(5)
+        return await tmp_db.export_journals(5)
+    data = asyncio.run(go())
+    assert data["emotion_journal_entries"] == []
+    assert data["cbt_journal_entries"] == []
