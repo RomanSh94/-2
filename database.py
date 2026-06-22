@@ -167,6 +167,21 @@ CREATE TABLE IF NOT EXISTS toxic_validation_blocks (
     created_at    TEXT DEFAULT (datetime('now'))
 );
 
+-- Epic 8: emotion journal entries (user's own words; no interpretation).
+CREATE TABLE IF NOT EXISTS emotion_journal_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    event      TEXT,
+    feeling    TEXT,
+    intensity  INTEGER,
+    body       TEXT,
+    need       TEXT,
+    action     TEXT,
+    outcome    TEXT,
+    lang       TEXT DEFAULT 'ru',
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS push_settings (
     user_id                INTEGER PRIMARY KEY,
     mute_mode              TEXT DEFAULT 'none',   -- none | forever | until
@@ -708,6 +723,20 @@ async def log_crisis_event(uid: int, level: str, risk_score: int,
                VALUES (?,?,?,?,?,?,?)""",
             (uid, level, risk_score, ",".join(categories), message_excerpt,
              lang, int(admin_notified)))
+        await db.commit(); return cur.lastrowid
+
+
+async def save_emotion_entry(uid: int, data: dict, lang: str = "ru") -> int:
+    """Persist one emotion-journal entry. `data` keys are EMOTION_FIELDS; missing
+    fields (e.g. body skipped at ORANGE) are stored as NULL."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "INSERT INTO emotion_journal_entries"
+            " (user_id,event,feeling,intensity,body,need,action,outcome,lang)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (uid, data.get("event"), data.get("feeling"), data.get("intensity"),
+             data.get("body"), data.get("need"), data.get("action"),
+             data.get("outcome"), lang))
         await db.commit(); return cur.lastrowid
 
 

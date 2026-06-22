@@ -50,6 +50,7 @@ from safety_validator import (
     validate_response_with_context, get_safe_fallback_high_risk,
 )
 from prompts import get_disambiguation_message
+import journals
 from memory import maybe_summarize, build_context
 from voice import transcribe_voice
 from notifications import push_alert
@@ -70,11 +71,15 @@ from database import (
     get_recent_messages, log_disambiguation,
     get_user_message_count, get_profile, delete_profile,
     log_review_flag, log_toxic_validation_block,
+    save_emotion_entry,
 )
 
 class InterventionStates(StatesGroup):
     awaiting_after   = State()
     awaiting_quality = State()
+
+class EmotionJournal(StatesGroup):
+    active = State()
 
 bot                = Bot(token=BOT_TOKEN)
 dp                 = Dispatcher(storage=MemoryStorage())
@@ -104,6 +109,39 @@ def quality_kb() -> InlineKeyboardMarkup:
 
 # ────────────────────────────────────────────────────────────────────────────
 
+async def trigger_crisis(message: Message, uid: int, username: str,
+                         user_text: str, risk: dict, lang: str) -> None:
+    """Deterministic Crisis Protocol (LLM is NEVER called here). Extracted from
+    pipeline so other entry points (e.g. the journals risk-gate) can REUSE the
+    exact same flow instead of duplicating it."""
+    eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
+                                 user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
+    # Persist the crisis message's risk snapshot + force a profile refresh
+    # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
+    await save_message(uid, "user", user_text, "crisis", lang,
+                       risk["score"], risk["categories"])
+    await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
+    # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
+    # the crisis flow is committed; never alters risk or the user's message.
+    recent_for_pf = await get_recent_messages(uid, limit=10)
+    pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
+    protective = detect_protective_factors(pf_text)
+    if protective:
+        await set_crisis_protective_factors(eid, protective)
+    await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
+                     risk["categories"], user_text)
+    alert = admin_alert_text(uid, username, RED, risk, user_text)
+    if protective:
+        alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, alert)
+        except Exception:
+            pass
+    await message.answer(get_crisis_text(lang), parse_mode="HTML",
+                         reply_markup=crisis_keyboard(lang))
+
+
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
                    tg_user=None) -> None:
     """Complete X20 pipeline.
@@ -132,32 +170,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                          risk["score"], risk["categories"], user_text)
 
     if classify(risk) == RED:
-        eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
-                                     user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
-        # Persist the crisis message's risk snapshot + force a profile refresh
-        # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
-        await save_message(uid, "user", user_text, "crisis", lang,
-                           risk["score"], risk["categories"])
-        await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
-        # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
-        # the crisis flow is committed; never alters risk or the user's message.
-        recent_for_pf = await get_recent_messages(uid, limit=10)
-        pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
-        protective = detect_protective_factors(pf_text)
-        if protective:
-            await set_crisis_protective_factors(eid, protective)
-        await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
-                         risk["categories"], user_text)
-        alert = admin_alert_text(uid, username, RED, risk, user_text)
-        if protective:
-            alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                await bot.send_message(admin_id, alert)
-            except Exception:
-                pass
-        await message.answer(get_crisis_text(lang), parse_mode="HTML",
-                             reply_markup=crisis_keyboard(lang))
+        await trigger_crisis(message, uid, username, user_text, risk, lang)
         return
 
     # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
@@ -651,6 +664,90 @@ async def ci_off(message: Message):
     await set_checkin(message.from_user.id, "", "", False, 10, "ru")
     lang = await get_user_language(message.from_user.id)
     await message.answer("Check-in отключён" if lang == "ru" else "Check-in disabled")
+
+# ── Epic 8: Journals — emotion journal FSM (registered ABOVE the catch-all so
+# journal steps take priority over the generic pipeline text handler) ─────────
+
+@dp.message(Command("emotion"))
+async def cmd_emotion(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    await state.clear()
+    await state.set_state(EmotionJournal.active)
+    await state.update_data(jstep=0, jdata={}, orange=False, nudged=False)
+    intro = ("📝 Дневник эмоций. Отвечай как есть, в любой момент — /journal_cancel.\n\n"
+             if lang == "ru" else
+             "📝 Emotion journal. Answer freely; stop anytime with /journal_cancel.\n\n")
+    await message.answer(intro + journals.emotion_prompt("event", lang))
+
+
+@dp.message(Command("journal_cancel"))
+@dp.message(F.text.in_({"/cancel", "/Cancel"}))
+async def cmd_journal_cancel(message: Message, state: FSMContext):
+    cur = await state.get_state()
+    await state.clear()
+    if cur:
+        lang = await get_user_language(message.from_user.id)
+        await message.answer("Окей, остановились. Ничего не записал."
+                             if lang == "ru" else "Okay, stopped. Nothing saved.")
+
+
+@dp.message(EmotionJournal.active, F.text)
+async def emotion_step(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    username = message.from_user.username or ""
+    text = message.text.strip()
+    lang = await get_user_language(uid)
+
+    # RISK GATE on every free-text field — reuse the real detector/crisis flow.
+    level, risk = journals.gate(text, lang)
+    if level == RED:
+        await state.clear()                       # abort journal, wipe FSM
+        await trigger_crisis(message, uid, username, text, risk, lang)
+        return
+    # Ambiguous phrase ("выйти в окно") inside a journal field → don't silently
+    # continue; abort and ask the deterministic clarifying question (+ hotline).
+    if risk.get("ambiguous_phrases"):
+        await state.clear()
+        await message.answer(get_disambiguation_message(
+            risk["ambiguous_phrases"][0], lang, with_hotline=True))
+        return
+
+    data = await state.get_data()
+    step = data["jstep"]
+    jdata = data["jdata"]
+    field = journals.EMOTION_FIELDS[step]
+    if field == "intensity":
+        digits = "".join(ch for ch in text if ch.isdigit())
+        jdata[field] = min(10, int(digits[:2])) if digits else None
+    else:
+        jdata[field] = text
+
+    orange = data.get("orange", False) or (level == "ORANGE")
+    nudged = data.get("nudged", False)
+    prefix = ""
+    if orange and not nudged:
+        prefix = journals.hotline_nudge(lang).strip() + "\n\n"
+        nudged = True
+
+    # Advance, skipping the somatic 'body' step when risk is elevated/sensitive.
+    nxt = step + 1
+    while nxt < len(journals.EMOTION_FIELDS) and \
+            journals.EMOTION_FIELDS[nxt] == "body" and \
+            journals.should_skip_body("ORANGE" if orange else level, risk):
+        nxt += 1
+
+    if nxt >= len(journals.EMOTION_FIELDS):
+        await save_emotion_entry(uid, jdata, lang)
+        await state.clear()
+        done = ("Сохранил. Спасибо, что побыл(а) с этим." if lang == "ru"
+                else "Saved. Thank you for staying with this.")
+        await message.answer(prefix + done)
+        return
+
+    await state.update_data(jstep=nxt, jdata=jdata, orange=orange, nudged=nudged)
+    await message.answer(prefix + journals.emotion_prompt(journals.EMOTION_FIELDS[nxt], lang))
+
 
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):
