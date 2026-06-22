@@ -21,6 +21,23 @@ ORANGE = "ORANGE"
 YELLOW = "YELLOW"
 GREEN  = "GREEN"
 
+# Crisis hotline directory. We only know the user's language (not country), so
+# we key by language and default to the project's main region (RU) + 112. The
+# tel: number powers the "📞 ПОЗВОНИТЬ" button; the full list is shown as text
+# in prompts.get_crisis_text. Extra CIS numbers are kept here for future
+# country-aware selection.
+CRISIS_HOTLINES = {
+    "ru": {"label": "8-800-2000-122", "tel": "+78002000122"},
+    "kz": {"label": "150",            "tel": "150"},
+    "by": {"label": "8-801-100-1611", "tel": "+88011001611"},
+    "ua": {"label": "7333",           "tel": "7333"},
+}
+
+
+def get_hotline(lang: str = "ru") -> dict:
+    """Pick a hotline by language; unknown → main region (RU)."""
+    return CRISIS_HOTLINES.get(lang, CRISIS_HOTLINES["ru"])
+
 
 def classify(risk: dict) -> str:
     """Map a risk_detector result dict to a crisis colour level."""
@@ -49,16 +66,15 @@ def crisis_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
     """
     if lang == "en":
         help_btn = InlineKeyboardButton(
-            text="🌍 Find a crisis center",
+            text="📞 CALL FOR HELP",
             url="https://www.iasp.info/resources/Crisis_Centres/")
-        safe_label  = "🟢 I'm safe right now"
-        still_label = "🆘 I'm still struggling"
+        safe_label  = "💬 I'm safe right now"
+        still_label = "💔 I'm still struggling"
     else:
-        help_btn = InlineKeyboardButton(
-            text="📞 8-800-2000-122",
-            url="tel:+78002000122")
-        safe_label  = "🟢 Я в безопасности"
-        still_label = "🆘 Мне всё ещё тяжело"
+        tel = get_hotline(lang)["tel"]
+        help_btn = InlineKeyboardButton(text="📞 ПОЗВОНИТЬ", url=f"tel:{tel}")
+        safe_label  = "💬 Я в безопасности"
+        still_label = "💔 Мне всё ещё плохо"
 
     return InlineKeyboardMarkup(inline_keyboard=[
         [help_btn],
