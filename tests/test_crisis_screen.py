@@ -39,15 +39,23 @@ def test_crisis_text_shows_a_number_and_is_warm():
     assert "не оставался" in txt or "не оставалась" in txt or "не оставался(ась)" in txt
 
 
-def test_crisis_keyboard_has_call_button_first():
+def test_crisis_keyboard_no_tel_url():
+    # Telegram rejects tel: in inline-button URLs (it crashes the send). The
+    # number lives in the message text instead; guard against re-introducing it.
+    for lang in ("ru", "en"):
+        for row in crisis_keyboard(lang).inline_keyboard:
+            for b in row:
+                assert not (b.url and b.url.startswith("tel:"))
+
+
+def test_crisis_keyboard_has_safety_buttons():
     kb = crisis_keyboard("ru")
-    first = kb.inline_keyboard[0][0]
-    assert first.text == "📞 ПОЗВОНИТЬ"
-    assert first.url.startswith("tel:")
-    # Safety self-report buttons come AFTER, on row 2.
-    row2 = kb.inline_keyboard[1]
-    assert any(b.callback_data == "crisis:safe" for b in row2)
-    assert any(b.callback_data == "crisis:still" for b in row2)
+    flat = [b for row in kb.inline_keyboard for b in row]
+    assert any(b.callback_data == "crisis:safe" for b in flat)
+    assert any(b.callback_data == "crisis:still" for b in flat)
+    # Only valid (non-tel) URL buttons allowed; EN's IASP https link is fine.
+    en = [b for row in crisis_keyboard("en").inline_keyboard for b in row]
+    assert any(b.url and b.url.startswith("https://") for b in en)
 
 
 def test_hotline_directory_defaults_to_ru():

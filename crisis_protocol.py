@@ -64,25 +64,26 @@ def crisis_keyboard(lang: str = "ru") -> InlineKeyboardMarkup:
     Row 2 — self-report buttons so the user can tell us how they are; this drives
     follow-up scheduling and resolution.
     """
+    # NOTE: Telegram REJECTS `tel:` URLs in inline keyboard buttons
+    # ("Wrong port number") — a tel: button crashes the whole crisis send. So the
+    # phone number is shown as plain text in get_crisis_text (mobile clients
+    # auto-linkify it → tap to call). Only valid https/tg URLs may sit in a url
+    # button; EN keeps the IASP https link. RU shows only the self-report row.
+    rows = []
     if lang == "en":
-        help_btn = InlineKeyboardButton(
-            text="📞 CALL FOR HELP",
-            url="https://www.iasp.info/resources/Crisis_Centres/")
+        rows.append([InlineKeyboardButton(
+            text="🌍 Find a crisis line",
+            url="https://www.iasp.info/resources/Crisis_Centres/")])
         safe_label  = "💬 I'm safe right now"
         still_label = "💔 I'm still struggling"
     else:
-        tel = get_hotline(lang)["tel"]
-        help_btn = InlineKeyboardButton(text="📞 ПОЗВОНИТЬ", url=f"tel:{tel}")
         safe_label  = "💬 Я в безопасности"
         still_label = "💔 Мне всё ещё плохо"
-
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [help_btn],
-        [
-            InlineKeyboardButton(text=safe_label,  callback_data="crisis:safe"),
-            InlineKeyboardButton(text=still_label, callback_data="crisis:still"),
-        ],
+    rows.append([
+        InlineKeyboardButton(text=safe_label,  callback_data="crisis:safe"),
+        InlineKeyboardButton(text=still_label, callback_data="crisis:still"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_alert_text(uid: int, username: str, level_color: str,

@@ -40,10 +40,12 @@ def test_keyboard_has_self_report_callbacks():
         assert "crisis:still" in callbacks
 
 
-def test_ru_keyboard_has_tel_button():
+def test_ru_keyboard_has_no_tel_button():
+    # Telegram rejects tel: in inline buttons (it crashed the crisis send). The
+    # number is shown as tappable plain text in get_crisis_text instead.
     kb = crisis_keyboard("ru")
     urls = [b.url for row in kb.inline_keyboard for b in row if b.url]
-    assert any(u.startswith("tel:") for u in urls)
+    assert not any(u.startswith("tel:") for u in urls)
 
 
 def test_en_keyboard_has_help_link():
