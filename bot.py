@@ -50,6 +50,7 @@ from safety_validator import (
     validate_response_with_context, get_safe_fallback_high_risk,
 )
 from prompts import get_disambiguation_message
+import journals
 from memory import maybe_summarize, build_context
 from voice import transcribe_voice
 from notifications import push_alert
@@ -70,11 +71,21 @@ from database import (
     get_recent_messages, log_disambiguation,
     get_user_message_count, get_profile, delete_profile,
     log_review_flag, log_toxic_validation_block,
+    save_emotion_entry, save_cbt_entry,
+    get_emotion_entries_since, get_checkin_logs_since, log_checkin,
+    set_tz_offset, get_journal_settings, set_journal_settings,
+    export_journals, delete_journals,
 )
 
 class InterventionStates(StatesGroup):
     awaiting_after   = State()
     awaiting_quality = State()
+
+class EmotionJournal(StatesGroup):
+    active = State()
+
+class CbtJournal(StatesGroup):
+    active = State()
 
 bot                = Bot(token=BOT_TOKEN)
 dp                 = Dispatcher(storage=MemoryStorage())
@@ -104,6 +115,39 @@ def quality_kb() -> InlineKeyboardMarkup:
 
 # ────────────────────────────────────────────────────────────────────────────
 
+async def trigger_crisis(message: Message, uid: int, username: str,
+                         user_text: str, risk: dict, lang: str) -> None:
+    """Deterministic Crisis Protocol (LLM is NEVER called here). Extracted from
+    pipeline so other entry points (e.g. the journals risk-gate) can REUSE the
+    exact same flow instead of duplicating it."""
+    eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
+                                 user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
+    # Persist the crisis message's risk snapshot + force a profile refresh
+    # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
+    await save_message(uid, "user", user_text, "crisis", lang,
+                       risk["score"], risk["categories"])
+    await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
+    # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
+    # the crisis flow is committed; never alters risk or the user's message.
+    recent_for_pf = await get_recent_messages(uid, limit=10)
+    pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
+    protective = detect_protective_factors(pf_text)
+    if protective:
+        await set_crisis_protective_factors(eid, protective)
+    await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
+                     risk["categories"], user_text)
+    alert = admin_alert_text(uid, username, RED, risk, user_text)
+    if protective:
+        alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, alert)
+        except Exception:
+            pass
+    await message.answer(get_crisis_text(lang), parse_mode="HTML",
+                         reply_markup=crisis_keyboard(lang))
+
+
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
                    tg_user=None) -> None:
     """Complete X20 pipeline.
@@ -132,32 +176,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                          risk["score"], risk["categories"], user_text)
 
     if classify(risk) == RED:
-        eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
-                                     user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
-        # Persist the crisis message's risk snapshot + force a profile refresh
-        # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
-        await save_message(uid, "user", user_text, "crisis", lang,
-                           risk["score"], risk["categories"])
-        await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
-        # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
-        # the crisis flow is committed; never alters risk or the user's message.
-        recent_for_pf = await get_recent_messages(uid, limit=10)
-        pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
-        protective = detect_protective_factors(pf_text)
-        if protective:
-            await set_crisis_protective_factors(eid, protective)
-        await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
-                         risk["categories"], user_text)
-        alert = admin_alert_text(uid, username, RED, risk, user_text)
-        if protective:
-            alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                await bot.send_message(admin_id, alert)
-            except Exception:
-                pass
-        await message.answer(get_crisis_text(lang), parse_mode="HTML",
-                             reply_markup=crisis_keyboard(lang))
+        await trigger_crisis(message, uid, username, user_text, risk, lang)
         return
 
     # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
@@ -651,6 +670,282 @@ async def ci_off(message: Message):
     await set_checkin(message.from_user.id, "", "", False, 10, "ru")
     lang = await get_user_language(message.from_user.id)
     await message.answer("Check-in отключён" if lang == "ru" else "Check-in disabled")
+
+# ── Epic 8: Journals — emotion journal FSM (registered ABOVE the catch-all so
+# journal steps take priority over the generic pipeline text handler) ─────────
+
+@dp.message(Command("emotion"))
+async def cmd_emotion(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    await state.clear()
+    await state.set_state(EmotionJournal.active)
+    await state.update_data(jstep=0, jdata={}, orange=False, nudged=False)
+    intro = ("📝 Дневник эмоций. Отвечай как есть, в любой момент — /journal_cancel.\n\n"
+             if lang == "ru" else
+             "📝 Emotion journal. Answer freely; stop anytime with /journal_cancel.\n\n")
+    await message.answer(intro + journals.emotion_prompt("event", lang))
+
+
+@dp.message(Command("journal_cancel"))
+@dp.message(F.text.in_({"/cancel", "/Cancel"}))
+async def cmd_journal_cancel(message: Message, state: FSMContext):
+    cur = await state.get_state()
+    await state.clear()
+    if cur:
+        lang = await get_user_language(message.from_user.id)
+        await message.answer("Окей, остановились. Ничего не записал."
+                             if lang == "ru" else "Okay, stopped. Nothing saved.")
+
+
+@dp.message(EmotionJournal.active, F.text)
+async def emotion_step(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    username = message.from_user.username or ""
+    text = message.text.strip()
+    lang = await get_user_language(uid)
+
+    # RISK GATE on every free-text field — reuse the real detector/crisis flow.
+    level, risk = journals.gate(text, lang)
+    if level == RED:
+        await state.clear()                       # abort journal, wipe FSM
+        await trigger_crisis(message, uid, username, text, risk, lang)
+        return
+    # Ambiguous phrase ("выйти в окно") inside a journal field → don't silently
+    # continue; abort and ask the deterministic clarifying question (+ hotline).
+    if risk.get("ambiguous_phrases"):
+        await state.clear()
+        await message.answer(get_disambiguation_message(
+            risk["ambiguous_phrases"][0], lang, with_hotline=True))
+        return
+
+    data = await state.get_data()
+    step = data["jstep"]
+    jdata = data["jdata"]
+    field = journals.EMOTION_FIELDS[step]
+    if field == "intensity":
+        digits = "".join(ch for ch in text if ch.isdigit())
+        jdata[field] = min(10, int(digits[:2])) if digits else None
+    else:
+        jdata[field] = text
+
+    orange = data.get("orange", False) or (level == "ORANGE")
+    nudged = data.get("nudged", False)
+    prefix = ""
+    if orange and not nudged:
+        prefix = journals.hotline_nudge(lang).strip() + "\n\n"
+        nudged = True
+
+    # Advance, skipping the somatic 'body' step when risk is elevated/sensitive.
+    nxt = step + 1
+    while nxt < len(journals.EMOTION_FIELDS) and \
+            journals.EMOTION_FIELDS[nxt] == "body" and \
+            journals.should_skip_body("ORANGE" if orange else level, risk):
+        nxt += 1
+
+    if nxt >= len(journals.EMOTION_FIELDS):
+        await save_emotion_entry(uid, jdata, lang)
+        await state.clear()
+        done = ("Сохранил. Спасибо, что побыл(а) с этим." if lang == "ru"
+                else "Saved. Thank you for staying with this.")
+        await message.answer(prefix + done)
+        return
+
+    await state.update_data(jstep=nxt, jdata=jdata, orange=orange, nudged=nudged)
+    await message.answer(prefix + journals.emotion_prompt(journals.EMOTION_FIELDS[nxt], lang))
+
+
+# ── Epic 8: CBT journal (deep) — aborts at ORANGE, not just RED ───────────────
+
+@dp.message(Command("cbt"))
+async def cmd_cbt(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    await state.clear()
+    await state.set_state(CbtJournal.active)
+    await state.update_data(cstep=0, cdata={})
+    intro = ("📘 КПТ-дневник. Ты сам(а) формулируешь мысли — я только записываю. "
+             "Остановиться — /journal_cancel.\n\n" if lang == "ru" else
+             "📘 CBT journal. You reframe your own thought — I just record. "
+             "Stop with /journal_cancel.\n\n")
+    await message.answer(intro + journals.cbt_prompt("situation", lang))
+
+
+@dp.message(CbtJournal.active, F.text)
+async def cbt_step(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    username = message.from_user.username or ""
+    text = message.text.strip()
+    lang = await get_user_language(uid)
+
+    level, risk = journals.gate(text, lang)
+    if level == RED:
+        await state.clear()
+        await trigger_crisis(message, uid, username, text, risk, lang)
+        return
+    if risk.get("ambiguous_phrases"):
+        await state.clear()
+        await message.answer(get_disambiguation_message(
+            risk["ambiguous_phrases"][0], lang, with_hotline=True))
+        return
+    if level == "ORANGE":
+        # Deep CBT is contraindicated at elevated risk — stop gently.
+        await state.clear()
+        msg = ("Давай пока не будем углубляться в разбор мыслей — сейчас важнее "
+               "немного стабилизироваться. Я рядом." if lang == "ru" else
+               "Let's not dig into the thoughts right now — steadying is more "
+               "important at the moment. I'm here.")
+        await message.answer(msg + journals.hotline_nudge(lang))
+        return
+
+    data = await state.get_data()
+    step = data["cstep"]; cdata = data["cdata"]
+    field = journals.CBT_FIELDS[step]
+    if field == "intensity":
+        digits = "".join(ch for ch in text if ch.isdigit())
+        cdata[field] = min(10, int(digits[:2])) if digits else None
+    else:
+        cdata[field] = text
+
+    nxt = step + 1
+    if nxt >= len(journals.CBT_FIELDS):
+        await save_cbt_entry(uid, cdata, lang)
+        await state.clear()
+        await message.answer("Записал. Это твоя работа с мыслью — спасибо."
+                             if lang == "ru" else "Saved. That was your own work — thank you.")
+        return
+    await state.update_data(cstep=nxt, cdata=cdata)
+    await message.answer(journals.cbt_prompt(journals.CBT_FIELDS[nxt], lang))
+
+
+# ── Epic 8: weekly report (deterministic), settings, GDPR ─────────────────────
+
+@dp.message(Command("report"))
+async def cmd_report(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    emo = await get_emotion_entries_since(uid, 7)
+    chk = await get_checkin_logs_since(uid, 7)
+    await message.answer(journals.build_weekly_report(emo, chk, lang))
+
+
+@dp.message(Command("journal"))
+async def cmd_journal(message: Message, state: FSMContext):
+    lang = await get_user_language(message.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Дневник эмоций", callback_data="jhub:emotion")],
+        [InlineKeyboardButton(text="📘 КПТ-дневник", callback_data="jhub:cbt")],
+        [InlineKeyboardButton(text="📊 Мой отчёт", callback_data="jhub:report")],
+        [InlineKeyboardButton(text="⚙️ Напоминания", callback_data="jhub:settings")],
+        [InlineKeyboardButton(text="🚨 Срочно плохо", callback_data="jhub:crisis")],
+    ])
+    await message.answer("Дневники X20. Что откроем?" if lang == "ru"
+                         else "X20 journals. What shall we open?", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("jhub:"))
+async def cb_jhub(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":")[1]
+    await callback.answer()
+    if action == "emotion":
+        await cmd_emotion(callback.message, state)
+    elif action == "cbt":
+        await cmd_cbt(callback.message, state)
+    elif action == "report":
+        await cmd_report(callback.message, state)
+    elif action == "settings":
+        await cmd_journal_settings(callback.message, state)
+    elif action == "crisis":
+        lang = await get_user_language(callback.from_user.id)
+        await callback.message.answer(get_crisis_text(lang), parse_mode="HTML",
+                                      reply_markup=crisis_keyboard(lang))
+
+
+@dp.message(Command("journal_settings"))
+async def cmd_journal_settings(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    s = await get_journal_settings(uid)
+    m = "✅" if s["morning_enabled"] else "❌"
+    e = "✅" if s["evening_enabled"] else "❌"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{m} Утро ({s['morning_hour']}:00)", callback_data="jset:morning")],
+        [InlineKeyboardButton(text=f"{e} Вечер ({s['evening_hour']}:00)", callback_data="jset:evening")],
+        [InlineKeyboardButton(text="🌍 Часовой пояс", callback_data="jset:tz")],
+    ])
+    await message.answer(
+        ("Напоминания приходят в твоём местном времени. По умолчанию выключены — "
+         "включай что нужно. Это не обязаловка, выключить можно одной кнопкой."
+         if lang == "ru" else
+         "Reminders arrive in your local time. Off by default — turn on what you want."),
+        reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("jset:"))
+async def cb_jset(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    what = callback.data.split(":")[1]
+    if what in ("morning", "evening"):
+        s = await get_journal_settings(uid)
+        key = f"{what}_enabled"
+        await set_journal_settings(uid, **{key: 0 if s[key] else 1})
+        await callback.answer("Готово")
+        await cmd_journal_settings(callback.message, state)
+    elif what == "tz":
+        row = [InlineKeyboardButton(text=("UTC" if o == 0 else f"UTC{o:+d}"),
+                                    callback_data=f"jtz:{o}") for o in (0, 1, 2, 3, 4, 5)]
+        kb = InlineKeyboardMarkup(inline_keyboard=[row[:3], row[3:],
+            [InlineKeyboardButton(text="МСК (UTC+3)", callback_data="jtz:3")]])
+        await callback.message.answer("Выбери свой часовой пояс:", reply_markup=kb)
+        await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("jtz:"))
+async def cb_jtz(callback: CallbackQuery):
+    offset = int(callback.data.split(":")[1])
+    await set_tz_offset(callback.from_user.id, offset)
+    await callback.answer("Часовой пояс сохранён")
+    await callback.message.answer(f"Ок, твой пояс: UTC{offset:+d}.")
+
+
+@dp.callback_query(F.data.startswith("checkin:"))
+async def cb_checkin(callback: CallbackQuery, state: FSMContext):
+    _, kind, value = callback.data.split(":", 2)
+    await log_checkin(callback.from_user.id, kind, value)
+    await callback.answer("Отметил")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if value == "emotion_journal":
+        await cmd_emotion(callback.message, state)
+    elif value == "cbt_journal":
+        await cmd_cbt(callback.message, state)
+    else:
+        await callback.message.answer("Спасибо, что отметил(а).")
+
+
+@dp.message(Command("journal_export"))
+async def cmd_journal_export(message: Message, state: FSMContext):
+    import json, io
+    data = await export_journals(message.from_user.id)
+    if not any(data.values()):
+        await message.answer("Журнальных записей пока нет.")
+        return
+    buf = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+    buf.name = "x20_journals.json"
+    from aiogram.types import BufferedInputFile
+    await message.answer_document(BufferedInputFile(buf.getvalue(), filename="x20_journals.json"),
+                                  caption="Твои журналы (JSON).")
+
+
+@dp.message(Command("journal_delete"))
+async def cmd_journal_delete(message: Message, state: FSMContext):
+    await delete_journals(message.from_user.id)
+    lang = await get_user_language(message.from_user.id)
+    await message.answer("Готово. Все журнальные записи стёрты."
+                         if lang == "ru" else "Done. All journal entries erased.")
+
 
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):

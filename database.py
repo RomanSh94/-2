@@ -167,6 +167,55 @@ CREATE TABLE IF NOT EXISTS toxic_validation_blocks (
     created_at    TEXT DEFAULT (datetime('now'))
 );
 
+-- Epic 8: emotion journal entries (user's own words; no interpretation).
+CREATE TABLE IF NOT EXISTS emotion_journal_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    event      TEXT,
+    feeling    TEXT,
+    intensity  INTEGER,
+    body       TEXT,
+    need       TEXT,
+    action     TEXT,
+    outcome    TEXT,
+    lang       TEXT DEFAULT 'ru',
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS cbt_journal_entries (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id           INTEGER NOT NULL,
+    situation         TEXT,
+    automatic_thought TEXT,
+    emotion           TEXT,
+    intensity         INTEGER,
+    evidence_for      TEXT,
+    evidence_against  TEXT,
+    realistic_thought TEXT,
+    change            TEXT,
+    lang              TEXT DEFAULT 'ru',
+    created_at        TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS checkin_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    kind       TEXT,                 -- morning | evening
+    value      TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS journal_settings (
+    user_id        INTEGER PRIMARY KEY,
+    morning_enabled INTEGER DEFAULT 0,
+    morning_hour    INTEGER DEFAULT 9,
+    evening_enabled INTEGER DEFAULT 0,
+    evening_hour    INTEGER DEFAULT 21,
+    last_morning    TEXT,             -- 'YYYY-MM-DD' local date last sent
+    last_evening    TEXT,
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS push_settings (
     user_id                INTEGER PRIMARY KEY,
     mute_mode              TEXT DEFAULT 'none',   -- none | forever | until
@@ -255,6 +304,8 @@ _MIGRATIONS = [
     ("messages", "risk_categories", "TEXT DEFAULT ''"),
     # Protective factors (Columbia) — context attached to a crisis event.
     ("crisis_events", "protective_factors_json", "TEXT DEFAULT '[]'"),
+    # Epic 8: per-user UTC offset (hours) for local-time journal reminders.
+    ("users", "tz_offset", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -691,7 +742,9 @@ async def forget_all(uid: int) -> None:
     crisis_events are intentionally kept (safety/duty-of-care record), not
     conversational content."""
     async with aiosqlite.connect(DB) as db:
-        for table in ("messages", "summaries", "user_states", "user_profiles"):
+        for table in ("messages", "summaries", "user_states", "user_profiles",
+                      "emotion_journal_entries", "cbt_journal_entries",
+                      "checkin_logs", "journal_settings"):
             await db.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
         await db.commit()
 
@@ -708,6 +761,130 @@ async def log_crisis_event(uid: int, level: str, risk_score: int,
                VALUES (?,?,?,?,?,?,?)""",
             (uid, level, risk_score, ",".join(categories), message_excerpt,
              lang, int(admin_notified)))
+        await db.commit(); return cur.lastrowid
+
+
+async def save_cbt_entry(uid: int, data: dict, lang: str = "ru") -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "INSERT INTO cbt_journal_entries (user_id,situation,automatic_thought,"
+            "emotion,intensity,evidence_for,evidence_against,realistic_thought,change,lang)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (uid, data.get("situation"), data.get("automatic_thought"),
+             data.get("emotion"), data.get("intensity"), data.get("evidence_for"),
+             data.get("evidence_against"), data.get("realistic_thought"),
+             data.get("change"), lang))
+        await db.commit(); return cur.lastrowid
+
+
+async def get_emotion_entries_since(uid: int, days: int = 7) -> list:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT feeling,intensity,event,need,action,outcome,created_at"
+            " FROM emotion_journal_entries WHERE user_id=?"
+            f"  AND created_at > datetime('now', '-{int(days)} days') ORDER BY id", (uid,))
+        rows = await cur.fetchall()
+    keys = ("feeling", "intensity", "event", "need", "action", "outcome", "created_at")
+    return [dict(zip(keys, r)) for r in rows]
+
+
+async def get_checkin_logs_since(uid: int, days: int = 7) -> list:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT kind,value,created_at FROM checkin_logs WHERE user_id=?"
+            f"  AND created_at > datetime('now', '-{int(days)} days') ORDER BY id", (uid,))
+        rows = await cur.fetchall()
+    return [dict(zip(("kind", "value", "created_at"), r)) for r in rows]
+
+
+async def log_checkin(uid: int, kind: str, value: str) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO checkin_logs (user_id,kind,value) VALUES (?,?,?)",
+                         (uid, kind, value))
+        await db.commit()
+
+
+async def set_tz_offset(uid: int, offset: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("UPDATE users SET tz_offset=? WHERE id=?", (offset, uid))
+        await db.commit()
+
+
+async def get_journal_settings(uid: int) -> dict:
+    keys = ("morning_enabled", "morning_hour", "evening_enabled", "evening_hour",
+            "last_morning", "last_evening")
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT " + ",".join(keys) + " FROM journal_settings WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+    if not row:
+        return {"morning_enabled": 0, "morning_hour": 9, "evening_enabled": 0,
+                "evening_hour": 21, "last_morning": None, "last_evening": None}
+    return dict(zip(keys, row))
+
+
+async def set_journal_settings(uid: int, **fields) -> None:
+    cur = await get_journal_settings(uid)
+    cur.update(fields)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO journal_settings (user_id,morning_enabled,morning_hour,"
+            "evening_enabled,evening_hour,last_morning,last_evening,updated_at)"
+            " VALUES (?,?,?,?,?,?,?,datetime('now'))"
+            " ON CONFLICT(user_id) DO UPDATE SET morning_enabled=excluded.morning_enabled,"
+            " morning_hour=excluded.morning_hour, evening_enabled=excluded.evening_enabled,"
+            " evening_hour=excluded.evening_hour, last_morning=excluded.last_morning,"
+            " last_evening=excluded.last_evening, updated_at=datetime('now')",
+            (uid, cur["morning_enabled"], cur["morning_hour"], cur["evening_enabled"],
+             cur["evening_hour"], cur["last_morning"], cur["last_evening"]))
+        await db.commit()
+
+
+async def get_journal_reminder_users() -> list:
+    """Users who opted into at least one journal reminder, with tz + last-sent."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT js.user_id, COALESCE(u.tz_offset,0), js.morning_enabled, js.morning_hour,"
+            " js.evening_enabled, js.evening_hour, js.last_morning, js.last_evening,"
+            " COALESCE(u.language,'ru')"
+            " FROM journal_settings js JOIN users u ON u.id=js.user_id"
+            " WHERE js.morning_enabled=1 OR js.evening_enabled=1")
+        rows = await cur.fetchall()
+    keys = ("user_id", "tz_offset", "morning_enabled", "morning_hour", "evening_enabled",
+            "evening_hour", "last_morning", "last_evening", "lang")
+    return [dict(zip(keys, r)) for r in rows]
+
+
+async def export_journals(uid: int) -> dict:
+    """All journal data for GDPR export."""
+    out = {}
+    async with aiosqlite.connect(DB) as db:
+        for table in ("emotion_journal_entries", "cbt_journal_entries", "checkin_logs"):
+            cur = await db.execute(f"SELECT * FROM {table} WHERE user_id=? ORDER BY id", (uid,))
+            cols = [d[0] for d in cur.description]
+            out[table] = [dict(zip(cols, r)) for r in await cur.fetchall()]
+    return out
+
+
+async def delete_journals(uid: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        for table in ("emotion_journal_entries", "cbt_journal_entries",
+                      "checkin_logs", "journal_settings"):
+            await db.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
+        await db.commit()
+
+
+async def save_emotion_entry(uid: int, data: dict, lang: str = "ru") -> int:
+    """Persist one emotion-journal entry. `data` keys are EMOTION_FIELDS; missing
+    fields (e.g. body skipped at ORANGE) are stored as NULL."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "INSERT INTO emotion_journal_entries"
+            " (user_id,event,feeling,intensity,body,need,action,outcome,lang)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (uid, data.get("event"), data.get("feeling"), data.get("intensity"),
+             data.get("body"), data.get("need"), data.get("action"),
+             data.get("outcome"), lang))
         await db.commit(); return cur.lastrowid
 
 
