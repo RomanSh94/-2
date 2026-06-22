@@ -1,0 +1,32 @@
+# X20 systemd unit — Вариант A (рекомендуемый): /opt/x20 + отдельный
+# непривилегированный пользователь x20 (НЕ root). Использовать на новом сервере.
+#
+# Установка: см. deploy/setup_opt.sh (делает всё это автоматически), или вручную:
+#   cp deploy/x20-opt.service /etc/systemd/system/x20.service
+#   systemctl daemon-reload && systemctl enable --now x20
+
+[Unit]
+Description=X20 Telegram support bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=x20
+Group=x20
+WorkingDirectory=/opt/x20
+EnvironmentFile=/opt/x20/.env
+ExecStart=/opt/x20/venv/bin/python bot.py
+# always, не on-failure: aiogram при SIGTERM выходит с кодом 0.
+Restart=always
+RestartSec=5
+
+# Hardening (безопасно для этого процесса; x20.db и backups внутри /opt/x20):
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/x20
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
