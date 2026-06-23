@@ -70,7 +70,7 @@ from database import (
     get_user_language,
     set_checkin, get_checkin_users, update_last_checkin,
     log_crisis_event, set_crisis_response, set_crisis_protective_factors,
-    get_active_crisis, bump_crisis_stage, resolve_crisis, set_stage3_at,
+    get_active_crisis, bump_crisis_stage, resolve_crisis, set_stage3_at, get_crisis_stage,
     get_memory_overview, forget_all,
     set_mute, reset_unanswered,
     get_recent_messages, log_disambiguation,
@@ -458,8 +458,7 @@ async def cb_crisis(callback: CallbackQuery):
 
     # Escalations — the ONLY actions that change the stage.
     if action == "still":
-        cur = await get_active_crisis(uid)
-        stage = cur[1] if cur else 0
+        stage = await get_crisis_stage(event_id)   # stage of THIS event (pt 5)
         target = 1 if stage == 0 else (3 if stage == 2 else None)
         if target is None:
             await callback.answer(); return
@@ -476,6 +475,9 @@ async def cb_crisis(callback: CallbackQuery):
     if action == "cant_call":
         changed = await bump_crisis_stage(event_id, 2)
         if changed:
+            # Alert on the FIRST escalation too (pt 3) — every actual stage rise
+            # notifies an admin exactly once (atomic bump guarantees once).
+            await _send_admin_crisis_alert(uid, username, 2, event_id)
             await _show_stage(callback, 2, lang, event_id)
         await callback.answer()
         return

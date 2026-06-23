@@ -112,6 +112,20 @@ def test_auto_resolve_expired(tmp_db):
     assert n == 1 and active is None
 
 
+def test_push_alert_excerpt_is_masked():
+    from notifications import _mask_excerpt
+    full = "хочу покончить со всем этим прямо сейчас, не могу больше так"
+    assert full not in _mask_excerpt(full)
+    assert len(_mask_excerpt(full)) <= 30
+
+
+def test_hotline_fallback_when_config_missing(monkeypatch):
+    import crisis_protocol as c
+    monkeypatch.setattr(c, "_load_contacts", lambda: [])   # simulate missing/corrupt file
+    assert c.get_hotline("ru")["primary"] == "8-800-2000-122"   # federal line survives
+    assert c.get_hotline("en")["primary"] == "988"
+
+
 def test_old_event_outside_window_does_not_gate(tmp_db):
     eid = _make_event(tmp_db)
     async def go():

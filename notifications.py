@@ -36,10 +36,19 @@ async def _send_webhook(payload: dict) -> bool:
     except Exception as e:
         print(f"[webhook] {e}"); return False
 
+def _mask_excerpt(text: str, keep: int = 24) -> str:
+    """Privacy: a SHORT excerpt, never the full personal message (email/webhook)."""
+    t = " ".join((text or "").split())
+    return (t[:keep] + "…") if len(t) > keep else t
+
+
 async def push_alert(subject: str, user_id: int, username: str, risk_level: str,
                      risk_score: int, categories: list, message_text: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    body = f"User: {user_id} (@{username})\nRisk: {risk_level}\nScore: {risk_score}\nCategories: {', '.join(categories)}\nMessage: {message_text[:300]}\nTime: {ts}"
+    excerpt = _mask_excerpt(message_text)
+    body = (f"User: {user_id} (@{username})\nRisk: {risk_level}\nScore: {risk_score}\n"
+            f"Categories: {', '.join(categories)}\n"
+            f"Excerpt: «{excerpt}» ({len(message_text or '')} chars)\nTime: {ts}")
     emoji = {"critical":"🚨","high":"⚠️"}.get(risk_level, "🔶")
     payload = {
         "text": f"{emoji} X20 Alert — {subject}",

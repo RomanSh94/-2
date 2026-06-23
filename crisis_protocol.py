@@ -41,14 +41,23 @@ def _load_contacts() -> list:
         return []
 
 
+# Hardcoded last-resort so a missing/corrupt crisis_contacts.json never drops the
+# real hotline to 112-only (the federal line is itself life-saving).
+_FALLBACK_HOTLINES = {
+    "ru": {"primary": "8-800-2000-122", "secondary": "112"},
+    "en": {"primary": "988",            "secondary": "911"},
+}
+
+
 def get_hotline(lang: str = "ru") -> dict:
     """Resolve {primary, secondary} numbers by language. Unknown → RU. 112 is the
-    guaranteed secondary if a row omits one."""
+    guaranteed secondary if a row omits one. If the config file can't be read,
+    fall back to a hardcoded number (never lose the federal line)."""
     contacts = _load_contacts()
     match = next((c for c in contacts if c.get("language") == lang), None) \
         or next((c for c in contacts if c.get("language") == "ru"), None)
     if not match:
-        return {"primary": "112", "secondary": "112"}
+        return _FALLBACK_HOTLINES.get(lang, _FALLBACK_HOTLINES["ru"])
     return {"primary": match.get("primary_emergency_number", "112"),
             "secondary": match.get("secondary_emergency_number") or "112"}
 
