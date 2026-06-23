@@ -1,0 +1,17 @@
+[
+  {"country": "RU", "language": "ru", "primary_emergency_number": "8-800-2000-122",
+   "secondary_emergency_number": "112", "source_note": "Телефон доверия (Россия)",
+   "last_verified_at": "2026-06-22"},
+  {"country": "KZ", "language": "ru", "primary_emergency_number": "150",
+   "secondary_emergency_number": "112", "source_note": "Казахстан, экстренная психол. помощь",
+   "last_verified_at": "2026-06-22"},
+  {"country": "BY", "language": "ru", "primary_emergency_number": "8-801-100-1611",
+   "secondary_emergency_number": "112", "source_note": "Беларусь, телефон доверия",
+   "last_verified_at": "2026-06-22"},
+  {"country": "UA", "language": "uk", "primary_emergency_number": "7333",
+   "secondary_emergency_number": "112", "source_note": "Україна, лінія допомоги",
+   "last_verified_at": "2026-06-22"},
+  {"country": "US", "language": "en", "primary_emergency_number": "988",
+   "secondary_emergency_number": "911", "source_note": "988 Suicide & Crisis Lifeline",
+   "last_verified_at": "2026-06-22"}
+]

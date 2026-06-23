@@ -306,6 +306,10 @@ _MIGRATIONS = [
     ("crisis_events", "protective_factors_json", "TEXT DEFAULT '[]'"),
     # Epic 8: per-user UTC offset (hours) for local-time journal reminders.
     ("users", "tz_offset", "INTEGER DEFAULT 0"),
+    # Crisis-loop fix: monotonic escalation stage on the active event + the time
+    # stage 3 was entered (drives the 5-10 min follow-up).
+    ("crisis_events", "crisis_stage", "INTEGER DEFAULT 0"),
+    ("crisis_events", "stage3_at", "TEXT"),
 ]
 
 
@@ -975,13 +979,88 @@ async def set_crisis_response(uid: int, response: str) -> None:
 
 
 async def get_active_crisis_events() -> list:
-    """Unresolved events: (id, user_id, lang, created_at, followups[list])."""
+    """Unresolved events: (id, user_id, lang, created_at, stage, followups[list])."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            "SELECT id,user_id,lang,created_at,followups_json"
+            "SELECT id,user_id,lang,created_at,COALESCE(crisis_stage,0),followups_json"
             " FROM crisis_events WHERE resolved=0")
         rows = await cur.fetchall()
-    return [(r[0], r[1], r[2], r[3], json.loads(r[4] or "[]")) for r in rows]
+    return [(r[0], r[1], r[2], r[3], r[4], json.loads(r[5] or "[]")) for r in rows]
+
+
+async def get_active_crisis(uid: int, within_hours: int = 24):
+    """The user's CURRENT crisis to gate on: most recent unresolved event created
+    within `within_hours`. Returns (event_id, stage, lang) or None.
+
+    The recency window is the lifecycle guard — a user who pressed a crisis
+    button long ago and never tapped "I'm safe" is NOT blocked forever; after
+    `within_hours` the gate releases (and the 7d follow-up auto-resolves it)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id,COALESCE(crisis_stage,0),lang FROM crisis_events"
+            " WHERE user_id=? AND resolved=0"
+            f"  AND created_at > datetime('now', '-{int(within_hours)} hours')"
+            " ORDER BY id DESC LIMIT 1", (uid,))
+        row = await cur.fetchone()
+    return (row[0], row[1], row[2]) if row else None
+
+
+async def bump_crisis_stage(event_id: int, target: int) -> bool:
+    """ATOMIC monotonic stage raise. Sets stage to `target` only if current < target
+    (so a stale/double tap is a no-op). Returns True iff it actually changed —
+    callers use that as the once-only guard for admin alerts."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE crisis_events SET crisis_stage=?"
+            "  WHERE id=? AND COALESCE(crisis_stage,0) < ?",
+            (target, event_id, target))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def get_crisis_stage(event_id: int) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(crisis_stage,0) FROM crisis_events WHERE id=?", (event_id,))
+        row = await cur.fetchone()
+    return row[0] if row else 0
+
+
+async def resolve_crisis(event_id: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("UPDATE crisis_events SET resolved=1 WHERE id=?", (event_id,))
+        await db.commit()
+
+
+async def set_stage3_at(event_id: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE crisis_events SET stage3_at=datetime('now') WHERE id=? AND stage3_at IS NULL",
+            (event_id,))
+        await db.commit()
+
+
+async def get_stage3_pending(min_minutes: int = 5) -> list:
+    """Unresolved stage-3 events whose stage3_at is at least min_minutes ago:
+    (id, user_id, lang, followups[list]). Drives the 5-10 min follow-up."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id,user_id,lang,followups_json FROM crisis_events"
+            " WHERE resolved=0 AND COALESCE(crisis_stage,0)>=3 AND stage3_at IS NOT NULL"
+            f"  AND stage3_at <= datetime('now', '-{int(min_minutes)} minutes')")
+        rows = await cur.fetchall()
+    return [(r[0], r[1], r[2], json.loads(r[3] or "[]")) for r in rows]
+
+
+async def auto_resolve_expired_crises(days: int = 7) -> int:
+    """Lifecycle cleanup: events still unresolved after `days` are auto-resolved
+    so they stop gating and stop follow-ups. Returns how many were closed."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE crisis_events SET resolved=1 WHERE resolved=0"
+            f"  AND created_at < datetime('now', '-{int(days)} days')")
+        await db.commit()
+        return cur.rowcount
 
 
 async def mark_crisis_followup_sent(event_id: int, tag: str) -> None:
