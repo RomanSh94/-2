@@ -59,5 +59,6 @@ def test_crisis_keyboard_has_safety_buttons():
 
 
 def test_hotline_directory_defaults_to_ru():
-    assert get_hotline("ru")["tel"] == "+78002000122"
-    assert get_hotline("xx")["tel"] == "+78002000122"   # unknown → main region
+    assert get_hotline("ru")["primary"] == "8-800-2000-122"
+    assert get_hotline("xx")["primary"] == "8-800-2000-122"   # unknown → main region
+    assert get_hotline("ru")["secondary"] == "112"            # universal fallback

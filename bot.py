@@ -29,7 +29,11 @@ from openai import AsyncOpenAI
 
 from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION
 from prompts import get_system_prompt, get_crisis_text, get_onboarding
-from crisis_protocol import classify, crisis_keyboard, admin_alert_text, RED
+from crisis_protocol import (
+    classify, crisis_keyboard, admin_alert_text, RED, ORANGE,
+    crisis_screen, safe_only_keyboard, crisis_call_text, crisis_contact_template,
+    crisis_safe_place_ack, crisis_resolved_text,
+)
 from humanization import (
     pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
 )
@@ -66,6 +70,7 @@ from database import (
     get_user_language,
     set_checkin, get_checkin_users, update_last_checkin,
     log_crisis_event, set_crisis_response, set_crisis_protective_factors,
+    get_active_crisis, bump_crisis_stage, resolve_crisis, set_stage3_at,
     get_memory_overview, forget_all,
     set_mute, reset_unanswered,
     get_recent_messages, log_disambiguation,
@@ -136,7 +141,7 @@ async def trigger_crisis(message: Message, uid: int, username: str,
         await set_crisis_protective_factors(eid, protective)
     await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
                      risk["categories"], user_text)
-    alert = admin_alert_text(uid, username, RED, risk, user_text)
+    alert = admin_alert_text(uid, username, 0, risk, user_text, eid)
     if protective:
         alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
     for admin_id in ADMIN_USER_IDS:
@@ -144,8 +149,8 @@ async def trigger_crisis(message: Message, uid: int, username: str,
             await bot.send_message(admin_id, alert)
         except Exception:
             pass
-    await message.answer(get_crisis_text(lang), parse_mode="HTML",
-                         reply_markup=crisis_keyboard(lang))
+    text, kb = crisis_screen(0, lang, eid)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
@@ -170,6 +175,27 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         await log_moderation(uid, username, first_name, risk["level"], risk["score"],
                               risk["categories"], user_text, "pending", risk["implicit"])
     
+    # 3.9 Active-crisis gate — while a recent crisis event is unresolved, the LLM
+    # is OFF and we don't return to normal chat. Free text either keeps the crisis
+    # screen (RED/ORANGE) or gently offers "Я в безопасности" (calm). The 24h
+    # recency window in get_active_crisis bounds this so nobody is stuck forever.
+    active = await get_active_crisis(uid)
+    if active and not (tg_user is not None):
+        event_id, stage, alang = active
+        lvl = classify(risk)
+        if lvl in (RED, ORANGE):
+            await save_message(uid, "user", user_text, "crisis", lang,
+                               risk["score"], risk["categories"])
+            text, kb = crisis_screen(stage, lang, event_id)
+            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await message.answer(
+                "Я рядом. Если ты сейчас в большей безопасности — нажми ниже, "
+                "и мы спокойно продолжим." if lang == "ru" else
+                "I'm here. If you're safer now, tap below and we'll continue gently.",
+                reply_markup=safe_only_keyboard(event_id, lang))
+        return
+
     # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here)
     if "aggression" in risk["categories"]:
         await push_alert("Aggression Detected", uid, username, risk["level"],
@@ -360,24 +386,100 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
 
 # ────────────────────────────────────────────────────────────────────────────
 
+async def _send_admin_crisis_alert(uid: int, username: str, stage: int, event_id) -> None:
+    risk = {"level": "critical", "score": "—", "categories": ["suicide"]}
+    alert = admin_alert_text(uid, username, stage, risk, "", event_id)
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, alert)
+        except Exception:
+            pass
+
+
+async def _show_stage(callback: CallbackQuery, stage: int, lang: str, event_id) -> None:
+    """Gate the OLD screen's buttons (with fallback) then show the new stage."""
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass  # Telegram may refuse to edit; the DB stage still prevents a loop.
+    text, kb = crisis_screen(stage, lang, event_id)
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
 @dp.callback_query(F.data.startswith("crisis:"))
 async def cb_crisis(callback: CallbackQuery):
-    """User self-report after a crisis message: 'safe' resolves the event and
-    stops follow-ups; 'still' keeps it open and re-surfaces crisis resources."""
+    """Staged crisis escalation. 'still'/'cant_call' raise the monotonic stage in
+    the DB (idempotent: a stale/double tap is a no-op); 'safe' resolves; 'call'/
+    'contact'/'safe_place'/'contacted' help without changing the stage."""
     uid = callback.from_user.id
-    action = callback.data.split(":")[1]   # 'safe' | 'still'
+    username = callback.from_user.username or ""
+    parts = callback.data.split(":")
+    action = parts[1]
     lang = await get_user_language(uid)
-    await set_crisis_response(uid, action)
+
+    # event_id from callback (new 3-part) or resolve the active event (old 2-part
+    # buttons from messages sent before this deploy → backward compatible).
+    event_id = None
+    if len(parts) >= 3 and parts[2].isdigit():
+        event_id = int(parts[2])
+    if event_id is None:
+        active = await get_active_crisis(uid)
+        event_id = active[0] if active else None
+    if event_id is None:
+        await callback.answer()
+        return
+
     if action == "safe":
-        await callback.message.answer(
-            "Рад, что ты в безопасности. Я рядом, если что." if lang == "ru"
-            else "Glad you're safe. I'm here if you need me.")
-    else:
-        await callback.message.answer(
-            ("Ты не один в этом. Пожалуйста, свяжись с теми, кто может помочь прямо сейчас."
-             if lang == "ru"
-             else "You're not alone in this. Please reach out to someone who can help right now."),
-            reply_markup=crisis_keyboard(lang))
+        await resolve_crisis(event_id)
+        await set_crisis_response(uid, "safe")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer(crisis_resolved_text(lang))
+        await callback.answer()
+        return
+
+    if action == "call":
+        await callback.message.answer(crisis_call_text(lang), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if action in ("contact",):
+        await callback.message.answer(crisis_contact_template(lang))
+        await callback.answer()
+        return
+
+    if action in ("safe_place", "contacted"):
+        await callback.message.answer(crisis_safe_place_ack(lang),
+                                      reply_markup=safe_only_keyboard(event_id, lang))
+        await callback.answer()
+        return
+
+    # Escalations — the ONLY actions that change the stage.
+    if action == "still":
+        cur = await get_active_crisis(uid)
+        stage = cur[1] if cur else 0
+        target = 1 if stage == 0 else (3 if stage == 2 else None)
+        if target is None:
+            await callback.answer(); return
+        changed = await bump_crisis_stage(event_id, target)   # atomic once-only
+        if not changed:
+            await callback.answer(); return                   # stale/double tap → no-op
+        if target == 3:
+            await set_stage3_at(event_id)
+        await _send_admin_crisis_alert(uid, username, target, event_id)  # once
+        await _show_stage(callback, target, lang, event_id)
+        await callback.answer()
+        return
+
+    if action == "cant_call":
+        changed = await bump_crisis_stage(event_id, 2)
+        if changed:
+            await _show_stage(callback, 2, lang, event_id)
+        await callback.answer()
+        return
+
     await callback.answer()
 
 

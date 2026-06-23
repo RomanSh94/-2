@@ -54,10 +54,14 @@ def test_en_keyboard_has_help_link():
     assert any("iasp" in u for u in urls)
 
 
-def test_admin_alert_is_tagged_critical():
-    txt = admin_alert_text(123, "alice", RED,
+def test_admin_alert_is_tagged_critical_and_privacy_safe():
+    full = "я больше совсем не хочу жить и думаю об этом каждый день уже неделю"
+    txt = admin_alert_text(123, "alice", 1,
                            {"level": "critical", "score": 100,
                             "categories": ["suicide"]},
-                           "i want to die")
+                           full, 42)
     assert "#CRITICAL" in txt
     assert "suicide" in txt
+    assert "event_id=42" in txt
+    # Privacy: the FULL personal message must NOT be forwarded — only a short excerpt.
+    assert full not in txt

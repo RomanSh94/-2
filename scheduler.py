@@ -5,12 +5,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from prompts import get_checkin_msg, get_crisis_followup, get_push_msg
-from crisis_protocol import crisis_keyboard
+from crisis_protocol import crisis_keyboard, crisis_screen
 from silence_engine import decide_push
+from config import ADMIN_USER_IDS
 import journals
 from database import (
     get_checkin_users, update_last_checkin,
     get_active_crisis_events, mark_crisis_followup_sent,
+    get_stage3_pending, auto_resolve_expired_crises,
     get_push_candidates, get_push_context, record_push,
     get_journal_reminder_users, set_journal_settings,
 )
@@ -26,9 +28,11 @@ def _parse_utc(ts: str) -> datetime:
 
 async def _send_crisis_followups(bot: Bot) -> None:
     """Gently check in on users after a crisis, at 1h / 24h / 7d, until the
-    event is resolved (user pressed 'I'm safe'). Each tag is sent at most once."""
+    event is resolved (user pressed 'I'm safe'). Each tag is sent at most once.
+    After 7d the event is auto-resolved (lifecycle cleanup)."""
+    await auto_resolve_expired_crises(7)
     now = datetime.now(timezone.utc)
-    for eid, uid, lang, created_at, sent in await get_active_crisis_events():
+    for eid, uid, lang, created_at, stage, sent in await get_active_crisis_events():
         try:
             elapsed = (now - _parse_utc(created_at)).total_seconds()
         except (ValueError, TypeError):
@@ -36,11 +40,39 @@ async def _send_crisis_followups(bot: Bot) -> None:
         for tag, secs in _CRISIS_OFFSETS:
             if elapsed >= secs and tag not in sent:
                 try:
-                    await bot.send_message(uid, get_crisis_followup(lang, tag),
-                                           reply_markup=crisis_keyboard(lang))
+                    text, kb = crisis_screen(stage, lang, eid)
+                    await bot.send_message(uid, get_crisis_followup(lang, tag))
+                    await bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb)
                     await mark_crisis_followup_sent(eid, tag)
                 except Exception as e:
                     print(f"[scheduler] crisis followup {tag} failed {uid}: {e}")
+
+
+_STAGE3_MAX_REDOS = 3
+
+
+async def _send_stage3_followups(bot: Bot) -> None:
+    """Stage-3 fast follow-up (5-10 min): if still unresolved, re-show the crisis
+    screen + a repeat critical alert, with an antispam cap on the number of redos.
+    Runs on a dedicated 3-min job so the 5-10 min window is actually honoured."""
+    for eid, uid, lang, sent in await get_stage3_pending(min_minutes=5):
+        redos = [t for t in sent if t.startswith("redo_")]
+        if len(redos) >= _STAGE3_MAX_REDOS:
+            continue
+        tag = f"redo_{len(redos) + 1}"
+        try:
+            text, kb = crisis_screen(3, lang, eid)
+            await bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb)
+            for admin_id in ADMIN_USER_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id, f"🚨 #CRITICAL stage=3 (повтор {len(redos)+1}) "
+                                  f"event_id={eid} user={uid} — событие не сведено.")
+                except Exception:
+                    pass
+            await mark_crisis_followup_sent(eid, tag)
+        except Exception as e:
+            print(f"[scheduler] stage3 followup failed {uid}: {e}")
 
 async def _send_checkins(bot: Bot) -> None:
     utc_hour = datetime.now(timezone.utc).hour
@@ -171,6 +203,8 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
               id="checkins", replace_existing=True, misfire_grace_time=300)
     s.add_job(_send_crisis_followups, "interval", minutes=15, args=[bot],
               id="crisis_followups", replace_existing=True, misfire_grace_time=600)
+    s.add_job(_send_stage3_followups, "interval", minutes=3, args=[bot],
+              id="stage3_followups", replace_existing=True, misfire_grace_time=120)
     s.add_job(_send_silence_pushes, "interval", minutes=30, args=[bot],
               id="silence_pushes", replace_existing=True, misfire_grace_time=600)
     s.add_job(_send_journal_checkins, "cron", minute=0, args=[bot],
