@@ -200,6 +200,31 @@ def crisis_safe_place_ack(lang: str = "ru") -> str:
             "в безопасности — нажми «Я в безопасности».")
 
 
+# While a crisis is active, the "offer 'I'm safe'" branch must be reserved for
+# EXPLICITLY reassuring text. Any distress / unsafe signal (or anything unclear)
+# keeps the crisis screen — default to safety, never assume it. Deterministic.
+_REASSURING_MARKERS = [
+    "я ок", "всё хорошо", "все хорошо", "уже лучше", "мне лучше", "стало легче",
+    "спасибо", "успокоил", "я в порядке", "всё нормально", "все нормально",
+    "отпустило", "спокойнее", "уже спокойно", "я в безопасности",
+    "i'm ok", "im ok", "i'm fine", "im fine", "better now", "calmer", "i'm safe",
+]
+_DISTRESS_MARKERS = [
+    "плохо", "не в безопасности", "небезопасно", "не могу", "страшно", "опасно",
+    "тяжело", "хуже", "паник", "не справля", "больно", "помоги", "умру", "конец",
+    "not safe", "can't", "scared", "worse", "help", "danger",
+]
+
+
+def is_reassuring(text: str) -> bool:
+    """True only for explicitly calm/positive text with NO distress signal.
+    Everything else (distress, or simply unclear) → keep the crisis screen."""
+    t = (text or "").lower()
+    if any(d in t for d in _DISTRESS_MARKERS):
+        return False
+    return any(r in t for r in _REASSURING_MARKERS)
+
+
 def crisis_resolved_text(lang: str = "ru") -> str:
     return ("Хорошо. Рад(а), что ты ответил(а). Сейчас ничего не будем разбирать.\n\n"
             "Просто побудь в более безопасном месте и не оставайся один(одна), "

@@ -32,7 +32,7 @@ from prompts import get_system_prompt, get_crisis_text, get_onboarding
 from crisis_protocol import (
     classify, crisis_keyboard, admin_alert_text, RED, ORANGE,
     crisis_screen, safe_only_keyboard, crisis_call_text, crisis_contact_template,
-    crisis_safe_place_ack, crisis_resolved_text,
+    crisis_safe_place_ack, crisis_resolved_text, is_reassuring,
 )
 from humanization import (
     pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
@@ -183,17 +183,21 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     if active and not (tg_user is not None):
         event_id, stage, alang = active
         lvl = classify(risk)
-        if lvl in (RED, ORANGE):
-            await save_message(uid, "user", user_text, "crisis", lang,
-                               risk["score"], risk["categories"])
-            text, kb = crisis_screen(stage, lang, event_id)
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
-        else:
+        # Default to the crisis screen. Only EXPLICITLY reassuring text (and not
+        # RED/ORANGE) gets the gentle "I'm safe" offer — anything with distress
+        # ("мне плохо, я не в безопасности") or anything unclear keeps the crisis
+        # screen. Never assume safety.
+        if lvl not in (RED, ORANGE) and is_reassuring(user_text):
             await message.answer(
                 "Я рядом. Если ты сейчас в большей безопасности — нажми ниже, "
                 "и мы спокойно продолжим." if lang == "ru" else
                 "I'm here. If you're safer now, tap below and we'll continue gently.",
                 reply_markup=safe_only_keyboard(event_id, lang))
+        else:
+            await save_message(uid, "user", user_text, "crisis", lang,
+                               risk["score"], risk["categories"])
+            text, kb = crisis_screen(stage, lang, event_id)
+            await message.answer(text, parse_mode="HTML", reply_markup=kb)
         return
 
     # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here)
@@ -310,8 +314,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     except Exception as e:
         print(f"[LLM] error uid={uid}: {type(e).__name__}: {e}")
         await message.answer(
-            "Я временно недоступен, попробуй чуть позже." if lang == "ru"
-            else "I'm temporarily unavailable, please try again shortly."
+            "Мне нужна секунда — я рядом, не уходи." if lang == "ru"
+            else "Give me a second — I'm here, don't go."
         )
         return
 
