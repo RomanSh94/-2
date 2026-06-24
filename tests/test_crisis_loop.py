@@ -40,6 +40,36 @@ def test_stage_clamped():
     assert t_hi == t3
 
 
+# ── Fix 1: active-crisis gate must NOT mistake distress for safety ─────────────
+def test_distress_text_is_not_reassuring():
+    from crisis_protocol import is_reassuring
+    # The exact regression: distress in an active crisis must keep the crisis
+    # screen, NOT offer "I'm safe".
+    assert is_reassuring("мне плохо я не в безопасности") is False
+    assert is_reassuring("не могу больше, страшно") is False
+    assert is_reassuring("что мне делать") is False          # unclear → not safe
+
+
+def test_explicit_reassurance_is_reassuring():
+    from crisis_protocol import is_reassuring
+    assert is_reassuring("всё хорошо, мне уже лучше") is True
+    assert is_reassuring("спасибо, я в порядке") is True
+    # mixed signal leans to NOT reassuring (distress word present)
+    assert is_reassuring("спасибо, но мне всё ещё плохо") is False
+
+
+# ── Fix 3: the crisis path is fully deterministic, independent of the LLM ──────
+def test_crisis_path_independent_of_llm():
+    import crisis_protocol as cp
+    # No model client anywhere in the crisis module.
+    assert "openai" not in open(cp.__file__, encoding="utf-8").read().lower()
+    # And the screens render with no LLM involved.
+    from risk_detector import detect_risk
+    assert cp.classify(detect_risk("хочу покончить с собой")) == "RED"
+    text, kb = cp.crisis_screen(0, "ru", 1)
+    assert "112" in text and kb.inline_keyboard
+
+
 # ── DB: atomic monotonic stage + lifecycle ────────────────────────────────────
 @pytest.fixture
 def tmp_db(tmp_path, monkeypatch):
