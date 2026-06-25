@@ -54,6 +54,7 @@ from safety_validator import (
     validate_response_with_context, get_safe_fallback_high_risk,
 )
 from prompts import get_disambiguation_message
+from tz import effective_tz
 import journals
 from memory import maybe_summarize, build_context
 from voice import transcribe_voice
@@ -78,7 +79,7 @@ from database import (
     log_review_flag, log_toxic_validation_block,
     save_emotion_entry, save_cbt_entry,
     get_emotion_entries_since, get_checkin_logs_since, log_checkin,
-    set_tz_offset, get_journal_settings, set_journal_settings,
+    set_tz_offset, get_user_tz, get_journal_settings, set_journal_settings,
     export_journals, delete_journals,
 )
 
@@ -96,6 +97,15 @@ bot                = Bot(token=BOT_TOKEN)
 dp                 = Dispatcher(storage=MemoryStorage())
 client             = AsyncOpenAI(api_key=OPENAI_API_KEY)
 dependency_monitor = DependencyMonitor()
+
+def tz_picker_keyboard() -> InlineKeyboardMarkup:
+    """Single timezone picker reused by /time and /journal_settings → 🌍.
+    Tapping a button → cb_jtz → set_tz_offset (which sets tz_set=1)."""
+    row = [InlineKeyboardButton(text=("UTC" if o == 0 else f"UTC{o:+d}"),
+                                callback_data=f"jtz:{o}") for o in (-1, 0, 1, 2, 3, 4, 5)]
+    return InlineKeyboardMarkup(inline_keyboard=[row[:4], row[4:],
+        [InlineKeyboardButton(text="МСК (UTC+3)", callback_data="jtz:3")]])
+
 
 # Human-readable RU labels for protective-factor categories (admin alert).
 _PF_LABELS = {
@@ -574,16 +584,19 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    from datetime import datetime
+    from datetime import datetime, timezone
     uid = message.from_user.id
     overview = await get_memory_overview(uid)          # before upsert: 0 msgs == first time
     is_first = overview["message_count"] == 0
     await upsert_user(uid, message.from_user.username or "", message.from_user.first_name or "")
     lang = await get_user_language(uid)
     text, buttons = get_onboarding(lang)
-    # §7.1 returning users get a time-varied greeting instead of the fixed intro line
+    # §7.1 returning users get a time-varied greeting — in their LOCAL time, not
+    # UTC (otherwise a daytime user gets a "поздно, не спится?" night line).
     if not is_first:
-        text = pick_greeting(False, datetime.now().hour, lang)
+        tz_off, tz_set, ulang = await get_user_tz(uid)
+        local_hour = (datetime.now(timezone.utc).hour + effective_tz(tz_off, tz_set, ulang)) % 24
+        text = pick_greeting(False, local_hour, lang)
     # Inline-кнопки вместо reply-клавиатуры: iOS прячет reply-клавиатуру за
     # иконкой у поля ввода, и пользователи её не видят. Inline видна везде.
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -754,7 +767,7 @@ async def cmd_unmute(message: Message):
 async def cmd_help(message: Message):
     lang = await get_user_language(message.from_user.id)
     await message.answer(
-        ("/start • /checkin • /memory • /profile • /forget_all • /mute • /unmute • /help"),
+        ("/start • /checkin • /time • /memory • /profile • /forget_all • /mute • /unmute • /help"),
         reply_markup=ReplyKeyboardRemove())
 
 @dp.message(Command("checkin"))
@@ -1007,12 +1020,20 @@ async def cb_jset(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Готово")
         await cmd_journal_settings(callback.message, state)
     elif what == "tz":
-        row = [InlineKeyboardButton(text=("UTC" if o == 0 else f"UTC{o:+d}"),
-                                    callback_data=f"jtz:{o}") for o in (0, 1, 2, 3, 4, 5)]
-        kb = InlineKeyboardMarkup(inline_keyboard=[row[:3], row[3:],
-            [InlineKeyboardButton(text="МСК (UTC+3)", callback_data="jtz:3")]])
-        await callback.message.answer("Выбери свой часовой пояс:", reply_markup=kb)
+        await callback.message.answer("Выбери свой часовой пояс:",
+                                      reply_markup=tz_picker_keyboard())
         await callback.answer()
+
+
+@dp.message(Command("time"))
+async def cmd_time(message: Message, state: FSMContext):
+    """Discoverable entry to the SAME tz picker as /journal_settings → 🌍."""
+    lang = await get_user_language(message.from_user.id)
+    await message.answer(
+        "В каком часовом поясе ты сейчас? Это нужно, чтобы приветствия и "
+        "напоминания приходили по твоему местному времени." if lang == "ru" else
+        "What's your timezone? So greetings and reminders arrive in your local time.",
+        reply_markup=tz_picker_keyboard())
 
 
 @dp.callback_query(F.data.startswith("jtz:"))

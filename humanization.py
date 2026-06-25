@@ -62,9 +62,9 @@ _GREETINGS = {
             "Привет. Чем закончился день?",
         ],
         "night": [
-            "Поздно. Не спится?",
-            "Уже ночь. Я тут, если нужно.",
-            "Привет. Тяжёлые ночи бывают — я рядом.",
+            "Если ты сейчас не спишь — я тут.",
+            "Поздний час. Я рядом, если нужно.",
+            "Привет. Я здесь, в любое время.",
         ],
     },
     "en": {
@@ -90,9 +90,9 @@ _GREETINGS = {
             "Hi. How did the day end?",
         ],
         "night": [
-            "It's late. Can't sleep?",
-            "Late night. I'm here if you need it.",
-            "Hi. Hard nights happen — I'm here.",
+            "If you're up late — I'm here.",
+            "Late hour. I'm around if you need me.",
+            "Hi. I'm here, any time.",
         ],
     },
 }
