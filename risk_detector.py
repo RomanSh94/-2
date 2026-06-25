@@ -278,6 +278,29 @@ def _suicide_regex_hit(text_lower: str) -> bool:
     return any(rx.search(text_lower) for rx in _SUICIDE_REGEXES)
 
 
+def _strip_apostrophes(s: str) -> str:
+    """Drop all three apostrophe glyphs (', ', `) so "can't"/"cant"/"can`t"
+    collapse to one form for matching."""
+    return s.translate({0x27: None, 0x2019: None, 0x60: None})
+
+
+# Apostrophe-insensitive EN suicide phrases. Built generically from the EN
+# suicide lists so EVERY phrase with an apostrophe (don't/dont, i'm/im, i've/ive,
+# can't/cant, i'd/id, …) is caught with or without the apostrophe — not a
+# point-fix for one phrase. RU patterns have no apostrophes, so RU is untouched.
+_EN_SUICIDE_NOAPOS = [
+    _strip_apostrophes(p)
+    for grp in PATTERNS["suicide"]["en"].values()
+    for p in grp
+    if p != _strip_apostrophes(p)   # only the apostrophe-bearing ones
+]
+
+
+def _en_suicide_noapos_hit(text_lower: str) -> bool:
+    t = _strip_apostrophes(text_lower)
+    return any(p in t for p in _EN_SUICIDE_NOAPOS)
+
+
 def detect_ambiguity(text: str) -> List[str]:
     """Return the list of ambiguous phrases/patterns found (empty if none).
 
@@ -391,7 +414,7 @@ def detect_risk(text: str, lang: str = "ru") -> Dict:
 
     # Suicide regex layer — verb/word-order variants + negated "смысл жить" +
     # window/balcony/height action metaphors that substrings miss.
-    if "suicide" not in categories and _suicide_regex_hit(t):
+    if "suicide" not in categories and (_suicide_regex_hit(t) or _en_suicide_noapos_hit(t)):
         categories.append("suicide"); score += WEIGHTS["suicide"]; has_explicit = True
 
     if "hopelessness" in categories and "burnout" in categories: score += 20
