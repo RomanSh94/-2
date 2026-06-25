@@ -306,6 +306,9 @@ _MIGRATIONS = [
     ("crisis_events", "protective_factors_json", "TEXT DEFAULT '[]'"),
     # Epic 8: per-user UTC offset (hours) for local-time journal reminders.
     ("users", "tz_offset", "INTEGER DEFAULT 0"),
+    # Timezone PR: distinguish "tz explicitly set" from the default 0 (=UTC), so
+    # an unset ru user defaults to MSK (+3) while an explicit UTC+0 stays 0.
+    ("users", "tz_set", "INTEGER DEFAULT 0"),
     # Crisis-loop fix: monotonic escalation stage on the active event + the time
     # stage 3 was entered (drives the 5-10 min follow-up).
     ("crisis_events", "crisis_stage", "INTEGER DEFAULT 0"),
@@ -685,10 +688,11 @@ async def record_push(uid: int, tier: str) -> None:
 
 async def get_push_candidates() -> list:
     """Users inactive ≥12h who aren't permanently muted:
-    (uid, last_seen, lang, tz_offset)."""
+    (uid, last_seen, lang, tz_offset, tz_set)."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            """SELECT u.id, u.last_seen, u.language, COALESCE(u.tz_offset,0)
+            """SELECT u.id, u.last_seen, u.language, COALESCE(u.tz_offset,0),
+                      COALESCE(u.tz_set,0)
                FROM users u
                LEFT JOIN push_settings p ON p.user_id = u.id
                WHERE u.last_seen <= datetime('now','-12 hours')
@@ -810,9 +814,21 @@ async def log_checkin(uid: int, kind: str, value: str) -> None:
 
 
 async def set_tz_offset(uid: int, offset: int) -> None:
+    """Record an explicit timezone choice (tz_set=1 so it won't be overridden by
+    the language default)."""
     async with aiosqlite.connect(DB) as db:
-        await db.execute("UPDATE users SET tz_offset=? WHERE id=?", (offset, uid))
+        await db.execute("UPDATE users SET tz_offset=?, tz_set=1 WHERE id=?", (offset, uid))
         await db.commit()
+
+
+async def get_user_tz(uid: int) -> tuple:
+    """(tz_offset, tz_set, lang) for one user — fed to tz.effective_tz()."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(tz_offset,0), COALESCE(tz_set,0), COALESCE(language,'ru')"
+            " FROM users WHERE id=?", (uid,))
+        row = await cur.fetchone()
+    return tuple(row) if row else (0, 0, "ru")
 
 
 async def get_journal_settings(uid: int) -> dict:
@@ -851,12 +867,12 @@ async def get_journal_reminder_users() -> list:
         cur = await db.execute(
             "SELECT js.user_id, COALESCE(u.tz_offset,0), js.morning_enabled, js.morning_hour,"
             " js.evening_enabled, js.evening_hour, js.last_morning, js.last_evening,"
-            " COALESCE(u.language,'ru')"
+            " COALESCE(u.language,'ru'), COALESCE(u.tz_set,0)"
             " FROM journal_settings js JOIN users u ON u.id=js.user_id"
             " WHERE js.morning_enabled=1 OR js.evening_enabled=1")
         rows = await cur.fetchall()
     keys = ("user_id", "tz_offset", "morning_enabled", "morning_hour", "evening_enabled",
-            "evening_hour", "last_morning", "last_evening", "lang")
+            "evening_hour", "last_morning", "last_evening", "lang", "tz_set")
     return [dict(zip(keys, r)) for r in rows]
 
 
@@ -1106,7 +1122,7 @@ async def get_checkin_users() -> list:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             "SELECT c.user_id,c.first_name,c.checkin_hour,c.language,"
-            " COALESCE(u.tz_offset,0)"
+            " COALESCE(u.tz_offset,0), COALESCE(u.tz_set,0)"
             " FROM checkins c LEFT JOIN users u ON u.id=c.user_id WHERE c.enabled=1")
         return await cur.fetchall()
 

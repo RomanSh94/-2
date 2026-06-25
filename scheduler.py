@@ -7,6 +7,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from prompts import get_checkin_msg, get_crisis_followup, get_push_msg
 from crisis_protocol import crisis_keyboard, crisis_screen
 from silence_engine import decide_push
+from tz import effective_tz
 from config import ADMIN_USER_IDS
 import journals
 from database import (
@@ -78,9 +79,9 @@ async def _send_checkins(bot: Bot) -> None:
     utc_hour = datetime.now(timezone.utc).hour
     users = await get_checkin_users()
     sent = 0
-    for uid, _, checkin_hour, lang, tz in users:
+    for uid, _, checkin_hour, lang, tz, tz_set in users:
         # checkin_hour is the user's LOCAL hour; compare in local time.
-        if checkin_hour != (utc_hour + (tz or 0)) % 24:
+        if checkin_hour != (utc_hour + effective_tz(tz, tz_set, lang)) % 24:
             continue
         try:
             msg = get_checkin_msg(lang)
@@ -96,12 +97,14 @@ async def _send_silence_pushes(bot: Bot) -> None:
     """Re-engagement pushes (§8). All antispam logic lives in decide_push();
     here we just gather context, ask, and send."""
     now = datetime.now(timezone.utc)
-    for uid, last_seen, lang, tz in await get_push_candidates():
+    for uid, last_seen, lang, tz, tz_set in await get_push_candidates():
         try:
             last_activity = _parse_utc(last_seen)
         except (ValueError, TypeError):
             continue
-        local_now = now + timedelta(hours=tz or 0)   # for quiet-hours only
+        # Quiet hours evaluated in the user's effective LOCAL time, so the +3
+        # default shift never pushes a notification into someone's night.
+        local_now = now + timedelta(hours=effective_tz(tz, tz_set, lang))
         ctx = await get_push_context(uid)
         muted_until = None
         if ctx["mute_mode"] == "until" and ctx["mute_until"]:
@@ -176,7 +179,7 @@ async def _send_journal_checkins(bot: Bot) -> None:
     Opt-in only, once per slot per local day, never during mute / post-crisis."""
     now = datetime.now(timezone.utc)
     for u in await get_journal_reminder_users():
-        tz = u["tz_offset"] or 0
+        tz = effective_tz(u["tz_offset"], u["tz_set"], u["lang"])
         local = now + timedelta(hours=tz)
         local_hour = local.hour
         local_date = local.strftime("%Y-%m-%d")
