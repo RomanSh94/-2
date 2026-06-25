@@ -5,7 +5,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from prompts import get_checkin_msg, get_crisis_followup, get_push_msg
-from crisis_protocol import crisis_keyboard, crisis_screen
+from crisis_protocol import crisis_screen
 from silence_engine import decide_push
 from tz import effective_tz
 from config import ADMIN_USER_IDS
