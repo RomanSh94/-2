@@ -118,21 +118,45 @@ MAX_STAGE = 3
 
 # (label, action) per stage. Actions: call/safe/still/cant_call/contact/
 # safe_place/contacted. Only still & cant_call change the stage.
+# Keyed by language; unknown language → "ru" (via _norm_lang).
 _STAGE_BUTTONS = {
-    0: [("📞 ПОЗВОНИТЬ", "call"), ("💬 Я в безопасности", "safe"),
-        ("💔 Мне всё ещё плохо", "still"), ("🚫 Не могу позвонить", "cant_call")],
-    1: [("📞 ПОЗВОНИТЬ", "call"), ("🚫 Не могу позвонить", "cant_call"),
-        ("👤 Написать близкому", "contact"), ("💬 Я в безопасности", "safe")],
-    2: [("📞 Всё-таки позвонить", "call"), ("✅ Я в безопасном месте", "safe_place"),
-        ("👤 Написал близкому", "contacted"), ("💔 Мне всё ещё плохо", "still")],
-    3: [("📞 ПОЗВОНИТЬ", "call"), ("👤 Написать близкому", "contact"),
-        ("💬 Я в безопасности", "safe")],
+    "ru": {
+        0: [("📞 ПОЗВОНИТЬ", "call"), ("💬 Я в безопасности", "safe"),
+            ("💔 Мне всё ещё плохо", "still"), ("🚫 Не могу позвонить", "cant_call")],
+        1: [("📞 ПОЗВОНИТЬ", "call"), ("🚫 Не могу позвонить", "cant_call"),
+            ("👤 Написать близкому", "contact"), ("💬 Я в безопасности", "safe")],
+        2: [("📞 Всё-таки позвонить", "call"), ("✅ Я в безопасном месте", "safe_place"),
+            ("👤 Написал близкому", "contacted"), ("💔 Мне всё ещё плохо", "still")],
+        3: [("📞 ПОЗВОНИТЬ", "call"), ("👤 Написать близкому", "contact"),
+            ("💬 Я в безопасности", "safe")],
+    },
+    "en": {
+        0: [("📞 CALL", "call"), ("💬 I'm safe", "safe"),
+            ("💔 I still feel awful", "still"), ("🚫 Can't call", "cant_call")],
+        1: [("📞 CALL", "call"), ("🚫 Can't call", "cant_call"),
+            ("👤 Message someone close", "contact"), ("💬 I'm safe", "safe")],
+        2: [("📞 Call anyway", "call"), ("✅ I'm in a safe place", "safe_place"),
+            ("👤 I messaged someone", "contacted"), ("💔 I still feel awful", "still")],
+        3: [("📞 CALL", "call"), ("👤 Message someone close", "contact"),
+            ("💬 I'm safe", "safe")],
+    },
 }
+
+
+def _norm_lang(lang: str) -> str:
+    """Crisis screens are bilingual; everything else falls back to RU so an
+    unknown language never lands on an untranslated/empty screen."""
+    return "en" if (lang or "").lower().startswith("en") else "ru"
 
 
 def _numbers_block(lang: str, emergency_first: bool = False) -> str:
     h = get_hotline(lang)
     p, s = h["primary"], h["secondary"]
+    if _norm_lang(lang) == "en":
+        if emergency_first:
+            return f"📞 <b>{s}</b> — emergency services\n📞 <b>{p}</b>"
+        return (f"📞 <b>{p}</b> — tap the number to call\n"
+                f"📞 <b>{s}</b> — emergency services")
     if emergency_first:
         return f"📞 <b>{s}</b> — экстренная служба\n📞 <b>{p}</b>"
     return (f"📞 <b>{p}</b> — нажми на номер, чтобы позвонить\n"
@@ -140,26 +164,44 @@ def _numbers_block(lang: str, emergency_first: bool = False) -> str:
 
 
 _STAGE_TEXT = {
-    0: ("Мне важно, чтобы ты сейчас не оставался(ась) один(одна).\n\n"
-        "Если есть риск, что ты можешь причинить себе вред — пожалуйста, "
-        "позвони прямо сейчас:\n\n{nums}\n\n"
-        "И если рядом есть близкий человек — напиши ему."),
-    1: ("Понял(а). Сейчас главное — не оставаться одному(одной).\n\n"
-        "Пожалуйста, позвони:\n\n{nums}\n\n"
-        "Если не можешь говорить — выбери «Не могу позвонить»."),
-    2: ("Хорошо. Тогда самый простой безопасный шаг: перейди в безопасное место, "
-        "подальше от всего, чем можешь себе навредить, и будь рядом с людьми.\n\n"
-        "Если рядом есть человек — покажи ему: «Мне сейчас небезопасно одному. "
-        "Пожалуйста, побудьте со мной и помогите вызвать помощь».\n\n{nums}"),
-    3: ("Сейчас это похоже на ситуацию, где нужна помощь живого человека.\n\n"
-        "Пожалуйста, не оставайся один(одна) — позвони или подойди к любому "
-        "человеку рядом:\n\n{nums_e}"),
+    "ru": {
+        0: ("Мне важно, чтобы ты сейчас не оставался(ась) один(одна).\n\n"
+            "Если есть риск, что ты можешь причинить себе вред — пожалуйста, "
+            "позвони прямо сейчас:\n\n{nums}\n\n"
+            "И если рядом есть близкий человек — напиши ему."),
+        1: ("Понял(а). Сейчас главное — не оставаться одному(одной).\n\n"
+            "Пожалуйста, позвони:\n\n{nums}\n\n"
+            "Если не можешь говорить — выбери «Не могу позвонить»."),
+        2: ("Хорошо. Тогда самый простой безопасный шаг: перейди в безопасное место, "
+            "подальше от всего, чем можешь себе навредить, и будь рядом с людьми.\n\n"
+            "Если рядом есть человек — покажи ему: «Мне сейчас небезопасно одному. "
+            "Пожалуйста, побудьте со мной и помогите вызвать помощь».\n\n{nums}"),
+        3: ("Сейчас это похоже на ситуацию, где нужна помощь живого человека.\n\n"
+            "Пожалуйста, не оставайся один(одна) — позвони или подойди к любому "
+            "человеку рядом:\n\n{nums_e}"),
+    },
+    "en": {
+        0: ("It matters that you're not alone with this right now.\n\n"
+            "If there's a risk you might hurt yourself — please call right now:\n\n"
+            "{nums}\n\n"
+            "And if there's someone close by, reach out to them."),
+        1: ("Okay. The most important thing right now is not to be alone.\n\n"
+            "Please call:\n\n{nums}\n\n"
+            "If you can't talk, choose 'Can't call'."),
+        2: ("Alright. The simplest safe step: move to a safe place, away from "
+            "anything you could harm yourself with, and be around people.\n\n"
+            "If someone is nearby — show them: 'I'm not safe alone right now. "
+            "Please stay with me and help me get help.'\n\n{nums}"),
+        3: ("Right now this looks like a situation where you need a real "
+            "person's help.\n\n"
+            "Please don't stay alone — call, or go to any person near you:\n\n{nums_e}"),
+    },
 }
 
 
-def _stage_keyboard(stage: int, event_id) -> InlineKeyboardMarkup:
+def _stage_keyboard(stage: int, event_id, lang: str = "ru") -> InlineKeyboardMarkup:
     rows, row = [], []
-    for label, action in _STAGE_BUTTONS[stage]:
+    for label, action in _STAGE_BUTTONS[_norm_lang(lang)][stage]:
         row.append(InlineKeyboardButton(text=label, callback_data=f"crisis:{action}:{event_id}"))
         if len(row) == 2:
             rows.append(row); row = []
@@ -170,31 +212,42 @@ def _stage_keyboard(stage: int, event_id) -> InlineKeyboardMarkup:
 
 def crisis_screen(stage: int, lang: str, event_id) -> tuple:
     """Return (text, keyboard) for a crisis stage. The number is always in the
-    body. stage is clamped to [0, MAX_STAGE]."""
+    body. stage is clamped to [0, MAX_STAGE]. Unknown language → RU."""
     stage = max(0, min(MAX_STAGE, int(stage)))
-    text = _STAGE_TEXT[stage].format(
+    text = _STAGE_TEXT[_norm_lang(lang)][stage].format(
         nums=_numbers_block(lang), nums_e=_numbers_block(lang, emergency_first=True))
-    return text, _stage_keyboard(stage, event_id)
+    return text, _stage_keyboard(stage, event_id, lang)
 
 
 def safe_only_keyboard(event_id, lang: str = "ru") -> InlineKeyboardMarkup:
-    label = "💬 Я в безопасности" if lang != "en" else "💬 I'm safe right now"
+    label = "💬 I'm safe" if _norm_lang(lang) == "en" else "💬 Я в безопасности"
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=label, callback_data=f"crisis:safe:{event_id}")]])
 
 
 def crisis_call_text(lang: str = "ru") -> str:
+    if _norm_lang(lang) == "en":
+        return ("Go ahead and dial — the number is tappable:\n\n" + _numbers_block(lang)
+                + "\n\nTap the number to call.")
     return ("Набери, пожалуйста — номер кликабельный:\n\n" + _numbers_block(lang)
             + "\n\nНажми на номер, чтобы позвонить.")
 
 
 def crisis_contact_template(lang: str = "ru") -> str:
+    if _norm_lang(lang) == "en":
+        return ("You can forward this to someone close to you:\n\n"
+                "'I'm having a really hard time and it's not safe for me to be "
+                "alone right now. Can you be with me or call me right now?'")
     return ("Можешь переслать это близкому человеку:\n\n"
             "«Мне сейчас тяжело и небезопасно оставаться одному. "
             "Можешь побыть со мной или позвонить мне прямо сейчас?»")
 
 
 def crisis_safe_place_ack(lang: str = "ru") -> str:
+    if _norm_lang(lang) == "en":
+        return ("That's good. You did well to take that step.\n\n"
+                "I won't go into anything right now. When you feel safe — "
+                "tap 'I'm safe'.")
     return ("Это хорошо. Ты молодец, что сделал(а) этот шаг.\n\n"
             "Я не буду сейчас ничего разбирать. Когда почувствуешь, что "
             "в безопасности — нажми «Я в безопасности».")
@@ -207,25 +260,42 @@ _REASSURING_MARKERS = [
     "я ок", "всё хорошо", "все хорошо", "уже лучше", "мне лучше", "стало легче",
     "спасибо", "успокоил", "я в порядке", "всё нормально", "все нормально",
     "отпустило", "спокойнее", "уже спокойно", "я в безопасности",
-    "i'm ok", "im ok", "i'm fine", "im fine", "better now", "calmer", "i'm safe",
+    "i'm ok", "im ok", "i'm fine", "im fine", "better now", "calmer",
+    "i'm safe", "im safe", "feeling better", "i'm okay", "im okay", "all good",
 ]
+# EN markers are matched after apostrophe-stripping (see is_reassuring), so
+# "i'm not safe" and "im not safe" both hit "not safe". Keep them apostrophe-free.
 _DISTRESS_MARKERS = [
     "плохо", "не в безопасности", "небезопасно", "не могу", "страшно", "опасно",
     "тяжело", "хуже", "паник", "не справля", "больно", "помоги", "умру", "конец",
-    "not safe", "can't", "scared", "worse", "help", "danger",
+    "not safe", "cant", "scared", "worse", "help", "danger", "awful", "terrible",
+    "hurt myself", "kill myself", "cant go on", "cant cope", "hopeless",
 ]
+
+
+def _strip_apostrophes(s: str) -> str:
+    """Normalise the three apostrophe glyphs away so 'can't'/'cant'/'can`t'
+    collapse to one form. Used for EN marker/pattern matching."""
+    return s.translate({0x27: None, 0x2019: None, 0x60: None})
 
 
 def is_reassuring(text: str) -> bool:
     """True only for explicitly calm/positive text with NO distress signal.
-    Everything else (distress, or simply unclear) → keep the crisis screen."""
-    t = (text or "").lower()
-    if any(d in t for d in _DISTRESS_MARKERS):
+    Everything else (distress, or simply unclear) → keep the crisis screen.
+    Apostrophes are normalised first so 'I'm not safe' == 'im not safe'."""
+    t = _strip_apostrophes((text or "").lower())
+    markers_d = [_strip_apostrophes(d) for d in _DISTRESS_MARKERS]
+    markers_r = [_strip_apostrophes(r) for r in _REASSURING_MARKERS]
+    if any(d in t for d in markers_d):
         return False
-    return any(r in t for r in _REASSURING_MARKERS)
+    return any(r in t for r in markers_r)
 
 
 def crisis_resolved_text(lang: str = "ru") -> str:
+    if _norm_lang(lang) == "en":
+        return ("Okay. I'm glad you answered. We won't go into anything right now.\n\n"
+                "Just stay somewhere safer and try not to be alone, if you can. "
+                "I'm here.")
     return ("Хорошо. Рад(а), что ты ответил(а). Сейчас ничего не будем разбирать.\n\n"
             "Просто побудь в более безопасном месте и не оставайся один(одна), "
             "если есть возможность. Я рядом.")
