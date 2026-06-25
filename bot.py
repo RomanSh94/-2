@@ -313,9 +313,16 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             answer = retry.choices[0].message.content
     except Exception as e:
         print(f"[LLM] error uid={uid}: {type(e).__name__}: {e}")
+        # LLM-failure fallback ONLY (this whole block runs on an LLM error).
+        # Honest, no false promise of "I'll be right back" / no timer; give a
+        # soft direction instead. Crisis path is separate and never reaches here.
         await message.answer(
-            "Мне нужна секунда — я рядом, не уходи." if lang == "ru"
-            else "Give me a second — I'm here, don't go."
+            "Сейчас я не могу ответить как обычно. Если тебе тяжело — не оставайся "
+            "с этим один(одна): можно написать близкому человеку или обратиться в "
+            "поддержку." if lang == "ru"
+            else "I can't reply the way I usually do right now. If things are hard, "
+            "please don't stay with it alone — reach out to someone you trust or a "
+            "support line."
         )
         return
 
