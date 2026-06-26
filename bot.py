@@ -182,6 +182,45 @@ async def trigger_crisis(message: Message, uid: int, username: str,
         print(f"[crisis] post-screen alert failed uid={uid}: {e}")
 
 
+async def journal_guard(message: Message, uid: int, lang: str,
+                        text: str | None = None, username: str = "") -> tuple[str, dict]:
+    """Single safety gate for every journal free-text point (§2: RED → no
+    journaling). Combines two checks:
+
+      1. Active-crisis check — while a recent crisis event is unresolved, no
+         journaling happens; we re-show the CURRENT crisis screen (reusing the
+         existing event id/stage — never spawning a second crisis_event).
+      2. Per-text risk gate (journals.gate over the real detector).
+
+    Returns (decision, risk):
+      "crisis"    — active crisis OR RED text; crisis screen already sent, abort
+      "ambiguous" — double-meaning phrase; clarifier sent, abort the journal
+      "orange"    — elevated; caller must not deepen (skip body / stop CBT)
+      "ok"        — proceed with the journal
+
+    Entry points (cmd_emotion/cmd_cbt) pass text=None → active-crisis check only.
+    Step handlers pass the user's text → both checks."""
+    active = await get_active_crisis(uid)
+    if active:
+        event_id, stage, _alang = active
+        scr, kb = crisis_screen(stage, lang, event_id)
+        await message.answer(scr, parse_mode="HTML", reply_markup=kb)
+        return "crisis", {}
+    if text is None:
+        return "ok", {}
+    level, risk = journals.gate(text, lang)
+    if level == RED:
+        await trigger_crisis(message, uid, username, text, risk, lang)
+        return "crisis", risk
+    if risk.get("ambiguous_phrases"):
+        await message.answer(get_disambiguation_message(
+            risk["ambiguous_phrases"][0], lang, with_hotline=True))
+        return "ambiguous", risk
+    if level == "ORANGE":
+        return "orange", risk
+    return "ok", risk
+
+
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
                    tg_user=None) -> None:
     """Complete X20 pipeline.
@@ -822,9 +861,15 @@ async def ci_off(message: Message):
 # journal steps take priority over the generic pipeline text handler) ─────────
 
 @dp.message(Command("emotion"))
-async def cmd_emotion(message: Message, state: FSMContext):
-    uid = message.from_user.id
+async def cmd_emotion(message: Message, state: FSMContext, tg_user=None):
+    # tg_user: when reached via a callback (cb_checkin / cb_jhub) message.from_user
+    # is the BOT — the real user must be passed explicitly, like pipeline does.
+    uid = (tg_user or message.from_user).id
     lang = await get_user_language(uid)
+    # §2: no journaling while a crisis is unresolved — show the crisis screen.
+    decision, _ = await journal_guard(message, uid, lang)
+    if decision == "crisis":
+        return
     await state.clear()
     await state.set_state(EmotionJournal.active)
     await state.update_data(jstep=0, jdata={}, orange=False, nudged=False)
@@ -852,18 +897,12 @@ async def emotion_step(message: Message, state: FSMContext):
     text = message.text.strip()
     lang = await get_user_language(uid)
 
-    # RISK GATE on every free-text field — reuse the real detector/crisis flow.
-    level, risk = journals.gate(text, lang)
-    if level == RED:
-        await state.clear()                       # abort journal, wipe FSM
-        await trigger_crisis(message, uid, username, text, risk, lang)
-        return
-    # Ambiguous phrase ("выйти в окно") inside a journal field → don't silently
-    # continue; abort and ask the deterministic clarifying question (+ hotline).
-    if risk.get("ambiguous_phrases"):
+    # Single safety gate: active-crisis check (re-show current screen, no second
+    # event) + per-field risk gate (RED → crisis, ambiguous → clarifier). Any of
+    # these aborts the journal and wipes the FSM.
+    decision, risk = await journal_guard(message, uid, lang, text, username)
+    if decision in ("crisis", "ambiguous"):
         await state.clear()
-        await message.answer(get_disambiguation_message(
-            risk["ambiguous_phrases"][0], lang, with_hotline=True))
         return
 
     data = await state.get_data()
@@ -876,7 +915,7 @@ async def emotion_step(message: Message, state: FSMContext):
     else:
         jdata[field] = text
 
-    orange = data.get("orange", False) or (level == "ORANGE")
+    orange = data.get("orange", False) or (decision == "orange")
     nudged = data.get("nudged", False)
     prefix = ""
     if orange and not nudged:
@@ -887,7 +926,7 @@ async def emotion_step(message: Message, state: FSMContext):
     nxt = step + 1
     while nxt < len(journals.EMOTION_FIELDS) and \
             journals.EMOTION_FIELDS[nxt] == "body" and \
-            journals.should_skip_body("ORANGE" if orange else level, risk):
+            journals.should_skip_body("ORANGE" if orange else "GREEN", risk):
         nxt += 1
 
     if nxt >= len(journals.EMOTION_FIELDS):
@@ -905,9 +944,13 @@ async def emotion_step(message: Message, state: FSMContext):
 # ── Epic 8: CBT journal (deep) — aborts at ORANGE, not just RED ───────────────
 
 @dp.message(Command("cbt"))
-async def cmd_cbt(message: Message, state: FSMContext):
-    uid = message.from_user.id
+async def cmd_cbt(message: Message, state: FSMContext, tg_user=None):
+    # tg_user: real user when reached via callback (see cmd_emotion note).
+    uid = (tg_user or message.from_user).id
     lang = await get_user_language(uid)
+    decision, _ = await journal_guard(message, uid, lang)
+    if decision == "crisis":
+        return
     await state.clear()
     await state.set_state(CbtJournal.active)
     await state.update_data(cstep=0, cdata={})
@@ -925,18 +968,13 @@ async def cbt_step(message: Message, state: FSMContext):
     text = message.text.strip()
     lang = await get_user_language(uid)
 
-    level, risk = journals.gate(text, lang)
-    if level == RED:
+    # Single safety gate (active crisis + per-text risk). Deep CBT is also
+    # contraindicated at ORANGE, so we stop gently there too.
+    decision, risk = await journal_guard(message, uid, lang, text, username)
+    if decision in ("crisis", "ambiguous"):
         await state.clear()
-        await trigger_crisis(message, uid, username, text, risk, lang)
         return
-    if risk.get("ambiguous_phrases"):
-        await state.clear()
-        await message.answer(get_disambiguation_message(
-            risk["ambiguous_phrases"][0], lang, with_hotline=True))
-        return
-    if level == "ORANGE":
-        # Deep CBT is contraindicated at elevated risk — stop gently.
+    if decision == "orange":
         await state.clear()
         msg = ("Давай пока не будем углубляться в разбор мыслей — сейчас важнее "
                "немного стабилизироваться. Я рядом." if lang == "ru" else
@@ -995,9 +1033,9 @@ async def cb_jhub(callback: CallbackQuery, state: FSMContext):
     action = callback.data.split(":")[1]
     await callback.answer()
     if action == "emotion":
-        await cmd_emotion(callback.message, state)
+        await cmd_emotion(callback.message, state, tg_user=callback.from_user)
     elif action == "cbt":
-        await cmd_cbt(callback.message, state)
+        await cmd_cbt(callback.message, state, tg_user=callback.from_user)
     elif action == "report":
         await cmd_report(callback.message, state)
     elif action == "settings":
@@ -1073,9 +1111,9 @@ async def cb_checkin(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     if value == "emotion_journal":
-        await cmd_emotion(callback.message, state)
+        await cmd_emotion(callback.message, state, tg_user=callback.from_user)
     elif value == "cbt_journal":
-        await cmd_cbt(callback.message, state)
+        await cmd_cbt(callback.message, state, tg_user=callback.from_user)
     else:
         await callback.message.answer("Спасибо, что отметил(а).")
 
