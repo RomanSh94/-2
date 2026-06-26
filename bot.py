@@ -34,6 +34,7 @@ from crisis_protocol import (
     crisis_screen, safe_only_keyboard, crisis_call_text, crisis_contact_template,
     crisis_safe_place_ack, crisis_resolved_text, is_reassuring,
 )
+from crisis_delivery import deliver_crisis
 from humanization import (
     pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
 )
@@ -81,6 +82,7 @@ from database import (
     get_emotion_entries_since, get_checkin_logs_since, log_checkin,
     set_tz_offset, get_user_tz, get_journal_settings, set_journal_settings,
     export_journals, delete_journals,
+    log_crisis_delivery,
 )
 
 class InterventionStates(StatesGroup):
@@ -130,6 +132,28 @@ def quality_kb() -> InlineKeyboardMarkup:
 
 # ────────────────────────────────────────────────────────────────────────────
 
+async def _crisis_delivery_alert(uid, eid, kind, error) -> None:
+    """v6 §6.3 — P0 alarm when a crisis message could not be delivered at ANY
+    ladder level. This is the silent-delivery guard: an undelivered crisis screen
+    must never pass unnoticed."""
+    msg = (f"🚨🚨 P0 CRISIS UNDELIVERED — uid={uid} event={eid} kind={kind}\n"
+           f"Все уровни доставки кризисного сообщения упали. err={error}")
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, msg)
+        except Exception:
+            pass
+
+
+async def send_crisis(send, text, kb, lang, uid, eid, kind) -> str:
+    """Bind crisis_delivery.deliver_crisis to this app's delivery-log + P0 alert.
+    `send` is message.answer / callback.message.answer / partial(bot.send_message,
+    uid). Returns the delivered level (rich/plain/minimal/none)."""
+    return await deliver_crisis(send, text=text, kb=kb, lang=lang, uid=uid, eid=eid,
+                                kind=kind, log=log_crisis_delivery,
+                                on_total_failure=_crisis_delivery_alert)
+
+
 async def trigger_crisis(message: Message, uid: int, username: str,
                          user_text: str, risk: dict, lang: str) -> None:
     """Deterministic Crisis Protocol (LLM is NEVER called here). Extracted from
@@ -160,7 +184,7 @@ async def trigger_crisis(message: Message, uid: int, username: str,
         except Exception:
             pass
     text, kb = crisis_screen(0, lang, eid)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await send_crisis(message.answer, text, kb, lang, uid, eid, "screen")
 
 
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
@@ -207,7 +231,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             await save_message(uid, "user", user_text, "crisis", lang,
                                risk["score"], risk["categories"])
             text, kb = crisis_screen(stage, lang, event_id)
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+            await send_crisis(message.answer, text, kb, lang, uid, event_id, "screen")
         return
 
     # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here)
@@ -424,7 +448,8 @@ async def _show_stage(callback: CallbackQuery, stage: int, lang: str, event_id) 
     except Exception:
         pass  # Telegram may refuse to edit; the DB stage still prevents a loop.
     text, kb = crisis_screen(stage, lang, event_id)
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await send_crisis(callback.message.answer, text, kb, lang,
+                      callback.from_user.id, event_id, "screen")
 
 
 @dp.callback_query(F.data.startswith("crisis:"))
@@ -457,23 +482,27 @@ async def cb_crisis(callback: CallbackQuery):
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await callback.message.answer(crisis_resolved_text(lang))
+        await send_crisis(callback.message.answer, crisis_resolved_text(lang), None,
+                          lang, uid, event_id, "resolved")
         await callback.answer()
         return
 
     if action == "call":
-        await callback.message.answer(crisis_call_text(lang), parse_mode="HTML")
+        await send_crisis(callback.message.answer, crisis_call_text(lang), None,
+                          lang, uid, event_id, "call_text")
         await callback.answer()
         return
 
     if action in ("contact",):
-        await callback.message.answer(crisis_contact_template(lang))
+        await send_crisis(callback.message.answer, crisis_contact_template(lang), None,
+                          lang, uid, event_id, "contact")
         await callback.answer()
         return
 
     if action in ("safe_place", "contacted"):
-        await callback.message.answer(crisis_safe_place_ack(lang),
-                                      reply_markup=safe_only_keyboard(event_id, lang))
+        await send_crisis(callback.message.answer, crisis_safe_place_ack(lang),
+                          safe_only_keyboard(event_id, lang), lang, uid, event_id,
+                          "safe_place")
         await callback.answer()
         return
 
@@ -985,8 +1014,10 @@ async def cb_jhub(callback: CallbackQuery, state: FSMContext):
         await cmd_journal_settings(callback.message, state)
     elif action == "crisis":
         lang = await get_user_language(callback.from_user.id)
-        await callback.message.answer(get_crisis_text(lang), parse_mode="HTML",
-                                      reply_markup=crisis_keyboard(lang))
+        # Legacy manual-crisis screen (no staged event → eid=None).
+        await send_crisis(callback.message.answer, get_crisis_text(lang),
+                          crisis_keyboard(lang), lang, callback.from_user.id,
+                          None, "manual")
 
 
 @dp.message(Command("journal_settings"))

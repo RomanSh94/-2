@@ -4,8 +4,10 @@ from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from functools import partial
 from prompts import get_checkin_msg, get_crisis_followup, get_push_msg
 from crisis_protocol import crisis_screen
+from crisis_delivery import deliver_crisis
 from silence_engine import decide_push
 from tz import effective_tz
 from config import ADMIN_USER_IDS
@@ -16,7 +18,24 @@ from database import (
     get_stage3_pending, auto_resolve_expired_crises,
     get_push_candidates, get_push_context, record_push,
     get_journal_reminder_users, set_journal_settings,
+    log_crisis_delivery,
 )
+
+
+async def _send_crisis(bot: Bot, uid: int, text, kb, lang, eid, kind) -> str:
+    """Scheduler-side binding of the crisis delivery ladder (same log + P0 alert
+    as bot.py, but built from the Bot passed in — no import of bot.py)."""
+    async def _alert(u, e, k, err):
+        m = (f"🚨🚨 P0 CRISIS UNDELIVERED (followup) — uid={u} event={e} kind={k}\n"
+             f"err={err}")
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                await bot.send_message(admin_id, m)
+            except Exception:
+                pass
+    return await deliver_crisis(partial(bot.send_message, uid), text=text, kb=kb,
+                                lang=lang, uid=uid, eid=eid, kind=kind,
+                                log=log_crisis_delivery, on_total_failure=_alert)
 
 # Crisis follow-up cadence after the initial crisis message.
 _CRISIS_OFFSETS = [("1h", 3600), ("24h", 86400), ("7d", 604800)]
@@ -42,8 +61,9 @@ async def _send_crisis_followups(bot: Bot) -> None:
             if elapsed >= secs and tag not in sent:
                 try:
                     text, kb = crisis_screen(stage, lang, eid)
-                    await bot.send_message(uid, get_crisis_followup(lang, tag))
-                    await bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb)
+                    await _send_crisis(bot, uid, get_crisis_followup(lang, tag), None,
+                                       lang, eid, "followup_intro")
+                    await _send_crisis(bot, uid, text, kb, lang, eid, "followup")
                     await mark_crisis_followup_sent(eid, tag)
                 except Exception as e:
                     print(f"[scheduler] crisis followup {tag} failed {uid}: {e}")
@@ -63,7 +83,7 @@ async def _send_stage3_followups(bot: Bot) -> None:
         tag = f"redo_{len(redos) + 1}"
         try:
             text, kb = crisis_screen(3, lang, eid)
-            await bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb)
+            await _send_crisis(bot, uid, text, kb, lang, eid, "followup")
             for admin_id in ADMIN_USER_IDS:
                 try:
                     await bot.send_message(
