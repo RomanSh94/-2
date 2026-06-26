@@ -40,6 +40,10 @@ async def _send_crisis(bot: Bot, uid: int, text, kb, lang, eid, kind) -> str:
 # Crisis follow-up cadence after the initial crisis message.
 _CRISIS_OFFSETS = [("1h", 3600), ("24h", 86400), ("7d", 604800)]
 
+# Bounded retries when a follow-up SCREEN fails to deliver at any ladder level
+# (mirrors the stage-3 redo cap). After this, mark done and rely on backstops.
+_FOLLOWUP_MAX_RETRIES = 3
+
 
 def _parse_utc(ts: str) -> datetime:
     """Parse a SQLite datetime('now') string ('YYYY-MM-DD HH:MM:SS') as UTC."""
@@ -61,9 +65,33 @@ async def _send_crisis_followups(bot: Bot) -> None:
             if elapsed >= secs and tag not in sent:
                 try:
                     text, kb = crisis_screen(stage, lang, eid)
+                    # DELIVERY ORDER IS INTENTIONAL — DO NOT reorder for "readability".
+                    # The number-carrying SCREEN goes FIRST, the gentle intro second.
+                    # On a half-failing network only one of two sends may get through
+                    # (a real prod TelegramNetworkError proved the network flaps); the
+                    # message that MUST arrive is the screen with the hotline, not a
+                    # context-less "как ты?". intro-first would re-open the silent-
+                    # delivery hole.
+                    level = await _send_crisis(bot, uid, text, kb, lang, eid, "followup")
+                    if level == "none":
+                        # The screen reached the user at NO level (P0-alert already
+                        # fired inside deliver_crisis). Do NOT mark the tag sent so the
+                        # next tick retries the SCREEN — bounded by a stage-3-style cap
+                        # so a long outage can't loop forever. The intro is NOT sent
+                        # here, so there is nothing to spam on retry.
+                        retries = [t for t in sent if t.startswith(f"{tag}_retry")]
+                        if len(retries) < _FOLLOWUP_MAX_RETRIES:
+                            await mark_crisis_followup_sent(eid, f"{tag}_retry{len(retries)+1}")
+                        else:
+                            # Retry budget spent — mark done and lean on the backstops:
+                            # P0-alert, the next offset tag, and the pipeline active-gate
+                            # (any user reply instantly re-shows the screen).
+                            await mark_crisis_followup_sent(eid, tag)
+                        continue
+                    # Screen delivered → the gentle check-in may follow (best-effort,
+                    # not gated; its failure doesn't undo the delivered screen).
                     await _send_crisis(bot, uid, get_crisis_followup(lang, tag), None,
                                        lang, eid, "followup_intro")
-                    await _send_crisis(bot, uid, text, kb, lang, eid, "followup")
                     await mark_crisis_followup_sent(eid, tag)
                 except Exception as e:
                     print(f"[scheduler] crisis followup {tag} failed {uid}: {e}")
@@ -91,6 +119,10 @@ async def _send_stage3_followups(bot: Bot) -> None:
                                   f"event_id={eid} user={uid} — событие не сведено.")
                 except Exception:
                     pass
+            # NOTE: do NOT gate this mark on delivery (unlike _send_crisis_followups).
+            # Here `redo_N` is the cap COUNTER, not a delivered-flag: the screen is
+            # re-sent as redo_{N+1} on the next 3-min tick regardless of outcome, up
+            # to _STAGE3_MAX_REDOS. Gating by delivery would break that retry loop.
             await mark_crisis_followup_sent(eid, tag)
         except Exception as e:
             print(f"[scheduler] stage3 followup failed {uid}: {e}")
