@@ -251,6 +251,46 @@ def test_emotion_step_safe_text_advances(patch_common):
     assert fsm._data["jstep"] == 1                   # advanced to next field
 
 
+# ── RED text in a step DURING an active crisis: current screen, no new event ───
+def test_active_crisis_plus_red_in_step_keeps_stage_no_second_event(patch_common):
+    """Active stage-2 crisis + a NEW red phrase typed in a journal step. The
+    active-crisis check must intercept BEFORE the RED->trigger_crisis branch, so:
+    the CURRENT (stage-2) screen is shown, no second crisis_event is created
+    (stage is NOT reset to 0), trigger_crisis is never called, nothing saved."""
+    logged = {"n": 0}
+    saved = {"n": 0}
+    crisis = {"n": 0}
+
+    async def spy_log(*a, **kw):
+        logged["n"] += 1
+        return 99
+    async def spy_save(*a, **kw):
+        saved["n"] += 1
+    async def spy_crisis(*a, **kw):
+        crisis["n"] += 1
+
+    patch_common.setattr(bot, "log_crisis_event", spy_log)
+    patch_common.setattr(bot, "save_emotion_entry", spy_save)
+    patch_common.setattr(bot, "trigger_crisis", spy_crisis)
+    patch_common.setattr(bot, "get_active_crisis", _async((7, 2, "ru")))   # stage 2
+
+    user = FakeUser(42)
+    msg = FakeMessage(user, "я хочу покончить с собой")    # RED phrase in the step
+    fsm = FakeFSM()
+    asyncio.run(fsm.set_state(bot.EmotionJournal.active))
+    asyncio.run(fsm.update_data(jstep=0, jdata={}, orange=False, nudged=False))
+
+    asyncio.run(bot.emotion_step(msg, fsm))
+
+    assert crisis["n"] == 0          # RED branch NOT reached → no new crisis flow
+    assert logged["n"] == 0          # no second crisis_event (no stage reset to 0)
+    assert saved["n"] == 0           # nothing saved
+    assert fsm._state is None        # journal aborted
+    # The CURRENT stage-2 screen was shown (not the stage-0 entry screen).
+    from crisis_protocol import crisis_screen
+    assert msg.answers[-1][0] == crisis_screen(2, "ru", 7)[0]
+
+
 # ── gate never spawns a second crisis_event when one is already active ─────────
 def test_active_crisis_does_not_spawn_second_event(patch_common):
     logged = {"n": 0}
