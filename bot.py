@@ -134,33 +134,52 @@ async def trigger_crisis(message: Message, uid: int, username: str,
                          user_text: str, risk: dict, lang: str) -> None:
     """Deterministic Crisis Protocol (LLM is NEVER called here). Extracted from
     pipeline so other entry points (e.g. the journals risk-gate) can REUSE the
-    exact same flow instead of duplicating it."""
+    exact same flow instead of duplicating it.
+
+    DELIVERY-FIRST: safety = detection + decision + *delivery*. The crisis screen
+    is sent as soon as we have the event id (needed for the callback buttons),
+    BEFORE any of the non-delivery bookkeeping (message log, profile refresh,
+    protective factors, admin alert). All of that runs afterwards inside a
+    try/except so a single failing await (DB timeout/lock, a dead webhook, etc.)
+    can never suppress the screen the person in crisis must see. This closes the
+    same *class* as the original P0 (detection ok, decision ok, delivery lost)."""
+    # Create the event first — its id is baked into the crisis screen buttons.
     eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
                                  user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
-    # Persist the crisis message's risk snapshot + force a profile refresh
-    # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
-    await save_message(uid, "user", user_text, "crisis", lang,
-                       risk["score"], risk["categories"])
-    await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
-    # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
-    # the crisis flow is committed; never alters risk or the user's message.
-    recent_for_pf = await get_recent_messages(uid, limit=10)
-    pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
-    protective = detect_protective_factors(pf_text)
-    if protective:
-        await set_crisis_protective_factors(eid, protective)
-    await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
-                     risk["categories"], user_text)
-    alert = admin_alert_text(uid, username, 0, risk, user_text, eid)
-    if protective:
-        alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            await bot.send_message(admin_id, alert)
-        except Exception:
-            pass
+    # DELIVER the crisis screen to the user before anything non-essential.
     text, kb = crisis_screen(0, lang, eid)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+    # Everything below is admin/research context — important, but it must NEVER
+    # block or undo the delivered screen. Each block is isolated and logged.
+    try:
+        # Persist the crisis message's risk snapshot + force a profile refresh
+        # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
+        await save_message(uid, "user", user_text, "crisis", lang,
+                           risk["score"], risk["categories"])
+        await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
+    except Exception as e:
+        print(f"[crisis] post-screen persist failed uid={uid}: {e}")
+    try:
+        # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
+        # the screen is delivered; never alters risk or the user's message.
+        recent_for_pf = await get_recent_messages(uid, limit=10)
+        pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
+        protective = detect_protective_factors(pf_text)
+        if protective:
+            await set_crisis_protective_factors(eid, protective)
+        await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
+                         risk["categories"], user_text)
+        alert = admin_alert_text(uid, username, 0, risk, user_text, eid)
+        if protective:
+            alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                await bot.send_message(admin_id, alert)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[crisis] post-screen alert failed uid={uid}: {e}")
 
 
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
