@@ -80,6 +80,9 @@ def patch_common(monkeypatch):
     monkeypatch.setattr(bot, "log_checkin", _async(None))
     monkeypatch.setattr(bot, "save_emotion_entry", _async(None))
     monkeypatch.setattr(bot, "save_cbt_entry", _async(None))
+    # journal_guard's active-crisis screen now goes through send_crisis → keep the
+    # delivery-log write out of the real DB during these unit tests.
+    monkeypatch.setattr(bot, "log_crisis_delivery", _async(None))
     # default: no active crisis (overridden per-test)
     monkeypatch.setattr(bot, "get_active_crisis", _async(None))
     return monkeypatch

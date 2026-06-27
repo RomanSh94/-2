@@ -228,7 +228,10 @@ async def journal_guard(message: Message, uid: int, lang: str,
     if active:
         event_id, stage, _alang = active
         scr, kb = crisis_screen(stage, lang, event_id)
-        await message.answer(scr, parse_mode="HTML", reply_markup=kb)
+        # §6.1: this crisis screen goes through the delivery ladder too. It is the
+        # one crisis send that exists only once PR1 (journal_guard) and §6.1 are
+        # both present, so neither PR could wrap it on its own branch.
+        await send_crisis(message.answer, scr, kb, lang, uid, event_id, "screen")
         return "crisis", {}
     if text is None:
         return "ok", {}
