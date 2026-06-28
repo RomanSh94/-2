@@ -246,6 +246,19 @@ CREATE TABLE IF NOT EXISTS crisis_events (
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
+-- v6 §6.2: crisis-message delivery log. One row per crisis send attempt, written
+-- by crisis_delivery.deliver_crisis. Makes "was the crisis screen delivered?" a
+-- logged fact (level_delivered = rich|plain|minimal|none) instead of a guess.
+CREATE TABLE IF NOT EXISTS crisis_message_delivery_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        INTEGER,
+    user_id         INTEGER,
+    kind            TEXT,                 -- screen | followup | call_text | ...
+    level_delivered TEXT,                 -- rich | plain | minimal | none
+    telegram_error  TEXT,                 -- last error if a level fell back/failed
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS response_quality (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id         INTEGER,
@@ -771,6 +784,23 @@ async def log_crisis_event(uid: int, level: str, risk_score: int,
             (uid, level, risk_score, ",".join(categories), message_excerpt,
              lang, int(admin_notified)))
         await db.commit(); return cur.lastrowid
+
+
+async def log_crisis_delivery(event_id, user_id: int, kind: str,
+                              level_delivered: str, telegram_error=None) -> None:
+    """v6 §6.2 — record the outcome of a crisis send (one row per send).
+    level_delivered ∈ {rich, plain, minimal, none}. Best-effort: a logging
+    failure must never affect the crisis path."""
+    try:
+        async with aiosqlite.connect(DB) as db:
+            await db.execute(
+                "INSERT INTO crisis_message_delivery_log "
+                "(event_id,user_id,kind,level_delivered,telegram_error) VALUES (?,?,?,?,?)",
+                (event_id, user_id, kind, level_delivered,
+                 (telegram_error[:300] if telegram_error else None)))
+            await db.commit()
+    except Exception as e:
+        print(f"[delivery-log] failed event={event_id} uid={user_id}: {e}")
 
 
 async def save_cbt_entry(uid: int, data: dict, lang: str = "ru") -> int:

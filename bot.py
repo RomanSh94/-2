@@ -34,6 +34,7 @@ from crisis_protocol import (
     crisis_screen, safe_only_keyboard, crisis_call_text, crisis_contact_template,
     crisis_safe_place_ack, crisis_resolved_text, is_reassuring,
 )
+from crisis_delivery import deliver_crisis
 from humanization import (
     pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
 )
@@ -81,6 +82,7 @@ from database import (
     get_emotion_entries_since, get_checkin_logs_since, log_checkin,
     set_tz_offset, get_user_tz, get_journal_settings, set_journal_settings,
     export_journals, delete_journals,
+    log_crisis_delivery,
 )
 
 class InterventionStates(StatesGroup):
@@ -130,37 +132,120 @@ def quality_kb() -> InlineKeyboardMarkup:
 
 # ────────────────────────────────────────────────────────────────────────────
 
+async def _crisis_delivery_alert(uid, eid, kind, error) -> None:
+    """v6 §6.3 — P0 alarm when a crisis message could not be delivered at ANY
+    ladder level. This is the silent-delivery guard: an undelivered crisis screen
+    must never pass unnoticed."""
+    msg = (f"🚨🚨 P0 CRISIS UNDELIVERED — uid={uid} event={eid} kind={kind}\n"
+           f"Все уровни доставки кризисного сообщения упали. err={error}")
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, msg)
+        except Exception:
+            pass
+
+
+async def send_crisis(send, text, kb, lang, uid, eid, kind) -> str:
+    """Bind crisis_delivery.deliver_crisis to this app's delivery-log + P0 alert.
+    `send` is message.answer / callback.message.answer / partial(bot.send_message,
+    uid). Returns the delivered level (rich/plain/minimal/none)."""
+    return await deliver_crisis(send, text=text, kb=kb, lang=lang, uid=uid, eid=eid,
+                                kind=kind, log=log_crisis_delivery,
+                                on_total_failure=_crisis_delivery_alert)
+
+
 async def trigger_crisis(message: Message, uid: int, username: str,
                          user_text: str, risk: dict, lang: str) -> None:
     """Deterministic Crisis Protocol (LLM is NEVER called here). Extracted from
     pipeline so other entry points (e.g. the journals risk-gate) can REUSE the
-    exact same flow instead of duplicating it."""
+    exact same flow instead of duplicating it.
+
+    DELIVERY-FIRST: safety = detection + decision + *delivery*. The crisis screen
+    is sent as soon as we have the event id (needed for the callback buttons),
+    BEFORE any of the non-delivery bookkeeping (message log, profile refresh,
+    protective factors, admin alert). All of that runs afterwards inside a
+    try/except so a single failing await (DB timeout/lock, a dead webhook, etc.)
+    can never suppress the screen the person in crisis must see. This closes the
+    same *class* as the original P0 (detection ok, decision ok, delivery lost)."""
+    # Create the event first — its id is baked into the crisis screen buttons.
     eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
                                  user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
-    # Persist the crisis message's risk snapshot + force a profile refresh
-    # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
-    await save_message(uid, "user", user_text, "crisis", lang,
-                       risk["score"], risk["categories"])
-    await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
-    # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
-    # the crisis flow is committed; never alters risk or the user's message.
-    recent_for_pf = await get_recent_messages(uid, limit=10)
-    pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
-    protective = detect_protective_factors(pf_text)
-    if protective:
-        await set_crisis_protective_factors(eid, protective)
-    await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
-                     risk["categories"], user_text)
-    alert = admin_alert_text(uid, username, 0, risk, user_text, eid)
-    if protective:
-        alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            await bot.send_message(admin_id, alert)
-        except Exception:
-            pass
+    # DELIVER the crisis screen to the user before anything non-essential.
     text, kb = crisis_screen(0, lang, eid)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await send_crisis(message.answer, text, kb, lang, uid, eid, "screen")
+
+    # Everything below is admin/research context — important, but it must NEVER
+    # block or undo the delivered screen. Each block is isolated and logged.
+    try:
+        # Persist the crisis message's risk snapshot + force a profile refresh
+        # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
+        await save_message(uid, "user", user_text, "crisis", lang,
+                           risk["score"], risk["categories"])
+        await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
+    except Exception as e:
+        print(f"[crisis] post-screen persist failed uid={uid}: {e}")
+    try:
+        # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
+        # the screen is delivered; never alters risk or the user's message.
+        recent_for_pf = await get_recent_messages(uid, limit=10)
+        pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
+        protective = detect_protective_factors(pf_text)
+        if protective:
+            await set_crisis_protective_factors(eid, protective)
+        await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
+                         risk["categories"], user_text)
+        alert = admin_alert_text(uid, username, 0, risk, user_text, eid)
+        if protective:
+            alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                await bot.send_message(admin_id, alert)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[crisis] post-screen alert failed uid={uid}: {e}")
+
+
+async def journal_guard(message: Message, uid: int, lang: str,
+                        text: str | None = None, username: str = "") -> tuple[str, dict]:
+    """Single safety gate for every journal free-text point (§2: RED → no
+    journaling). Combines two checks:
+
+      1. Active-crisis check — while a recent crisis event is unresolved, no
+         journaling happens; we re-show the CURRENT crisis screen (reusing the
+         existing event id/stage — never spawning a second crisis_event).
+      2. Per-text risk gate (journals.gate over the real detector).
+
+    Returns (decision, risk):
+      "crisis"    — active crisis OR RED text; crisis screen already sent, abort
+      "ambiguous" — double-meaning phrase; clarifier sent, abort the journal
+      "orange"    — elevated; caller must not deepen (skip body / stop CBT)
+      "ok"        — proceed with the journal
+
+    Entry points (cmd_emotion/cmd_cbt) pass text=None → active-crisis check only.
+    Step handlers pass the user's text → both checks."""
+    active = await get_active_crisis(uid)
+    if active:
+        event_id, stage, _alang = active
+        scr, kb = crisis_screen(stage, lang, event_id)
+        # §6.1: this crisis screen goes through the delivery ladder too. It is the
+        # one crisis send that exists only once PR1 (journal_guard) and §6.1 are
+        # both present, so neither PR could wrap it on its own branch.
+        await send_crisis(message.answer, scr, kb, lang, uid, event_id, "screen")
+        return "crisis", {}
+    if text is None:
+        return "ok", {}
+    level, risk = journals.gate(text, lang)
+    if level == RED:
+        await trigger_crisis(message, uid, username, text, risk, lang)
+        return "crisis", risk
+    if risk.get("ambiguous_phrases"):
+        await message.answer(get_disambiguation_message(
+            risk["ambiguous_phrases"][0], lang, with_hotline=True))
+        return "ambiguous", risk
+    if level == "ORANGE":
+        return "orange", risk
+    return "ok", risk
 
 
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
@@ -207,7 +292,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             await save_message(uid, "user", user_text, "crisis", lang,
                                risk["score"], risk["categories"])
             text, kb = crisis_screen(stage, lang, event_id)
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+            await send_crisis(message.answer, text, kb, lang, uid, event_id, "screen")
         return
 
     # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here)
@@ -424,7 +509,8 @@ async def _show_stage(callback: CallbackQuery, stage: int, lang: str, event_id) 
     except Exception:
         pass  # Telegram may refuse to edit; the DB stage still prevents a loop.
     text, kb = crisis_screen(stage, lang, event_id)
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await send_crisis(callback.message.answer, text, kb, lang,
+                      callback.from_user.id, event_id, "screen")
 
 
 @dp.callback_query(F.data.startswith("crisis:"))
@@ -457,23 +543,27 @@ async def cb_crisis(callback: CallbackQuery):
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await callback.message.answer(crisis_resolved_text(lang))
+        await send_crisis(callback.message.answer, crisis_resolved_text(lang), None,
+                          lang, uid, event_id, "resolved")
         await callback.answer()
         return
 
     if action == "call":
-        await callback.message.answer(crisis_call_text(lang), parse_mode="HTML")
+        await send_crisis(callback.message.answer, crisis_call_text(lang), None,
+                          lang, uid, event_id, "call_text")
         await callback.answer()
         return
 
     if action in ("contact",):
-        await callback.message.answer(crisis_contact_template(lang))
+        await send_crisis(callback.message.answer, crisis_contact_template(lang), None,
+                          lang, uid, event_id, "contact")
         await callback.answer()
         return
 
     if action in ("safe_place", "contacted"):
-        await callback.message.answer(crisis_safe_place_ack(lang),
-                                      reply_markup=safe_only_keyboard(event_id, lang))
+        await send_crisis(callback.message.answer, crisis_safe_place_ack(lang),
+                          safe_only_keyboard(event_id, lang), lang, uid, event_id,
+                          "safe_place")
         await callback.answer()
         return
 
@@ -803,9 +893,15 @@ async def ci_off(message: Message):
 # journal steps take priority over the generic pipeline text handler) ─────────
 
 @dp.message(Command("emotion"))
-async def cmd_emotion(message: Message, state: FSMContext):
-    uid = message.from_user.id
+async def cmd_emotion(message: Message, state: FSMContext, tg_user=None):
+    # tg_user: when reached via a callback (cb_checkin / cb_jhub) message.from_user
+    # is the BOT — the real user must be passed explicitly, like pipeline does.
+    uid = (tg_user or message.from_user).id
     lang = await get_user_language(uid)
+    # §2: no journaling while a crisis is unresolved — show the crisis screen.
+    decision, _ = await journal_guard(message, uid, lang)
+    if decision == "crisis":
+        return
     await state.clear()
     await state.set_state(EmotionJournal.active)
     await state.update_data(jstep=0, jdata={}, orange=False, nudged=False)
@@ -833,18 +929,12 @@ async def emotion_step(message: Message, state: FSMContext):
     text = message.text.strip()
     lang = await get_user_language(uid)
 
-    # RISK GATE on every free-text field — reuse the real detector/crisis flow.
-    level, risk = journals.gate(text, lang)
-    if level == RED:
-        await state.clear()                       # abort journal, wipe FSM
-        await trigger_crisis(message, uid, username, text, risk, lang)
-        return
-    # Ambiguous phrase ("выйти в окно") inside a journal field → don't silently
-    # continue; abort and ask the deterministic clarifying question (+ hotline).
-    if risk.get("ambiguous_phrases"):
+    # Single safety gate: active-crisis check (re-show current screen, no second
+    # event) + per-field risk gate (RED → crisis, ambiguous → clarifier). Any of
+    # these aborts the journal and wipes the FSM.
+    decision, risk = await journal_guard(message, uid, lang, text, username)
+    if decision in ("crisis", "ambiguous"):
         await state.clear()
-        await message.answer(get_disambiguation_message(
-            risk["ambiguous_phrases"][0], lang, with_hotline=True))
         return
 
     data = await state.get_data()
@@ -857,7 +947,7 @@ async def emotion_step(message: Message, state: FSMContext):
     else:
         jdata[field] = text
 
-    orange = data.get("orange", False) or (level == "ORANGE")
+    orange = data.get("orange", False) or (decision == "orange")
     nudged = data.get("nudged", False)
     prefix = ""
     if orange and not nudged:
@@ -868,7 +958,7 @@ async def emotion_step(message: Message, state: FSMContext):
     nxt = step + 1
     while nxt < len(journals.EMOTION_FIELDS) and \
             journals.EMOTION_FIELDS[nxt] == "body" and \
-            journals.should_skip_body("ORANGE" if orange else level, risk):
+            journals.should_skip_body("ORANGE" if orange else "GREEN", risk):
         nxt += 1
 
     if nxt >= len(journals.EMOTION_FIELDS):
@@ -886,9 +976,13 @@ async def emotion_step(message: Message, state: FSMContext):
 # ── Epic 8: CBT journal (deep) — aborts at ORANGE, not just RED ───────────────
 
 @dp.message(Command("cbt"))
-async def cmd_cbt(message: Message, state: FSMContext):
-    uid = message.from_user.id
+async def cmd_cbt(message: Message, state: FSMContext, tg_user=None):
+    # tg_user: real user when reached via callback (see cmd_emotion note).
+    uid = (tg_user or message.from_user).id
     lang = await get_user_language(uid)
+    decision, _ = await journal_guard(message, uid, lang)
+    if decision == "crisis":
+        return
     await state.clear()
     await state.set_state(CbtJournal.active)
     await state.update_data(cstep=0, cdata={})
@@ -906,18 +1000,13 @@ async def cbt_step(message: Message, state: FSMContext):
     text = message.text.strip()
     lang = await get_user_language(uid)
 
-    level, risk = journals.gate(text, lang)
-    if level == RED:
+    # Single safety gate (active crisis + per-text risk). Deep CBT is also
+    # contraindicated at ORANGE, so we stop gently there too.
+    decision, risk = await journal_guard(message, uid, lang, text, username)
+    if decision in ("crisis", "ambiguous"):
         await state.clear()
-        await trigger_crisis(message, uid, username, text, risk, lang)
         return
-    if risk.get("ambiguous_phrases"):
-        await state.clear()
-        await message.answer(get_disambiguation_message(
-            risk["ambiguous_phrases"][0], lang, with_hotline=True))
-        return
-    if level == "ORANGE":
-        # Deep CBT is contraindicated at elevated risk — stop gently.
+    if decision == "orange":
         await state.clear()
         msg = ("Давай пока не будем углубляться в разбор мыслей — сейчас важнее "
                "немного стабилизироваться. Я рядом." if lang == "ru" else
@@ -976,17 +1065,19 @@ async def cb_jhub(callback: CallbackQuery, state: FSMContext):
     action = callback.data.split(":")[1]
     await callback.answer()
     if action == "emotion":
-        await cmd_emotion(callback.message, state)
+        await cmd_emotion(callback.message, state, tg_user=callback.from_user)
     elif action == "cbt":
-        await cmd_cbt(callback.message, state)
+        await cmd_cbt(callback.message, state, tg_user=callback.from_user)
     elif action == "report":
         await cmd_report(callback.message, state)
     elif action == "settings":
         await cmd_journal_settings(callback.message, state)
     elif action == "crisis":
         lang = await get_user_language(callback.from_user.id)
-        await callback.message.answer(get_crisis_text(lang), parse_mode="HTML",
-                                      reply_markup=crisis_keyboard(lang))
+        # Legacy manual-crisis screen (no staged event → eid=None).
+        await send_crisis(callback.message.answer, get_crisis_text(lang),
+                          crisis_keyboard(lang), lang, callback.from_user.id,
+                          None, "manual")
 
 
 @dp.message(Command("journal_settings"))
@@ -1054,9 +1145,9 @@ async def cb_checkin(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     if value == "emotion_journal":
-        await cmd_emotion(callback.message, state)
+        await cmd_emotion(callback.message, state, tg_user=callback.from_user)
     elif value == "cbt_journal":
-        await cmd_cbt(callback.message, state)
+        await cmd_cbt(callback.message, state, tg_user=callback.from_user)
     else:
         await callback.message.answer("Спасибо, что отметил(а).")
 
