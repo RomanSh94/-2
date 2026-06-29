@@ -51,8 +51,8 @@ from cognitive_capacity import get_capacity
 from relationship_monitor import monitor_relationship
 from practice_registry import select_practice, get_practice_by_id
 from safety_validator import (
-    validate_response, get_fallback,
-    validate_response_with_context, get_safe_fallback_high_risk,
+    validate_response,
+    validate_response_with_context, select_fallback,
 )
 from prompts import get_disambiguation_message
 from tz import effective_tz
@@ -441,18 +441,17 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 temperature=0.7, max_tokens=300)
             candidate = retry.choices[0].message.content
             ok2, _ = validate_response_with_context(candidate, user_text, risk, lang)
-            answer = candidate if ok2 else get_fallback(lang)
+            # Risk-aware: at elevated risk the failed-regen path must NOT drop to the
+            # neutral line — it routes to the high-risk fallback like the elif below.
+            answer = candidate if ok2 else select_fallback(risk, lang)
         except Exception as e:
             print(f"[anti-toxic] retry failed uid={uid}: {type(e).__name__}: {e}")
-            answer = get_fallback(lang)
+            answer = select_fallback(risk, lang)
     elif not is_safe:
         await log_validator_block(uid, reason, answer)
-        # At elevated risk use the deterministic high-risk fallback; otherwise
-        # the neutral fallback. NEVER re-prompt the LLM here.
-        answer = (get_safe_fallback_high_risk(lang)
-                  if risk.get("level") in ("medium", "high", "critical")
-                  or risk.get("ambiguous_phrases")
-                  else get_fallback(lang))
+        # At elevated risk the deterministic high-risk fallback; otherwise neutral.
+        # NEVER re-prompt the LLM here.
+        answer = select_fallback(risk, lang)
 
     # 17. Save & send (with a human-feeling typing pause, §7.2). The user
     # message carries its risk snapshot — the deterministic source for §4/§5.
