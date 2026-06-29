@@ -34,8 +34,11 @@ FORBIDDEN_PHRASES = [
 
 FORBIDDEN_RE = [re.compile(p, re.IGNORECASE) for p in FORBIDDEN_PHRASES]
 
-FALLBACK_RU = "Я здесь. Расскажи мне больше о том, что происходит."
-FALLBACK_EN = "I'm here. Tell me more about what's happening."
+# Neutral fallback (low risk only). Deliberately free of the burned-out support
+# clichés in humanization._ROBOTIC — the old copy literally contained "расскажи
+# больше" / "tell me more", which the anti-robot filter itself bans.
+FALLBACK_RU = "Давай проще. Что сейчас в этой ситуации самое тяжёлое?"
+FALLBACK_EN = "Let's make this simpler. What feels hardest in this situation right now?"
 
 
 def validate_response(text: str, lang: str = "ru") -> tuple[bool, str | None]:
@@ -87,6 +90,23 @@ SAFE_FALLBACK_HIGH_RISK_EN = (
 
 def get_safe_fallback_high_risk(lang: str = "ru") -> str:
     return SAFE_FALLBACK_HIGH_RISK_EN if lang == "en" else SAFE_FALLBACK_HIGH_RISK_RU
+
+
+def select_fallback(risk: dict, lang: str = "ru") -> str:
+    """Pick the right fallback for the risk, so EVERY block path (incl. the
+    toxic-validation regen-failure path) stays risk-aware instead of always
+    handing back the neutral line.
+
+    At elevated risk OR after an ambiguous phrase → the high-risk fallback (which
+    carries a hotline / direction to help); otherwise the neutral fallback.
+
+    `risk` is defensively coerced to {} — this helper runs on FAILURE paths
+    (regen failed / exception), where receiving an empty/None risk must yield the
+    safe neutral default, never a crash on top of an already-failed turn."""
+    risk = risk or {}
+    if risk.get("level") in ("medium", "high", "critical") or risk.get("ambiguous_phrases"):
+        return get_safe_fallback_high_risk(lang)
+    return get_fallback(lang)
 
 
 # ── Epic C: anti-toxic-validation ─────────────────────────────────────────────
