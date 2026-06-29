@@ -58,10 +58,10 @@ EMOTION_STEPS = [
      "did you feel it most? For example: chest, throat, stomach, head, "
      "shoulders, tension, emptiness."),
     ("need",
-     "Чего тебе тогда не хватало — чего ты на самом деле хотел(а) в тот момент? "
-     "Можно коротко: чтобы услышали, покоя, поддержки, отдыха, не знаю.",
-     "What were you missing then — what did you actually need in that moment? "
-     "Keep it short: to be heard, calm, support, rest, don't know."),
+     "Чего тебе тогда не хватало в тот момент? Можно коротко: чтобы услышали, "
+     "покоя, поддержки, отдыха, не знаю.",
+     "What were you missing in that moment? Keep it short: to be heard, calm, "
+     "support, rest, don't know."),
     ("action",
      "Что ты сделал(а) после этого? Без оценки, просто как было.",
      "What did you do after that? No judgment, just what happened."),
@@ -166,23 +166,26 @@ def cbt_prompt(step_key: str, lang: str = "ru") -> str:
 # These were inline in bot.py; centralised here so the journal copy lives in one
 # module and stays unit-testable without importing the aiogram bot.
 def emotion_saved_text(lang: str = "ru") -> str:
+    # Value as a property of journaling itself ("helps you notice"), NOT a promise
+    # of a product feature ("we'll show you the patterns") — there is no journal
+    # history/graph in the user-facing app.
     return (
         "Сохранил. По этой записи уже видна цепочка: что произошло → что ты "
-        "почувствовал(а) → как отреагировал(а). Когда таких записей станет "
-        "несколько, можно будет заметить, что повторяется." if lang != "en" else
+        "почувствовал(а) → как отреагировал(а). Такие записи помогают замечать "
+        "повторяющиеся ситуации и реакции." if lang != "en" else
         "Saved. This entry already shows a chain: what happened → what you felt "
-        "→ how you reacted. Once you have a few of them, you'll be able to "
-        "notice what repeats.")
+        "→ how you reacted. Keeping notes like this helps you notice recurring "
+        "situations and reactions.")
 
 
 def cbt_saved_text(lang: str = "ru") -> str:
     return (
-        "Записал. Ты уже отделил(а) ситуацию от мысли и проверил(а), насколько "
-        "она точна. Позже можно будет увидеть, какие мысли повторяются чаще."
+        "Записал. Ты отделил(а) ситуацию от мысли и посмотрел(а) на неё с разных "
+        "сторон. Так мысль легче проверять, а не сразу принимать за факт."
         if lang != "en" else
-        "Saved. You've already separated the situation from the thought and "
-        "checked how accurate it is. Later you'll be able to see which thoughts "
-        "come up more often.")
+        "Saved. You separated the situation from the thought and looked at it "
+        "from different sides. That makes a thought easier to test, instead of "
+        "taking it as fact right away.")
 
 
 def checkin_ack_text(lang: str = "ru") -> str:
