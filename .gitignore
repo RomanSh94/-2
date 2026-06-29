@@ -1,5 +1,11 @@
 # Secrets — never commit
 .env
+.env.test
+
+# Test instance DB (throwaway)
+x20_test.db
+x20_test.db-wal
+x20_test.db-shm
 
 # Python artifacts
 __pycache__/
@@ -15,3 +21,7 @@ x20.db-shm
 # Local tooling
 .claude/
 settings.local.json
+
+# Local diagnostic probes & background-task outputs (throwaway, never committed)
+_*.py
+*.output
