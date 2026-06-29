@@ -45,9 +45,13 @@ def test_dont_skip_body_when_green_and_no_sensitive():
 
 # ── Fixed, non-interpretive prompts ───────────────────────────────────────────
 def test_prompts_are_fixed_and_present():
-    assert emotion_prompt("event") == "Что произошло?"
-    assert emotion_prompt("event", "en") == "What happened?"
+    # Invariant: field order is unchanged and every step has non-empty RU+EN copy.
     assert EMOTION_FIELDS[0] == "event" and EMOTION_FIELDS[-1] == "outcome"
+    for f in EMOTION_FIELDS:
+        assert emotion_prompt(f) and emotion_prompt(f, "en")
+    # Key substrings of the new UX copy (so a silent revert is caught).
+    assert "без анализа" in emotion_prompt("event")
+    assert "no analysis" in emotion_prompt("event", "en")
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -109,8 +113,43 @@ def test_report_has_counts_and_no_diagnosis():
 
 
 def test_cbt_prompts_present():
-    assert journals.cbt_prompt("situation") == "Опиши ситуацию: что случилось?"
     assert journals.CBT_FIELDS[0] == "situation" and journals.CBT_FIELDS[-1] == "change"
+    for f in journals.CBT_FIELDS:
+        assert journals.cbt_prompt(f) and journals.cbt_prompt(f, "en")
+    # The reframing step still asks for the user's OWN words (CBT meaning kept).
+    assert "своими словами" in journals.cbt_prompt("realistic_thought")
+    assert "your own words" in journals.cbt_prompt("realistic_thought", "en")
+
+
+# ── UX copy is clean: no forbidden phrases, no robotic clichés, validator-safe ─
+def _all_journal_copy():
+    texts = []
+    for f in EMOTION_FIELDS:
+        texts += [emotion_prompt(f), emotion_prompt(f, "en")]
+    for f in journals.CBT_FIELDS:
+        texts += [journals.cbt_prompt(f), journals.cbt_prompt(f, "en")]
+    for fn in (journals.emotion_saved_text, journals.cbt_saved_text,
+               journals.checkin_ack_text):
+        texts += [fn("ru"), fn("en")]
+    return texts
+
+
+def test_new_copy_has_no_forbidden_phrases_and_validates():
+    from safety_validator import FORBIDDEN_PHRASES, validate_response
+    for t in _all_journal_copy():
+        low = t.lower()
+        for bad in FORBIDDEN_PHRASES:
+            assert bad not in low, f"forbidden phrase {bad!r} in: {t}"
+        ok, reason = validate_response(t, "ru")
+        assert ok, f"validate_response rejected: {t} ({reason})"
+
+
+def test_save_and_ack_are_not_robotic():
+    from humanization import has_robotic_phrase
+    for fn in (journals.emotion_saved_text, journals.cbt_saved_text,
+               journals.checkin_ack_text):
+        for lng in ("ru", "en"):
+            assert not has_robotic_phrase(fn(lng), lng), f"robotic: {fn(lng)}"
 
 
 # ── GDPR ──────────────────────────────────────────────────────────────────────

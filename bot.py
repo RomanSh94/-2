@@ -964,9 +964,7 @@ async def emotion_step(message: Message, state: FSMContext):
     if nxt >= len(journals.EMOTION_FIELDS):
         await save_emotion_entry(uid, jdata, lang)
         await state.clear()
-        done = ("Сохранил. Спасибо, что побыл(а) с этим." if lang == "ru"
-                else "Saved. Thank you for staying with this.")
-        await message.answer(prefix + done)
+        await message.answer(prefix + journals.emotion_saved_text(lang))
         return
 
     await state.update_data(jstep=nxt, jdata=jdata, orange=orange, nudged=nudged)
@@ -1028,8 +1026,7 @@ async def cbt_step(message: Message, state: FSMContext):
     if nxt >= len(journals.CBT_FIELDS):
         await save_cbt_entry(uid, cdata, lang)
         await state.clear()
-        await message.answer("Записал. Это твоя работа с мыслью — спасибо."
-                             if lang == "ru" else "Saved. That was your own work — thank you.")
+        await message.answer(journals.cbt_saved_text(lang))
         return
     await state.update_data(cstep=nxt, cdata=cdata)
     await message.answer(journals.cbt_prompt(journals.CBT_FIELDS[nxt], lang))
@@ -1149,7 +1146,10 @@ async def cb_checkin(callback: CallbackQuery, state: FSMContext):
     elif value == "cbt_journal":
         await cmd_cbt(callback.message, state, tg_user=callback.from_user)
     else:
-        await callback.message.answer("Спасибо, что отметил(а).")
+        # Statement only: the check-in mark is saved (checkin_logs) but there is
+        # no user-facing trend/graph, so we promise nothing beyond "noted".
+        lang = await get_user_language(callback.from_user.id)
+        await callback.message.answer(journals.checkin_ack_text(lang))
 
 
 @dp.message(Command("journal_export"))
