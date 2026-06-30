@@ -20,28 +20,47 @@ import crisis_delivery
 import database
 
 
-def test_inert_when_flag_absent(monkeypatch):
-    monkeypatch.setattr(database, "DB", "x20.db")          # prod DB
-    monkeypatch.delenv("CRISIS_FAULT_INJECT", raising=False)
-    assert bot._fault_inject_n() == 0
+def _set(monkeypatch, *, instance, db, flag):
+    """Set the three gate inputs (None → unset)."""
+    if instance is None:
+        monkeypatch.delenv("X20_INSTANCE", raising=False)
+    else:
+        monkeypatch.setenv("X20_INSTANCE", instance)
+    monkeypatch.setattr(database, "DB", db)
+    if flag is None:
+        monkeypatch.delenv("CRISIS_FAULT_INJECT", raising=False)
+    else:
+        monkeypatch.setenv("CRISIS_FAULT_INJECT", flag)
 
 
-def test_inert_in_prod_even_if_flag_set(monkeypatch):
-    # The key safety property: setting the flag in PROD must do nothing, because the
-    # prod process runs on x20.db, not the test DB.
-    monkeypatch.setattr(database, "DB", "x20.db")
-    monkeypatch.setenv("CRISIS_FAULT_INJECT", "2")
-    assert bot._fault_inject_n() == 0
-
-
-def test_active_only_on_test_db_with_flag(monkeypatch):
-    monkeypatch.setattr(database, "DB", "x20_test.db")
-    monkeypatch.setenv("CRISIS_FAULT_INJECT", "2")
+def test_active_only_when_all_three_conditions_hold(monkeypatch):
+    _set(monkeypatch, instance="test", db="x20_test.db", flag="2")
     assert bot._fault_inject_n() == 2
-    # garbage flag value → safe 0, never crashes
-    monkeypatch.setenv("CRISIS_FAULT_INJECT", "nonsense")
+
+
+def test_inert_when_instance_marker_missing_or_wrong(monkeypatch):
+    # flag + test DB present, but no X20_INSTANCE marker → inert (this is the hard
+    # prod exclusion: a prod process accidentally on a test DB still has no marker).
+    _set(monkeypatch, instance=None, db="x20_test.db", flag="2")
     assert bot._fault_inject_n() == 0
-    monkeypatch.setenv("CRISIS_FAULT_INJECT", "-3")
+    _set(monkeypatch, instance="prod", db="x20_test.db", flag="2")   # wrong value
+    assert bot._fault_inject_n() == 0
+
+
+def test_inert_on_prod_db_even_with_marker_and_flag(monkeypatch):
+    _set(monkeypatch, instance="test", db="x20.db", flag="2")
+    assert bot._fault_inject_n() == 0
+
+
+def test_inert_without_flag(monkeypatch):
+    _set(monkeypatch, instance="test", db="x20_test.db", flag=None)
+    assert bot._fault_inject_n() == 0
+
+
+def test_inert_on_garbage_flag(monkeypatch):
+    _set(monkeypatch, instance="test", db="x20_test.db", flag="nonsense")
+    assert bot._fault_inject_n() == 0
+    _set(monkeypatch, instance="test", db="x20_test.db", flag="-3")
     assert bot._fault_inject_n() == 0
 
 

@@ -6,6 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/root/x20-test
+# Instance marker — gates the crisis fault-injection hook (bot._fault_inject_n).
+# MUST exist only on the test instance; prod's x20.service never sets it.
+Environment=X20_INSTANCE=test
 ExecStart=/root/x20-test/venv/bin/python /root/x20-test/run_test_bot.py
 Restart=always
 RestartSec=5

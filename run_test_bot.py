@@ -23,6 +23,9 @@ for k, v in _vals.items():
 if not os.environ.get("BOT_TOKEN"):
     raise SystemExit("run_test_bot: BOT_TOKEN missing — fill .env.test")
 os.environ.setdefault("ADMIN_PORT", "8081")
+# Instance marker — this launcher IS the test instance. Gates the crisis
+# fault-injection hook (bot._fault_inject_n); prod (python bot.py) never sets it.
+os.environ["X20_INSTANCE"] = "test"
 
 import asyncio
 import database

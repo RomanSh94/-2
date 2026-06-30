@@ -150,12 +150,15 @@ async def _crisis_delivery_alert(uid, eid, kind, error) -> None:
 # ── Fault injection (TEST INSTANCE ONLY) ──────────────────────────────────────
 # Lets a human verify the delivery ladder (rich→plain→minimal→P0) live, by forcing
 # the first N crisis send attempts to fail — something a real Telegram BadRequest
-# can't be triggered by clicking. DOUBLE-GATED and physically inert in prod:
-#   1. CRISIS_FAULT_INJECT env var must be a positive int (OFF / absent by default);
-#   2. AND the process must be the isolated test instance (database.DB == the test
-#      DB). Prod runs on x20.db, so even if the flag were set in prod it stays 0.
-# When inactive this returns 0 and send_crisis does NOT wrap `send` — the path is
-# the prior deliver_crisis call, unchanged.
+# can't be triggered by clicking. This hook DELIBERATELY breaks crisis delivery, so
+# it is TRIPLE-GATED — ALL three must hold, else it returns 0 and send_crisis does
+# NOT wrap `send` (the path is the prior deliver_crisis call, unchanged):
+#   1. CRISIS_FAULT_INJECT env var is a positive int (OFF / absent by default);
+#   2. AND database.DB == the test DB (x20_test.db); prod runs on x20.db;
+#   3. AND X20_INSTANCE == "test" — an explicit instance marker set ONLY by the
+#      test launcher (deploy/x20-test.service + run_test_bot.py), NEVER in prod.
+# The DB-name check alone is too fragile (a prod process accidentally started with a
+# test config would match); the instance marker is the hard prod exclusion.
 _TEST_DB_NAME = "x20_test.db"
 
 
@@ -168,8 +171,11 @@ class _InjectedSendFailure(Exception):
 
 
 def _fault_inject_n() -> int:
+    # Triple gate — every condition must hold or the hook is inert (returns 0).
+    if os.getenv("X20_INSTANCE") != "test":
+        return 0                      # not the test instance → inert (prod has no marker)
     if getattr(database, "DB", None) != _TEST_DB_NAME:
-        return 0                      # prod (x20.db) → physically inert, always
+        return 0                      # prod (x20.db) → inert
     try:
         return max(0, int(os.getenv("CRISIS_FAULT_INJECT", "0")))
     except (TypeError, ValueError):
