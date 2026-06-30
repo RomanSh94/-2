@@ -25,7 +25,6 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramBadRequest
 from openai import AsyncOpenAI
 import os
 import database  # module ref (not `from`) so we can read database.DB at runtime
@@ -155,8 +154,17 @@ async def _crisis_delivery_alert(uid, eid, kind, error) -> None:
 #   1. CRISIS_FAULT_INJECT env var must be a positive int (OFF / absent by default);
 #   2. AND the process must be the isolated test instance (database.DB == the test
 #      DB). Prod runs on x20.db, so even if the flag were set in prod it stays 0.
-# When inactive this returns 0 and send_crisis passes `send` through UNCHANGED.
+# When inactive this returns 0 and send_crisis does NOT wrap `send` — the path is
+# the prior deliver_crisis call, unchanged.
 _TEST_DB_NAME = "x20_test.db"
+
+
+class _InjectedSendFailure(Exception):
+    """Raised ONLY by the fault-injection wrapper. A plain Exception, so it is
+    caught by deliver_crisis's broad `except Exception` rung (non-retryable → drops
+    to the next rung) and str()-formats cleanly into the delivery log. Deliberately
+    NOT an aiogram exception: constructing TelegramBadRequest(method=None, …) couples
+    the test tool to aiogram internals and risks str()/repr breaking across versions."""
 
 
 def _fault_inject_n() -> int:
@@ -176,9 +184,8 @@ def _faulty_send(send, n: int):
     async def wrapped(*args, **kwargs):
         if state["left"] > 0:
             state["left"] -= 1
-            raise TelegramBadRequest(
-                method=None,
-                message="CRISIS_FAULT_INJECT: simulated send failure (test instance)")
+            raise _InjectedSendFailure(
+                "CRISIS_FAULT_INJECT: simulated send failure (test instance)")
         return await send(*args, **kwargs)
     return wrapped
 
@@ -186,7 +193,10 @@ def _faulty_send(send, n: int):
 async def send_crisis(send, text, kb, lang, uid, eid, kind) -> str:
     """Bind crisis_delivery.deliver_crisis to this app's delivery-log + P0 alert.
     `send` is message.answer / callback.message.answer / partial(bot.send_message,
-    uid). Returns the delivered level (rich/plain/minimal/none)."""
+    uid). Returns the delivered level (rich/plain/minimal/none).
+
+    When fault injection is OFF (always, in prod) `send` is NOT wrapped — the call
+    below is the prior, unchanged deliver_crisis path."""
     n = _fault_inject_n()
     if n > 0:                         # TEST INSTANCE ONLY — inert in prod
         send = _faulty_send(send, n)
