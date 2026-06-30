@@ -25,7 +25,10 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 from openai import AsyncOpenAI
+import os
+import database  # module ref (not `from`) so we can read database.DB at runtime
 
 from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION
 from prompts import get_system_prompt, get_crisis_text, get_onboarding
@@ -145,10 +148,48 @@ async def _crisis_delivery_alert(uid, eid, kind, error) -> None:
             pass
 
 
+# ── Fault injection (TEST INSTANCE ONLY) ──────────────────────────────────────
+# Lets a human verify the delivery ladder (rich→plain→minimal→P0) live, by forcing
+# the first N crisis send attempts to fail — something a real Telegram BadRequest
+# can't be triggered by clicking. DOUBLE-GATED and physically inert in prod:
+#   1. CRISIS_FAULT_INJECT env var must be a positive int (OFF / absent by default);
+#   2. AND the process must be the isolated test instance (database.DB == the test
+#      DB). Prod runs on x20.db, so even if the flag were set in prod it stays 0.
+# When inactive this returns 0 and send_crisis passes `send` through UNCHANGED.
+_TEST_DB_NAME = "x20_test.db"
+
+
+def _fault_inject_n() -> int:
+    if getattr(database, "DB", None) != _TEST_DB_NAME:
+        return 0                      # prod (x20.db) → physically inert, always
+    try:
+        return max(0, int(os.getenv("CRISIS_FAULT_INJECT", "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _faulty_send(send, n: int):
+    """Wrap `send` so its first `n` calls raise a simulated non-retryable send
+    error (drops the ladder to the next rung), then pass through to the real send."""
+    state = {"left": n}
+
+    async def wrapped(*args, **kwargs):
+        if state["left"] > 0:
+            state["left"] -= 1
+            raise TelegramBadRequest(
+                method=None,
+                message="CRISIS_FAULT_INJECT: simulated send failure (test instance)")
+        return await send(*args, **kwargs)
+    return wrapped
+
+
 async def send_crisis(send, text, kb, lang, uid, eid, kind) -> str:
     """Bind crisis_delivery.deliver_crisis to this app's delivery-log + P0 alert.
     `send` is message.answer / callback.message.answer / partial(bot.send_message,
     uid). Returns the delivered level (rich/plain/minimal/none)."""
+    n = _fault_inject_n()
+    if n > 0:                         # TEST INSTANCE ONLY — inert in prod
+        send = _faulty_send(send, n)
     return await deliver_crisis(send, text=text, kb=kb, lang=lang, uid=uid, eid=eid,
                                 kind=kind, log=log_crisis_delivery,
                                 on_total_failure=_crisis_delivery_alert)
