@@ -1,0 +1,14 @@
+[Unit]
+Description=X20 TEST bot (isolated staging — separate token + x20_test.db)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/x20-test
+ExecStart=/root/x20-test/venv/bin/python /root/x20-test/run_test_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
