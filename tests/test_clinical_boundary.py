@@ -63,21 +63,56 @@ LATENT_ALLOWED_FILES = {
 _SKIP_DIRS = {"tests", "venv", ".venv", "__pycache__", ".git", ".github"}
 
 
-def test_no_control_layer_reads_a_latent_source():
+def find_latent_source_offenders(root: pathlib.Path = ROOT) -> list[str]:
+    """Scan `root` for .py files (outside LATENT_ALLOWED_FILES / skip-dirs /
+    underscore-prefixed probes) that contain a latent-source read symbol.
+    Parametrized by root so the SAME scan logic can run against the real repo
+    (the actual guard) and against a synthetic tmp_path (the positive-control
+    test) without ever touching the repository tree."""
     offenders = []
-    for path in ROOT.rglob("*.py"):
-        rel = path.relative_to(ROOT)
+    for path in root.rglob("*.py"):
+        rel = path.relative_to(root)
         if _SKIP_DIRS & set(rel.parts):
             continue
         if path.name in LATENT_ALLOWED_FILES or path.name.startswith("_"):
             continue
         src = path.read_text(encoding="utf-8")
         offenders += [f"{path.name} -> {s}" for s in _ALL_LATENT_SYMBOLS if s in src]
+    return offenders
+
+
+def test_no_control_layer_reads_a_latent_source():
+    offenders = find_latent_source_offenders()
     assert not offenders, (
         "Clinical Boundary A1 -- a non-allowlisted module reads a latent source "
         "outside the traced path. Route it through traced_response, or add the "
         "file to LATENT_ALLOWED_FILES / register the symbol, in a reviewable "
         "diff:\n  " + "\n  ".join(offenders))
+
+
+def test_scanner_catches_a_rogue_latent_read(tmp_path):
+    # Positive control (committed, runs in CI — not a manual bash probe): proves the
+    # default-deny guard actually enforces something rather than trivially passing.
+    # Uses a synthetic tmp_path directory — never touches the repo tree, so there is
+    # no cleanup risk and no chance of leftover files polluting git status/diff-scope.
+    rogue = tmp_path / "rogue_latent_probe.py"
+    rogue.write_text("from database import pattern_hypothesis_lookup\n", encoding="utf-8")
+    offenders = find_latent_source_offenders(root=tmp_path)
+    assert any("rogue_latent_probe.py" in o for o in offenders), (
+        "positive control failed: scanner did not catch a rogue latent-source read "
+        "in a non-allowlisted module — the default-deny guard is not actually "
+        "enforcing anything"
+    )
+
+
+def test_scanner_allows_a_file_in_the_allowlist(tmp_path):
+    # Complementary negative control: an allowlisted filename with the SAME latent
+    # read is NOT flagged — proves the allowlist path of the scanner also works,
+    # not just "everything is always an offender".
+    ok = tmp_path / "database.py"
+    ok.write_text("from database import pattern_hypothesis_lookup\n", encoding="utf-8")
+    offenders = find_latent_source_offenders(root=tmp_path)
+    assert offenders == []
 
 
 def _function_source(module_file: str, func_name: str) -> str | None:
