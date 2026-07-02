@@ -76,15 +76,24 @@ def test_delete_review_pack_is_idempotent(tmp_path, monkeypatch):
 
 
 # ── static guard: review_pack.py must never touch an alert/log-broadcast path ──
-_FORBIDDEN_SYMBOLS = (
+# Lives here, not in review_pack.py: a module cannot hold the denylist of words it
+# promises not to contain (that list would itself contain every word, making the
+# module self-match). Both the real guard test AND its positive control call the
+# SAME find_forbidden_alert_symbols() — the control proves the actual check
+# function catches a violation, not a copy of its logic.
+FORBIDDEN_ALERT_SYMBOLS = (
     "notifications", "push_alert", "admin_alert_text", "_send_email",
     "_send_webhook", "ALERT_WEBHOOK_URL", "ALERT_EMAIL_TO", "logging.",
 )
 
 
+def find_forbidden_alert_symbols(src: str) -> list[str]:
+    return [s for s in FORBIDDEN_ALERT_SYMBOLS if s in src]
+
+
 def test_review_pack_module_never_imports_alert_or_log_channels():
     src = (ROOT / "review_pack.py").read_text(encoding="utf-8")
-    offenders = [s for s in _FORBIDDEN_SYMBOLS if s in src]
+    offenders = find_forbidden_alert_symbols(src)
     assert not offenders, (
         "review_pack.py references an alert/log-broadcast symbol — the review pack "
         "must NEVER reach logs/alerts/webhooks/CI artifacts/debug output:\n  "
@@ -92,9 +101,9 @@ def test_review_pack_module_never_imports_alert_or_log_channels():
 
 
 def test_scanner_would_catch_a_forbidden_import(tmp_path):
-    # Positive control: prove the scan logic actually flags a violation.
+    # Positive control: the REAL find_forbidden_alert_symbols, run against a
+    # synthetic rogue module, must actually flag it.
     rogue = tmp_path / "rogue_review_pack.py"
     rogue.write_text("from notifications import push_alert\n", encoding="utf-8")
-    src = rogue.read_text(encoding="utf-8")
-    offenders = [s for s in _FORBIDDEN_SYMBOLS if s in src]
+    offenders = find_forbidden_alert_symbols(rogue.read_text(encoding="utf-8"))
     assert offenders, "positive control failed: the forbidden-symbol scan caught nothing"

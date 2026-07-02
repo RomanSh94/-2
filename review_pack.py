@@ -25,6 +25,12 @@ from datetime import datetime, timezone
 
 REVIEW_PACK_DIR = pathlib.Path("private_review_packs")
 
+# NOTE: the forbidden-alert-symbol denylist and its scan function live in
+# tests/test_review_pack.py, deliberately NOT here. A module cannot hold the list
+# of words it promises not to contain — that list would itself contain every word,
+# making the module self-match on its own denylist (a real bug caught while wiring
+# this up: the guard test failed against review_pack.py for exactly this reason).
+
 
 async def generate_review_pack(uid: int) -> dict:
     """Build the review pack IN MEMORY. Does not write to disk, log, or alert
