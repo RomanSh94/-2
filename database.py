@@ -259,6 +259,23 @@ CREATE TABLE IF NOT EXISTS crisis_message_delivery_log (
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
+-- A1 (PR 0): trace of every response influenced by a latent entity (profile,
+-- pattern_hypothesis, questionnaire_score, confirmed_episode, schema_theme, mode,
+-- formulation). Written by traced_response.traced_response_builder BEFORE the reply
+-- is sent (fail-closed). `human_readable` must name the real source, never a
+-- placeholder. `response_id` is a stable inspectable id joining all influence rows
+-- of one reply. This is itself SENSITIVE (it is the bot-built model of the owner) —
+-- registered in the privacy registry (PR 1A).
+CREATE TABLE IF NOT EXISTS influence_trace (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    response_id     TEXT NOT NULL,        -- stable trace_group_id for one reply
+    user_id         INTEGER NOT NULL,     -- trace must be attributable to a person
+    influence_type  TEXT NOT NULL,        -- pattern_hypothesis | questionnaire_score | confirmed_episode | schema_theme | mode | formulation | profile
+    source_id       TEXT NOT NULL,        -- id of the source entity (never empty)
+    human_readable  TEXT NOT NULL,        -- "reply drew on pattern_hypothesis X"
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS response_quality (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id         INTEGER,
@@ -801,6 +818,69 @@ async def log_crisis_delivery(event_id, user_id: int, kind: str,
             await db.commit()
     except Exception as e:
         print(f"[delivery-log] failed event={event_id} uid={user_id}: {e}")
+
+
+# Placeholders that mean "no real influence recorded" — a trace row made of these
+# is a lie about what actually drove the reply. Kept independent of
+# traced_response._PLACEHOLDERS on purpose: the WRITER must reject garbage even if
+# called directly (bypassing the builder), not merely trust its caller.
+_TRACE_PLACEHOLDERS = {
+    "", "none", "n/a", "na", "null", "nil", "placeholder", "influence: none",
+    "no influence", "-", "todo", "tbd", "unknown",
+}
+
+
+def _validate_trace_row(response_id: str, user_id, influence_type: str,
+                        source_id: str, human_readable: str) -> None:
+    if not response_id or not str(response_id).strip():
+        raise ValueError("influence_trace: response_id must not be empty")
+    if user_id is None:
+        raise ValueError("influence_trace: user_id must not be None (trace must be attributable)")
+    if not influence_type or not str(influence_type).strip():
+        raise ValueError("influence_trace: influence_type must not be empty")
+    sid = str(source_id or "").strip()
+    hr = str(human_readable or "").strip()
+    if not sid or sid.lower() in _TRACE_PLACEHOLDERS:
+        raise ValueError(f"influence_trace: source_id is empty/placeholder ({source_id!r})")
+    if not hr or hr.lower() in _TRACE_PLACEHOLDERS:
+        raise ValueError(f"influence_trace: human_readable is empty/placeholder ({human_readable!r})")
+    if sid not in hr:
+        raise ValueError(
+            f"influence_trace: human_readable ({human_readable!r}) does not name "
+            f"source_id ({source_id!r}) — trace would not be reviewable")
+
+
+async def log_influence_trace(response_id: str, user_id, rows: list) -> None:
+    """A1 (PR 0) — persist the influence trace for ONE reply. `rows` is a list of
+    (influence_type, source_id, human_readable) tuples.
+
+    UNLIKE the best-effort delivery log, this DELIBERATELY RAISES on failure: the
+    traced_response_builder awaits it BEFORE sending, and a persist failure MUST
+    block the latent reply (fail-closed). Never swallow the exception here.
+
+    VALIDATES every row before writing ANYTHING (all-or-nothing): empty/placeholder
+    source_id or human_readable, or a human_readable that doesn't name its
+    source_id, raises ValueError and nothing is persisted — even if called directly,
+    bypassing traced_response_builder's own content_ful() check."""
+    for (it, sid, hr) in rows:
+        _validate_trace_row(response_id, user_id, it, sid, hr)
+    async with aiosqlite.connect(DB) as db:
+        await db.executemany(
+            "INSERT INTO influence_trace "
+            "(response_id,user_id,influence_type,source_id,human_readable) "
+            "VALUES (?,?,?,?,?)",
+            [(response_id, user_id, it, sid, hr) for (it, sid, hr) in rows])
+        await db.commit()
+
+
+async def get_influence_trace(response_id: str) -> list:
+    """Return the persisted influence rows for a response_id (psychologist review /
+    tests). Ordered by id."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT influence_type,source_id,human_readable FROM influence_trace "
+            "WHERE response_id=? ORDER BY id", (response_id,))
+        return [tuple(r) for r in await cur.fetchall()]
 
 
 async def save_cbt_entry(uid: int, data: dict, lang: str = "ru") -> int:
