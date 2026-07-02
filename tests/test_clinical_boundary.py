@@ -59,6 +59,14 @@ PROFILE_READ_SYMBOLS = LATENT_SOURCE_SYMBOLS["profile"]
 LATENT_ALLOWED_FILES = {
     "psychology_profile.py", "database.py", "bot.py", "dashboard.py",
     "traced_response.py",
+    # PR 1A additions — reviewed: neither file READS a latent source as a control
+    # signal; both trip the substring scan on inert metadata/placeholders only.
+    "privacy_registry.py",  # holds TABLE NAME string constants (e.g.
+                            # "user_psychology_profile") for export/delete policy
+                            # bookkeeping — never reads profile VALUES.
+    "review_pack.py",       # the review-pack shell has an empty `pattern_hypotheses`
+                            # placeholder KEY for a future PR; no pattern data source
+                            # exists yet and none is read here.
 }
 _SKIP_DIRS = {"tests", "venv", ".venv", "__pycache__", ".git", ".github"}
 

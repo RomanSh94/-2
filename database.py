@@ -883,6 +883,17 @@ async def get_influence_trace(response_id: str) -> list:
         return [tuple(r) for r in await cur.fetchall()]
 
 
+async def get_influence_trace_for_user(uid: int) -> list:
+    """All influence_trace rows for one user, across every response_id (used by
+    review_pack.generate_review_pack — the owner/psychologist view). Ordered by id."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT response_id,influence_type,source_id,human_readable,created_at "
+            "FROM influence_trace WHERE user_id=? ORDER BY id", (uid,))
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in await cur.fetchall()]
+
+
 async def save_cbt_entry(uid: int, data: dict, lang: str = "ru") -> int:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
@@ -1264,6 +1275,67 @@ async def update_weekly_progress(uid: int):
                ON CONFLICT DO NOTHING""",
             (uid, year_week, avg_b, avg_a, avg_d, cnt, ok))
         await db.commit()
+
+# ── PR 1A: Privacy & Data Governance — registry-driven export/delete ──────────
+# Generic, driven by privacy_registry.PRIVACY_REGISTRY, so it stays complete as
+# tables are added (a table missing from the registry is caught by
+# tests/test_privacy_registry.py, not silently skipped here).
+
+async def export_all_personal_data(uid: int) -> dict:
+    """Full personal-data export for the owner: every INCLUDE-policy table, keyed
+    by table name. Includes crisis_events/crisis_message_delivery_log (retained
+    records are still the owner's own data — retained means not silently DELETED,
+    not hidden from the owner)."""
+    import privacy_registry as pr
+    out = {}
+    async with aiosqlite.connect(DB) as db:
+        for name, entry in pr.PRIVACY_REGISTRY.items():
+            if entry.export_policy != "INCLUDE":
+                continue
+            cur = await db.execute(
+                f"SELECT * FROM {name} WHERE {entry.user_id_column}=? ORDER BY rowid",
+                (uid,))
+            cols = [d[0] for d in cur.description]
+            out[name] = [dict(zip(cols, r)) for r in await cur.fetchall()]
+    return out
+
+
+async def delete_all_personal_data(uid: int) -> dict:
+    """GDPR right-to-erasure across every registered table, per its delete_policy:
+      CASCADE_DELETE -> row(s) removed;
+      ANONYMIZE      -> PII columns cleared, row kept (currently only `users`);
+      RETAIN         -> NOT touched; the summary records WHY, so a delete-all
+                        request is never a silent no-op on safety/audit data.
+
+    influence_trace is CASCADE_DELETE and is deleted alongside the rest in the
+    SAME call, which is what avoids dangling references: a trace row that named a
+    now-deleted entity does not survive as an orphan, because the trace row itself
+    is gone too — not because source_id is nulled out.
+
+    Returns {table: outcome} where outcome is an int row-count (CASCADE_DELETE),
+    True (ANONYMIZE), or the retention reason string (RETAIN)."""
+    import privacy_registry as pr
+    summary: dict = {}
+    async with aiosqlite.connect(DB) as db:
+        for name, entry in pr.PRIVACY_REGISTRY.items():
+            if entry.delete_policy == "RETAIN":
+                summary[name] = f"RETAINED: {entry.reason}"
+                continue
+            if entry.delete_policy == "ANONYMIZE":
+                if name == "users":
+                    await db.execute(
+                        "UPDATE users SET username=NULL, first_name=NULL WHERE id=?",
+                        (uid,))
+                    summary[name] = True
+                else:  # pragma: no cover — no other ANONYMIZE table registered yet
+                    raise NotImplementedError(f"ANONYMIZE not implemented for {name}")
+                continue
+            # CASCADE_DELETE
+            cur = await db.execute(
+                f"DELETE FROM {name} WHERE {entry.user_id_column}=?", (uid,))
+            summary[name] = cur.rowcount
+        await db.commit()
+    return summary
 
 # ── Sync helpers (Flask) ──────────────────────────────────────────────────────
 
