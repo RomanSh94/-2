@@ -25,3 +25,11 @@ settings.local.json
 # Local diagnostic probes & background-task outputs (throwaway, never committed)
 _*.py
 *.output
+
+# PR 1A — Privacy & Data Governance.
+# Copyrighted questionnaire instruments (item text, reverse keys, norms) — never
+# committed; the repo ships only the scoring engine + CI fixtures.
+private_questionnaires/
+# On-demand psychologist_review_pack exports (owner-requested only) — sensitive
+# aggregate artifact, own retention/delete, never in git.
+private_review_packs/
