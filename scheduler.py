@@ -11,6 +11,7 @@ from crisis_delivery import deliver_crisis
 from silence_engine import decide_push
 from tz import effective_tz
 from config import ADMIN_USER_IDS
+import access_control
 import journals
 from database import (
     get_checkin_users, update_last_checkin,
@@ -22,17 +23,34 @@ from database import (
 )
 
 
+def _minimal_reviewer_payload(uid: int, eid, note: str) -> str:
+    """PR 1B-1: same minimal, no-raw-content payload as bot.py's version (kept
+    duplicated, not imported from bot.py, for the same reason _send_crisis below
+    doesn't import bot.py — this module must not depend on it)."""
+    return f"🔔 Clinical review needed\ntester_id: {uid}\nevent_id: {eid}\nnote: {note}"
+
+
 async def _send_crisis(bot: Bot, uid: int, text, kb, lang, eid, kind) -> str:
     """Scheduler-side binding of the crisis delivery ladder (same log + P0 alert
     as bot.py, but built from the Bot passed in — no import of bot.py)."""
     async def _alert(u, e, k, err):
-        m = (f"🚨🚨 P0 CRISIS UNDELIVERED (followup) — uid={u} event={e} kind={k}\n"
-             f"err={err}")
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                await bot.send_message(admin_id, m)
-            except Exception:
-                pass
+        # PR 1B-1: routed like every other crisis alert.
+        routed_kind, targets = access_control.crisis_alert_targets(u)
+        if routed_kind == "owner":
+            m = (f"🚨🚨 P0 CRISIS UNDELIVERED (followup) — uid={u} event={e} kind={k}\n"
+                 f"err={err}")
+            for admin_id in targets:
+                try:
+                    await bot.send_message(admin_id, m)
+                except Exception:
+                    pass
+        elif routed_kind == "reviewer":
+            payload = _minimal_reviewer_payload(u, e, "crisis followup delivery FAILED (P0)")
+            for reviewer_id in targets:
+                try:
+                    await bot.send_message(reviewer_id, payload)
+                except Exception:
+                    pass
     return await deliver_crisis(partial(bot.send_message, uid), text=text, kb=kb,
                                 lang=lang, uid=uid, eid=eid, kind=kind,
                                 log=log_crisis_delivery, on_total_failure=_alert)
@@ -112,13 +130,24 @@ async def _send_stage3_followups(bot: Bot) -> None:
         try:
             text, kb = crisis_screen(3, lang, eid)
             await _send_crisis(bot, uid, text, kb, lang, eid, "followup")
-            for admin_id in ADMIN_USER_IDS:
-                try:
-                    await bot.send_message(
-                        admin_id, f"🚨 #CRITICAL stage=3 (повтор {len(redos)+1}) "
-                                  f"event_id={eid} user={uid} — событие не сведено.")
-                except Exception:
-                    pass
+            # PR 1B-1: routed like every other crisis alert.
+            routed_kind, targets = access_control.crisis_alert_targets(uid)
+            if routed_kind == "owner":
+                for admin_id in targets:
+                    try:
+                        await bot.send_message(
+                            admin_id, f"🚨 #CRITICAL stage=3 (повтор {len(redos)+1}) "
+                                      f"event_id={eid} user={uid} — событие не сведено.")
+                    except Exception:
+                        pass
+            elif routed_kind == "reviewer":
+                payload = _minimal_reviewer_payload(
+                    uid, eid, f"stage3 unresolved (redo {len(redos)+1})")
+                for reviewer_id in targets:
+                    try:
+                        await bot.send_message(reviewer_id, payload)
+                    except Exception:
+                        pass
             # NOTE: do NOT gate this mark on delivery (unlike _send_crisis_followups).
             # Here `redo_N` is the cap COUNTER, not a delivered-flag: the screen is
             # re-sent as redo_{N+1} on the next 3-min tick regardless of outcome, up

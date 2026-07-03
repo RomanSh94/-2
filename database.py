@@ -276,6 +276,16 @@ CREATE TABLE IF NOT EXISTS influence_trace (
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
+-- PR 1B-1: controlled_clinical_test acknowledgment. A CLINICIAN_TESTER must
+-- explicitly acknowledge the test-mode notice before getting full product access
+-- (access_control.has_full_access also requires a live reviewer mapping — this
+-- table alone is not sufficient for access, by design; see access_control.py).
+-- Consent/test-state, NOT a safety-audit record -> CASCADE_DELETE, not RETAIN.
+CREATE TABLE IF NOT EXISTS tester_acknowledgments (
+    user_id         INTEGER PRIMARY KEY,
+    acknowledged_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS response_quality (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id         INTEGER,
@@ -894,6 +904,23 @@ async def get_influence_trace_for_user(uid: int) -> list:
         return [dict(zip(cols, r)) for r in await cur.fetchall()]
 
 
+# ── PR 1B-1: controlled_clinical_test acknowledgment ───────────────────────────
+
+async def get_tester_acknowledged(uid: int) -> bool:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM tester_acknowledgments WHERE user_id=?", (uid,))
+        return (await cur.fetchone()) is not None
+
+
+async def set_tester_acknowledged(uid: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO tester_acknowledgments (user_id) VALUES (?) "
+            "ON CONFLICT(user_id) DO NOTHING", (uid,))
+        await db.commit()
+
+
 async def save_cbt_entry(uid: int, data: dict, lang: str = "ru") -> int:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
@@ -1059,6 +1086,16 @@ def sync_mark_flag_reviewed(flag_id: int) -> None:
     conn = _conn()
     conn.execute("UPDATE review_flags SET reviewed=1 WHERE id=?", (flag_id,))
     conn.commit(); conn.close()
+
+def sync_review_flag_uid(flag_id: int):
+    """PR 1B-1: the dashboard needs to know WHOSE flag this is before marking it
+    reviewed, so it can block a direct /safety/review/<id> URL hit for a
+    CLINICIAN_TESTER's flag in controlled_clinical_test. Returns None if the
+    flag doesn't exist."""
+    conn = _conn()
+    row = conn.execute("SELECT user_id FROM review_flags WHERE id=?", (flag_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 async def log_toxic_validation_block(uid: int, matched: str, original_text: str) -> None:
     async with aiosqlite.connect(DB) as db:

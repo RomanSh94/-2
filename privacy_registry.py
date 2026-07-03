@@ -21,6 +21,9 @@ DELETE_POLICIES = {"CASCADE_DELETE", "ANONYMIZE", "RETAIN"}
 CATEGORIES = {
     "ACCOUNT", "CONVERSATION", "STATE", "JOURNAL", "ENGAGEMENT",
     "RESEARCH_LOG", "PSYCH_PROFILE", "INFLUENCE_MODEL", "CRISIS_SAFETY",
+    "CONSENT",  # PR 1B-1: added explicitly for tester_acknowledgments — consent/
+               # test-state, not a safety-audit record, so it takes CASCADE_DELETE
+               # (not RETAIN) unlike CRISIS_SAFETY.
 }
 
 
@@ -237,6 +240,16 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
         export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
         retention_policy="Until user-requested delete-all (also existing delete_profile()).",
         log_policy="`snapshot_json` never in logs/alerts."),
+
+    # PR 1B-1
+    "tester_acknowledgments": _e(
+        table="tester_acknowledgments", user_id_column="user_id", category="CONSENT",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Owner/tester controlled; no special retention — this is "
+                         "consent/test-state, not a safety-audit record, so it does "
+                         "NOT get the CRISIS_SAFETY RETAIN treatment.",
+        log_policy="Never log payload — acknowledgment timestamp only, but keep out "
+                  "of logs/alerts by default like everything else here."),
 }
 
 

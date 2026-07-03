@@ -97,6 +97,7 @@ async def persist_influence_trace(response_id: str, user_id, rows) -> None:
 
 async def traced_response_builder(*, user_id, influences, build_response, send,
                                   persist_trace, neutral_fallback,
+                                  requester_uid,
                                   response_id: str | None = None):
     """Assemble and deliver a latent-influenced reply through the trace guard.
 
@@ -108,8 +109,32 @@ async def traced_response_builder(*, user_id, influences, build_response, send,
       persist_trace:   (response_id, user_id, rows) -> None — RAISES on failure.
       neutral_fallback:() -> None      — sends a NON-latent reply if trace can't
                                          persist (fail-closed degradation).
-    Returns the response_id on success, or None if it failed closed.
+      requester_uid:   REQUIRED (PR 1B-1, no default — Python itself refuses a
+                       call that omits it). Checked against access_control BEFORE
+                       the trace-integrity check below, so an unauthorized caller
+                       is rejected before we even inspect the influences. This is
+                       a SEPARATE, earlier gate than the fail-closed-on-persist
+                       guard from PR 0 — both apply, neither replaces the other.
+    Returns the response_id on success, or None if it failed closed (persist
+    failure only — an access-control denial RAISES instead, see below).
     """
+    # PR 1B-1 role/mode gate — earlier and independent of the trace-integrity and
+    # persist-fail-closed checks below. Raises access_control.A1NotAllowed; the
+    # caller must not treat this as a soft failure — nothing is built or sent.
+    import access_control
+    await access_control.assert_a1_allowed(requester_uid)
+
+    # Own-context enforcement (checkpoint item 4): a role/mode-allowed requester
+    # may still only build a latent reply for THEMSELVES. Without this, an
+    # allowed OWNER/TESTER/REVIEWER could accidentally construct a traced reply
+    # using someone else's user_id context — a cross-user latent-influence leak
+    # that role/mode checks alone do not prevent (they only ask "is this
+    # requester allowed A1 at all", not "for whom").
+    if requester_uid != user_id:
+        raise access_control.A1NotAllowed(
+            "A1 requester/user context mismatch: a traced reply may only be "
+            "built for the requester's own data")
+
     if not content_ful(influences):
         # Contract breach: refuse to send a latent reply without a real trace.
         raise TraceIntegrityError(

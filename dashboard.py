@@ -4,6 +4,7 @@ from functools import wraps
 from flask import Flask, render_template_string, request, redirect, session, url_for, send_file
 from markupsafe import escape as _e
 from config import ADMIN_PASSWORD, ADMIN_PORT, DASHBOARD_HOST, DASHBOARD_SECRET
+import access_control
 from database import (
     sync_stats, sync_daily, sync_users, sync_user, sync_user_messages,
     sync_user_summary, sync_moderation, sync_risk_breakdown,
@@ -11,9 +12,24 @@ from database import (
     sync_adverse_events, sync_validator_blocks, sync_export_query_safe,
     sync_get_profile, sync_get_profile_history,
     sync_unreviewed_flags, sync_mark_flag_reviewed, sync_toxic_blocks,
-    sync_crisis_with_protective,
+    sync_crisis_with_protective, sync_review_flag_uid,
     _EXPORT_ALLOWED_TABLES,
 )
+
+# PR 1B-1 checkpoint-2 item 7 — dashboard isolation for controlled_clinical_test.
+# These helpers read access_control.DEPLOYMENT_MODE fresh on EVERY call (never
+# cached at import/process-start time), so a mode switch takes effect on the
+# very next request without a dashboard restart — same continuous-check
+# discipline as access_control.resolved_reviewers_for.
+def _tester_isolation_active() -> bool:
+    return access_control.DEPLOYMENT_MODE == "controlled_clinical_test"
+
+
+def _is_tester(uid) -> bool:
+    try:
+        return access_control.resolve_role_safe(int(uid)) == access_control.CLINICIAN_TESTER
+    except (TypeError, ValueError):
+        return False
 
 app = Flask(__name__)
 app.secret_key = DASHBOARD_SECRET or (ADMIN_PASSWORD + "_x20")
@@ -102,6 +118,8 @@ body{{background:#f4f6fb}}
 @auth
 def users():
     users_list = sync_users(100)
+    if _tester_isolation_active():
+        users_list = [u for u in users_list if not _is_tester(u["id"])]
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Users</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 </head><body><div class="container-fluid p-4">
@@ -115,6 +133,8 @@ def users():
 @app.route("/user/<int:uid>")
 @auth
 def user_detail(uid):
+    if _tester_isolation_active() and _is_tester(uid):
+        return "Not available in controlled clinical test mode.", 403
     user = sync_user(uid)
     msgs = sync_user_messages(uid)
     summary = sync_user_summary(uid)
@@ -133,6 +153,10 @@ def user_detail(uid):
 @app.route("/safety/review/<int:flag_id>")
 @auth
 def safety_mark_reviewed(flag_id):
+    if _tester_isolation_active():
+        owner_uid = sync_review_flag_uid(flag_id)
+        if owner_uid is not None and _is_tester(owner_uid):
+            return "Not available in controlled clinical test mode.", 403
     sync_mark_flag_reviewed(flag_id)
     return redirect("/safety")
 
@@ -144,6 +168,12 @@ def safety_review():
     pf = sync_crisis_with_protective(50)
     flags = sync_unreviewed_flags(50)
     toxic = sync_toxic_blocks(50)
+    if _tester_isolation_active():
+        # Exclude CLINICIAN_TESTER rows from every safety-review table — this
+        # page carries raw excerpts/context, exactly what isolation exists for.
+        pf = [r for r in pf if not _is_tester(r[0])]
+        flags = [r for r in flags if not _is_tester(r[1])]
+        toxic = [r for r in toxic if not _is_tester(r[0])]
 
     def pf_row(r):
         uid, level, pj, excerpt, created = r
@@ -196,6 +226,8 @@ def safety_review():
 @auth
 def admin_profile(uid):
     import json
+    if _tester_isolation_active() and _is_tester(uid):
+        return "Not available in controlled clinical test mode.", 403
     p = sync_get_profile(uid)
     if not p:
         return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Profile {uid}</title>
@@ -267,6 +299,10 @@ def admin_profile(uid):
 @auth
 def moderation():
     logs = sync_moderation(100)
+    if _tester_isolation_active():
+        # Rows carry user_id + raw message_text -- same sensitivity class as
+        # /safety, so the same exclusion applies.
+        logs = [l for l in logs if not _is_tester(l["user_id"])]
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Moderation</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 </head><body><div class="container-fluid p-4">
@@ -279,6 +315,20 @@ def moderation():
 @app.route("/research")
 @auth
 def research():
+    # PR 1B-1 checkpoint-2 item 7.4 — sync_outcome_stats/sync_ab_stats are
+    # SQL-side GROUP BY aggregates over ALL users with no per-uid filter and no
+    # per-scenario/variant minimum-N floor. In controlled_clinical_test a
+    # scenario or A/B variant used by only one (tester) participant would make
+    # that row effectively a tester-specific data point wearing an aggregate
+    # label -- exactly the small-N de-anonymization risk. There's no query
+    # here that excludes testers without rewriting the SQL against a dynamic
+    # tester-id list (deferred; the conservative default for THIS PR is to
+    # disable the whole page in this mode rather than ship an unproven partial
+    # filter).
+    if _tester_isolation_active():
+        return ("Research aggregates are disabled in controlled clinical test "
+                "mode — current aggregates have no tester-exclusion or "
+                "minimum-N floor and could expose small-N tester data.", 403)
     outcomes = sync_outcome_stats()
     ab_data = sync_ab_stats()
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Research</title>
@@ -300,6 +350,20 @@ def research():
 @app.route("/export")
 @auth
 def export():
+    # PR 1B-1 checkpoint-2 item 7.1 — EVERY table in _EXPORT_ALLOWED_TABLES is
+    # user-level (user_id + often raw/excerpt text: crisis_events,
+    # moderation_logs, adverse_events, disambiguation_events, validator_blocks,
+    # response_quality, router_decision_logs, intervention_results,
+    # weekly_progress_snapshots). sync_export_query_safe does a plain
+    # `SELECT * ... LIMIT 1000` with no per-row role filtering, so a raw CSV
+    # export of any of them would leak CLINICIAN_TESTER rows straight past the
+    # /safety, /moderation, /users isolation above. There is no aggregate/
+    # non-user-level table in the allowlist to carve out safely, so the
+    # conservative PR 1B-1 fix is to disable /export ENTIRELY in
+    # controlled_clinical_test, not attempt partial per-table filtering.
+    if _tester_isolation_active():
+        return ("Export is disabled in controlled clinical test mode — every "
+                "exportable table is user-level and could leak tester data.", 403)
     table = request.args.get("table", "intervention_results")
     if table == "all_data":
         table = "intervention_results"

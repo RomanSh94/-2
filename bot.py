@@ -27,6 +27,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from openai import AsyncOpenAI
 
+import access_control
 from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION
 from prompts import get_system_prompt, get_crisis_text, get_onboarding
 from crisis_protocol import (
@@ -83,6 +84,7 @@ from database import (
     set_tz_offset, get_user_tz, get_journal_settings, set_journal_settings,
     export_journals, delete_journals,
     log_crisis_delivery,
+    get_tester_acknowledged, set_tester_acknowledged,
 )
 
 class InterventionStates(StatesGroup):
@@ -132,17 +134,124 @@ def quality_kb() -> InlineKeyboardMarkup:
 
 # ────────────────────────────────────────────────────────────────────────────
 
+def _minimal_reviewer_payload(uid: int, eid, note: str) -> str:
+    """PR 1B-1: the ONLY payload a CLINICIAN_REVIEWER ever receives — no message
+    text, no username, no risk categories beyond the fixed `note` label. Enough
+    to know a clinical review is needed, nothing more."""
+    return f"🔔 Clinical review needed\ntester_id: {uid}\nevent_id: {eid}\nnote: {note}"
+
+
+_CLOSED_TEST_TEXT = {
+    "ru": "Сейчас доступ к X20 ограничен приглашёнными участниками закрытого "
+          "тестирования. Если тебе тяжело прямо сейчас — напиши это здесь, "
+          "экстренная поддержка работает для всех.",
+    "en": "X20 access is currently limited to invited participants of a closed "
+          "test. If you're struggling right now, write it here — crisis support "
+          "still works for everyone.",
+}
+
+_TESTER_WAITING_TEXT = {
+    "ru": "Спасибо, отмечено. Доступ откроется, как только за тобой закрепят "
+          "куратора-ревьюера.",
+    "en": "Thanks, noted. Access will open once a reviewer is assigned to you.",
+}
+
+# Owner-specified verbatim RU text; EN is a plain translation, not a separate
+# legal/consent document.
+_TESTER_ACK_TEXT = {
+    "ru": "Вы приглашены как clinical tester. Бот может использовать данные "
+          "ваших собственных опросников/дневников/паттернов для ответов через "
+          "traced A1 mechanism. Ваши данные изолированы от владельца и других "
+          "тестеров. Это тестовый режим, не публичный продукт.",
+    "en": "You are invited as a clinical tester. The bot may use your own "
+          "questionnaire/journal/pattern data to shape replies via the traced "
+          "A1 mechanism. Your data is isolated from the owner and other "
+          "testers. This is a test mode, not a public product.",
+}
+
+
+def _tester_ack_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=("✅ Я согласен(на)" if lang == "ru" else "✅ I agree"),
+            callback_data="tester_ack:yes")]])
+
+
+async def ensure_full_access_or_closed_test(entity, uid: int) -> bool:
+    """PR 1B-1 checkpoint-2 item 6 — the ONE gate every product entrypoint calls.
+
+    Returns True if the caller may proceed with its ordinary product behavior.
+    Returns False (after sending the appropriate screen) otherwise:
+      - CLINICIAN_TESTER in controlled_clinical_test, not yet acknowledged ->
+        the tester-acknowledgment notice + an inline "I agree" button.
+      - anything else without full access (UNKNOWN, CLINICIAN_REVIEWER, an
+        acknowledged tester with no reviewer mapping, an invalid/public mode,
+        etc.) -> the generic closed-test message.
+
+    `entity` is a Message or a CallbackQuery — both are used as real bot
+    entrypoints. This function never touches the crisis path; callers are
+    expected to have already run the RED / active-crisis checks first."""
+    if await access_control.has_full_access(uid):
+        return True
+    lang = await get_user_language(uid)
+    target = entity.message if isinstance(entity, CallbackQuery) else entity
+    role = access_control.resolve_role_safe(uid)
+    if (role == access_control.CLINICIAN_TESTER
+            and access_control.DEPLOYMENT_MODE == "controlled_clinical_test"
+            and not await get_tester_acknowledged(uid)):
+        await target.answer(_TESTER_ACK_TEXT[lang if lang in _TESTER_ACK_TEXT else "ru"],
+                            reply_markup=_tester_ack_keyboard(lang))
+    elif role == access_control.CLINICIAN_TESTER:
+        # Acknowledged already, but no (valid) reviewer mapping yet.
+        await target.answer(_TESTER_WAITING_TEXT[lang if lang in _TESTER_WAITING_TEXT else "ru"])
+    else:
+        await target.answer(_CLOSED_TEST_TEXT[lang if lang in _CLOSED_TEST_TEXT else "ru"])
+    if isinstance(entity, CallbackQuery):
+        await entity.answer()
+    return False
+
+
+@dp.callback_query(F.data == "tester_ack:yes")
+async def cb_tester_ack(callback: CallbackQuery):
+    uid = callback.from_user.id
+    await set_tester_acknowledged(uid)
+    lang = await get_user_language(uid)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if await access_control.has_full_access(uid):
+        msg = ("Спасибо. Доступ открыт — можно продолжать, напиши /start."
+               if lang == "ru" else
+               "Thanks. Access granted — you can continue, try /start.")
+    else:
+        msg = _TESTER_WAITING_TEXT[lang if lang in _TESTER_WAITING_TEXT else "ru"]
+    await callback.message.answer(msg)
+    await callback.answer()
+
+
 async def _crisis_delivery_alert(uid, eid, kind, error) -> None:
     """v6 §6.3 — P0 alarm when a crisis message could not be delivered at ANY
     ladder level. This is the silent-delivery guard: an undelivered crisis screen
-    must never pass unnoticed."""
-    msg = (f"🚨🚨 P0 CRISIS UNDELIVERED — uid={uid} event={eid} kind={kind}\n"
-           f"Все уровни доставки кризисного сообщения упали. err={error}")
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            await bot.send_message(admin_id, msg)
-        except Exception:
-            pass
+    must never pass unnoticed. PR 1B-1: routed the same way as every other
+    crisis alert — "none" (UNKNOWN / unmapped tester / resolver failure) means
+    nobody is alerted, per the isolation model, not a silent bug."""
+    routed_kind, targets = access_control.crisis_alert_targets(uid)
+    if routed_kind == "owner":
+        msg = (f"🚨🚨 P0 CRISIS UNDELIVERED — uid={uid} event={eid} kind={kind}\n"
+               f"Все уровни доставки кризисного сообщения упали. err={error}")
+        for admin_id in targets:
+            try:
+                await bot.send_message(admin_id, msg)
+            except Exception:
+                pass
+    elif routed_kind == "reviewer":
+        payload = _minimal_reviewer_payload(uid, eid, "crisis message delivery FAILED (P0)")
+        for reviewer_id in targets:
+            try:
+                await bot.send_message(reviewer_id, payload)
+            except Exception:
+                pass
 
 
 async def send_crisis(send, text, kb, lang, uid, eid, kind) -> str:
@@ -166,42 +275,101 @@ async def trigger_crisis(message: Message, uid: int, username: str,
     protective factors, admin alert). All of that runs afterwards inside a
     try/except so a single failing await (DB timeout/lock, a dead webhook, etc.)
     can never suppress the screen the person in crisis must see. This closes the
-    same *class* as the original P0 (detection ok, decision ok, delivery lost)."""
-    # Create the event first — its id is baked into the crisis screen buttons.
-    eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
-                                 user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
+    same *class* as the original P0 (detection ok, decision ok, delivery lost).
+
+    PR 1B-1 checkpoint-2 Priority 0: the event-creating write itself
+    (log_crisis_event) is now inside its own try/except. crisis_events.user_id
+    has no FOREIGN KEY constraint (verified against the schema — no PRAGMA
+    foreign_keys, no FK clause), so an unknown/never-upserted uid is not an FK
+    failure; but the GENERAL invariant is broader than that one cause — ANY
+    pre-delivery DB error (lock timeout, disk full, corruption) must not block
+    the screen either. On failure, eid stays None and the screen degrades to
+    PLAIN TEXT ONLY, no buttons at all — checkpoint-2 round 3, item 1A: a
+    degraded fallback still must not send ANY stateful "crisis:*" button,
+    because DB instability that broke log_crisis_event may still be broken
+    when the user taps a button a moment later (cb_crisis's own DB reads can
+    then raise — see cb_crisis's own try/except around that resolve, item 1B).
+    get_crisis_text already contains the hotline/plain emergency guidance in
+    the message body itself, so no button is needed to deliver the number."""
+    eid = None
+    try:
+        # Create the event first — its id is baked into the crisis screen buttons.
+        eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
+                                     user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
+    except Exception as e:
+        # Sanitized: no raw user_text/username in this log line.
+        print(f"[crisis] log_crisis_event FAILED: {type(e).__name__}: {e}")
+        eid = None
+
+    if eid is not None:
+        text, kb = crisis_screen(0, lang, eid)
+    else:
+        # Degraded delivery: no event row exists, so NO buttons are sent at
+        # all -- not even the eid-less "manual" crisis:safe/crisis:still pair.
+        # The hotline number is already in the plain text body.
+        text, kb = get_crisis_text(lang), None
     # DELIVER the crisis screen to the user before anything non-essential.
-    text, kb = crisis_screen(0, lang, eid)
     await send_crisis(message.answer, text, kb, lang, uid, eid, "screen")
+
+    if eid is None:
+        # No crisis_events row exists to attach bookkeeping/alerts to, and the
+        # DB is evidently degraded — every remaining step below either needs a
+        # real eid or is itself a DB write. Stop here; the screen is what
+        # mattered and it was delivered.
+        return
+
+    # PR 1B-1: role is resolved ONLY here, strictly AFTER delivery above. A broken
+    # resolver (or any exception) resolves to UNKNOWN (resolve_role_safe) and can
+    # therefore never affect whether the screen was sent — that already happened.
+    role = access_control.resolve_role_safe(uid)
 
     # Everything below is admin/research context — important, but it must NEVER
     # block or undo the delivered screen. Each block is isolated and logged.
     try:
         # Persist the crisis message's risk snapshot + force a profile refresh
         # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
-        await save_message(uid, "user", user_text, "crisis", lang,
-                           risk["score"], risk["categories"])
-        await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
+        # UNKNOWN (uninvited, not onboarded) does NOT get ordinary memory/profile
+        # building — only the deterministic crisis_events audit row above exists.
+        if role != access_control.UNKNOWN:
+            await save_message(uid, "user", user_text, "crisis", lang,
+                               risk["score"], risk["categories"])
+            await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
     except Exception as e:
         print(f"[crisis] post-screen persist failed uid={uid}: {e}")
     try:
-        # Epic A — protective factors: CONTEXT ONLY for the admin. Detected AFTER
-        # the screen is delivered; never alters risk or the user's message.
-        recent_for_pf = await get_recent_messages(uid, limit=10)
-        pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
-        protective = detect_protective_factors(pf_text)
-        if protective:
-            await set_crisis_protective_factors(eid, protective)
-        await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
-                         risk["categories"], user_text)
-        alert = admin_alert_text(uid, username, 0, risk, user_text, eid)
-        if protective:
-            alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                await bot.send_message(admin_id, alert)
-            except Exception:
-                pass
+        # PR 1B-1 checkpoint-2 item 1: single routing decision FIRST. Protective-
+        # factor detection is context ONLY for the owner's alert text — it must
+        # not be computed/persisted at all for a CLINICIAN_TESTER event (reviewer
+        # only ever gets _minimal_reviewer_payload, which never includes it), so
+        # gate strictly on kind == "owner" rather than merely role != UNKNOWN.
+        kind, targets = access_control.crisis_alert_targets(uid)
+        protective = None
+        if kind == "owner":
+            # Epic A — protective factors: CONTEXT ONLY for a human reviewer.
+            # Detected AFTER the screen is delivered; never alters risk or the
+            # user's message.
+            recent_for_pf = await get_recent_messages(uid, limit=10)
+            pf_text = user_text + " " + " ".join(c for _, c in recent_for_pf)
+            protective = detect_protective_factors(pf_text)
+            if protective:
+                await set_crisis_protective_factors(eid, protective)
+            await push_alert("Critical Risk", uid, username, risk["level"], risk["score"],
+                             risk["categories"], user_text)
+            alert = admin_alert_text(uid, username, 0, risk, user_text, eid)
+            if protective:
+                alert += "\n🛟 Возможные опоры: " + ", ".join(_PF_LABELS.get(p, p) for p in protective)
+            for admin_id in targets:
+                try:
+                    await bot.send_message(admin_id, alert)
+                except Exception:
+                    pass
+        elif kind == "reviewer":
+            payload = _minimal_reviewer_payload(uid, eid, "critical risk (RED)")
+            for reviewer_id in targets:
+                try:
+                    await bot.send_message(reviewer_id, payload)
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[crisis] post-screen alert failed uid={uid}: {e}")
 
@@ -256,24 +424,19 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     поэтому реальный пользователь передаётся явно (callback.from_user)."""
     u = tg_user or message.from_user
     uid, username, first_name = u.id, u.username or "", u.first_name or ""
-    
-    # 1. Detect language
+
+    # 1. Detect language (pure, no I/O — safe to run before any access check)
     lang = detect_language(user_text)
-    await upsert_user(uid, username, first_name, lang)
-    await reset_unanswered(uid)   # user re-engaged → clear ignored-push backoff
-    
-    # 2. Risk detection
+
+    # 2. Risk detection (pure, no I/O)
     risk = detect_risk(user_text, lang)
-    
-    # 3. Log if medium+
-    if risk["level"] in ("medium", "high", "critical"):
-        await log_moderation(uid, username, first_name, risk["level"], risk["score"],
-                              risk["categories"], user_text, "pending", risk["implicit"])
-    
+
     # 3.9 Active-crisis gate — while a recent crisis event is unresolved, the LLM
     # is OFF and we don't return to normal chat. Free text either keeps the crisis
     # screen (RED/ORANGE) or gently offers "Я в безопасности" (calm). The 24h
     # recency window in get_active_crisis bounds this so nobody is stuck forever.
+    # Crisis-adjacent like the RED branch below — runs regardless of role/access,
+    # structurally BEFORE the product-access gate.
     active = await get_active_crisis(uid)
     if active and not (tg_user is not None):
         event_id, stage, alang = active
@@ -289,20 +452,50 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 "I'm here. If you're safer now, tap below and we'll continue gently.",
                 reply_markup=safe_only_keyboard(event_id, lang))
         else:
-            await save_message(uid, "user", user_text, "crisis", lang,
-                               risk["score"], risk["categories"])
+            # PR 1B-1: same role-gated bookkeeping as trigger_crisis — an UNKNOWN
+            # (uninvited) uid does not get ordinary message/profile persistence.
+            if access_control.resolve_role_safe(uid) != access_control.UNKNOWN:
+                await save_message(uid, "user", user_text, "crisis", lang,
+                                   risk["score"], risk["categories"])
             text, kb = crisis_screen(stage, lang, event_id)
             await send_crisis(message.answer, text, kb, lang, uid, event_id, "screen")
         return
 
-    # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here)
-    if "aggression" in risk["categories"]:
-        await push_alert("Aggression Detected", uid, username, risk["level"],
-                         risk["score"], risk["categories"], user_text)
-
+    # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here).
+    # RED bypasses the product-access gate below entirely, for ANY role — the
+    # crisis path must never be gated by access control.
     if classify(risk) == RED:
         await trigger_crisis(message, uid, username, user_text, risk, lang)
         return
+
+    # 4.1 Product access gate — strictly AFTER both crisis paths above, and
+    # BEFORE any ordinary product persistence (upsert_user/log_moderation/state/
+    # profile/memory/LLM). UNKNOWN, CLINICIAN_REVIEWER, an unacknowledged
+    # CLINICIAN_TESTER, or an acknowledged tester with no reviewer mapping all
+    # get the closed-test/tester-acknowledgment screen instead, and NOTHING
+    # ordinary is written about them.
+    if not await ensure_full_access_or_closed_test(message, uid):
+        return
+
+    # 5. Ordinary persistence — only now that access is confirmed.
+    await upsert_user(uid, username, first_name, lang)
+    await reset_unanswered(uid)   # user re-engaged → clear ignored-push backoff
+
+    # 3. Log if medium+
+    if risk["level"] in ("medium", "high", "critical"):
+        await log_moderation(uid, username, first_name, risk["level"], risk["score"],
+                              risk["categories"], user_text, "pending", risk["implicit"])
+
+    # Aggression signal — checkpoint-2 item 2: routed through access_control
+    # instead of an unconditional push_alert. By construction we only reach here
+    # for a role that already has full product access (OWNER, or an
+    # acknowledged+mapped CLINICIAN_TESTER); should_alert_owner is False for a
+    # tester, so no owner alert and no raw-text leak happens for them. RED+
+    # aggression never reaches here (RED already returned above), so there is
+    # never a duplicate owner alert.
+    if "aggression" in risk["categories"] and access_control.should_alert_owner(uid):
+        await push_alert("Aggression Detected", uid, username, risk["level"],
+                         risk["score"], risk["categories"], user_text)
 
     # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
     # (current one not saved yet). Used to amplify ambiguity and bias routing.
@@ -470,13 +663,18 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         if await check_sudden_improvement(uid):
             if await log_review_flag(uid, "sudden_improvement",
                                      "Резкий переход от длительной безнадёжности к спокойствию."):
-                note = (f"🟦 На ревью: пользователь {uid} (@{username or '—'}) — резкий переход "
-                        f"от длительной безнадёжности к спокойствию. Стоит глянуть.")
-                for admin_id in ADMIN_USER_IDS:
-                    try:
-                        await bot.send_message(admin_id, note)
-                    except Exception:
-                        pass
+                # PR 1B-1: not a crisis event, so no reviewer variant here — this
+                # is a quiet human-review signal about the OWNER's own userbase.
+                # For CLINICIAN_TESTER/UNKNOWN it is simply suppressed, not
+                # rerouted (nothing analogous to crisis "clinical review" applies).
+                if access_control.should_alert_owner(uid):
+                    note = (f"🟦 На ревью: пользователь {uid} (@{username or '—'}) — резкий переход "
+                            f"от длительной безнадёжности к спокойствию. Стоит глянуть.")
+                    for admin_id in ADMIN_USER_IDS:
+                        try:
+                            await bot.send_message(admin_id, note)
+                        except Exception:
+                            pass
     except Exception as e:
         print(f"[review-flag] uid={uid}: {type(e).__name__}: {e}")
     
@@ -492,13 +690,23 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
 # ────────────────────────────────────────────────────────────────────────────
 
 async def _send_admin_crisis_alert(uid: int, username: str, stage: int, event_id) -> None:
-    risk = {"level": "critical", "score": "—", "categories": ["suicide"]}
-    alert = admin_alert_text(uid, username, stage, risk, "", event_id)
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            await bot.send_message(admin_id, alert)
-        except Exception:
-            pass
+    # PR 1B-1: routed like every other crisis alert (single decision point).
+    kind, targets = access_control.crisis_alert_targets(uid)
+    if kind == "owner":
+        risk = {"level": "critical", "score": "—", "categories": ["suicide"]}
+        alert = admin_alert_text(uid, username, stage, risk, "", event_id)
+        for admin_id in targets:
+            try:
+                await bot.send_message(admin_id, alert)
+            except Exception:
+                pass
+    elif kind == "reviewer":
+        payload = _minimal_reviewer_payload(uid, event_id, f"stage escalated to {stage}")
+        for reviewer_id in targets:
+            try:
+                await bot.send_message(reviewer_id, payload)
+            except Exception:
+                pass
 
 
 async def _show_stage(callback: CallbackQuery, stage: int, lang: str, event_id) -> None:
@@ -524,12 +732,25 @@ async def cb_crisis(callback: CallbackQuery):
     lang = await get_user_language(uid)
 
     # event_id from callback (new 3-part) or resolve the active event (old 2-part
-    # buttons from messages sent before this deploy → backward compatible).
+    # legacy buttons from messages sent before this deploy → backward compatible).
     event_id = None
     if len(parts) >= 3 and parts[2].isdigit():
         event_id = int(parts[2])
     if event_id is None:
-        active = await get_active_crisis(uid)
+        # checkpoint-2 round 3 item 1B: this DB-resolve is the ONLY part of
+        # cb_crisis wrapped here -- the staged (3-part) path below is left
+        # unwrapped so a real bug there still surfaces normally. A degraded-
+        # fallback screen (item 1A) sends no buttons at all, but pre-existing
+        # legacy 2-part callback_data ("crisis:safe"/"crisis:still") can still
+        # arrive from messages sent before this deploy, and the DB may still
+        # be unstable when the user taps it -- get_active_crisis must not be
+        # allowed to raise past this handler.
+        try:
+            active = await get_active_crisis(uid)
+        except Exception as e:
+            print(f"[crisis] cb_crisis legacy-resolve FAILED: {type(e).__name__}: {e}")
+            await callback.answer()
+            return
         event_id = active[0] if active else None
     if event_id is None:
         await callback.answer()
@@ -675,6 +896,8 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
 async def cmd_start(message: Message):
     from datetime import datetime, timezone
     uid = message.from_user.id
+    if not await ensure_full_access_or_closed_test(message, uid):
+        return
     overview = await get_memory_overview(uid)          # before upsert: 0 msgs == first time
     is_first = overview["message_count"] == 0
     await upsert_user(uid, message.from_user.username or "", message.from_user.first_name or "")
@@ -719,6 +942,8 @@ async def cb_mood(callback: CallbackQuery, state: FSMContext):
 async def cmd_profile(message: Message):
     """§5 — show the user the deterministic profile the bot has built (no diagnoses)."""
     uid = message.from_user.id
+    if not await ensure_full_access_or_closed_test(message, uid):
+        return
     lang = await get_user_language(uid)
     prof = await get_profile(uid)
     if not prof:
@@ -737,6 +962,8 @@ async def cmd_profile(message: Message):
 
 @dp.message(Command("profile_reset"))
 async def cmd_profile_reset(message: Message):
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     await delete_profile(message.from_user.id)
     await message.answer(
@@ -746,6 +973,8 @@ async def cmd_profile_reset(message: Message):
 
 @dp.callback_query(F.data == "profile:reset")
 async def cb_profile_reset(callback: CallbackQuery):
+    if not await ensure_full_access_or_closed_test(callback, callback.from_user.id):
+        return
     lang = await get_user_language(callback.from_user.id)
     await delete_profile(callback.from_user.id)
     try:
@@ -762,6 +991,8 @@ async def cb_profile_reset(callback: CallbackQuery):
 async def cmd_memory(message: Message):
     """GDPR §6.3 — show the user what the bot remembers about them."""
     uid = message.from_user.id
+    if not await ensure_full_access_or_closed_test(message, uid):
+        return
     lang = await get_user_language(uid)
     o = await get_memory_overview(uid)
     if lang == "en":
@@ -790,6 +1021,8 @@ async def cmd_memory(message: Message):
 @dp.message(Command("forget_all"))
 async def cmd_forget_all(message: Message):
     """GDPR right-to-erasure — ask for explicit confirmation first."""
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -809,6 +1042,8 @@ async def cmd_forget_all(message: Message):
 @dp.callback_query(F.data.startswith("forget:"))
 async def cb_forget(callback: CallbackQuery):
     uid = callback.from_user.id
+    if not await ensure_full_access_or_closed_test(callback, uid):
+        return
     lang = await get_user_language(uid)
     if callback.data.split(":")[1] == "yes":
         await forget_all(uid)
@@ -820,6 +1055,8 @@ async def cb_forget(callback: CallbackQuery):
 
 @dp.message(Command("mute"))
 async def cmd_mute(message: Message):
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     await set_mute(message.from_user.id, "forever")
     await message.answer("Пуши отключены. /unmute — включить обратно." if lang == "ru"
@@ -829,6 +1066,8 @@ async def cmd_mute(message: Message):
 @dp.message(Command("mute_today"))
 async def cmd_mute_today(message: Message):
     from datetime import datetime, timezone, timedelta
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     until = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0)
@@ -839,6 +1078,8 @@ async def cmd_mute_today(message: Message):
 @dp.message(Command("mute_week"))
 async def cmd_mute_week(message: Message):
     from datetime import datetime, timezone, timedelta
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     until = datetime.now(timezone.utc) + timedelta(days=7)
     await set_mute(message.from_user.id, "until", until.strftime("%Y-%m-%d %H:%M:%S"))
@@ -847,6 +1088,8 @@ async def cmd_mute_week(message: Message):
 
 @dp.message(Command("unmute"))
 async def cmd_unmute(message: Message):
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     await set_mute(message.from_user.id, "none")
     await message.answer("Пуши снова включены." if lang == "ru" else "Pushes back on.")
@@ -861,11 +1104,15 @@ async def cmd_help(message: Message):
 
 @dp.message(Command("checkin"))
 async def cmd_checkin(message: Message):
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     text = ("Выбери время check-in (UTC):" if lang == "ru" else "Choose check-in time (UTC):")
     await message.answer(text + "\n/checkin_8 • /checkin_10 • /checkin_12 • /checkin_18 • /checkin_20\n/checkin_off")
 
 async def _enable_ci(message: Message, hour: int):
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     await set_checkin(message.from_user.id, message.from_user.username or "",
                       message.from_user.first_name or "", True, hour, lang)
@@ -884,6 +1131,8 @@ async def ci_20(m: Message): await _enable_ci(m, 20)
 
 @dp.message(Command("checkin_off"))
 async def ci_off(message: Message):
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     await set_checkin(message.from_user.id, "", "", False, 10, "ru")
     lang = await get_user_language(message.from_user.id)
     await message.answer("Check-in отключён" if lang == "ru" else "Check-in disabled")
@@ -898,8 +1147,12 @@ async def cmd_emotion(message: Message, state: FSMContext, tg_user=None):
     uid = (tg_user or message.from_user).id
     lang = await get_user_language(uid)
     # §2: no journaling while a crisis is unresolved — show the crisis screen.
+    # This must run BEFORE the access gate: an active crisis is crisis-adjacent
+    # and must be re-shown regardless of role/access.
     decision, _ = await journal_guard(message, uid, lang)
     if decision == "crisis":
+        return
+    if not await ensure_full_access_or_closed_test(message, uid):
         return
     await state.clear()
     await state.set_state(EmotionJournal.active)
@@ -980,6 +1233,8 @@ async def cmd_cbt(message: Message, state: FSMContext, tg_user=None):
     decision, _ = await journal_guard(message, uid, lang)
     if decision == "crisis":
         return
+    if not await ensure_full_access_or_closed_test(message, uid):
+        return
     await state.clear()
     await state.set_state(CbtJournal.active)
     await state.update_data(cstep=0, cdata={})
@@ -1036,6 +1291,8 @@ async def cbt_step(message: Message, state: FSMContext):
 @dp.message(Command("report"))
 async def cmd_report(message: Message, state: FSMContext):
     uid = message.from_user.id
+    if not await ensure_full_access_or_closed_test(message, uid):
+        return
     lang = await get_user_language(uid)
     emo = await get_emotion_entries_since(uid, 7)
     chk = await get_checkin_logs_since(uid, 7)
@@ -1044,6 +1301,8 @@ async def cmd_report(message: Message, state: FSMContext):
 
 @dp.message(Command("journal"))
 async def cmd_journal(message: Message, state: FSMContext):
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Дневник эмоций", callback_data="jhub:emotion")],
@@ -1079,6 +1338,8 @@ async def cb_jhub(callback: CallbackQuery, state: FSMContext):
 @dp.message(Command("journal_settings"))
 async def cmd_journal_settings(message: Message, state: FSMContext):
     uid = message.from_user.id
+    if not await ensure_full_access_or_closed_test(message, uid):
+        return
     lang = await get_user_language(uid)
     s = await get_journal_settings(uid)
     m = "✅" if s["morning_enabled"] else "❌"
@@ -1099,6 +1360,8 @@ async def cmd_journal_settings(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("jset:"))
 async def cb_jset(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
+    if not await ensure_full_access_or_closed_test(callback, uid):
+        return
     what = callback.data.split(":")[1]
     if what in ("morning", "evening"):
         s = await get_journal_settings(uid)
@@ -1115,6 +1378,8 @@ async def cb_jset(callback: CallbackQuery, state: FSMContext):
 @dp.message(Command("time"))
 async def cmd_time(message: Message, state: FSMContext):
     """Discoverable entry to the SAME tz picker as /journal_settings → 🌍."""
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     lang = await get_user_language(message.from_user.id)
     await message.answer(
         "В каком часовом поясе ты сейчас? Это нужно, чтобы приветствия и "
@@ -1125,6 +1390,8 @@ async def cmd_time(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("jtz:"))
 async def cb_jtz(callback: CallbackQuery):
+    if not await ensure_full_access_or_closed_test(callback, callback.from_user.id):
+        return
     offset = int(callback.data.split(":")[1])
     await set_tz_offset(callback.from_user.id, offset)
     await callback.answer("Часовой пояс сохранён")
@@ -1133,6 +1400,8 @@ async def cb_jtz(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("checkin:"))
 async def cb_checkin(callback: CallbackQuery, state: FSMContext):
+    if not await ensure_full_access_or_closed_test(callback, callback.from_user.id):
+        return
     _, kind, value = callback.data.split(":", 2)
     await log_checkin(callback.from_user.id, kind, value)
     await callback.answer("Отметил")
@@ -1154,6 +1423,8 @@ async def cb_checkin(callback: CallbackQuery, state: FSMContext):
 @dp.message(Command("journal_export"))
 async def cmd_journal_export(message: Message, state: FSMContext):
     import json, io
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     data = await export_journals(message.from_user.id)
     if not any(data.values()):
         await message.answer("Журнальных записей пока нет.")
@@ -1167,6 +1438,8 @@ async def cmd_journal_export(message: Message, state: FSMContext):
 
 @dp.message(Command("journal_delete"))
 async def cmd_journal_delete(message: Message, state: FSMContext):
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
     await delete_journals(message.from_user.id)
     lang = await get_user_language(message.from_user.id)
     await message.answer("Готово. Все журнальные записи стёрты."
