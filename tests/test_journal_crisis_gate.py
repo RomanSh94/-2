@@ -90,6 +90,17 @@ def patch_common(monkeypatch):
 
 # ── delivery-first: crisis screen survives post-screen failures ───────────────
 def test_screen_first_survives_bookkeeping_failure(monkeypatch):
+    # PR 1B-1: trigger_crisis now skips save_message/maybe_update_profile for the
+    # UNKNOWN role (no ordinary memory/profile for an uninvited person). uid=42
+    # resolves as UNKNOWN under default access_control config, which would skip
+    # the very bookkeeping this test exercises. Pin it to OWNER so this
+    # pre-role-model test still verifies its original point (screen survives a
+    # bookkeeping failure) for a role where bookkeeping is expected to run at
+    # all -- role-gated bookkeeping itself is covered separately in
+    # tests/test_crisis_role_isolation.py.
+    import access_control
+    monkeypatch.setattr(access_control, "OWNER_USER_ID", 42)
+
     order = []
     monkeypatch.setattr(bot, "log_crisis_event", _async(7))
 
@@ -129,6 +140,14 @@ def test_screen_first_survives_bookkeeping_failure(monkeypatch):
 
 # ── uid fix: evening check-in button enters journal under the USER's id ───────
 def test_checkin_button_uses_real_user_id_not_bot(patch_common):
+    # PR 1B-1 checkpoint-2: cb_checkin now runs the product-access gate before
+    # entering the journal FSM. uid=42 would resolve as UNKNOWN and be blocked
+    # by the closed-test screen, which is not what this pre-role-model test is
+    # about (the uid-vs-bot-id fix) -- pin it to OWNER so it still reaches the
+    # code path it was written to exercise.
+    import access_control
+    patch_common.setattr(access_control, "OWNER_USER_ID", 42)
+
     seen = {}
 
     async def fake_active(uid):
@@ -153,6 +172,11 @@ def test_checkin_button_uses_real_user_id_not_bot(patch_common):
 def test_checkin_button_active_crisis_shows_screen_not_journal(patch_common):
     """The required case: evening button while a crisis is active → crisis
     screen, journal NOT entered, gate keyed on the real uid."""
+    # PR 1B-1 checkpoint-2: pin uid=42 to OWNER for the same reason as
+    # test_checkin_button_uses_real_user_id_not_bot above (product-access gate).
+    import access_control
+    patch_common.setattr(access_control, "OWNER_USER_ID", 42)
+
     seen = {}
 
     async def fake_active(uid):
@@ -187,6 +211,12 @@ def test_emotion_entry_blocked_by_active_crisis(patch_common):
 
 
 def test_emotion_entry_ok_when_no_crisis(patch_common):
+    # PR 1B-1 checkpoint-2: cmd_emotion now runs the product-access gate after
+    # journal_guard's active-crisis check. Pin uid=42 to OWNER for the same
+    # reason as the cb_checkin tests above.
+    import access_control
+    patch_common.setattr(access_control, "OWNER_USER_ID", 42)
+
     user = FakeUser(42)
     msg = FakeMessage(user)
     fsm = FakeFSM()

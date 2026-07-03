@@ -93,7 +93,15 @@ def test_log_influence_trace_all_or_nothing_across_rows(tmp_db):
     assert _rows_count(tmp_db) == 0
 
 
-def test_builder_with_real_binding_persists_rows(tmp_db):
+def test_builder_with_real_binding_persists_rows(tmp_db, monkeypatch):
+    # PR 1B-1: bypass the role gate here -- this test proves the trace wiring to
+    # the REAL DB binding, not role/mode policy (see tests/test_a1_role_gate.py).
+    import access_control
+
+    async def _always_allow(requester_uid):
+        return None
+    monkeypatch.setattr(access_control, "assert_a1_allowed", _always_allow)
+
     sent = []
 
     async def build():
@@ -107,7 +115,7 @@ def test_builder_with_real_binding_persists_rows(tmp_db):
 
     async def go():
         rid = await traced_response_builder(
-            user_id=7,
+            user_id=7, requester_uid=7,
             influences=[Influence("schema_theme", "theme_9", "reply drew on schema_theme theme_9")],
             build_response=build, send=send,
             persist_trace=persist_influence_trace, neutral_fallback=fb,

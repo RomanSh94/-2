@@ -203,12 +203,28 @@ def _real_influence():
                       "reply drew on pattern_hypothesis pattern_42")]
 
 
+# PR 1B-1: traced_response_builder now requires requester_uid and checks
+# access_control.assert_a1_allowed before anything else. These tests exercise the
+# TRACE mechanism (persist-before-send, content-ful check, fail-closed on persist
+# failure) -- role/mode policy has its own dedicated tests in
+# tests/test_a1_role_gate.py. Bypass the role gate here so these tests stay
+# decoupled from whatever role a bare uid=1 would resolve to in a given env.
+@pytest.fixture(autouse=True)
+def _bypass_role_gate_for_trace_mechanics(monkeypatch):
+    import access_control
+
+    async def _always_allow(requester_uid):
+        return None
+
+    monkeypatch.setattr(access_control, "assert_a1_allowed", _always_allow)
+
+
 def _run(influences, *, persist_raises=False):
     rec = _Recorder()
     persist, build, send, fb = rec.make(persist_raises=persist_raises)
     rid = asyncio.run(traced_response_builder(
-        user_id=1, influences=influences, build_response=build, send=send,
-        persist_trace=persist, neutral_fallback=fb))
+        user_id=1, requester_uid=1, influences=influences, build_response=build,
+        send=send, persist_trace=persist, neutral_fallback=fb))
     return rid, rec
 
 
@@ -236,8 +252,8 @@ def test_empty_influence_is_rejected_nothing_sent():
     persist, build, send, fb = rec.make()
     with pytest.raises(TraceIntegrityError):
         asyncio.run(traced_response_builder(
-            user_id=1, influences=[], build_response=build, send=send,
-            persist_trace=persist, neutral_fallback=fb))
+            user_id=1, requester_uid=1, influences=[], build_response=build,
+            send=send, persist_trace=persist, neutral_fallback=fb))
     assert rec.sent == [] and rec.order == []            # never even persisted
 
 
