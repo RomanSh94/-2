@@ -1262,9 +1262,18 @@ async def cmd_unmute(message: Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
+    """Static, role-unaware by design (PR 1B post-stabilization cleanup):
+    /privacy_export_all and /privacy_delete_all are real self-service rights
+    every caller has regardless of role, so they belong here. /review_pack is
+    deliberately NOT listed -- it's a reviewer/owner tool, not normal
+    self-service; safe to call (denial is generic) but unnecessary UX noise
+    for the ordinary-user audience this static string is written for.
+    Reviewers are briefed out-of-band. Role-aware /help can be revisited
+    later if that stops being sufficient."""
     lang = await get_user_language(message.from_user.id)
     await message.answer(
-        ("/start • /checkin • /time • /memory • /profile • /forget_all • /mute • /unmute • /help"),
+        ("/start • /checkin • /time • /memory • /profile • /forget_all • "
+         "/privacy_export_all • /privacy_delete_all • /mute • /unmute • /help"),
         reply_markup=ReplyKeyboardRemove())
 
 @dp.message(Command("checkin"))

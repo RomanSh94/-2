@@ -39,6 +39,43 @@ NEARA — это: AI-инструмент самонаблюдения; эмоц
 
 ---
 
+## 0.3. Normative Amendment — Access Roles & Deployment Modes (PR 1B-1)
+
+**Status: NORMATIVE.**
+
+**Role model.** Four roles: `OWNER`, `CLINICIAN_TESTER`, `CLINICIAN_REVIEWER`, `UNKNOWN`. Three deployment modes: `personal_use` (default), `controlled_clinical_test`, `public` (unsupported — always denies access; requires its own future governing PR before use).
+
+**Access invariant.** Ordinary product access is controlled by a single access gate (`access_control.has_full_access`). `CLINICIAN_REVIEWER` has **no ordinary product access, by design** — reviewer powers are a specific, narrow grant (review-pack requests for a mapped tester), never a form of product access, and must never be widened into one.
+
+**Crisis invariant.** Crisis detection, crisis response, and crisis-safety delivery are **never** gated by ordinary role or product access. A blocked, unknown, or unmapped user must still receive full crisis handling — this holds structurally (crisis paths run before any access check), not as a per-role exception.
+
+**Dashboard/reviewer isolation invariant.** Reviewer/clinical-review access is scoped to what a reviewer is explicitly mapped to; it must never silently broaden into ordinary product permissions or cross-tester visibility.
+
+**Live smoke status.** PR 1B-1 live smoke (real Telegram accounts, real process restart) remains **postponed by the owner** and is **not** claimed as passed.
+
+## 0.4. Normative Amendment — Scoped Data Access & Privacy Self-Service (PR 1B-2)
+
+**Status: NORMATIVE.**
+
+`scoped_access.py` is the requester/target guardrail for sensitive user-data access, orthogonal to `access_control.has_full_access`.
+
+**Closed purpose set:** `self_view`, `privacy_export`, `privacy_delete`, `review_pack`.
+
+- `self_view` / `privacy_export` / `privacy_delete` are **self-only**: `requester_uid == target_uid`, with **no role-based cross-user exception** — not for `OWNER`, not for a mapped `CLINICIAN_REVIEWER`.
+- `review_pack` is **not** normal self-service. Permission delegates **exactly** to `access_control.can_request_review_pack(requester_uid, target_uid)`; role logic for this purpose must never be duplicated inside `scoped_access.py` — one source of truth only.
+
+**Privacy commands** (`/privacy_export_all`, `/privacy_delete_all`, `/forget_all`) are self-service and **intentionally bypass** ordinary product access — a person's right to their own data doesn't depend on whether they currently have product access. They accept **no target-uid argument**. `/review_pack <target_uid>` is the **only** Telegram command that accepts a target uid.
+
+**Delete-all is registry-driven** via `privacy_registry.PRIVACY_REGISTRY` — no hardcoded table list. The old hand-written partial `database.forget_all` was deleted in PR 1B-2 and **must not be restored**. `crisis_events` and `crisis_message_delivery_log` remain `RETAIN` by policy — never silently deleted.
+
+**Destructive delete callbacks fail closed** unless the embedded uid is present, numeric, and matches `callback.from_user.id` — missing, malformed, or mismatched uid is a pure no-op, never a delete.
+
+`preview_delete_all_personal_data(uid)` exposes only per-table policy, row counts, and retention reasons — no raw message content or excerpts.
+
+PR 1B-2 does **not** claim PR 1B-1 live smoke passed.
+
+---
+
 ## 1. Главный архитектурный риск
 
 Самая опасная ошибка — скрытый «AI-психолог» через внутренние флаги.
