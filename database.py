@@ -332,6 +332,33 @@ CREATE TABLE IF NOT EXISTS psychology_profile_history (
 );
 CREATE INDEX IF NOT EXISTS idx_profile_history_user
     ON psychology_profile_history(user_id, created_at DESC);
+
+-- Questionnaire Core PR #1 — storage-only. No scores, no interpretation, no
+-- diagnosis anywhere in this table pair. current_index drives resume; status
+-- is the only state machine (active/completed/cancelled).
+CREATE TABLE IF NOT EXISTS questionnaire_sessions (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id               INTEGER NOT NULL,
+    questionnaire_id      TEXT NOT NULL,
+    questionnaire_version TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'active',  -- active | completed | cancelled
+    current_index         INTEGER NOT NULL DEFAULT 0,
+    started_at            TEXT DEFAULT (datetime('now')),
+    completed_at          TEXT
+);
+
+-- answer_id/answer_value are stable tokens from the definition (e.g. an
+-- option id and its scale value) -- NEVER the item/option display text.
+CREATE TABLE IF NOT EXISTS questionnaire_responses (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id          INTEGER NOT NULL,
+    session_id       INTEGER NOT NULL,
+    questionnaire_id TEXT NOT NULL,
+    item_id          TEXT NOT NULL,
+    answer_id        TEXT NOT NULL,
+    answer_value     TEXT,
+    answered_at      TEXT DEFAULT (datetime('now'))
+);
 """
 
 # Additive column migrations (no migration system in this repo; ADD COLUMN is
@@ -1384,6 +1411,77 @@ async def preview_delete_all_personal_data(uid: int) -> dict:
                 "retain_reason": entry.reason if entry.delete_policy == "RETAIN" else None,
             }
     return preview
+
+# ── Questionnaire Core PR #1 — storage-only session/response CRUD ────────────
+
+async def start_questionnaire_session(uid: int, questionnaire_id: str, version: str) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "INSERT INTO questionnaire_sessions "
+            "(user_id, questionnaire_id, questionnaire_version, status, current_index) "
+            "VALUES (?,?,?, 'active', 0)", (uid, questionnaire_id, version))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_active_questionnaire_session(uid: int) -> dict | None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id, questionnaire_id, questionnaire_version, current_index "
+            "FROM questionnaire_sessions WHERE user_id=? AND status='active' "
+            "ORDER BY id DESC LIMIT 1", (uid,))
+        row = await cur.fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "questionnaire_id": row[1],
+            "questionnaire_version": row[2], "current_index": row[3]}
+
+
+async def get_questionnaire_session(session_id: int) -> dict | None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id, user_id, questionnaire_id, questionnaire_version, status, current_index "
+            "FROM questionnaire_sessions WHERE id=?", (session_id,))
+        row = await cur.fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "user_id": row[1], "questionnaire_id": row[2],
+            "questionnaire_version": row[3], "status": row[4], "current_index": row[5]}
+
+
+async def record_questionnaire_response(uid: int, session_id: int, questionnaire_id: str,
+                                        item_id: str, answer_id: str, answer_value: str) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO questionnaire_responses "
+            "(user_id, session_id, questionnaire_id, item_id, answer_id, answer_value) "
+            "VALUES (?,?,?,?,?,?)",
+            (uid, session_id, questionnaire_id, item_id, answer_id, answer_value))
+        await db.commit()
+
+
+async def advance_questionnaire_session(session_id: int, new_index: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE questionnaire_sessions SET current_index=? WHERE id=?",
+            (new_index, session_id))
+        await db.commit()
+
+
+async def complete_questionnaire_session(session_id: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE questionnaire_sessions SET status='completed', completed_at=datetime('now') "
+            "WHERE id=?", (session_id,))
+        await db.commit()
+
+
+async def cancel_questionnaire_session(session_id: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE questionnaire_sessions SET status='cancelled', completed_at=datetime('now') "
+            "WHERE id=?", (session_id,))
+        await db.commit()
 
 # ── Sync helpers (Flask) ──────────────────────────────────────────────────────
 

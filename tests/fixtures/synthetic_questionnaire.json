@@ -1,0 +1,34 @@
+{
+  "id": "synthetic_demo_v1",
+  "title": "Demo self-check (synthetic, non-clinical)",
+  "version": "1",
+  "lang": "ru",
+  "description": "Пример структуры опросника для тестов. Не клинический инструмент.",
+  "contains_risk_items": false,
+  "items": [
+    {
+      "id": "energy",
+      "text": "Как ты оценишь свою энергию сегодня?",
+      "risk_flag": false,
+      "options": [
+        {"id": "low", "label": "Низкая", "value": "1", "risk_flag": false},
+        {"id": "mid", "label": "Средняя", "value": "2", "risk_flag": false},
+        {"id": "high", "label": "Высокая", "value": "3", "risk_flag": false}
+      ]
+    },
+    {
+      "id": "focus",
+      "text": "Насколько легко было сосредоточиться сегодня?",
+      "risk_flag": false,
+      "options": [
+        {"id": "hard", "label": "Тяжело", "value": "1", "risk_flag": false},
+        {"id": "ok", "label": "Нормально", "value": "2", "risk_flag": false},
+        {"id": "easy", "label": "Легко", "value": "3", "risk_flag": false}
+      ]
+    }
+  ],
+  "completion_message": {
+    "ru": "Опрос завершён. (Это текст из ПРИВАТНОГО определения — не должен использоваться напрямую.)",
+    "en": "Questionnaire finished. (This text comes from the PRIVATE definition -- must not be used directly.)"
+  }
+}

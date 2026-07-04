@@ -88,7 +88,12 @@ from database import (
     export_journals, delete_journals,
     log_crisis_delivery,
     get_tester_acknowledged, set_tester_acknowledged,
+    start_questionnaire_session, get_active_questionnaire_session,
+    get_questionnaire_session, record_questionnaire_response,
+    advance_questionnaire_session, complete_questionnaire_session,
+    cancel_questionnaire_session,
 )
+import questionnaires
 
 class InterventionStates(StatesGroup):
     awaiting_after   = State()
@@ -1618,6 +1623,201 @@ async def cmd_journal_delete(message: Message, state: FSMContext):
     lang = await get_user_language(message.from_user.id)
     await message.answer("Готово. Все журнальные записи стёрты."
                          if lang == "ru" else "Done. All journal entries erased.")
+
+
+# ── Questionnaire Core PR #1 — storage-only, non-diagnostic self-report ────────
+# Deliberately NOT in /help (infrastructure-first, not a discoverability
+# feature yet). NOT self-service like the privacy commands -- this is an
+# ordinary product feature, gated the same way as /emotion, /cbt: the active-
+# crisis check (journal_guard, text=None) runs BEFORE the product-access gate,
+# exactly like cmd_emotion, so a crisis is never blocked by access status.
+# Callback format is deliberately short ("q:a:<session_id>:<answer_id>" /
+# "q:c:<session_id>") to stay comfortably under Telegram's 64-byte
+# callback_data limit -- the current item is looked up from the session's
+# current_index in the DB, never encoded in the callback itself.
+
+def _questionnaire_consent_text(lang: str) -> str:
+    if lang == "ru":
+        return ("Это структурированный самоопрос — не диагноз и не замена специалиста. "
+                "Можно остановиться в любой момент. Ответы сохраняются: их можно "
+                "экспортировать через /privacy_export_all и удалить через /privacy_delete_all.")
+    return ("This is a structured self-check — not a diagnosis and not a substitute "
+            "for a professional. You can stop anytime. Answers are saved: you can "
+            "export them with /privacy_export_all and delete them with /privacy_delete_all.")
+
+
+def _questionnaire_not_configured_text(lang: str) -> str:
+    # Deliberately identical for BOTH "not_configured" and "invalid" loader
+    # outcomes -- malformed JSON / multiple private files / a risk-bearing
+    # definition being rejected / a plain missing directory must never be
+    # distinguishable to the Telegram user; those are internal/test facts only.
+    return "Опросники пока не настроены." if lang == "ru" else "Questionnaires are not configured yet."
+
+
+def _questionnaire_completion_text(lang: str) -> str:
+    # Fixed generic text -- deliberately NOT the private definition's own
+    # completion_message, which has not been validated against the forbidden
+    # diagnosis/dependency wording list. Using it unvalidated here would be
+    # exactly the kind of interpretation-adjacent claim this PR must not make.
+    if lang == "ru":
+        return "Спасибо, ответы сохранены. Это не диагноз — просто структурированная самооценка."
+    return "Thanks, your answers are saved. This is not a diagnosis — just structured self-reflection."
+
+
+def _questionnaire_cancelled_text(lang: str) -> str:
+    return "Опрос отменён." if lang == "ru" else "Questionnaire cancelled."
+
+
+def _questionnaire_item_keyboard(session_id: int, item: dict, lang: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=opt["label"], callback_data=f"q:a:{session_id}:{opt['id']}")]
+            for opt in item["options"]]
+    rows.append([InlineKeyboardButton(
+        text=("Отмена" if lang == "ru" else "Cancel"), callback_data=f"q:c:{session_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_questionnaire_step(send, session_id: int, index: int, definition: dict, lang: str) -> None:
+    """Send the item at `index`, or complete the session if none remains.
+    `send` is message.answer / callback.message.answer, matching the existing
+    project convention (see send_crisis's `send` parameter)."""
+    item = questionnaires.get_item(definition, index)
+    if item is None:
+        await complete_questionnaire_session(session_id)
+        await send(_questionnaire_completion_text(lang))
+        return
+    await send(item["text"], reply_markup=_questionnaire_item_keyboard(session_id, item, lang))
+
+
+@dp.message(Command("questionnaire"))
+async def cmd_questionnaire(message: Message):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    # Active-crisis check BEFORE the product gate -- same order as cmd_emotion.
+    decision, _ = await journal_guard(message, uid, lang)
+    if decision == "crisis":
+        return
+    if not await ensure_full_access_or_closed_test(message, uid):
+        return
+
+    definition, error = questionnaires.get_validated_definition()
+    if error is not None:
+        await message.answer(_questionnaire_not_configured_text(lang))
+        return
+
+    active = await get_active_questionnaire_session(uid)
+    if active:
+        # Resume ONLY if the current definition still matches the session's
+        # recorded id/version exactly -- any mismatch (private file changed,
+        # removed, or replaced since the session started) fails closed rather
+        # than silently resuming against a different definition, and never
+        # creates a second active session.
+        if (active["questionnaire_id"] != definition["id"]
+                or active["questionnaire_version"] != definition["version"]):
+            await message.answer(_questionnaire_not_configured_text(lang))
+            return
+        await _send_questionnaire_step(
+            message.answer, active["id"], active["current_index"], definition, lang)
+        return
+
+    await message.answer(_questionnaire_consent_text(lang))
+    session_id = await start_questionnaire_session(uid, definition["id"], definition["version"])
+    await _send_questionnaire_step(message.answer, session_id, 0, definition, lang)
+
+
+@dp.callback_query(F.data.startswith("q:a:"))
+async def cb_questionnaire_answer(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    # Active-crisis gate FIRST -- before format/session/definition checks,
+    # before storing anything, before advancing the session. An answer
+    # callback is a STEP of an in-progress flow, same class as
+    # emotion_step/cbt_step; the project invariant is that an active crisis
+    # blocks the step before any ordinary behavior continues, so this must
+    # run here too, not only at /questionnaire's own start.
+    decision, _ = await journal_guard(callback.message, uid, lang)
+    if decision == "crisis":
+        await callback.answer()
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 4 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id, answer_id = int(parts[2]), parts[3]
+
+    session = await get_questionnaire_session(session_id)
+    if not session or session["user_id"] != uid or session["status"] != "active":
+        # Wrong user / unknown / non-active session: silent no-op. Showing
+        # ANY message here (even the generic one) would confirm to an
+        # attacker that a session with this id exists at all.
+        await callback.answer()
+        return
+
+    definition, error = questionnaires.get_validated_definition()
+    if error is not None:
+        # Same-user, own session, but the private definition itself is now
+        # missing/invalid -- an internal configuration problem, not a tamper
+        # attempt. Show the SAME neutral text as /questionnaire's own
+        # not-configured path; never mention malformed JSON, multiple
+        # private files, or risk-bearing rejection to the user.
+        await callback.message.answer(_questionnaire_not_configured_text(lang))
+        await callback.answer()
+        return
+    if (definition["id"] != session["questionnaire_id"]
+            or definition["version"] != session["questionnaire_version"]):
+        await callback.message.answer(_questionnaire_not_configured_text(lang))
+        await callback.answer()
+        return
+
+    item = questionnaires.get_item(definition, session["current_index"])
+    if item is None:
+        # The private definition changed underneath an in-progress session
+        # (fewer items than before) -- same neutral text, not a stack trace
+        # or a "definition mismatch" explanation.
+        await callback.message.answer(_questionnaire_not_configured_text(lang))
+        await callback.answer()
+        return
+    option = questionnaires.find_option(item, answer_id)
+    if option is None:
+        # answer_id doesn't belong to the current item: malformed/tampered
+        # callback_data, same silent-no-op class as the wrong-user case.
+        await callback.answer()
+        return
+
+    await record_questionnaire_response(
+        uid, session_id, definition["id"], item["id"], option["id"], option["value"])
+    next_index = session["current_index"] + 1
+    await advance_questionnaire_session(session_id, next_index)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _send_questionnaire_step(callback.message.answer, session_id, next_index, definition, lang)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:c:"))
+async def cb_questionnaire_cancel(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+
+    session = await get_questionnaire_session(session_id)
+    if not session or session["user_id"] != uid or session["status"] != "active":
+        await callback.answer()
+        return
+
+    await cancel_questionnaire_session(session_id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(_questionnaire_cancelled_text(lang))
+    await callback.answer()
 
 
 @dp.message(F.voice)
