@@ -9,6 +9,7 @@ import pytest
 
 import database
 import review_pack
+import access_control as ac
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -20,10 +21,21 @@ def tmp_db(tmp_path, monkeypatch):
     return database
 
 
+@pytest.fixture(autouse=True)
+def _allow_self_request(monkeypatch):
+    # PR 1B-2: generate_review_pack now enforces access_control.
+    # can_request_review_pack(requester_uid, target_uid). These pre-existing
+    # PR 1A tests exercise the SHELL/DATA mechanics, not the permission
+    # contract (that has its own dedicated tests in test_review_pack_permission.py)
+    # -- pin uid 42 as OWNER requesting their own pack so they keep validating
+    # what they were written to validate.
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 42)
+
+
 def test_generate_review_pack_shell_structure(tmp_db):
     async def go():
         await tmp_db.upsert_user(42, "alice", "Alice", "ru")
-        return await review_pack.generate_review_pack(42)
+        return await review_pack.generate_review_pack(42, requester_uid=42)
     pack = asyncio.run(go())
     expected_keys = {
         "generated_at", "user_id", "user_message", "bot_response", "active_mode",
@@ -47,7 +59,7 @@ def test_generate_review_pack_wires_real_influence_trace(tmp_db):
         await tmp_db.log_influence_trace("rid-1", 42, [
             ("mode", "m1", "reply drew on mode m1"),
         ])
-        return await review_pack.generate_review_pack(42)
+        return await review_pack.generate_review_pack(42, requester_uid=42)
     pack = asyncio.run(go())
     assert len(pack["influence_trace"]) == 1
     assert pack["influence_trace"][0]["source_id"] == "m1"
@@ -58,7 +70,7 @@ def test_save_and_delete_review_pack_roundtrip(tmp_db, tmp_path, monkeypatch):
 
     async def go():
         await tmp_db.upsert_user(42, "alice", "Alice", "ru")
-        return await review_pack.generate_review_pack(42)
+        return await review_pack.generate_review_pack(42, requester_uid=42)
     pack = asyncio.run(go())
 
     path = review_pack.save_review_pack(pack, 42)
