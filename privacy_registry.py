@@ -24,6 +24,8 @@ CATEGORIES = {
     "CONSENT",  # PR 1B-1: added explicitly for tester_acknowledgments — consent/
                # test-state, not a safety-audit record, so it takes CASCADE_DELETE
                # (not RETAIN) unlike CRISIS_SAFETY.
+    "QUESTIONNAIRE",  # Questionnaire Core PR #1: self-report sessions/responses.
+                     # Storage-only data, not a safety-audit record -> CASCADE_DELETE.
 }
 
 
@@ -250,6 +252,21 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
                          "NOT get the CRISIS_SAFETY RETAIN treatment.",
         log_policy="Never log payload — acknowledgment timestamp only, but keep out "
                   "of logs/alerts by default like everything else here."),
+
+    # Questionnaire Core PR #1 — storage-only, no scores/interpretation anywhere.
+    "questionnaire_sessions": _e(
+        table="questionnaire_sessions", user_id_column="user_id", category="QUESTIONNAIRE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="Session metadata only (status/index/timestamps) — no raw "
+                  "item/answer text ever stored here."),
+
+    "questionnaire_responses": _e(
+        table="questionnaire_responses", user_id_column="user_id", category="QUESTIONNAIRE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="answer_id/answer_value are stable definition tokens, never the "
+                  "original item/option display text — never in logs/alerts regardless."),
 }
 
 
