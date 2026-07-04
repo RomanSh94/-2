@@ -784,20 +784,6 @@ async def get_memory_overview(uid: int) -> dict:
     }
 
 
-async def forget_all(uid: int) -> None:
-    """GDPR right-to-erasure: wipe conversational memory for a user.
-
-    Deletes messages, summaries, rolling state and the learned profile.
-    crisis_events are intentionally kept (safety/duty-of-care record), not
-    conversational content."""
-    async with aiosqlite.connect(DB) as db:
-        for table in ("messages", "summaries", "user_states", "user_profiles",
-                      "emotion_journal_entries", "cbt_journal_entries",
-                      "checkin_logs", "journal_settings"):
-            await db.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
-        await db.commit()
-
-
 # ── Crisis Events (Epic 1) ────────────────────────────────────────────────────
 
 async def log_crisis_event(uid: int, level: str, risk_score: int,
@@ -1373,6 +1359,31 @@ async def delete_all_personal_data(uid: int) -> dict:
             summary[name] = cur.rowcount
         await db.commit()
     return summary
+
+
+async def preview_delete_all_personal_data(uid: int) -> dict:
+    """PR 1B-2 — real, registry-driven preview of what delete_all_personal_data
+    WOULD do, without deleting anything. No hardcoded table list: every table
+    in PRIVACY_REGISTRY is covered because this loops the same registry
+    delete_all_personal_data does.
+
+    Returns {table: {"policy": ..., "row_count": ..., "retain_reason": ...}}.
+    `retain_reason` is only present (non-None) for RETAIN tables. `row_count`
+    is a plain COUNT(*) for this uid -- no raw rows, no message content, no
+    excerpts of any kind are read or returned."""
+    import privacy_registry as pr
+    preview: dict = {}
+    async with aiosqlite.connect(DB) as db:
+        for name, entry in pr.PRIVACY_REGISTRY.items():
+            cur = await db.execute(
+                f"SELECT COUNT(*) FROM {name} WHERE {entry.user_id_column}=?", (uid,))
+            (row_count,) = await cur.fetchone()
+            preview[name] = {
+                "policy": entry.delete_policy,
+                "row_count": row_count,
+                "retain_reason": entry.reason if entry.delete_policy == "RETAIN" else None,
+            }
+    return preview
 
 # ── Sync helpers (Flask) ──────────────────────────────────────────────────────
 

@@ -28,6 +28,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from openai import AsyncOpenAI
 
 import access_control
+import scoped_access
+import review_pack
 from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION
 from prompts import get_system_prompt, get_crisis_text, get_onboarding
 from crisis_protocol import (
@@ -74,7 +76,8 @@ from database import (
     set_checkin, get_checkin_users, update_last_checkin,
     log_crisis_event, set_crisis_response, set_crisis_protective_factors,
     get_active_crisis, bump_crisis_stage, resolve_crisis, set_stage3_at, get_crisis_stage,
-    get_memory_overview, forget_all,
+    get_memory_overview,
+    export_all_personal_data, delete_all_personal_data, preview_delete_all_personal_data,
     set_mute, reset_unanswered,
     get_recent_messages, log_disambiguation,
     get_user_message_count, get_profile, delete_profile,
@@ -1018,40 +1021,202 @@ async def cmd_memory(message: Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
-@dp.message(Command("forget_all"))
-async def cmd_forget_all(message: Message):
-    """GDPR right-to-erasure — ask for explicit confirmation first."""
-    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
-        return
-    lang = await get_user_language(message.from_user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
+# ── PR 1B-2: privacy self-service (registry-driven, NOT product-gated) ────────
+# /forget_all, /privacy_export_all, /privacy_delete_all all implement the
+# user's own privacy rights and therefore must work even when ordinary product
+# access is blocked (UNKNOWN, unmapped/unacknowledged tester, etc.) -- none of
+# them call ensure_full_access_or_closed_test / has_full_access. Permission is
+# scoped_access (requester_uid == target_uid, always true here since none of
+# these commands accept a target argument) -- called explicitly anyway for a
+# single, auditable enforcement point rather than "trusting" that every
+# handler derived uid correctly.
+
+def _privacy_retained_tables() -> list[str]:
+    import privacy_registry as pr
+    return sorted(t for t, e in pr.PRIVACY_REGISTRY.items() if e.delete_policy == "RETAIN")
+
+
+async def _privacy_delete_preview_text(uid: int, lang: str) -> str:
+    """PR 1B-2 round 2, blocker 3: built from the REAL, registry-driven
+    preview_delete_all_personal_data(uid) -- actual row counts for THIS uid,
+    not a static category list. No raw content, only counts/policy/reason."""
+    preview = await preview_delete_all_personal_data(uid)
+    to_delete = sum(v["row_count"] for v in preview.values() if v["policy"] != "RETAIN")
+    retained = [(t, v["row_count"]) for t, v in preview.items() if v["policy"] == "RETAIN"]
+    retained_names = ", ".join(t for t, _ in retained)
+    retained_rows = sum(n for _, n in retained)
+    if lang == "ru":
+        lines = [
+            f"Будет удалено/анонимизировано записей: {to_delete} "
+            "(переписка, профиль, дневники, журнал влияния и др.)."]
+        if retained_rows:
+            lines.append(
+                f"\nЗаписи безопасности ({retained_names}): {retained_rows} шт. "
+                "СОХРАНЯЮТСЯ — это требование политики безопасности/аудита "
+                "кризисных событий, а не сбой удаления.")
+        lines.append("\nПродолжить?")
+        return "\n".join(lines)
+    lines = [
+        f"Rows to be deleted/anonymized: {to_delete} "
+        "(messages, profile, journals, influence trace, etc.)."]
+    if retained_rows:
+        lines.append(
+            f"\nSafety-audit records ({retained_names}): {retained_rows} row(s) are "
+            "RETAINED by policy — that's not a deletion failure.")
+    lines.append("\nContinue?")
+    return "\n".join(lines)
+
+
+def _privacy_delete_done_text(lang: str) -> str:
+    retained = ", ".join(_privacy_retained_tables())
+    if lang == "ru":
+        return (
+            "Готово. Личные данные удалены согласно политике конфиденциальности.\n"
+            f"Записи безопасности ({retained}) сохранены — это требование политики "
+            "безопасности, а не сбой удаления.")
+    return (
+        "Done. Personal data deleted per the privacy policy.\n"
+        f"Safety-audit records ({retained}) are retained by policy — not a deletion "
+        "failure.")
+
+
+def _privacy_delete_kb(prefix: str, lang: str, uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text=("🗑 Да, стереть всё" if lang == "ru" else "🗑 Yes, erase everything"),
-            callback_data="forget:yes"),
+            callback_data=f"{prefix}:yes:{uid}"),
         InlineKeyboardButton(
             text=("Отмена" if lang == "ru" else "Cancel"),
-            callback_data="forget:no"),
+            callback_data=f"{prefix}:no:{uid}"),
     ]])
-    await message.answer(
-        ("Это удалит всю переписку, резюме и профиль безвозвратно. Продолжить?"
-         if lang == "ru"
-         else "This permanently deletes all your messages, summary and profile. Continue?"),
-        reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("forget:"))
-async def cb_forget(callback: CallbackQuery):
+async def _handle_privacy_delete_callback(callback: CallbackQuery) -> None:
+    """Shared confirm/execute logic for BOTH forget:* and privacy_delete:*
+    callback_data prefixes -- one underlying flow, two entry points (see
+    cmd_forget_all's docstring for why the prefix stays separate).
+
+    PR 1B-2 (round 2): this is a DESTRUCTIVE-DELETE confirmation, so it fails
+    CLOSED on any malformed callback_data -- unlike the crisis path's legacy
+    2-part callback (which only ever READS state), there is no backward-
+    compatible "no embedded uid" case here anymore. A callback missing the
+    uid segment, with a non-numeric uid segment, or with a uid that doesn't
+    match the presser, is treated identically: no delete, no cancel message,
+    pure no-op besides acknowledging the tap."""
+    parts = callback.data.split(":")
     uid = callback.from_user.id
-    if not await ensure_full_access_or_closed_test(callback, uid):
+    if len(parts) < 3 or not parts[2].isdigit() or int(parts[2]) != uid:
+        await callback.answer()
         return
+    action = parts[1]
     lang = await get_user_language(uid)
-    if callback.data.split(":")[1] == "yes":
-        await forget_all(uid)
-        msg = "Готово. Я всё стёр." if lang == "ru" else "Done. Everything is erased."
+    if action == "yes":
+        scoped_access.assert_can_read_user_data(uid, uid, "privacy_delete")
+        await delete_all_personal_data(uid)
+        msg = _privacy_delete_done_text(lang)
     else:
         msg = "Отменено." if lang == "ru" else "Cancelled."
     await callback.message.answer(msg)
     await callback.answer()
+
+
+@dp.message(Command("forget_all"))
+async def cmd_forget_all(message: Message):
+    """GDPR right-to-erasure. PR 1B-2: now a thin alias over the same
+    registry-driven flow as /privacy_delete_all (delete_all_personal_data) —
+    the old hand-written database.forget_all (an 8-table partial list) has
+    been removed entirely, not left as a parallel/deprecated path."""
+    uid = message.from_user.id
+    scoped_access.assert_can_read_user_data(uid, uid, "privacy_delete")
+    lang = await get_user_language(uid)
+    await message.answer(await _privacy_delete_preview_text(uid, lang),
+                         reply_markup=_privacy_delete_kb("forget", lang, uid))
+
+
+@dp.callback_query(F.data.startswith("forget:"))
+async def cb_forget(callback: CallbackQuery):
+    await _handle_privacy_delete_callback(callback)
+
+
+@dp.message(Command("privacy_export_all"))
+async def cmd_privacy_export_all(message: Message):
+    """PR 1B-2: self-service GDPR export. Not gated by ordinary product
+    access — a person's right to their own data doesn't depend on whether
+    they currently have product access. No target-uid argument exists; the
+    scoped_access call below is requester==target by construction, kept for a
+    single explicit/auditable enforcement point."""
+    import json, io
+    from aiogram.types import BufferedInputFile
+    uid = message.from_user.id
+    scoped_access.assert_can_read_user_data(uid, uid, "privacy_export")
+    lang = await get_user_language(uid)
+    data = await export_all_personal_data(uid)
+    if not any(data.values()):
+        await message.answer(
+            "Персональных данных пока нет." if lang == "ru" else "No personal data yet.")
+        return
+    retained = ", ".join(_privacy_retained_tables())
+    note = (
+        f"\n\nПримечание: записи безопасности ({retained}) включены в этот экспорт, "
+        "но сохраняются по политике безопасности и НЕ удаляются командой "
+        "/privacy_delete_all или /forget_all." if lang == "ru" else
+        f"\n\nNote: safety-audit records ({retained}) are included in this export but "
+        "are RETAINED by policy — they are NOT removed by /privacy_delete_all or "
+        "/forget_all.")
+    buf = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
+    await message.answer_document(
+        BufferedInputFile(buf.getvalue(), filename="x20_privacy_export.json"),
+        caption=("Полный экспорт твоих данных (JSON)." if lang == "ru" else
+                 "Full export of your data (JSON).") + note)
+
+
+@dp.message(Command("privacy_delete_all"))
+async def cmd_privacy_delete_all(message: Message):
+    """PR 1B-2: self-service GDPR delete, identical flow to /forget_all (see
+    _handle_privacy_delete_callback) under its own command name/prefix."""
+    uid = message.from_user.id
+    scoped_access.assert_can_read_user_data(uid, uid, "privacy_delete")
+    lang = await get_user_language(uid)
+    await message.answer(await _privacy_delete_preview_text(uid, lang),
+                         reply_markup=_privacy_delete_kb("privacy_delete", lang, uid))
+
+
+@dp.callback_query(F.data.startswith("privacy_delete:"))
+async def cb_privacy_delete(callback: CallbackQuery):
+    await _handle_privacy_delete_callback(callback)
+
+
+# ── PR 1B-2: reviewer/owner tool — NOT a product command, NOT privacy self-
+# service. Permission is EXACTLY access_control.can_request_review_pack, which
+# review_pack.generate_review_pack already enforces internally; this handler
+# adds no additional gate and must never call ensure_full_access_or_closed_test
+# (a CLINICIAN_REVIEWER has zero ordinary product access but must still be
+# able to use this for a mapped tester). Denial text is deliberately generic —
+# no raw data, no confirmation the target exists, no role/mapping detail.
+@dp.message(Command("review_pack"))
+async def cmd_review_pack(message: Message):
+    import json, io
+    from aiogram.types import BufferedInputFile
+    requester_uid = message.from_user.id
+    lang = await get_user_language(requester_uid)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+        await message.answer(
+            "Использование: /review_pack <user_id>" if lang == "ru" else
+            "Usage: /review_pack <user_id>")
+        return
+    target_uid = int(parts[1].strip())
+    try:
+        pack = await review_pack.generate_review_pack(target_uid, requester_uid=requester_uid)
+    except review_pack.ReviewPackNotAllowed:
+        await message.answer(
+            "Недостаточно прав для этого запроса." if lang == "ru" else
+            "Not authorized for this request.")
+        return
+    buf = io.BytesIO(json.dumps(pack, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
+    await message.answer_document(
+        BufferedInputFile(buf.getvalue(), filename=f"review_pack_{target_uid}.json"),
+        caption="Review pack")
 
 @dp.message(Command("mute"))
 async def cmd_mute(message: Message):

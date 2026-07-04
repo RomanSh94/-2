@@ -113,3 +113,62 @@ def test_delete_all_is_scoped_to_the_requesting_user_only(tmp_db):
     other = asyncio.run(go())
     assert len(other["messages"]) == 1                      # user 43 untouched
     assert len(other["crisis_events"]) == 1
+
+
+# ── PR 1B-2 round 2, blocker 3: preview_delete_all_personal_data ────────────────
+def test_preview_covers_every_registered_table(tmp_db):
+    async def go():
+        await _seed(tmp_db)
+        return await tmp_db.preview_delete_all_personal_data(42)
+    preview = asyncio.run(go())
+    assert set(preview.keys()) == set(pr.PRIVACY_REGISTRY.keys())
+
+
+def test_preview_returns_real_row_counts(tmp_db):
+    async def go():
+        await _seed(tmp_db)
+        return await tmp_db.preview_delete_all_personal_data(42)
+    preview = asyncio.run(go())
+    assert preview["messages"]["row_count"] == 1
+    assert preview["emotion_journal_entries"]["row_count"] == 1
+    assert preview["influence_trace"]["row_count"] == 1
+    assert preview["crisis_events"]["row_count"] == 1
+    # a table with no rows for this uid reports 0, not missing/None
+    assert preview["adverse_events"]["row_count"] == 0
+
+
+def test_preview_marks_policy_and_retain_reason(tmp_db):
+    async def go():
+        await _seed(tmp_db)
+        return await tmp_db.preview_delete_all_personal_data(42)
+    preview = asyncio.run(go())
+    assert preview["messages"]["policy"] == "CASCADE_DELETE"
+    assert preview["messages"]["retain_reason"] is None
+    assert preview["users"]["policy"] == "ANONYMIZE"
+    assert preview["crisis_events"]["policy"] == "RETAIN"
+    assert preview["crisis_events"]["retain_reason"]   # non-empty reason string
+    assert "audit" in preview["crisis_events"]["retain_reason"].lower() or \
+        "safety" in preview["crisis_events"]["retain_reason"].lower()
+
+
+def test_preview_contains_no_raw_content(tmp_db):
+    async def go():
+        await _seed(tmp_db)
+        return await tmp_db.preview_delete_all_personal_data(42)
+    preview = asyncio.run(go())
+    serialized = repr(preview)
+    assert "hello" not in serialized          # the message content seeded above
+    assert "excerpt" not in serialized        # the crisis message_excerpt seeded above
+    # every value is exactly {policy, row_count, retain_reason} -- no other keys
+    for entry in preview.values():
+        assert set(entry.keys()) == {"policy", "row_count", "retain_reason"}
+
+
+def test_preview_does_not_delete_anything(tmp_db):
+    async def go():
+        await _seed(tmp_db)
+        await tmp_db.preview_delete_all_personal_data(42)
+        return await tmp_db.export_all_personal_data(42)
+    remaining = asyncio.run(go())
+    assert len(remaining["messages"]) == 1
+    assert len(remaining["crisis_events"]) == 1

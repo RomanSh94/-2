@@ -154,11 +154,17 @@ def test_save_and_ack_are_not_robotic():
 
 # ── GDPR ──────────────────────────────────────────────────────────────────────
 def test_forget_all_wipes_journals(tmp_db):
+    # PR 1B-2: database.forget_all (an 8-table hand-written partial) was
+    # deleted -- /forget_all is now a thin alias over the registry-driven
+    # delete_all_personal_data, which cascade-deletes both journal tables
+    # (CASCADE_DELETE policy) alongside everything else. This test still
+    # proves the same thing it always did: erasing a user's data wipes their
+    # journals too.
     async def go():
         await tmp_db.upsert_user(5, "u", "U")
         await tmp_db.save_emotion_entry(5, {"event": "x", "feeling": "грусть", "intensity": 3})
         await tmp_db.save_cbt_entry(5, {"situation": "y", "emotion": "тревога"})
-        await tmp_db.forget_all(5)
+        await tmp_db.delete_all_personal_data(5)
         return await tmp_db.export_journals(5)
     data = asyncio.run(go())
     assert data["emotion_journal_entries"] == []
