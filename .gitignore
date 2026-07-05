@@ -33,3 +33,9 @@ private_questionnaires/
 # On-demand psychologist_review_pack exports (owner-requested only) — sensitive
 # aggregate artifact, own retention/delete, never in git.
 private_review_packs/
+
+# Local-only handoff/status docs — structural protection (default-deny, not
+# just "never git add -A" discipline) against accidental commit.
+BOT_OVERVIEW.md
+CODEX_HANDOFF.md
+PROJECT_STATUS.md
