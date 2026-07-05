@@ -94,6 +94,8 @@ from database import (
     cancel_questionnaire_session,
 )
 import questionnaires
+import navigation
+import emotion_map
 
 class InterventionStates(StatesGroup):
     awaiting_after   = State()
@@ -919,10 +921,14 @@ async def cmd_start(message: Message):
         text = pick_greeting(False, local_hour, lang)
     # Inline-кнопки вместо reply-клавиатуры: iOS прячет reply-клавиатуру за
     # иконкой у поля ввода, и пользователи её не видят. Inline видна везде.
+    # Onboarding asks "как ты себя чувствуешь" -- Emotion Map helper row added
+    # (deterministic vocabulary aid, not a new gate/flow; opening it never
+    # stores anything, see cb_emotion_map).
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=b, callback_data=f"mood:{i}")]
         for i, b in enumerate(buttons)
-    ])
+    ] + [[InlineKeyboardButton(
+        text=("🗺 Карта эмоций" if lang == "ru" else "🗺 Emotion map"), callback_data="emotion:map")]])
     await message.answer(text + "\n\n⚠️ " + ("Я не терапевт." if lang == "ru" else "I'm not a therapist."),
                          reply_markup=kb)
 
@@ -1274,10 +1280,14 @@ async def cmd_help(message: Message):
     self-service; safe to call (denial is generic) but unnecessary UX noise
     for the ordinary-user audience this static string is written for.
     Reviewers are briefed out-of-band. Role-aware /help can be revisited
-    later if that stops being sufficient."""
+    later if that stops being sufficient.
+
+    /menu IS listed (unlike /questionnaire, which stays hidden because it has
+    no configured content yet) -- /menu is the discoverable navigation hub
+    and hiding it would defeat its purpose."""
     lang = await get_user_language(message.from_user.id)
     await message.answer(
-        ("/start • /checkin • /time • /memory • /profile • /forget_all • "
+        ("/start • /menu • /checkin • /time • /memory • /profile • /forget_all • "
          "/privacy_export_all • /privacy_delete_all • /mute • /unmute • /help"),
         reply_markup=ReplyKeyboardRemove())
 
@@ -1399,7 +1409,11 @@ async def emotion_step(message: Message, state: FSMContext):
         return
 
     await state.update_data(jstep=nxt, jdata=jdata, orange=orange, nudged=nudged)
-    await message.answer(prefix + journals.emotion_prompt(journals.EMOTION_FIELDS[nxt], lang))
+    # "feeling" is the one field that asks the user to NAME an emotion --
+    # offer the deterministic Emotion Map helper there only.
+    next_kb = _emotion_map_keyboard(lang) if journals.EMOTION_FIELDS[nxt] == "feeling" else None
+    await message.answer(prefix + journals.emotion_prompt(journals.EMOTION_FIELDS[nxt], lang),
+                         reply_markup=next_kb)
 
 
 # ── Epic 8: CBT journal (deep) — aborts at ORANGE, not just RED ───────────────
@@ -1462,7 +1476,10 @@ async def cbt_step(message: Message, state: FSMContext):
         await message.answer(journals.cbt_saved_text(lang))
         return
     await state.update_data(cstep=nxt, cdata=cdata)
-    await message.answer(journals.cbt_prompt(journals.CBT_FIELDS[nxt], lang))
+    # "emotion" is the field that asks the user to NAME a feeling -- same
+    # Emotion Map helper as the emotion-journal "feeling" step.
+    next_kb = _emotion_map_keyboard(lang) if journals.CBT_FIELDS[nxt] == "emotion" else None
+    await message.answer(journals.cbt_prompt(journals.CBT_FIELDS[nxt], lang), reply_markup=next_kb)
 
 
 # ── Epic 8: weekly report (deterministic), settings, GDPR ─────────────────────
@@ -1817,6 +1834,134 @@ async def cb_questionnaire_cancel(callback: CallbackQuery):
     except Exception:
         pass
     await callback.message.answer(_questionnaire_cancelled_text(lang))
+    await callback.answer()
+
+
+# ── Navigation Hub — deterministic menu/catalog, no clinical logic ─────────────
+# CRITICAL invariant (this project has already fixed this class of bug twice):
+# /menu and EVERY navigation/emotion-map callback below reuse the SAME two
+# gates as every other product entrypoint, in the SAME order --
+# journal_guard (active-crisis, crisis-adjacent, must run regardless of
+# role/access) THEN ensure_full_access_or_closed_test (ordinary product
+# access). A stale inline button pressed later, after access/crisis state
+# changed, must not bypass either gate -- navigation surfaces don't store
+# data, but they still expose product surfaces and must not distract from an
+# active crisis screen.
+async def _nav_gate(entity, uid: int, lang: str) -> bool:
+    """Shared gate for /menu, every navigation callback, and emotion:map.
+    Returns True iff the caller may proceed."""
+    target_message = entity.message if isinstance(entity, CallbackQuery) else entity
+    decision, _ = await journal_guard(target_message, uid, lang)
+    if decision == "crisis":
+        if isinstance(entity, CallbackQuery):
+            await entity.answer()
+        return False
+    if not await ensure_full_access_or_closed_test(entity, uid):
+        return False
+    return True
+
+
+def _menu_keyboard(lang: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=(ru if lang == "ru" else en), callback_data=f"{key}:hub")]
+            for key, ru, en in navigation.MENU_SECTIONS]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _hub_back_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=("⬅️ В меню" if lang == "ru" else "⬅️ Back to menu"), callback_data="menu:back")]])
+
+
+async def _answer_target(entity, text: str, **kw) -> None:
+    target = entity.message if isinstance(entity, CallbackQuery) else entity
+    await target.answer(text, **kw)
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(message, uid, lang):
+        return
+    await message.answer(navigation.menu_text(lang), reply_markup=_menu_keyboard(lang))
+
+
+@dp.callback_query(F.data == "tests:hub")
+async def cb_tests_hub(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await _answer_target(callback, navigation.tests_hub_text(lang), reply_markup=_hub_back_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "journals:hub")
+async def cb_journals_hub(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await _answer_target(callback, navigation.journals_hub_text(lang), reply_markup=_hub_back_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "results:hub")
+async def cb_results_hub(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await _answer_target(callback, navigation.results_hub_text(lang), reply_markup=_hub_back_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "privacy:hub")
+async def cb_privacy_hub(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await _answer_target(callback, navigation.privacy_hub_text(lang), reply_markup=_hub_back_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "about:hub")
+async def cb_about_hub(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await _answer_target(callback, navigation.about_hub_text(lang), reply_markup=_hub_back_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "menu:back")
+async def cb_menu_back(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await _answer_target(callback, navigation.menu_text(lang), reply_markup=_menu_keyboard(lang))
+    await callback.answer()
+
+
+# ── Emotion Map — deterministic, non-diagnostic vocabulary helper ─────────────
+def _emotion_map_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=("🗺 Карта эмоций" if lang == "ru" else "🗺 Emotion map"), callback_data="emotion:map")]])
+
+
+@dp.callback_query(F.data == "emotion:map")
+async def cb_emotion_map(callback: CallbackQuery):
+    """Read-only helper: shows the map, never stores a selection, never
+    touches FSM/journal/questionnaire state. Same gates as everything else."""
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    text = emotion_map.emotion_map_text(lang) + "\n\n" + emotion_map.emotion_map_return_hint(lang)
+    await callback.message.answer(text)
     await callback.answer()
 
 
