@@ -14,6 +14,7 @@ import types
 import pytest
 
 import bot
+import journals
 import navigation
 import access_control as ac
 from crisis_protocol import get_hotline
@@ -47,6 +48,28 @@ class FakeCallback:
 
     async def answer(self, *a, **kw):
         pass
+
+
+class FakeFSM:
+    def __init__(self, data=None):
+        self._data = dict(data or {})
+        self._state = None
+
+    async def get_data(self):
+        return dict(self._data)
+
+    async def update_data(self, **kw):
+        self._data.update(kw)
+
+    async def set_state(self, s):
+        self._state = s
+
+    async def get_state(self):
+        return self._state
+
+    async def clear(self):
+        self._data = {}
+        self._state = None
 
 
 def _async(value=None):
@@ -197,3 +220,50 @@ def test_navigation_module_has_no_forbidden_imports():
     for forbidden in ("traced_response", "review_pack", "influence_trace",
                       "choose_scenario", "get_system_prompt"):
         assert forbidden not in src
+
+
+# ── regression guard: journal-prompt double-send (post Emotion Map split) ─────
+# The Emotion Map split removed a reply_markup=next_kb parameter from the
+# single message.answer(...) call that sends the next journal prompt in both
+# emotion_step and cbt_step. This proves that edit left exactly ONE send
+# behind -- not a leftover second send and not any surviving Emotion Map
+# keyboard -- as a persisted test, not just a one-time diff review.
+def test_emotion_step_sends_prompt_exactly_once_for_feeling_field(monkeypatch):
+    async def _async(value=None):
+        return value
+    monkeypatch.setattr(bot, "get_user_language", lambda uid: _async("ru"))
+    monkeypatch.setattr(bot, "get_active_crisis", lambda uid: _async(None))
+    monkeypatch.setattr(bot, "save_emotion_entry", lambda *a, **kw: _async(None))
+
+    user = FakeUser(1)
+    msg = FakeMessage(user, "поругался с коллегой на работе")
+    # jstep=0 ("event") -> answering it advances to "feeling" (index 1).
+    fsm = FakeFSM({"jstep": 0, "jdata": {}, "orange": False, "nudged": False})
+    asyncio.run(bot.emotion_step(msg, fsm))
+
+    assert journals.EMOTION_FIELDS[1] == "feeling"
+    matching = [a for a in msg.answers
+                if a[0].strip() == journals.emotion_prompt("feeling", "ru").strip()
+                or a[0].strip().endswith(journals.emotion_prompt("feeling", "ru").strip())]
+    assert len(matching) == 1, f"expected exactly one send of the 'feeling' prompt, got {len(matching)}"
+    # No leftover Emotion Map keyboard on the (single) sent message.
+    assert matching[0][1].get("reply_markup") is None
+
+
+def test_cbt_step_sends_prompt_exactly_once_for_emotion_field(monkeypatch):
+    async def _async(value=None):
+        return value
+    monkeypatch.setattr(bot, "get_user_language", lambda uid: _async("ru"))
+    monkeypatch.setattr(bot, "get_active_crisis", lambda uid: _async(None))
+    monkeypatch.setattr(bot, "save_cbt_entry", lambda *a, **kw: _async(None))
+
+    user = FakeUser(1)
+    msg = FakeMessage(user, "я не справлюсь")
+    # cstep=1 ("automatic_thought") -> answering it advances to "emotion" (index 2).
+    fsm = FakeFSM({"cstep": 1, "cdata": {}})
+    asyncio.run(bot.cbt_step(msg, fsm))
+
+    assert journals.CBT_FIELDS[2] == "emotion"
+    matching = [a for a in msg.answers if a[0].strip() == journals.cbt_prompt("emotion", "ru").strip()]
+    assert len(matching) == 1, f"expected exactly one send of the 'emotion' prompt, got {len(matching)}"
+    assert matching[0][1].get("reply_markup") is None
