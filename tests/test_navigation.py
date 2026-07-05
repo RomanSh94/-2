@@ -246,8 +246,13 @@ def test_emotion_step_sends_prompt_exactly_once_for_feeling_field(monkeypatch):
                 if a[0].strip() == journals.emotion_prompt("feeling", "ru").strip()
                 or a[0].strip().endswith(journals.emotion_prompt("feeling", "ru").strip())]
     assert len(matching) == 1, f"expected exactly one send of the 'feeling' prompt, got {len(matching)}"
-    # No leftover Emotion Map keyboard on the (single) sent message.
-    assert matching[0][1].get("reply_markup") is None
+    # The single send carries the Emotion Map keyboard (this is the field
+    # that asks the user to NAME an emotion) -- not a second/duplicate send.
+    markup = matching[0][1].get("reply_markup")
+    assert markup is not None
+    buttons = [btn for row in markup.inline_keyboard for btn in row]
+    assert any(btn.callback_data == "emotion:map" for btn in buttons)
+    assert any("Карта эмоций" in btn.text or "Emotion map" in btn.text for btn in buttons)
 
 
 def test_cbt_step_sends_prompt_exactly_once_for_emotion_field(monkeypatch):
@@ -266,4 +271,10 @@ def test_cbt_step_sends_prompt_exactly_once_for_emotion_field(monkeypatch):
     assert journals.CBT_FIELDS[2] == "emotion"
     matching = [a for a in msg.answers if a[0].strip() == journals.cbt_prompt("emotion", "ru").strip()]
     assert len(matching) == 1, f"expected exactly one send of the 'emotion' prompt, got {len(matching)}"
-    assert matching[0][1].get("reply_markup") is None
+    # Same Emotion Map keyboard expectation as the emotion-journal "feeling"
+    # step -- one send, carrying the map button, not a duplicate.
+    markup = matching[0][1].get("reply_markup")
+    assert markup is not None
+    buttons = [btn for row in markup.inline_keyboard for btn in row]
+    assert any(btn.callback_data == "emotion:map" for btn in buttons)
+    assert any("Карта эмоций" in btn.text or "Emotion map" in btn.text for btn in buttons)
