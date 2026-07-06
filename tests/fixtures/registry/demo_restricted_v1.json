@@ -1,0 +1,24 @@
+{
+  "id": "demo_restricted_v1",
+  "version": "1",
+  "lang": "ru",
+  "title": "Demo Restricted Check",
+  "description": "Синтетический опросник со статусом restricted — не должен запускаться в этом PR.",
+  "category": "mood",
+  "estimated_minutes": 1,
+  "status": "active",
+  "legal_status": "restricted",
+  "result_policy": "no_score",
+  "contains_risk_items": false,
+  "items": [
+    {
+      "id": "q1",
+      "text": "Демонстрационный вопрос restricted-опросника",
+      "options": [
+        {"id": "a0", "label": "0 — нет", "value": "0"},
+        {"id": "a1", "label": "1 — да", "value": "1"}
+      ]
+    }
+  ],
+  "completion_message": {"ru": "Готово.", "en": "Done."}
+}

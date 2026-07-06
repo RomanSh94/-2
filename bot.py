@@ -94,6 +94,7 @@ from database import (
     cancel_questionnaire_session,
 )
 import questionnaires
+import questionnaire_ux
 import navigation
 import emotion_map
 
@@ -1642,103 +1643,239 @@ async def cmd_journal_delete(message: Message, state: FSMContext):
                          if lang == "ru" else "Done. All journal entries erased.")
 
 
-# ── Questionnaire Core PR #1 — storage-only, non-diagnostic self-report ────────
-# Deliberately NOT in /help (infrastructure-first, not a discoverability
-# feature yet). NOT self-service like the privacy commands -- this is an
-# ordinary product feature, gated the same way as /emotion, /cbt: the active-
-# crisis check (journal_guard, text=None) runs BEFORE the product-access gate,
-# exactly like cmd_emotion, so a crisis is never blocked by access status.
-# Callback format is deliberately short ("q:a:<session_id>:<answer_id>" /
-# "q:c:<session_id>") to stay comfortably under Telegram's 64-byte
-# callback_data limit -- the current item is looked up from the session's
-# current_index in the DB, never encoded in the callback itself.
+# ── Questionnaire Registry UX (PR A) — in-chat skeleton, storage-only ──────────
+# FULLY REPLACES the earlier Questionnaire Core PR #1 single-definition
+# handlers (there is no parallel/coexisting old loader path -- see
+# questionnaires.py module docstring for the behavioral-parity write-up).
+#
+# Deliberately NOT in /help yet (infrastructure-first). Gated the same way as
+# /emotion, /cbt, and the Navigation Hub: journal_guard (active-crisis) runs
+# BEFORE ensure_full_access_or_closed_test (product access) on every single
+# new entrypoint below -- see _questionnaire_gate, which layers a session-
+# ownership check on top of the exact same two gates _nav_gate uses, in the
+# same order.
+#
+# Callback format (all <=64 bytes -- see test_questionnaire_registry.py):
+#   q:l                    list
+#   q:c:<cat>              category
+#   q:d:<qid>              detail card
+#   q:s:<qid>              start
+#   q:a:<sid>:<step>:<aid> answer
+#   q:b:<sid>              back
+#   q:p:<sid>              pause/continue later
+#   q:x:<sid>              cancel
+# item_id is NEVER embedded in callback_data -- the current item is derived
+# from session.current_index (aliased here as "step"), read fresh from the
+# DB on every callback.
+#
+# Mid-session re-validation: the registry is reloaded FRESH FROM DISK on every
+# q:a callback (see _load_registry_fresh) rather than cached for the process
+# lifetime, specifically so a definition that becomes archived/draft/
+# restricted/invalid between session start and a later answer is caught by
+# can_answer() on the very next callback, not just at session start.
 
-def _questionnaire_consent_text(lang: str) -> str:
-    if lang == "ru":
-        return ("Это структурированный самоопрос — не диагноз и не замена специалиста. "
-                "Можно остановиться в любой момент. Ответы сохраняются: их можно "
-                "экспортировать через /privacy_export_all и удалить через /privacy_delete_all.")
-    return ("This is a structured self-check — not a diagnosis and not a substitute "
-            "for a professional. You can stop anytime. Answers are saved: you can "
-            "export them with /privacy_export_all and delete them with /privacy_delete_all.")
+def _load_registry_fresh() -> questionnaires.Registry:
+    """Always re-reads the directory from disk. Deliberately NOT memoized at
+    module/process scope: PR A's spec requires that a definition invalidated
+    *after* a session starts (archived/draft/restricted/schema-broken) is
+    caught on the next q:a callback, not only at session start. A cached
+    long-lived Registry instance would make that re-check decorative (it
+    would keep answering against the stale in-memory copy) -- so every
+    gate/handler that needs current validity calls this, not a stored
+    instance."""
+    return questionnaires.load_registry()
 
 
-def _questionnaire_not_configured_text(lang: str) -> str:
-    # Deliberately identical for BOTH "not_configured" and "invalid" loader
-    # outcomes -- malformed JSON / multiple private files / a risk-bearing
-    # definition being rejected / a plain missing directory must never be
-    # distinguishable to the Telegram user; those are internal/test facts only.
-    return "Опросники пока не настроены." if lang == "ru" else "Questionnaires are not configured yet."
-
-
-def _questionnaire_completion_text(lang: str) -> str:
-    # Fixed generic text -- deliberately NOT the private definition's own
-    # completion_message, which has not been validated against the forbidden
-    # diagnosis/dependency wording list. Using it unvalidated here would be
-    # exactly the kind of interpretation-adjacent claim this PR must not make.
-    if lang == "ru":
-        return "Спасибо, ответы сохранены. Это не диагноз — просто структурированная самооценка."
-    return "Thanks, your answers are saved. This is not a diagnosis — just structured self-reflection."
-
-
-def _questionnaire_cancelled_text(lang: str) -> str:
-    return "Опрос отменён." if lang == "ru" else "Questionnaire cancelled."
-
-
-def _questionnaire_item_keyboard(session_id: int, item: dict, lang: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=opt["label"], callback_data=f"q:a:{session_id}:{opt['id']}")]
+def _questionnaire_item_keyboard(definition: dict, session_id: int, step: int, item: dict, lang: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=opt["label"],
+                                  callback_data=f"q:a:{session_id}:{step}:{opt['id']}")]
             for opt in item["options"]]
-    rows.append([InlineKeyboardButton(
-        text=("Отмена" if lang == "ru" else "Cancel"), callback_data=f"q:c:{session_id}")])
+    rows.append([
+        InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+                             callback_data=f"q:b:{session_id}"),
+        InlineKeyboardButton(text=("✖️ Прервать" if lang == "ru" else "✖️ Cancel"),
+                             callback_data=f"q:x:{session_id}"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _send_questionnaire_step(send, session_id: int, index: int, definition: dict, lang: str) -> None:
-    """Send the item at `index`, or complete the session if none remains.
+def _questionnaire_list_keyboard(lang: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=questionnaire_ux.category_label(key, lang),
+                                  callback_data=f"q:c:{key}")]
+            for key, _, _ in questionnaire_ux.CATEGORIES]
+    rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+                                      callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _questionnaire_category_keyboard(category: str, definitions: list, lang: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=d["title"], callback_data=f"q:d:{d['id']}")]
+            for d in definitions]
+    rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+                                      callback_data="q:l")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _questionnaire_detail_keyboard(qid: str, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("▶️ Начать" if lang == "ru" else "▶️ Start"),
+                              callback_data=f"q:s:{qid}")],
+        [InlineKeyboardButton(text=("⬅️ К списку" if lang == "ru" else "⬅️ To the list"),
+                              callback_data="q:l")],
+    ])
+
+
+def _questionnaire_completion_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
+                              callback_data="q:l")],
+        [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
+                              callback_data="menu:back")],
+    ])
+
+
+async def _questionnaire_gate(entity, uid: int, lang: str) -> bool:
+    """Same two gates as _nav_gate (journal_guard THEN
+    ensure_full_access_or_closed_test), in the same order. A separate
+    function (not a call to _nav_gate itself) only so this module stays
+    self-contained/greppable as its own evidence trail; behavior is
+    identical."""
+    target_message = entity.message if isinstance(entity, CallbackQuery) else entity
+    decision, _ = await journal_guard(target_message, uid, lang)
+    if decision == "crisis":
+        if isinstance(entity, CallbackQuery):
+            await entity.answer()
+        return False
+    if not await ensure_full_access_or_closed_test(entity, uid):
+        return False
+    return True
+
+
+async def _send_questionnaire_step(send, definition: dict, session_id: int, step: int, lang: str) -> None:
+    """Send the item at `step`, or complete the session if none remains.
     `send` is message.answer / callback.message.answer, matching the existing
     project convention (see send_crisis's `send` parameter)."""
-    item = questionnaires.get_item(definition, index)
+    item = questionnaires.get_item(definition, step)
     if item is None:
         await complete_questionnaire_session(session_id)
-        await send(_questionnaire_completion_text(lang))
+        await send(questionnaire_ux.completion_text(lang), reply_markup=_questionnaire_completion_keyboard(lang))
         return
-    await send(item["text"], reply_markup=_questionnaire_item_keyboard(session_id, item, lang))
+    total = len(definition.get("items", []))
+    text = questionnaire_ux.question_text(step, total, item["text"], lang)
+    await send(text, reply_markup=_questionnaire_item_keyboard(definition, session_id, step, item, lang))
 
 
 @dp.message(Command("questionnaire"))
 async def cmd_questionnaire(message: Message):
     uid = message.from_user.id
     lang = await get_user_language(uid)
-    # Active-crisis check BEFORE the product gate -- same order as cmd_emotion.
-    decision, _ = await journal_guard(message, uid, lang)
-    if decision == "crisis":
+    if not await _questionnaire_gate(message, uid, lang):
         return
-    if not await ensure_full_access_or_closed_test(message, uid):
-        return
+    await message.answer(questionnaire_ux.list_text(lang), reply_markup=_questionnaire_list_keyboard(lang))
 
-    definition, error = questionnaires.get_validated_definition()
-    if error is not None:
-        await message.answer(_questionnaire_not_configured_text(lang))
+
+@dp.callback_query(F.data == "q:l")
+async def cb_questionnaire_list(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
         return
+    await callback.message.answer(questionnaire_ux.list_text(lang), reply_markup=_questionnaire_list_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:c:"))
+async def cb_questionnaire_category(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    category = parts[2]
+    registry = _load_registry_fresh()
+    definitions = registry.list_active(category)
+    # "restricted" legal_status is hidden from listings in this PR too (not
+    # just blocked at start/answer time) -- future licensed-content PR may
+    # change that; not now (see CLAUDE.md task scope).
+    definitions = [d for d in definitions if d.get("legal_status") != "restricted"]
+    await callback.message.answer(
+        questionnaire_ux.category_text(category, definitions, lang),
+        reply_markup=_questionnaire_category_keyboard(category, definitions, lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:d:"))
+async def cb_questionnaire_detail(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    qid = parts[2]
+    registry = _load_registry_fresh()
+    definition = registry.get(qid)
+    if definition is None or definition.get("status") != "active" or definition.get("legal_status") == "restricted":
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    await callback.message.answer(questionnaire_ux.detail_text(definition, lang),
+                                  reply_markup=_questionnaire_detail_keyboard(qid, lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:s:"))
+async def cb_questionnaire_start(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    qid = parts[2]
+    registry = _load_registry_fresh()
+    if not registry.can_start(qid):
+        # Covers: unknown id, draft, archived, restricted, or an invalid
+        # (schema-broken/risk-bearing) definition -- all fail closed with the
+        # SAME neutral message, never distinguishing the internal reason.
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    definition = registry.get(qid)
 
     active = await get_active_questionnaire_session(uid)
     if active:
-        # Resume ONLY if the current definition still matches the session's
-        # recorded id/version exactly -- any mismatch (private file changed,
-        # removed, or replaced since the session started) fails closed rather
-        # than silently resuming against a different definition, and never
-        # creates a second active session.
         if (active["questionnaire_id"] != definition["id"]
                 or active["questionnaire_version"] != definition["version"]):
-            await message.answer(_questionnaire_not_configured_text(lang))
+            await callback.message.answer(questionnaire_ux.not_available_text(lang))
+            await callback.answer()
             return
-        await _send_questionnaire_step(
-            message.answer, active["id"], active["current_index"], definition, lang)
+        await _send_questionnaire_step(callback.message.answer, definition, active["id"],
+                                       active["current_index"], lang)
+        await callback.answer()
         return
 
-    await message.answer(_questionnaire_consent_text(lang))
     session_id = await start_questionnaire_session(uid, definition["id"], definition["version"])
-    await _send_questionnaire_step(message.answer, session_id, 0, definition, lang)
+    await _send_questionnaire_step(callback.message.answer, definition, session_id, 0, lang)
+    await callback.answer()
+
+
+async def _load_owned_active_session(session_id: int, uid: int):
+    """Session-ownership check: load session; return None (silent no-op
+    upstream) if it doesn't exist, belongs to a different user, or isn't
+    active. Never distinguishes these cases to the caller -- same
+    non-disclosure rule as the original PR #1 handler."""
+    session = await get_questionnaire_session(session_id)
+    if not session or session["user_id"] != uid or session["status"] != "active":
+        return None
+    return session
 
 
 @dp.callback_query(F.data.startswith("q:a:"))
@@ -1746,52 +1883,64 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     # Active-crisis gate FIRST -- before format/session/definition checks,
-    # before storing anything, before advancing the session. An answer
-    # callback is a STEP of an in-progress flow, same class as
-    # emotion_step/cbt_step; the project invariant is that an active crisis
-    # blocks the step before any ordinary behavior continues, so this must
-    # run here too, not only at /questionnaire's own start.
+    # before storing anything, before advancing the session. Same invariant
+    # as every other in-progress-flow step (emotion_step/cbt_step).
     decision, _ = await journal_guard(callback.message, uid, lang)
     if decision == "crisis":
         await callback.answer()
         return
 
     parts = callback.data.split(":")
-    if len(parts) != 4 or not parts[2].isdigit():
+    if len(parts) != 5 or not parts[2].isdigit() or not parts[3].isdigit():
         await callback.answer()
         return
-    session_id, answer_id = int(parts[2]), parts[3]
+    session_id, callback_step, answer_id = int(parts[2]), int(parts[3]), parts[4]
 
-    session = await get_questionnaire_session(session_id)
-    if not session or session["user_id"] != uid or session["status"] != "active":
-        # Wrong user / unknown / non-active session: silent no-op. Showing
-        # ANY message here (even the generic one) would confirm to an
-        # attacker that a session with this id exists at all.
+    session = await _load_owned_active_session(session_id, uid)
+    if session is None:
+        # Wrong user / unknown / non-active session: silent no-op -- showing
+        # ANY message here would confirm to an attacker that a session with
+        # this id exists at all.
         await callback.answer()
         return
 
-    definition, error = questionnaires.get_validated_definition()
-    if error is not None:
-        # Same-user, own session, but the private definition itself is now
-        # missing/invalid -- an internal configuration problem, not a tamper
-        # attempt. Show the SAME neutral text as /questionnaire's own
-        # not-configured path; never mention malformed JSON, multiple
-        # private files, or risk-bearing rejection to the user.
-        await callback.message.answer(_questionnaire_not_configured_text(lang))
+    # Stale-callback protection: the callback's OWN step must match the
+    # session's current step. A mismatch means the user pressed an option on
+    # an older/already-answered screen (e.g. double-tap, or went back and the
+    # old inline keyboard is still visible) -- do NOT save/advance; show the
+    # neutral "no longer current" message and re-show the CURRENT question.
+    if callback_step != session["current_index"]:
+        registry = _load_registry_fresh()
+        definition = registry.get(session["questionnaire_id"])
+        if definition is None or not registry.can_answer(session["questionnaire_id"]):
+            await callback.message.answer(questionnaire_ux.not_available_text(lang))
+            await callback.answer()
+            return
+        await callback.message.answer(questionnaire_ux.stale_answer_text(lang))
+        await _send_questionnaire_step(callback.message.answer, definition, session_id,
+                                       session["current_index"], lang)
         await callback.answer()
         return
-    if (definition["id"] != session["questionnaire_id"]
-            or definition["version"] != session["questionnaire_version"]):
-        await callback.message.answer(_questionnaire_not_configured_text(lang))
+
+    # Continuous validity re-check (not just stale-step detection): re-verify
+    # on EVERY answer callback that the definition is still active/valid --
+    # not only at session start. A definition's status can change between
+    # session start and a later answer (archived/draft/restricted/schema
+    # invalidated) -- fail closed: don't save, don't advance, end gracefully.
+    registry = _load_registry_fresh()
+    if not registry.can_answer(session["questionnaire_id"]):
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    definition = registry.get(session["questionnaire_id"])
+    if definition["version"] != session["questionnaire_version"]:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
 
     item = questionnaires.get_item(definition, session["current_index"])
     if item is None:
-        # The private definition changed underneath an in-progress session
-        # (fewer items than before) -- same neutral text, not a stack trace
-        # or a "definition mismatch" explanation.
-        await callback.message.answer(_questionnaire_not_configured_text(lang))
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
     option = questionnaires.find_option(item, answer_id)
@@ -1803,28 +1952,86 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
 
     await record_questionnaire_response(
         uid, session_id, definition["id"], item["id"], option["id"], option["value"])
-    next_index = session["current_index"] + 1
-    await advance_questionnaire_session(session_id, next_index)
+    next_step = session["current_index"] + 1
+    await advance_questionnaire_session(session_id, next_step)
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await _send_questionnaire_step(callback.message.answer, session_id, next_index, definition, lang)
+    await _send_questionnaire_step(callback.message.answer, definition, session_id, next_step, lang)
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("q:c:"))
-async def cb_questionnaire_cancel(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("q:b:"))
+async def cb_questionnaire_back(callback: CallbackQuery):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
     parts = callback.data.split(":")
     if len(parts) != 3 or not parts[2].isdigit():
         await callback.answer()
         return
     session_id = int(parts[2])
 
-    session = await get_questionnaire_session(session_id)
-    if not session or session["user_id"] != uid or session["status"] != "active":
+    session = await _load_owned_active_session(session_id, uid)
+    if session is None:
+        await callback.answer()
+        return
+
+    registry = _load_registry_fresh()
+    if not registry.can_answer(session["questionnaire_id"]):
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    definition = registry.get(session["questionnaire_id"])
+
+    prev_step = max(0, session["current_index"] - 1)
+    await advance_questionnaire_session(session_id, prev_step)
+    await _send_questionnaire_step(callback.message.answer, definition, session_id, prev_step, lang)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:p:"))
+async def cb_questionnaire_pause(callback: CallbackQuery):
+    """Pause / continue later: no-op on session state (current_index already
+    persists the resume point on every answer) -- just acknowledges and shows
+    a neutral confirmation, without ending the session like cancel does."""
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+
+    session = await _load_owned_active_session(session_id, uid)
+    if session is None:
+        await callback.answer()
+        return
+
+    await callback.message.answer(
+        "Опрос сохранён, можно продолжить позже через /questionnaire." if lang == "ru"
+        else "Progress saved -- continue later with /questionnaire.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:x:"))
+async def cb_questionnaire_cancel(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+
+    session = await _load_owned_active_session(session_id, uid)
+    if session is None:
         await callback.answer()
         return
 
@@ -1833,7 +2040,7 @@ async def cb_questionnaire_cancel(callback: CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await callback.message.answer(_questionnaire_cancelled_text(lang))
+    await callback.message.answer(questionnaire_ux.cancelled_text(lang))
     await callback.answer()
 
 

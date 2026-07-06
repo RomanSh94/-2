@@ -1,0 +1,24 @@
+{
+  "id": "demo_draft_v1",
+  "version": "1",
+  "lang": "ru",
+  "title": "Demo Draft Check",
+  "description": "Синтетический опросник в статусе draft — не должен запускаться.",
+  "category": "mood",
+  "estimated_minutes": 1,
+  "status": "draft",
+  "legal_status": "synthetic",
+  "result_policy": "no_score",
+  "contains_risk_items": false,
+  "items": [
+    {
+      "id": "q1",
+      "text": "Демонстрационный вопрос черновика",
+      "options": [
+        {"id": "a0", "label": "0 — нет", "value": "0"},
+        {"id": "a1", "label": "1 — да", "value": "1"}
+      ]
+    }
+  ],
+  "completion_message": {"ru": "Готово.", "en": "Done."}
+}
