@@ -1,4 +1,4 @@
-"""Questionnaire Core PR #1 — no A1 influence, no product-reply wiring.
+"""Questionnaire Registry (PR A) — no A1 influence, no product-reply wiring.
 
 This PR is storage-only: questionnaire data must never be traced as an A1
 latent-influence source, and must never affect router/tone/prompt/LLM
@@ -8,21 +8,16 @@ included.
 """
 import ast
 import asyncio
-import json
-import pathlib
 import types
 
 import pytest
 
 import bot
 import database
+import questionnaires
 
-FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "synthetic_questionnaire.json"
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-
-
-def _definition() -> dict:
-    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
+FIXTURE_DIR = ROOT / "tests" / "fixtures" / "registry"
 
 
 class FakeUser:
@@ -40,6 +35,9 @@ class FakeMessage:
 
     async def answer(self, text, **kw):
         self.answers.append((text, kw))
+
+    async def edit_reply_markup(self, **kw):
+        pass
 
 
 class FakeCallback:
@@ -70,27 +68,32 @@ def _common(monkeypatch, tmp_db):
     import access_control as ac
     monkeypatch.setattr(bot, "get_user_language", _async("ru"))
     monkeypatch.setattr(bot, "get_active_crisis", _async(None))
+    monkeypatch.setattr(bot, "log_crisis_delivery", _async(None))
     monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "personal_use")
     monkeypatch.setattr(ac, "OWNER_USER_ID", 1)
-    monkeypatch.setattr(bot.questionnaires, "get_validated_definition",
-                        lambda *a, **kw: (_definition(), None))
+    monkeypatch.setattr(bot, "CallbackQuery", FakeCallback)
+    monkeypatch.setattr(bot, "_load_registry_fresh",
+                        lambda: questionnaires.load_registry(FIXTURE_DIR))
+
+
+def _start_and_answer_all(user, msg):
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    session_id = con.execute(
+        "SELECT id FROM questionnaire_sessions WHERE user_id=?", (user.id,)).fetchone()[0]
+    con.close()
+    for step in range(5):
+        cb = FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a1")
+        asyncio.run(bot.cb_questionnaire_answer(cb))
+    return session_id
 
 
 # ── behavioral: real flow leaves influence_trace untouched ─────────────────────
 def test_questionnaire_flow_does_not_write_influence_trace(tmp_db):
     user = FakeUser(1)
     msg = FakeMessage(user)
-    asyncio.run(bot.cmd_questionnaire(msg))
-    import sqlite3
-    con = sqlite3.connect(database.DB)
-    session_id = con.execute(
-        "SELECT id FROM questionnaire_sessions WHERE user_id=1").fetchone()[0]
-    con.close()
-
-    cb1 = FakeCallback(user, msg, data=f"q:a:{session_id}:mid")
-    asyncio.run(bot.cb_questionnaire_answer(cb1))
-    cb2 = FakeCallback(user, msg, data=f"q:a:{session_id}:ok")
-    asyncio.run(bot.cb_questionnaire_answer(cb2))
+    _start_and_answer_all(user, msg)
 
     trace_rows = asyncio.run(database.get_influence_trace_for_user(1))
     assert trace_rows == []
@@ -101,34 +104,21 @@ def test_questionnaire_completion_does_not_use_traced_response(monkeypatch, tmp_
 
     async def _spy(*a, **kw):
         calls["n"] += 1
-    # If bot.py ever imported traced_response_builder under this name, this
-    # patch would catch a call; today bot.py doesn't import it at all (see
-    # source-scan test below), so this is a belt-and-suspenders behavioral
-    # check that stays meaningful if that ever changes.
     monkeypatch.setattr("traced_response.traced_response_builder", _spy, raising=False)
 
     user = FakeUser(1)
     msg = FakeMessage(user)
-    asyncio.run(bot.cmd_questionnaire(msg))
-    import sqlite3
-    con = sqlite3.connect(database.DB)
-    session_id = con.execute(
-        "SELECT id FROM questionnaire_sessions WHERE user_id=1").fetchone()[0]
-    con.close()
-    cb1 = FakeCallback(user, msg, data=f"q:a:{session_id}:mid")
-    asyncio.run(bot.cb_questionnaire_answer(cb1))
-    cb2 = FakeCallback(user, msg, data=f"q:a:{session_id}:ok")
-    asyncio.run(bot.cb_questionnaire_answer(cb2))
+    _start_and_answer_all(user, msg)
 
     assert calls["n"] == 0
 
 
 # ── source-level scan: the questionnaire code path never touches A1/router ────
 _QUESTIONNAIRE_FUNCS = (
-    "cmd_questionnaire", "cb_questionnaire_answer", "cb_questionnaire_cancel",
-    "_send_questionnaire_step", "_questionnaire_item_keyboard",
-    "_questionnaire_consent_text", "_questionnaire_not_configured_text",
-    "_questionnaire_completion_text", "_questionnaire_cancelled_text",
+    "cmd_questionnaire", "cb_questionnaire_list", "cb_questionnaire_category",
+    "cb_questionnaire_detail", "cb_questionnaire_start", "cb_questionnaire_answer",
+    "cb_questionnaire_back", "cb_questionnaire_pause", "cb_questionnaire_cancel",
+    "_send_questionnaire_step", "_questionnaire_item_keyboard", "_questionnaire_gate",
 )
 _FORBIDDEN_SYMBOLS = (
     "traced_response", "influence_trace", "choose_scenario",
