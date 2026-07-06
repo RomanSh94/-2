@@ -239,3 +239,43 @@ def explanation_text(scale_explanation_main: str, lang: str = "ru") -> str:
     return (f"🧠 What the scales mean\n\n"
             f"{scale_explanation_main}\n\n"
             f"This is not a diagnosis or a medical conclusion.")
+
+
+# ── PR C1 — specialist report (self-only, no LLM, dormant unless the flag/
+# eligibility conditions in bot.py's report handler allow a score line).
+# Pure string builder: bot.py assembles the (item_text, answer_label) pairs
+# in definition-item order and passes them in already resolved; this module
+# only formats them. Reuses the same "не диагноз" disclaimer framing as the
+# rest of this file rather than inventing new wording.
+
+def specialist_report_text(title: str, completed_at: str | None,
+                            answer_lines: list[str],
+                            score_line: str | None, lang: str = "ru") -> str:
+    if lang == "ru":
+        parts = [f"📄 Отчёт для специалиста\n\n{title}"]
+        if completed_at:
+            parts.append(f"Дата завершения: {completed_at}")
+        parts.append("")
+        parts.append("Ответы:")
+        parts.extend(answer_lines)
+        if score_line:
+            parts.append("")
+            parts.append(score_line)
+        parts.append("")
+        parts.append("Это не диагноз и не медицинское заключение. Отчёт предназначен "
+                      "только для вашего личного использования, например при разговоре "
+                      "со специалистом.")
+        return "\n".join(parts)
+    parts = [f"📄 Specialist report\n\n{title}"]
+    if completed_at:
+        parts.append(f"Completed: {completed_at}")
+    parts.append("")
+    parts.append("Answers:")
+    parts.extend(answer_lines)
+    if score_line:
+        parts.append("")
+        parts.append(score_line)
+    parts.append("")
+    parts.append("This is not a diagnosis or a medical conclusion. This report is for "
+                  "your own personal use, for example when talking with a specialist.")
+    return "\n".join(parts)

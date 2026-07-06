@@ -2260,6 +2260,108 @@ async def cb_questionnaire_explanation(callback: CallbackQuery):
     await callback.answer()
 
 
+# ── PR C1 — specialist report (self-only, no LLM) ────────────────────────────
+# Callback format: q:o:<sid> -- <=64 bytes, no item_id embedded (same
+# convention as q:r/q:k/q:e/q:b/q:p/q:x). Gate order, identical structure to
+# q:r/q:k/q:e:
+#   1. journal_guard (via _questionnaire_gate)
+#   2. ensure_full_access_or_closed_test (via _questionnaire_gate)
+#   3. session ownership (_load_owned_session -- NOT _load_owned_active_session,
+#      since the report must still be viewable after the session completes)
+#   4. definition validity (reload fresh from disk via _load_registry_fresh)
+#   5. answers assembled in DEFINITION item order (not raw SQL row order),
+#      latest response per item wins on duplicates, fail closed to
+#      questionnaire_ux.not_available_text on any item/answer id drift
+#   6. score line included ONLY if config.QUESTIONNAIRE_INTERPRETATION_ENABLED
+#      AND questionnaires.is_result_eligible(definition) AND
+#      questionnaires.compute_sum_score succeeds -- otherwise the report still
+#      renders all answers, just without a score line
+#
+# No LLM call anywhere in this path -- pure deterministic string building from
+# already-stored data. This is a SEPARATE, self-only (requester_uid ==
+# target_uid) mechanism from review_pack.py's reviewer-initiated, role-gated
+# path -- see CLINICAL_BOUNDARY.md §0.5 point 6. No new review_pack coupling
+# is introduced here.
+
+def _build_specialist_report_answers(definition: dict, responses: list[dict]) -> list[str] | None:
+    """Returns one rendered "question -- answer" line per item, in DEFINITION
+    item order, using the LATEST recorded response for an item if duplicates
+    exist (later rows in `responses`, which is already oldest-first from
+    get_questionnaire_responses, overwrite earlier ones in this dict so the
+    last write for a given item_id wins). Returns None (fail closed) if any
+    item has no response, or a response's item_id/answer_id no longer matches
+    the current definition -- never guesses."""
+    latest_by_item: dict[str, dict] = {}
+    for r in responses:
+        latest_by_item[r["item_id"]] = r  # later rows overwrite -- latest wins
+
+    lines = []
+    for item in definition.get("items", []):
+        item_id = item["id"]
+        response = latest_by_item.get(item_id)
+        if response is None:
+            return None
+        option = questionnaires.find_option(item, response["answer_id"])
+        if option is None:
+            return None
+        lines.append(f"{item['text']} -- {option['label']}")
+    return lines
+
+
+@dp.callback_query(F.data.startswith("q:o:"))
+async def cb_questionnaire_specialist_report(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):           # 1, 2
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+
+    session = await _load_owned_session(session_id, uid)             # 3
+    if session is None:
+        await callback.answer()
+        return
+
+    registry = _load_registry_fresh()                                 # 4
+    definition = registry.get(session["questionnaire_id"])
+    if definition is None:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    if definition["version"] != session["questionnaire_version"]:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    responses = await get_questionnaire_responses(session_id)
+    answer_lines = _build_specialist_report_answers(definition, responses)  # 5
+    if answer_lines is None:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    score_line = None                                                  # 6
+    if config.QUESTIONNAIRE_INTERPRETATION_ENABLED and questionnaires.is_result_eligible(definition):
+        try:
+            score, max_score, _values = questionnaires.compute_sum_score(definition, responses)
+            if lang == "ru":
+                score_line = f"Результат: {score} / {max_score}"
+            else:
+                score_line = f"Result: {score} / {max_score}"
+        except questionnaires.ScoringError:
+            score_line = None
+
+    completed_at = session.get("completed_at") if isinstance(session, dict) else None
+
+    report = questionnaire_ux.specialist_report_text(
+        definition["title"], completed_at, answer_lines, score_line, lang)
+    await callback.message.answer(report)
+    await callback.answer()
+
+
 # ── Navigation Hub — deterministic menu/catalog, no clinical logic ─────────────
 # CRITICAL invariant (this project has already fixed this class of bug twice):
 # /menu and EVERY navigation/emotion-map callback below reuse the SAME two
