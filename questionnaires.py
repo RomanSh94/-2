@@ -196,3 +196,85 @@ def find_option(item: dict, answer_id: str) -> dict | None:
         if option.get("id") == answer_id:
             return option
     return None
+
+
+# ── PR B — result-screen eligibility + on-the-fly scoring ───────────────────
+# Dormant unless bot.py's kill-switch gate calls these (config.
+# QUESTIONNAIRE_INTERPRETATION_ENABLED must be true first). PR B only ever
+# interprets synthetic demo content -- see CLAUDE.md task scope. No score is
+# ever cached; callers recompute from questionnaire_responses every time.
+
+ELIGIBLE_RESULT_POLICIES = ("user_visible_full", "user_visible_score")
+
+
+def is_result_eligible(definition: dict) -> bool:
+    """True only for synthetic, active, non-restricted definitions whose
+    result_policy is user_visible_full or user_visible_score. Fails closed on
+    anything else (restricted, draft, archived, specialist_only, no_score,
+    public_domain/licensed real instruments) -- PR B never interprets those,
+    even if the schema technically allows them."""
+    if definition is None:
+        return False
+    if definition.get("status") != "active":
+        return False
+    if definition.get("legal_status") != "synthetic":
+        return False
+    if definition.get("result_policy") not in ELIGIBLE_RESULT_POLICIES:
+        return False
+    if definition.get("scoring", {}).get("type") != "sum":
+        return False
+    return True
+
+
+class ScoringError(Exception):
+    """Raised when responses can't be scored consistently with the current
+    definition (incomplete, or an option/item id mismatch). Callers must fail
+    closed (neutral 'not available' text) -- never guess or show a partial
+    score."""
+
+
+def compute_sum_score(definition: dict, responses: list[dict]) -> tuple[int, int, list[int]]:
+    """Deterministic on-the-fly scoring: score = sum(option.value for each
+    recorded response), max_score = sum(max(option.value) per item). Requires
+    EXACTLY one response per item, and every response's item_id/answer_id to
+    match the CURRENT definition -- otherwise raises ScoringError.
+
+    Returns (score, max_score, ordered_values) where ordered_values are the
+    per-item integer values in item order (for the calculations screen)."""
+    items = definition.get("items", [])
+    if len(responses) != len(items):
+        raise ScoringError(
+            f"expected {len(items)} responses, got {len(responses)}")
+
+    responses_by_item = {}
+    for r in responses:
+        if r["item_id"] in responses_by_item:
+            raise ScoringError(f"duplicate response for item {r['item_id']!r}")
+        responses_by_item[r["item_id"]] = r
+
+    ordered_values: list[int] = []
+    max_score = 0
+    for item in items:
+        item_id = item["id"]
+        response = responses_by_item.get(item_id)
+        if response is None:
+            raise ScoringError(f"missing response for item {item_id!r}")
+        option = find_option(item, response["answer_id"])
+        if option is None:
+            raise ScoringError(
+                f"answer_id {response['answer_id']!r} not found in item {item_id!r}")
+        try:
+            value = int(option["value"])
+        except (TypeError, ValueError):
+            raise ScoringError(f"non-integer option value: {option['value']!r}")
+        ordered_values.append(value)
+        item_max = 0
+        for opt in item.get("options", []):
+            try:
+                item_max = max(item_max, int(opt["value"]))
+            except (TypeError, ValueError):
+                raise ScoringError(f"non-integer option value: {opt['value']!r}")
+        max_score += item_max
+
+    score = sum(ordered_values)
+    return score, max_score, ordered_values

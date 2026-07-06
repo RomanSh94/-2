@@ -1,0 +1,25 @@
+{
+  "id": "demo_specialist_only_v1",
+  "version": "1",
+  "lang": "ru",
+  "title": "Demo Specialist-Only Check",
+  "description": "Синтетический опросник с result_policy=specialist_only — результат никогда не должен показываться пользователю в этом PR.",
+  "category": "anxiety",
+  "estimated_minutes": 1,
+  "status": "active",
+  "legal_status": "synthetic",
+  "result_policy": "specialist_only",
+  "contains_risk_items": false,
+  "scoring": {"type": "sum"},
+  "items": [
+    {
+      "id": "q1",
+      "text": "Демонстрационный вопрос specialist_only-опросника",
+      "options": [
+        {"id": "a0", "label": "0 — нет", "value": "0"},
+        {"id": "a1", "label": "1 — да", "value": "1"}
+      ]
+    }
+  ],
+  "completion_message": {"ru": "Готово.", "en": "Done."}
+}

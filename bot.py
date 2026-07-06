@@ -30,6 +30,7 @@ from openai import AsyncOpenAI
 import access_control
 import scoped_access
 import review_pack
+import config
 from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION
 from prompts import get_system_prompt, get_crisis_text, get_onboarding
 from crisis_protocol import (
@@ -91,7 +92,7 @@ from database import (
     start_questionnaire_session, get_active_questionnaire_session,
     get_questionnaire_session, record_questionnaire_response,
     advance_questionnaire_session, complete_questionnaire_session,
-    cancel_questionnaire_session,
+    cancel_questionnaire_session, get_questionnaire_responses,
 )
 import questionnaires
 import questionnaire_ux
@@ -1734,6 +1735,58 @@ def _questionnaire_completion_keyboard(lang: str) -> InlineKeyboardMarkup:
     ])
 
 
+# ── PR B — result / calculations / explanation screens (dormant unless
+# config.QUESTIONNAIRE_INTERPRETATION_ENABLED is true AND the definition is
+# eligible; see questionnaires.is_result_eligible). Deliberately NO
+# "discuss with bot" / "report to specialist" buttons -- future PRs only.
+
+def _questionnaire_result_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("📊 Расчёты" if lang == "ru" else "📊 Calculations"),
+                              callback_data=f"q:k:{session_id}"),
+         InlineKeyboardButton(text=("🧠 Что значат шкалы" if lang == "ru" else "🧠 What scales mean"),
+                              callback_data=f"q:e:{session_id}")],
+        [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
+                              callback_data="q:l")],
+        [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
+                              callback_data="menu:back")],
+    ])
+
+
+def _questionnaire_back_to_result_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("⬅️ К результату" if lang == "ru" else "⬅️ Back to result"),
+                              callback_data=f"q:r:{session_id}")],
+        [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
+                              callback_data="menu:back")],
+    ])
+
+
+async def _questionnaire_sum_or_none(definition: dict, session_id: int):
+    """Returns (score, max_score, ordered_values) or None on any failure
+    (incomplete/inconsistent responses, ineligible definition, non-sum
+    scoring). Callers must fail closed to questionnaire_ux.not_available_text
+    on None -- never guess, never show a partial score."""
+    if not questionnaires.is_result_eligible(definition):
+        return None
+    responses = await get_questionnaire_responses(session_id)
+    try:
+        return questionnaires.compute_sum_score(definition, responses)
+    except questionnaires.ScoringError:
+        return None
+
+
+async def _send_questionnaire_result(send, definition: dict, session_id: int, lang: str) -> None:
+    result = await _questionnaire_sum_or_none(definition, session_id)
+    if result is None:
+        await send(questionnaire_ux.not_available_text(lang))
+        return
+    score, max_score, _values = result
+    segments = definition.get("visualization", {}).get("segments", 7)
+    await send(questionnaire_ux.result_text(score, max_score, lang, segments),
+              reply_markup=_questionnaire_result_keyboard(session_id, lang))
+
+
 async def _questionnaire_gate(entity, uid: int, lang: str) -> bool:
     """Same two gates as _nav_gate (journal_guard THEN
     ensure_full_access_or_closed_test), in the same order. A separate
@@ -1758,6 +1811,13 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
     item = questionnaires.get_item(definition, step)
     if item is None:
         await complete_questionnaire_session(session_id)
+        # PR B: kill-switch + eligibility gate on the completion branch. When
+        # the flag is off (default) or the definition isn't eligible, this is
+        # BYTE-FOR-BYTE PR A's completion screen -- never a score, never a
+        # different keyboard.
+        if config.QUESTIONNAIRE_INTERPRETATION_ENABLED and questionnaires.is_result_eligible(definition):
+            await _send_questionnaire_result(send, definition, session_id, lang)
+            return
         await send(questionnaire_ux.completion_text(lang), reply_markup=_questionnaire_completion_keyboard(lang))
         return
     total = len(definition.get("items", []))
@@ -2041,6 +2101,162 @@ async def cb_questionnaire_cancel(callback: CallbackQuery):
     except Exception:
         pass
     await callback.message.answer(questionnaire_ux.cancelled_text(lang))
+    await callback.answer()
+
+
+# ── PR B — result / calculations / explanation callbacks ────────────────────
+# Callback format: q:r:<sid> result, q:k:<sid> calculations, q:e:<sid> scale
+# explanation -- all <=64 bytes, no item_id embedded (same convention as
+# q:b/q:p/q:x above). Gate order for each, identical structure to every other
+# questionnaire handler:
+#   1. journal_guard (via _questionnaire_gate)
+#   2. ensure_full_access_or_closed_test (via _questionnaire_gate)
+#   3. session ownership (_load_owned_active_session... but result screens are
+#      reachable AFTER completion, so ownership is checked against the
+#      session row directly, not "active" status -- see _load_owned_session)
+#   4. kill-switch check (config.QUESTIONNAIRE_INTERPRETATION_ENABLED)
+#   5. definition validity (reload fresh from disk via _load_registry_fresh)
+#   6. eligibility check (legal_status/result_policy via
+#      questionnaires.is_result_eligible)
+#   7. only then render/send content
+
+async def _load_owned_session(session_id: int, uid: int):
+    """Like _load_owned_active_session, but does NOT require status=='active'
+    -- result/calculations/explanation screens are shown AFTER a session is
+    completed, so they must still work post-completion. Still enforces
+    ownership (same silent no-op non-disclosure convention)."""
+    session = await get_questionnaire_session(session_id)
+    if not session or session["user_id"] != uid:
+        return None
+    return session
+
+
+@dp.callback_query(F.data.startswith("q:r:"))
+async def cb_questionnaire_result(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):          # 1, 2
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+
+    session = await _load_owned_session(session_id, uid)            # 3
+    if session is None:
+        await callback.answer()
+        return
+
+    if not config.QUESTIONNAIRE_INTERPRETATION_ENABLED:              # 4
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    registry = _load_registry_fresh()                                # 5
+    definition = registry.get(session["questionnaire_id"])
+    if definition is None:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    if not questionnaires.is_result_eligible(definition):             # 6
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    await _send_questionnaire_result(callback.message.answer, definition, session_id, lang)  # 7
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:k:"))
+async def cb_questionnaire_calculations(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):          # 1, 2
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+
+    session = await _load_owned_session(session_id, uid)            # 3
+    if session is None:
+        await callback.answer()
+        return
+
+    if not config.QUESTIONNAIRE_INTERPRETATION_ENABLED:              # 4
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    registry = _load_registry_fresh()                                # 5
+    definition = registry.get(session["questionnaire_id"])
+    if definition is None:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    if not questionnaires.is_result_eligible(definition):             # 6
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    result = await _questionnaire_sum_or_none(definition, session_id)  # 7
+    if result is None:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    score, max_score, values = result
+    await callback.message.answer(
+        questionnaire_ux.calculations_text(values, score, max_score, lang),
+        reply_markup=_questionnaire_back_to_result_keyboard(session_id, lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:e:"))
+async def cb_questionnaire_explanation(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):          # 1, 2
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+
+    session = await _load_owned_session(session_id, uid)            # 3
+    if session is None:
+        await callback.answer()
+        return
+
+    if not config.QUESTIONNAIRE_INTERPRETATION_ENABLED:              # 4
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    registry = _load_registry_fresh()                                # 5
+    definition = registry.get(session["questionnaire_id"])
+    if definition is None:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    if not questionnaires.is_result_eligible(definition):             # 6
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    main_text = definition.get("scale_explanations", {}).get("main")  # 7
+    if not main_text:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    await callback.message.answer(
+        questionnaire_ux.explanation_text(main_text, lang),
+        reply_markup=_questionnaire_back_to_result_keyboard(session_id, lang))
     await callback.answer()
 
 

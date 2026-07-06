@@ -22,3 +22,13 @@ AB_VARIANTS = [v.strip() for v in os.getenv("AB_VARIANTS","control,variant_a").s
 
 ROUTER_VERSION    = "2.0"
 PRACTICE_VERSION  = "v1"
+
+# PR B (questionnaire result screens) — hard kill switch, default OFF. When
+# false (the default; no .env entry sets this true), every questionnaire
+# result/calculations/explanation entrypoint must behave byte-for-byte like
+# PR A's dormant completion screen. See CLAUDE.md / bot.py's questionnaire
+# section for the full gate order this flag sits in.
+QUESTIONNAIRE_INTERPRETATION_ENABLED = (
+    os.getenv("QUESTIONNAIRE_INTERPRETATION_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)

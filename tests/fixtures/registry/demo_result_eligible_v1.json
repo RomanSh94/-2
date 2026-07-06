@@ -1,0 +1,57 @@
+{
+  "id": "demo_result_eligible_v1",
+  "version": "1",
+  "lang": "ru",
+  "title": "Demo Result-Eligible Check",
+  "description": "Синтетический демонстрационный опросник для проверки экранов результата (PR B). Не клинический инструмент.",
+  "description_short": "3 вопроса, 1 минута",
+  "category": "anxiety",
+  "estimated_minutes": 1,
+  "status": "active",
+  "legal_status": "synthetic",
+  "result_policy": "user_visible_full",
+  "requires_gender": false,
+  "requires_age": false,
+  "contains_risk_items": false,
+  "scoring": {"type": "sum"},
+  "visualization": {"type": "intensity_bar", "segments": 7, "labels": ["низкая", "умеренная", "заметная", "высокая"]},
+  "scale_explanations": {
+    "main": "Эта демонстрационная шкала отражает общий уровень внутреннего напряжения, о котором вы сообщили в своих ответах. Более высокое значение означает, что вы чаще отмечали у себя соответствующие ощущения за последнее время. Шкала синтетическая и создана только для проверки интерфейса."
+  },
+  "items": [
+    {
+      "id": "q1",
+      "text": "Демонстрационный вопрос №1 о внутреннем напряжении",
+      "options": [
+        {"id": "a0", "label": "0 — совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — иногда", "value": "1"},
+        {"id": "a2", "label": "2 — часто", "value": "2"},
+        {"id": "a3", "label": "3 — почти каждый день", "value": "3"}
+      ]
+    },
+    {
+      "id": "q2",
+      "text": "Демонстрационный вопрос №2 о внутреннем напряжении",
+      "options": [
+        {"id": "a0", "label": "0 — совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — иногда", "value": "1"},
+        {"id": "a2", "label": "2 — часто", "value": "2"},
+        {"id": "a3", "label": "3 — почти каждый день", "value": "3"}
+      ]
+    },
+    {
+      "id": "q3",
+      "text": "Демонстрационный вопрос №3 о внутреннем напряжении",
+      "options": [
+        {"id": "a0", "label": "0 — совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — иногда", "value": "1"},
+        {"id": "a2", "label": "2 — часто", "value": "2"},
+        {"id": "a3", "label": "3 — почти каждый день", "value": "3"}
+      ]
+    }
+  ],
+  "completion_message": {
+    "ru": "Опрос завершён. (Текст из определения — напрямую не используется.)",
+    "en": "Questionnaire finished. (Definition text -- not used directly.)"
+  }
+}
