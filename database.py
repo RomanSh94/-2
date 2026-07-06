@@ -1460,6 +1460,18 @@ async def record_questionnaire_response(uid: int, session_id: int, questionnaire
         await db.commit()
 
 
+async def get_questionnaire_responses(session_id: int) -> list[dict]:
+    """Read-only helper (PR B): all recorded responses for one session, oldest
+    first. Used ONLY to compute an on-the-fly sum score for eligible synthetic
+    questionnaires -- no score is ever cached or written back to a table."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT item_id, answer_id, answer_value FROM questionnaire_responses "
+            "WHERE session_id=? ORDER BY id", (session_id,))
+        rows = await cur.fetchall()
+    return [{"item_id": r[0], "answer_id": r[1], "answer_value": r[2]} for r in rows]
+
+
 async def advance_questionnaire_session(session_id: int, new_index: int) -> None:
     async with aiosqlite.connect(DB) as db:
         await db.execute(

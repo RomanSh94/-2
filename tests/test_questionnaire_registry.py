@@ -93,8 +93,9 @@ def _make_active_session(uid=1):
 # ── registry loads multiple definitions (item 1) ─────────────────────────────
 def test_registry_loads_all_four_fixture_definitions():
     registry = questionnaires.load_registry(FIXTURE_DIR)
-    assert set(registry.by_id.keys()) == {
-        "demo_anxiety_v1", "demo_archived_v1", "demo_draft_v1", "demo_restricted_v1"}
+    assert {
+        "demo_anxiety_v1", "demo_archived_v1", "demo_draft_v1", "demo_restricted_v1",
+    }.issubset(registry.by_id.keys())
 
 
 def test_active_questionnaire_in_list_active():

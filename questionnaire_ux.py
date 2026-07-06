@@ -132,3 +132,110 @@ def cancelled_text(lang: str = "ru") -> str:
     if lang == "ru":
         return "Опрос прерван."
     return "Questionnaire stopped."
+
+
+# ── PR B — gated result/calculations/explanation screens ────────────────────
+# Everything below is dormant unless config.QUESTIONNAIRE_INTERPRETATION_ENABLED
+# is true AND the definition passes the eligibility check in bot.py (synthetic
+# legal_status + user_visible_full/user_visible_score result_policy). Pure,
+# deterministic string builders only -- no scoring/eligibility logic lives
+# here (that's questionnaires.py / bot.py); this module only renders text from
+# numbers/labels it is given. Never use: норма, патология, опасность,
+# расстройство, вероятность заболевания, диагноз (except in the fixed
+# "not a diagnosis" disclaimers) -- anywhere in this module.
+
+_INTENSITY_LABELS = ("низкая", "умеренная", "заметная", "высокая")
+_INTENSITY_LABELS_EN = ("low", "moderate", "noticeable", "high")
+_SEGMENT_COLORS = ("🟩", "🟨", "🟧", "🟥")
+
+
+def render_intensity_bar(score: int, max_score: int, segments: int = 7) -> str:
+    """Pure/deterministic. Renders `segments` colored blocks (low->high:
+    green/yellow/orange/red) filled proportionally to score/max_score, with
+    the remainder as empty ⬜ blocks. No labels, no numbers -- just the bar."""
+    if segments <= 0:
+        return ""
+    if max_score <= 0:
+        fraction = 0.0
+    else:
+        fraction = max(0.0, min(1.0, score / max_score))
+    filled = round(fraction * segments)
+    filled = max(0, min(segments, filled))
+    bar_chars = []
+    for i in range(filled):
+        # Color ramps low->high across the FILLED portion's own position in
+        # the overall bar (not just the fill count), so a bar filled to 2/7
+        # stays green while one filled to 6/7 progresses to red.
+        pos_fraction = (i + 1) / segments
+        if pos_fraction <= 0.25:
+            color_idx = 0
+        elif pos_fraction <= 0.5:
+            color_idx = 1
+        elif pos_fraction <= 0.75:
+            color_idx = 2
+        else:
+            color_idx = 3
+        bar_chars.append(_SEGMENT_COLORS[color_idx])
+    bar_chars += ["⬜"] * (segments - filled)
+    return "".join(bar_chars)
+
+
+def intensity_label(score: int, max_score: int, lang: str = "ru") -> str:
+    """Maps score/max_score fraction to one of exactly four labels (never
+    anything else): низкая/умеренная/заметная/высокая (ru) or their EN
+    equivalents low/moderate/noticeable/high."""
+    if max_score <= 0:
+        fraction = 0.0
+    else:
+        fraction = max(0.0, min(1.0, score / max_score))
+    labels = _INTENSITY_LABELS if lang == "ru" else _INTENSITY_LABELS_EN
+    if fraction <= 0.25:
+        return labels[0]
+    if fraction <= 0.5:
+        return labels[1]
+    if fraction <= 0.75:
+        return labels[2]
+    return labels[3]
+
+
+def result_text(score: int, max_score: int, lang: str = "ru", segments: int = 7) -> str:
+    bar = render_intensity_bar(score, max_score, segments)
+    label = intensity_label(score, max_score, lang)
+    if lang == "ru":
+        return (f"✅ Результат готов\n\n"
+                f"Ваш результат: {score} / {max_score}\n\n"
+                f"{bar}\n"
+                f"0        ●        {max_score}\n\n"
+                f"Выраженность по вашим ответам: {label}\n\n"
+                f"Это не диагноз. Результат можно использовать для самонаблюдения.")
+    return (f"✅ Result ready\n\n"
+            f"Your result: {score} / {max_score}\n\n"
+            f"{bar}\n"
+            f"0        ●        {max_score}\n\n"
+            f"Level based on your answers: {label}\n\n"
+            f"This is not a diagnosis. You can use the result for self-observation.")
+
+
+def calculations_text(values: list[int], score: int, max_score: int, lang: str = "ru") -> str:
+    sum_expr = " + ".join(str(v) for v in values)
+    if lang == "ru":
+        return (f"📊 Расчёты\n\n"
+                f"Ответы:\n{sum_expr} = {score}\n\n"
+                f"Итог:\n{score} / {max_score}\n\n"
+                f"Цветовая шкала показывает выраженность суммы ответов.\n"
+                f"Она не является диагнозом.")
+    return (f"📊 Calculations\n\n"
+            f"Answers:\n{sum_expr} = {score}\n\n"
+            f"Total:\n{score} / {max_score}\n\n"
+            f"The color scale reflects the intensity of the answer sum.\n"
+            f"It is not a diagnosis.")
+
+
+def explanation_text(scale_explanation_main: str, lang: str = "ru") -> str:
+    if lang == "ru":
+        return (f"🧠 Что значат шкалы\n\n"
+                f"{scale_explanation_main}\n\n"
+                f"Это не диагноз и не медицинское заключение.")
+    return (f"🧠 What the scales mean\n\n"
+            f"{scale_explanation_main}\n\n"
+            f"This is not a diagnosis or a medical conclusion.")

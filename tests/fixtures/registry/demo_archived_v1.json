@@ -8,7 +8,8 @@
   "estimated_minutes": 1,
   "status": "archived",
   "legal_status": "synthetic",
-  "result_policy": "no_score",
+  "result_policy": "user_visible_full",
+  "scoring": {"type": "sum"},
   "contains_risk_items": false,
   "items": [
     {
