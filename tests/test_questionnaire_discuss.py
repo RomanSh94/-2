@@ -406,8 +406,18 @@ def test_discuss_no_fsm_state_added():
     assert "FSMContext" not in discuss_src
 
 
-# ── 13. no visible button added in C2 (deferred to C2.1) ─────────────────────
-def test_discuss_no_visible_button_added_in_c2(monkeypatch):
+# ── 13. PR C2.1: button now present on the result keyboard (flag ON +
+# eligible), wired to the bare q:m:<sid> menu handler. This test used to be
+# named test_discuss_no_visible_button_added_in_c2 and asserted the button's
+# ABSENCE -- that was correct for C2 (handlers existed, no entry point yet).
+# C2.1's entire job is adding that entry point, so both assertions below flip
+# from ABSENCE to PRESENCE, exactly like the "специалист" flip in PR C1.1.
+# Note this test's default _complete_flow qid is "demo_result_eligible_v1"
+# (flag ON via the autouse _common fixture + eligible definition), so both
+# blocks below exercise the RESULT keyboard, not the completion keyboard --
+# the flag-off/ineligible "must stay absent" case is covered separately by
+# test_discuss_button_absent_from_flag_off_completion_keyboard below.
+def test_discuss_button_present_on_result_and_requery(monkeypatch):
     user = FakeUser(1)
     msg = FakeMessage(user)
     session_id = _complete_flow(user, msg)
@@ -415,8 +425,8 @@ def test_discuss_no_visible_button_added_in_c2(monkeypatch):
     kb = kw["reply_markup"]
     texts = [btn.text for row in kb.inline_keyboard for btn in row]
     datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    assert not any("Обсудить" in t for t in texts)
-    assert not any(d.startswith("q:m:") for d in datas)
+    assert any("Обсудить" in t for t in texts)
+    assert f"q:m:{session_id}" in datas
 
     cb = FakeCallback(user, msg, data=f"q:r:{session_id}")
     asyncio.run(bot.cb_questionnaire_result(cb))
@@ -424,8 +434,51 @@ def test_discuss_no_visible_button_added_in_c2(monkeypatch):
     kb2 = kw2["reply_markup"]
     texts2 = [btn.text for row in kb2.inline_keyboard for btn in row]
     datas2 = [btn.callback_data for row in kb2.inline_keyboard for btn in row]
-    assert not any("Обсудить" in t for t in texts2)
-    assert not any(d.startswith("q:m:") for d in datas2)
+    assert any("Обсудить" in t for t in texts2)
+    assert f"q:m:{session_id}" in datas2
+
+
+# ── 13b. PR C2.1: flag OFF -- completion keyboard must never show the
+# discuss-with-bot entry point (it would dead-end since interpretation is
+# off). This preserves the safety property that used to live in
+# test_discuss_no_visible_button_added_in_c2 for the flag-off path.
+def test_discuss_button_absent_from_flag_off_completion_keyboard(monkeypatch):
+    monkeypatch.setattr(config, "QUESTIONNAIRE_INTERPRETATION_ENABLED", False)
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    _complete_flow(user, msg, qid="demo_anxiety_v1", n_items=5)
+    _, kw = msg.answers[-1]
+    kb = kw["reply_markup"]
+    texts = [btn.text for row in kb.inline_keyboard for btn in row]
+    datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    assert not any("Обсудить" in t for t in texts)
+    assert not any(d.startswith("q:m:") for d in datas)
+
+
+# ── 13c. PR C2.1: integration proof -- the button's callback_data actually
+# opens the real, already-existing bare-menu handler (no LLM/traced call).
+def test_discuss_button_opens_existing_bare_menu(monkeypatch):
+    called = {"traced": False}
+
+    async def _fake_traced(*a, **kw):
+        called["traced"] = True
+        return None
+
+    monkeypatch.setattr(bot, "traced_response_builder", _fake_traced, raising=False)
+
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = _complete_flow(user, msg)
+    _, kw = msg.answers[-1]
+    kb = kw["reply_markup"]
+    datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    menu_data = next(d for d in datas if d == f"q:m:{session_id}")
+
+    cb = FakeCallback(user, msg, data=menu_data)
+    asyncio.run(bot.cb_questionnaire_discuss_menu(cb))
+    text, _ = msg.answers[-1]
+    assert text != questionnaire_ux.not_available_text("ru")
+    assert called["traced"] is False
 
 
 # ── 14. callback_data stays under 64 bytes for every discuss format ─────────

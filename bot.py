@@ -1745,8 +1745,9 @@ def _questionnaire_completion_keyboard(session_id: int, lang: str) -> InlineKeyb
 # ── PR B — result / calculations / explanation screens (dormant unless
 # config.QUESTIONNAIRE_INTERPRETATION_ENABLED is true AND the definition is
 # eligible; see questionnaires.is_result_eligible). PR C1.1 added the
-# specialist-report button (q:o:<sid>) below -- "discuss with bot" is still
-# NOT wired here; that remains a future PR.
+# specialist-report button (q:o:<sid>) below. PR C2.1 wires the
+# discuss-with-bot entry point (q:m:<sid>, bare menu format) into this
+# keyboard only -- see cb_questionnaire_discuss_menu, unchanged from C2.
 
 def _questionnaire_result_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1756,6 +1757,8 @@ def _questionnaire_result_keyboard(session_id: int, lang: str) -> InlineKeyboard
                               callback_data=f"q:e:{session_id}")],
         [InlineKeyboardButton(text=("🧾 Отчёт специалисту" if lang == "ru" else "🧾 Specialist report"),
                               callback_data=f"q:o:{session_id}")],
+        [InlineKeyboardButton(text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss result"),
+                              callback_data=f"q:m:{session_id}")],
         [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
                               callback_data="q:l")],
         [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),

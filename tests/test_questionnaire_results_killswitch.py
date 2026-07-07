@@ -213,17 +213,19 @@ def test_result_screen_has_exactly_four_expected_buttons(monkeypatch):
     _, kw = msg.answers[-1]
     kb = kw["reply_markup"]
     texts = [btn.text for row in kb.inline_keyboard for btn in row]
-    # PR C1.1: result keyboard grew by one button (specialist report), so the
-    # total is now 5, not 4. The "специалист" assertion below is flipped from
-    # asserting ABSENCE to asserting PRESENCE -- that inversion is the entire
-    # point of this PR (wiring reachability to the already-merged q:o
-    # handler). "Обсудить" (discuss-with-bot) remains absent/out of scope.
-    assert len(texts) == 5
+    # PR C1.1: result keyboard grew by one button (specialist report), 5 not 4.
+    # PR C2.1: result keyboard grew by one more button (discuss-with-bot,
+    # q:m:<sid> bare menu format), so the total is now 6, not 5. The
+    # "Обсудить" assertion below is flipped from asserting ABSENCE to
+    # asserting PRESENCE -- that inversion is the entire point of this PR
+    # (wiring reachability to the already-merged q:m bare-menu handler),
+    # exactly like how the "специалист" assertion flipped in PR C1.1.
+    assert len(texts) == 6
     assert any("Расчёты" in t for t in texts)
     assert any("шкал" in t for t in texts)
     assert any("Другой опросник" in t for t in texts)
     assert any("В меню" in t for t in texts)
-    assert not any("Обсудить" in t for t in texts)
+    assert any("Обсудить" in t for t in texts)
     assert any("специалист" in t.lower() for t in texts)
 
 
