@@ -74,6 +74,17 @@ NEARA — это: AI-инструмент самонаблюдения; эмоц
 
 PR 1B-2 does **not** claim PR 1B-1 live smoke passed.
 
+## 0.5. Normative Amendment — Scoring/Interpretation Exception & Specialist Report (PR C1)
+
+**Status: NORMATIVE.**
+
+1. **Scoring/interpretation exception (owner-approved override of the earlier deferred boundary).** User-visible score, color/intensity bar, and intensity label are allowed specifically for definitions whose `result_policy` is `user_visible_full` or `user_visible_score`, exactly as implemented in PR B and this PR (C1). This is a narrow, named exception — it does **not** reopen scoring/interpretation as a general product surface.
+2. **Still forbidden regardless of `result_policy`:** diagnosis labels, disorder claims, probability-of-illness claims, treatment prescriptions. `specialist_only`, `restricted`, `draft`, `archived`, and `no_score` must **never** show a score, color bar, or intensity label — no exception, including in the specialist report.
+3. **Scale-meaning explanations must be original wording** describing the general construct in the abstract — never a paraphrase, even a simplified one, of a real instrument's copyrighted interpretive manual text. This applies now (synthetic fixtures only) and to any future real instrument (e.g. STAI, GAD-7).
+4. **Norm-conversion tables** (raw-to-sten, percentile, or similar) are treated the same as copyrighted interpretive text — never reproduce or paraphrase a real instrument's table without separately confirmed license.
+5. **§8 gates production ENABLE, not code merge.** `CLINICAL_BOUNDARY.md §8` blocks user-visible questionnaire interpretation from reaching real users until crisis-delivery live smoke passes — still postponed/not passed as of this PR. Code implementing scoring/interpretation UX (PR B, this PR C1) may be built and merged dormant behind `QUESTIONNAIRE_INTERPRETATION_ENABLED` (default false). Flipping that flag to true in a real deployment is a separate, explicit owner decision (future PR C3 or equivalent) — not authorized by this PR or by PR B's merge.
+6. **The specialist report (this PR) is self-only** — `requester_uid == target_uid`, the same principle `scoped_access.py` applies to `self_view`/`privacy_export` (§0.4): a user viewing/exporting their OWN completed questionnaire. It is a **separate system** from `review_pack.py`'s reviewer-initiated, role-gated mechanism (`access_control.can_request_review_pack`) — the two must not be conflated, and this PR adds no new coupling between them.
+
 ---
 
 ## 1. Главный архитектурный риск
