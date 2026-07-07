@@ -1726,8 +1726,14 @@ def _questionnaire_detail_keyboard(qid: str, lang: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _questionnaire_completion_keyboard(lang: str) -> InlineKeyboardMarkup:
+def _questionnaire_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
+    # PR C1.1: added the specialist-report button (q:o:<sid>) as its own row,
+    # ahead of the navigation buttons -- this is the flag-off/ineligible path,
+    # where the report still renders (all answers, no score line; see q:o's
+    # own conditional-score-line logic in cb_questionnaire_specialist_report).
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("🧾 Отчёт специалисту" if lang == "ru" else "🧾 Specialist report"),
+                              callback_data=f"q:o:{session_id}")],
         [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
                               callback_data="q:l")],
         [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
@@ -1737,8 +1743,9 @@ def _questionnaire_completion_keyboard(lang: str) -> InlineKeyboardMarkup:
 
 # ── PR B — result / calculations / explanation screens (dormant unless
 # config.QUESTIONNAIRE_INTERPRETATION_ENABLED is true AND the definition is
-# eligible; see questionnaires.is_result_eligible). Deliberately NO
-# "discuss with bot" / "report to specialist" buttons -- future PRs only.
+# eligible; see questionnaires.is_result_eligible). PR C1.1 added the
+# specialist-report button (q:o:<sid>) below -- "discuss with bot" is still
+# NOT wired here; that remains a future PR.
 
 def _questionnaire_result_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1746,6 +1753,8 @@ def _questionnaire_result_keyboard(session_id: int, lang: str) -> InlineKeyboard
                               callback_data=f"q:k:{session_id}"),
          InlineKeyboardButton(text=("🧠 Что значат шкалы" if lang == "ru" else "🧠 What scales mean"),
                               callback_data=f"q:e:{session_id}")],
+        [InlineKeyboardButton(text=("🧾 Отчёт специалисту" if lang == "ru" else "🧾 Specialist report"),
+                              callback_data=f"q:o:{session_id}")],
         [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
                               callback_data="q:l")],
         [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
@@ -1818,7 +1827,8 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
         if config.QUESTIONNAIRE_INTERPRETATION_ENABLED and questionnaires.is_result_eligible(definition):
             await _send_questionnaire_result(send, definition, session_id, lang)
             return
-        await send(questionnaire_ux.completion_text(lang), reply_markup=_questionnaire_completion_keyboard(lang))
+        await send(questionnaire_ux.completion_text(lang),
+                   reply_markup=_questionnaire_completion_keyboard(session_id, lang))
         return
     total = len(definition.get("items", []))
     text = questionnaire_ux.question_text(step, total, item["text"], lang)

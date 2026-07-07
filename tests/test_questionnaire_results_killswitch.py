@@ -124,7 +124,9 @@ def test_flag_off_completion_is_byte_identical_to_pr_a():
     assert final_text == bot.questionnaire_ux.completion_text("ru")
     kb = kw["reply_markup"]
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    assert callback_datas == ["q:l", "menu:back"]
+    # PR C1.1: completion keyboard now also carries the specialist-report
+    # button (q:o:<sid>) ahead of the nav buttons -- was ["q:l", "menu:back"].
+    assert callback_datas == [f"q:o:{session_id}", "q:l", "menu:back"]
     session = asyncio.run(database.get_questionnaire_session(session_id))
     assert session["status"] == "completed"
 
@@ -211,13 +213,18 @@ def test_result_screen_has_exactly_four_expected_buttons(monkeypatch):
     _, kw = msg.answers[-1]
     kb = kw["reply_markup"]
     texts = [btn.text for row in kb.inline_keyboard for btn in row]
-    assert len(texts) == 4
+    # PR C1.1: result keyboard grew by one button (specialist report), so the
+    # total is now 5, not 4. The "специалист" assertion below is flipped from
+    # asserting ABSENCE to asserting PRESENCE -- that inversion is the entire
+    # point of this PR (wiring reachability to the already-merged q:o
+    # handler). "Обсудить" (discuss-with-bot) remains absent/out of scope.
+    assert len(texts) == 5
     assert any("Расчёты" in t for t in texts)
     assert any("шкал" in t for t in texts)
     assert any("Другой опросник" in t for t in texts)
     assert any("В меню" in t for t in texts)
     assert not any("Обсудить" in t for t in texts)
-    assert not any("специалист" in t.lower() for t in texts)
+    assert any("специалист" in t.lower() for t in texts)
 
 
 # ── 6. calculations screen shows raw sum/max only, no norm/sten/percentile ───
@@ -450,8 +457,38 @@ def test_intensity_label_only_four_values():
 def test_pr_a_completion_keyboard_unchanged_shape():
     user = FakeUser(1)
     msg = FakeMessage(user)
-    _complete_flow(user, msg)  # flag is False (autouse fixture default)
+    session_id = _complete_flow(user, msg)  # flag is False (autouse fixture default)
     _, kw = msg.answers[-1]
     kb = kw["reply_markup"]
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    assert callback_datas == ["q:l", "menu:back"]
+    # PR C1.1: completion keyboard now also carries the specialist-report
+    # button (q:o:<sid>) ahead of the nav buttons -- was ["q:l", "menu:back"].
+    assert callback_datas == [f"q:o:{session_id}", "q:l", "menu:back"]
+
+
+# ── PR C1.1 — specialist report button wired into result/completion keyboards
+def test_flag_off_completion_has_specialist_report_button():
+    """Flag off (default): _questionnaire_completion_keyboard is used, and it
+    must carry a q:o:<sid> button matching the real session id."""
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = _complete_flow(user, msg)
+    _, kw = msg.answers[-1]
+    kb = kw["reply_markup"]
+    buttons = [(btn.text, btn.callback_data) for row in kb.inline_keyboard for btn in row]
+    matching = [cd for text, cd in buttons if "специалист" in text.lower()]
+    assert matching == [f"q:o:{session_id}"]
+
+
+def test_flag_on_eligible_result_screen_has_specialist_report_button(monkeypatch):
+    """Flag on + eligible definition: _questionnaire_result_keyboard is used,
+    and it must carry a q:o:<sid> button matching the real session id."""
+    monkeypatch.setattr(config, "QUESTIONNAIRE_INTERPRETATION_ENABLED", True)
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = _complete_flow(user, msg, qid="demo_result_eligible_v1", answer="a1", n_items=3)
+    _, kw = msg.answers[-1]
+    kb = kw["reply_markup"]
+    buttons = [(btn.text, btn.callback_data) for row in kb.inline_keyboard for btn in row]
+    matching = [cd for text, cd in buttons if "специалист" in text.lower()]
+    assert matching == [f"q:o:{session_id}"]
