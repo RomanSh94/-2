@@ -29,7 +29,18 @@ import database
 database.DB = "x20_test.db"          # isolate the DB before anything touches it
 
 from bot import main                 # imports config (now reading .env.test)
+import config
 
 if __name__ == "__main__":
-    print("🧪 X20 TEST bot — DB=x20_test.db, port=" + os.environ["ADMIN_PORT"])
+    # Self-check banner (PR C3a) -- config.QUESTIONNAIRE_INTERPRETATION_ENABLED
+    # is read from os.environ at config.py's IMPORT time (see config.py), which
+    # already happened above via `from bot import main`. Changing .env.test on
+    # disk after this process has started has no effect -- restart the test
+    # process to pick up a new value. This banner exists so the owner can
+    # visually confirm which process (and which flag value) they launched,
+    # never so they can toggle the flag without a restart.
+    print("🧪 X20 TEST bot")
+    print(f"DB={database.DB}")
+    print(f"QUESTIONNAIRE_INTERPRETATION_ENABLED={config.QUESTIONNAIRE_INTERPRETATION_ENABLED}")
+    print("port=" + os.environ["ADMIN_PORT"])
     asyncio.run(main())
