@@ -58,6 +58,7 @@ from safety_validator import (
     validate_response,
     validate_response_with_context, select_fallback,
 )
+from traced_response import Influence, traced_response_builder, persist_influence_trace
 from prompts import get_disambiguation_message
 from tz import effective_tz
 import journals
@@ -2369,6 +2370,249 @@ async def cb_questionnaire_specialist_report(callback: CallbackQuery):
     report = questionnaire_ux.specialist_report_text(
         definition["title"], completed_at, answer_lines, score_line, lang)
     await callback.message.answer(report)
+    await callback.answer()
+
+
+# ── PR C2 — discuss-with-bot via A1 / traced_response_builder ───────────────
+# Callback format: q:m:<sid> bare menu (NO LLM call at all), q:m:<sid>:<topic>
+# ("why"|"next"|"specialist") ONE bounded traced LLM reply, no continuation.
+# The user never types free text in this flow -- each topic button sends
+# exactly one fixed, template-driven prompt (built from title/score/
+# intensity_label/topic_id, never raw stored answer text) and ends the flow.
+# Tapping another topic is a fresh independent callback. NO FSM, no multi-turn
+# state.
+#
+# Because there is no user-typed text anywhere in this flow, this code
+# deliberately does NOT call risk_detector.detect_risk anywhere -- a future PR
+# adding free-text continuation would need to add RED/ORANGE risk handling
+# THEN, not now. See CLAUDE.md / this PR's description for this scope note.
+#
+# Gate order (identical structure to q:r/q:k/q:e/q:o above), for BOTH the bare
+# menu and every topic callback:
+#   1. journal_guard (via _questionnaire_gate)
+#   2. ensure_full_access_or_closed_test (via _questionnaire_gate)
+#   3. session ownership (_load_owned_session -- reachable after completion)
+#   4. kill-switch check (config.QUESTIONNAIRE_INTERPRETATION_ENABLED)
+#   5. definition validity (reload fresh from disk via _load_registry_fresh,
+#      version must match the session's recorded questionnaire_version)
+#   6. eligibility check (questionnaires.is_result_eligible)
+# The bare q:m:<sid> menu follows the EXACT same six-step chain as the topic
+# callbacks (not a looser check) -- it leads directly into eligible topics, so
+# it must be gated as strictly as they are.
+#
+# This is the FIRST production caller of traced_response_builder (PR #43):
+# persist_trace failure, build_response failure (DiscussBuildFailed), and
+# validator rejection (DiscussOutputRejected) all degrade to the SAME
+# neutral_fallback text -- one shared fallback per caller, by construction.
+
+class DiscussBuildFailed(Exception):
+    """Raised by _discuss_build_response when the LLM call itself fails.
+    Never caught locally -- propagates to traced_response_builder, which
+    routes it to neutral_fallback. No fallback text is ever produced here."""
+
+
+class DiscussOutputRejected(Exception):
+    """Raised by _discuss_build_response when validate_response_with_context
+    rejects the generated reply. Never caught locally -- propagates to
+    traced_response_builder, which routes it to neutral_fallback."""
+
+
+_DISCUSS_TOPICS = ("why", "next", "specialist")
+
+
+def _discuss_menu_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("Почему так вышло?" if lang == "ru" else "Why did this come out this way?"),
+            callback_data=f"q:m:{session_id}:why")],
+        [InlineKeyboardButton(
+            text=("Что можно сделать дальше?" if lang == "ru" else "What can I do next?"),
+            callback_data=f"q:m:{session_id}:next")],
+        [InlineKeyboardButton(
+            text=("Вопросы специалисту" if lang == "ru" else "Questions for a specialist"),
+            callback_data=f"q:m:{session_id}:specialist")],
+        [InlineKeyboardButton(
+            text=("⬅️ Назад к результату" if lang == "ru" else "⬅️ Back to result"),
+            callback_data=f"q:r:{session_id}")],
+        [InlineKeyboardButton(
+            text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
+            callback_data="menu:back")],
+    ])
+
+
+async def _discuss_gate_and_load(session: dict, lang: str):
+    """Steps 4-6 of the gate chain (kill-switch, definition validity,
+    eligibility) PLUS scoring, given an ALREADY-loaded, ALREADY-owned session
+    (step 3 -- _load_owned_session -- is the caller's responsibility, same as
+    every other q:r/q:k/q:e/q:o handler, so that an ownership failure stays a
+    SILENT no-op and is never conflated with "not available"). Returns
+    (definition, score, max_score, intensity) on success, or None on ANY
+    failure -- caller must send questionnaire_ux.not_available_text and
+    return. Never calls the LLM or traced_response_builder; this is pure
+    gating + scoring, identical in spirit to _questionnaire_sum_or_none."""
+    if not config.QUESTIONNAIRE_INTERPRETATION_ENABLED:                   # 4
+        return None
+
+    registry = _load_registry_fresh()                                     # 5
+    definition = registry.get(session["questionnaire_id"])
+    if definition is None:
+        return None
+    if definition["version"] != session["questionnaire_version"]:
+        return None
+
+    if not questionnaires.is_result_eligible(definition):                 # 6
+        return None
+
+    responses = await get_questionnaire_responses(session_id=session["id"])
+    try:
+        score, max_score, _values = questionnaires.compute_sum_score(definition, responses)
+    except questionnaires.ScoringError:
+        return None
+    intensity = questionnaire_ux.intensity_label(score, max_score, lang)
+    return definition, score, max_score, intensity
+
+
+def _is_bare_discuss_menu_data(data: str) -> bool:
+    """True only for q:m:<sid> (exactly 3 parts, digit session id) -- NOT for
+    a topic callback q:m:<sid>:<topic>, so this filter and the topic filter
+    below are mutually exclusive and aiogram never has to pick between two
+    matching handlers for the same callback_data."""
+    if not data.startswith("q:m:"):
+        return False
+    parts = data.split(":")
+    return len(parts) == 3
+
+
+def _is_discuss_topic_data(data: str) -> bool:
+    """True only for q:m:<sid>:<topic> with topic in _DISCUSS_TOPICS."""
+    if not data.startswith("q:m:"):
+        return False
+    parts = data.split(":")
+    return len(parts) == 4 and parts[3] in _DISCUSS_TOPICS
+
+
+@dp.callback_query(lambda c: _is_bare_discuss_menu_data(c.data or ""))
+async def cb_questionnaire_discuss_menu(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):            # 1, 2
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+
+    session = await _load_owned_session(session_id, uid)                  # 3
+    if session is None:
+        # Silent no-op -- same non-disclosure convention as q:r/q:k/q:e/q:o.
+        await callback.answer()
+        return
+
+    loaded = await _discuss_gate_and_load(session, lang)                  # 4-6
+    if loaded is None:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    # Deterministic menu -- NO LLM call at all.
+    await callback.message.answer(
+        questionnaire_ux.discuss_menu_text(lang),
+        reply_markup=_discuss_menu_keyboard(session_id, lang))
+    await callback.answer()
+
+
+async def _discuss_build_response(title: str, score: int, max_score: int,
+                                   intensity: str, topic_id: str, lang: str) -> str:
+    """Strictly raise-or-return-valid-text. NEVER sends messages, NEVER
+    returns fallback text, NEVER catches its own failures and silently
+    converts them to a local fallback string. Only two failure outcomes:
+    DiscussBuildFailed (LLM call itself failed) or DiscussOutputRejected
+    (validator rejected the generated text) -- both propagate uncaught to
+    traced_response_builder (PR #43), which routes both to neutral_fallback."""
+    prompt_text = questionnaire_ux.discuss_topic_prompt(
+        title, score, max_score, intensity, topic_id, lang)
+    messages = [
+        {"role": "system", "content": get_system_prompt("open_chat", lang)},
+        {"role": "user", "content": prompt_text},
+    ]
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini", messages=messages, temperature=0.65, max_tokens=300,
+        )
+        answer = response.choices[0].message.content
+    except Exception as e:
+        raise DiscussBuildFailed(f"LLM call failed: {type(e).__name__}") from e
+
+    # Deterministic, neutral risk context -- there is no user-typed text in
+    # this flow, so this is NOT detect_risk output; it is a fixed, empty-risk
+    # shape matching risk_detector.detect_risk's real return keys
+    # (score/level/categories/implicit/ambiguous_phrases), constructed so the
+    # validator's risk-gated side-checks (which only fire on
+    # level in medium/high/critical, or a truthy ambiguous_phrases) stay
+    # dormant -- proven empirically in
+    # tests/test_questionnaire_discuss.py::test_discuss_validator_receives_deterministic_context.
+    neutral_risk = {"score": 0, "level": "low", "categories": [],
+                     "implicit": False, "ambiguous_phrases": []}
+    is_safe, reason = validate_response_with_context(answer, prompt_text, neutral_risk, lang)
+    if not is_safe:
+        raise DiscussOutputRejected(f"validator rejected: {reason}")
+    return answer
+
+
+@dp.callback_query(lambda c: _is_discuss_topic_data(c.data or ""))
+async def cb_questionnaire_discuss_topic(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):            # 1, 2
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 4 or not parts[2].isdigit() or parts[3] not in _DISCUSS_TOPICS:
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+    topic_id = parts[3]
+
+    session = await _load_owned_session(session_id, uid)                  # 3
+    if session is None:
+        # Silent no-op -- same non-disclosure convention as q:r/q:k/q:e/q:o.
+        await callback.answer()
+        return
+
+    loaded = await _discuss_gate_and_load(session, lang)                  # 4-6
+    if loaded is None:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    definition, score, max_score, intensity = loaded
+
+    influence = Influence(
+        "questionnaire_result", session_id,
+        f"reply drew on questionnaire session {session_id} ({definition['title']}) "
+        f"result {score}/{max_score} ({intensity}), topic={topic_id}",
+    )
+
+    async def _build():
+        return await _discuss_build_response(
+            definition["title"], score, max_score, intensity, topic_id, lang)
+
+    async def _send(text):
+        await callback.message.answer(text)
+
+    async def _neutral_fallback():
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+
+    try:
+        await traced_response_builder(
+            user_id=uid, requester_uid=uid,
+            influences=[influence],
+            build_response=_build,
+            send=_send,
+            persist_trace=persist_influence_trace,
+            neutral_fallback=_neutral_fallback,
+        )
+    except access_control.A1NotAllowed:
+        await _neutral_fallback()
     await callback.answer()
 
 

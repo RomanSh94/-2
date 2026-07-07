@@ -279,3 +279,70 @@ def specialist_report_text(title: str, completed_at: str | None,
     parts.append("This is not a diagnosis or a medical conclusion. This report is for "
                   "your own personal use, for example when talking with a specialist.")
     return "\n".join(parts)
+
+
+# ── PR C2 — discuss-with-bot menu (deterministic, no LLM) ────────────────────
+# Dormant unless bot.py's gate (same eligibility chain as q:r/q:o) allows it.
+# This module holds ONLY the fixed menu text/topic prompt strings; the actual
+# LLM call and trace-builder wiring live in bot.py. No new button is added to
+# _questionnaire_result_keyboard/_questionnaire_completion_keyboard in this PR
+# -- q:m is reachable only by direct callback in PR C2 (see CLAUDE.md / this
+# PR's scope notes; the visible button is deferred to C2.1).
+
+def discuss_menu_text(lang: str = "ru") -> str:
+    if lang == "ru":
+        return ("💬 Обсудить результат\n\n"
+                "Я могу помочь спокойно посмотреть на результат как на ориентир "
+                "для самонаблюдения.\n"
+                "Это не диагноз и не медицинское заключение.\n\n"
+                "Что хочешь разобрать?")
+    return ("💬 Discuss the result\n\n"
+            "I can help you take a calm look at the result as a marker for "
+            "self-observation.\n"
+            "This is not a diagnosis or a medical conclusion.\n\n"
+            "What would you like to go through?")
+
+
+def discuss_topic_prompt(title: str, score: int, max_score: int, intensity: str,
+                          topic_id: str, lang: str = "ru") -> str:
+    """Fixed, template-driven prompt text sent to the LLM for one topic. Never
+    includes raw stored answer text, instrument manual wording, norm-table
+    data, or diagnosis labels -- only title/score/intensity_label/topic_id and
+    a non-diagnostic interpretation-boundary instruction."""
+    if lang == "ru":
+        boundary = ("Это не диагноз и не медицинское заключение. Не ставь диагнозов, "
+                     "не называй расстройств, не оценивай вероятность заболевания, не "
+                     "назначай лечение и не давай медицинских советов. Поддерживай "
+                     "самонаблюдение пользователя.")
+        topic_lines = {
+            "why": "Помоги человеку спокойно порассуждать, что в его повседневной жизни "
+                   "могло отражаться в таком результате -- без диагнозов и причинных "
+                   "утверждений, только как повод для самонаблюдения.",
+            "next": "Предложи мягкие, небольшие практические шаги для самонаблюдения и "
+                    "заботы о себе, которые человек может попробовать дальше.",
+            "specialist": "Помоги человеку сформулировать 2-3 вопроса, которые он мог бы "
+                          "задать специалисту, опираясь на этот результат как ориентир "
+                          "для разговора -- не вместо специалиста.",
+        }
+        topic_line = topic_lines.get(topic_id, topic_lines["why"])
+        return (f"Опросник: {title}\nРезультат: {score} / {max_score}\n"
+                f"Выраженность: {intensity}\nТема: {topic_id}\n\n"
+                f"{topic_line}\n\n{boundary}")
+    boundary = ("This is not a diagnosis or a medical conclusion. Do not diagnose, do "
+                "not name disorders, do not estimate probability of illness, do not "
+                "prescribe treatment, and do not give medical advice. Support the "
+                "user's self-observation.")
+    topic_lines = {
+        "why": "Help the person calmly reflect on what in their everyday life might be "
+               "reflected in this result -- without diagnoses or causal claims, only "
+               "as a prompt for self-observation.",
+        "next": "Suggest gentle, small practical steps for self-observation and "
+                "self-care the person could try next.",
+        "specialist": "Help the person phrase 2-3 questions they could bring to a "
+                      "specialist, using this result as a talking-point marker -- not "
+                      "a substitute for a specialist.",
+    }
+    topic_line = topic_lines.get(topic_id, topic_lines["why"])
+    return (f"Questionnaire: {title}\nResult: {score} / {max_score}\n"
+            f"Intensity: {intensity}\nTopic: {topic_id}\n\n"
+            f"{topic_line}\n\n{boundary}")
