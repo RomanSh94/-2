@@ -127,3 +127,49 @@ def test_builder_with_real_binding_persists_rows(tmp_db, monkeypatch):
     assert rid == "rid-real"
     assert sent == ["LATENT"]                       # latent reply delivered
     assert rows == [("schema_theme", "theme_9", "reply drew on schema_theme theme_9")]
+
+
+def test_build_response_failure_degrades_to_neutral_fallback_not_send(tmp_db, monkeypatch):
+    # Completes the fail-closed contract: previously only persist_trace failures
+    # were caught here -- a build_response failure (e.g. a caller's own output
+    # validator rejecting the LLM reply and raising to signal that) propagated
+    # UNCAUGHT out of traced_response_builder. This proves the same
+    # neutral_fallback path now catches that case too, and the (already
+    # persisted) trace does not result in the latent reply being sent.
+    import access_control
+
+    async def _always_allow(requester_uid):
+        return None
+    monkeypatch.setattr(access_control, "assert_a1_allowed", _always_allow)
+
+    sent = []
+
+    class _RejectedByValidator(Exception):
+        pass
+
+    async def build():
+        raise _RejectedByValidator("output validator rejected the LLM reply")
+
+    async def send(t):
+        sent.append(t)
+
+    async def fb():
+        sent.append("FALLBACK")
+
+    async def go():
+        rid = await traced_response_builder(
+            user_id=8, requester_uid=8,
+            influences=[Influence("questionnaire_result", "sid-9", "reply drew on questionnaire_result sid-9")],
+            build_response=build, send=send,
+            persist_trace=persist_influence_trace, neutral_fallback=fb,
+            response_id="rid-buildfail")
+        rows = await tmp_db.get_influence_trace("rid-buildfail")
+        return rid, rows
+
+    rid, rows = asyncio.run(go())
+    assert rid is None                              # failed closed, same as a persist failure
+    assert sent == ["FALLBACK"]                      # neutral fallback only -- send() never called
+    # The trace WAS already durably persisted before build_response ran (an
+    # orphan trace is acceptable and safer than a delivered reply with no
+    # trace -- same invariant as the persist-failure case).
+    assert rows == [("questionnaire_result", "sid-9", "reply drew on questionnaire_result sid-9")]

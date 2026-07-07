@@ -21,7 +21,10 @@ enforces:
    BEFORE the reply is sent. If persist fails, the latent reply is NOT sent — we
    degrade to a non-latent neutral fallback. Never send-then-log: that order can
    never fail closed. An orphan trace (persisted, reply not sent) is acceptable and
-   safer than a delivered reply with no trace.
+   safer than a delivered reply with no trace. The same neutral-fallback path also
+   catches a build_response failure (e.g. a caller's own output-safety validator
+   rejecting the LLM reply and signaling that via a raised exception) — a caller
+   never needs a second, independent fallback text for that case.
 
 3. NOT A CRISIS PATH. Fail-closed hangs ONLY on the latent path. Crisis/safety
    delivery has its own deterministic guaranteed-delivery path and is NEVER routed
@@ -153,6 +156,21 @@ async def traced_response_builder(*, user_id, influences, build_response, send,
         await neutral_fallback()          # non-latent; latent context never used
         return None
 
-    text = await build_response()          # latent context used ONLY now (trace durable)
+    # FAIL-CLOSED (completes the contract): a build_response failure (e.g. the
+    # caller's own output-safety validator rejected the LLM reply and raised
+    # to signal that) must degrade to the SAME neutral path as a persist
+    # failure -- the trace is already durably persisted at this point, but the
+    # reply itself was judged unsafe to send. Previously only persist_trace
+    # failures were caught here; build_response exceptions propagated
+    # uncaught, which meant a caller had no way to fail closed on a rejected
+    # reply without inventing a second, independent fallback text. This keeps
+    # "exactly one fallback text per caller" true by construction, for every
+    # caller of traced_response_builder, not just one.
+    try:
+        text = await build_response()      # latent context used ONLY now (trace durable)
+    except Exception as e:  # noqa: BLE001 — any build_response failure blocks the latent reply
+        print(f"[influence-trace] build_response FAILED rid={rid} uid={user_id}: {e}")
+        await neutral_fallback()
+        return None
     await send(text)
     return rid
