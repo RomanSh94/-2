@@ -2670,8 +2670,14 @@ async def _nav_gate(entity, uid: int, lang: str) -> bool:
 
 
 def _menu_keyboard(lang: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=(ru if lang == "ru" else en), callback_data=f"{key}:hub")]
-            for key, ru, en in navigation.MENU_SECTIONS]
+    # "tests" routes straight to the real Questionnaire Core (q:l /
+    # cb_questionnaire_list) instead of the old Navigation Hub placeholder --
+    # see cb_tests_hub's comment for why. The other 4 entries keep the
+    # original f"{key}:hub" pattern, byte-for-byte unchanged.
+    rows = [[InlineKeyboardButton(
+        text=(ru if lang == "ru" else en),
+        callback_data=("q:l" if key == "tests" else f"{key}:hub"),
+    )] for key, ru, en in navigation.MENU_SECTIONS]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2695,6 +2701,11 @@ async def cmd_menu(message: Message):
 
 
 @dp.callback_query(F.data == "tests:hub")
+# No longer reachable from the main menu -- the "tests" button now routes
+# directly to q:l / cb_questionnaire_list (see _menu_keyboard). Kept in place
+# (not deleted) for a stale/cached client that still holds an old "tests:hub"
+# button; removing this dead handler is a candidate for a future, separate
+# cleanup PR, not this one.
 async def cb_tests_hub(callback: CallbackQuery):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
