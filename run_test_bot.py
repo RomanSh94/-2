@@ -24,12 +24,22 @@ if not os.environ.get("BOT_TOKEN"):
     raise SystemExit("run_test_bot: BOT_TOKEN missing — fill .env.test")
 os.environ.setdefault("ADMIN_PORT", "8081")
 
+# PR C3a.1 — marks this process as the test instance. Must be set AFTER the
+# .env.test values above are copied into os.environ, but BEFORE `from bot
+# import main` (which triggers config.py's first import) so any code reading
+# X20_TEST_INSTANCE at import time sees it. This is one of the required,
+# fail-closed conditions for the temporary invite-access mechanism in
+# access_control.py — it is never sufficient on its own (database.DB ==
+# "x20_test.db", set below, is a separate, additional required condition).
+os.environ.setdefault("X20_TEST_INSTANCE", "1")
+
 import asyncio
 import database
 database.DB = "x20_test.db"          # isolate the DB before anything touches it
 
 from bot import main                 # imports config (now reading .env.test)
 import config
+import access_control
 
 if __name__ == "__main__":
     # Self-check banner (PR C3a) -- config.QUESTIONNAIRE_INTERPRETATION_ENABLED
@@ -43,4 +53,11 @@ if __name__ == "__main__":
     print(f"DB={database.DB}")
     print(f"QUESTIONNAIRE_INTERPRETATION_ENABLED={config.QUESTIONNAIRE_INTERPRETATION_ENABLED}")
     print("port=" + os.environ["ADMIN_PORT"])
+    # PR C3a.1 -- never print the invite code itself, only whether the
+    # mechanism is enabled/active and when it ends.
+    _temp_invite_enabled = os.environ.get("TEMP_TEST_INVITE_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on")
+    print(f"TEMP_TEST_INVITE_ENABLED={_temp_invite_enabled}")
+    print(f"TEMP_TEST_INVITE_ACTIVE={access_control.is_temp_test_invite_active()}")
+    print(f"TEMP_TEST_INVITE_END_UTC={os.environ.get('TEMP_TEST_INVITE_END_UTC') or 'unset'}")
     asyncio.run(main())
