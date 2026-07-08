@@ -909,6 +909,32 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
 async def cmd_start(message: Message):
     from datetime import datetime, timezone
     uid = message.from_user.id
+    # PR C3a.1 -- parse a /start deep-link payload BEFORE the access gate.
+    # This is the critical ordering: a temp-invite-code holder has no prior
+    # access, so if we ran ensure_full_access_or_closed_test first they'd be
+    # blocked before ever reaching the code that grants them access, making
+    # the whole feature a dead branch. This codebase has no existing deep-link
+    # parsing helper (verified: no `deep_link`/`start_param` hits anywhere),
+    # so we do plain string parsing on message.text ourselves.
+    parts = (message.text or "").split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+    if payload:
+        try:
+            cfg = access_control.temp_test_invite_config()
+        except Exception:
+            cfg = {"valid": False, "code": None}
+        # Non-disclosure: never reveal whether the payload was close/correct/
+        # expired -- a wrong or inactive payload just falls through silently
+        # to the existing closed-test behavior below, exactly as before.
+        if cfg.get("valid") and cfg.get("code") is not None and payload == cfg["code"] \
+                and access_control.is_temp_test_invite_active():
+            access_control.grant_temp_test_access(uid)
+            lang = await get_user_language(uid)
+            end_str = cfg["end"].strftime("%Y-%m-%d %H:%M UTC")
+            grant_msg = (f"✅ Временный тестовый доступ выдан до {end_str}."
+                         if lang == "ru" else
+                         f"✅ Temporary test access granted until {end_str}.")
+            await message.answer(grant_msg)
     if not await ensure_full_access_or_closed_test(message, uid):
         return
     overview = await get_memory_overview(uid)          # before upsert: 0 msgs == first time

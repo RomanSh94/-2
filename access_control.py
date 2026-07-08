@@ -17,6 +17,7 @@ reason. A broken resolver must never accidentally grant access or leak a
 sensitive alert to the wrong channel — see CLINICAL_BOUNDARY.md §0.3.
 """
 import os
+from datetime import datetime, timedelta, timezone
 
 from config import ADMIN_USER_IDS
 
@@ -148,6 +149,14 @@ async def has_full_access(uid: int) -> bool:
         if not acknowledged:
             return False
         return bool(resolved_reviewers_for(uid))
+    # PR C3a.1 — temporary invite-based test access. Only ever matters for a
+    # uid that didn't already resolve via an existing role path above (OWNER /
+    # CLINICIAN_TESTER are handled and returned above already). Structurally
+    # inert unless every fail-closed condition in has_temp_test_access /
+    # is_temp_test_invite_active holds (test instance + test DB + mode +
+    # enabled flag + valid window) — see access_control.py's temp-invite block.
+    if has_temp_test_access(uid):
+        return True
     return False
 
 
@@ -181,6 +190,12 @@ class A1NotAllowed(PermissionError):
 
 
 async def assert_a1_allowed(requester_uid: int) -> None:
+    # PR C3a.1 — temp-invite users may exercise A1 only while their grant is
+    # active; has_temp_test_access re-checks the full fail-closed condition set
+    # (including window expiry) on every call, so this can never outlive the
+    # invite window.
+    if has_temp_test_access(requester_uid):
+        return
     if not await a1_allowed(requester_uid):
         # Checkpoint item 8: no raw uid in the exception text — this is not yet
         # wired into a live print/log path (traced_response_builder has no bot.py
@@ -256,3 +271,143 @@ def can_request_review_pack(requester_uid: int, target_uid: int) -> bool:
         return False
     except Exception:
         return False
+
+
+# ── PR C3a.1 — temporary invite-based test access ──────────────────────────────
+# A deliberately narrow, safety-bounded mechanism so the owner can grant
+# short-lived (<=72h) test access to a Telegram id they don't know in advance,
+# on the TEST INSTANCE ONLY. See CLAUDE.md / the PR description for full
+# rationale. Every condition below is fail-closed and re-checked fresh (never
+# cached) each time it matters. This block never stores, logs, or prints the
+# actual invite code value anywhere — only plain string equality against it.
+
+# In-memory only, by design: this is a short-lived, test-only mechanism. If the
+# test process restarts, the grant is gone and the account holder can simply
+# re-open the same invite deep link to grant again. No DB table.
+_TEMP_TEST_GRANTED_UNTIL: dict[int, datetime] = {}
+
+_TEMP_TEST_INVITE_MAX_WINDOW = timedelta(hours=72)
+
+
+def _parse_utc_iso(raw: str):
+    """Parse a UTC ISO-8601 timestamp string. Returns an aware UTC datetime, or
+    None if raw is empty/unparseable. Never raises."""
+    if not raw:
+        return None
+    try:
+        # Accept a trailing "Z" (not accepted by fromisoformat on some Python
+        # versions) as well as an explicit +00:00 offset or a naive timestamp
+        # (treated as UTC).
+        value = raw.strip()
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def temp_test_invite_config() -> dict:
+    """Reads and validates every env-based condition for temporary invite
+    access, fresh (no caching) every call. Returns a dict:
+      {"valid": bool, "reason": str, "code": str|None,
+       "start": datetime|None, "end": datetime|None}
+    "code"/"start"/"end" are only populated when "valid" is True. The invite
+    code value itself is never logged anywhere by this function or any caller
+    — it is returned here purely so is_temp_test_invite_active/other functions
+    in this module can compare it, never for display."""
+    if DEPLOYMENT_MODE != "controlled_clinical_test":
+        return {"valid": False, "reason": "deployment_mode", "code": None,
+                 "start": None, "end": None}
+    if os.getenv("X20_TEST_INSTANCE") != "1":
+        return {"valid": False, "reason": "not_test_instance", "code": None,
+                 "start": None, "end": None}
+    try:
+        import database
+        if getattr(database, "DB", None) != "x20_test.db":
+            return {"valid": False, "reason": "not_test_db", "code": None,
+                     "start": None, "end": None}
+    except Exception:
+        return {"valid": False, "reason": "not_test_db", "code": None,
+                 "start": None, "end": None}
+    enabled = os.getenv("TEMP_TEST_INVITE_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on")
+    if not enabled:
+        return {"valid": False, "reason": "disabled", "code": None,
+                 "start": None, "end": None}
+    code = os.getenv("TEMP_TEST_INVITE_CODE", "")
+    if len(code) < 24:
+        return {"valid": False, "reason": "code_too_short", "code": None,
+                 "start": None, "end": None}
+    start = _parse_utc_iso(os.getenv("TEMP_TEST_INVITE_START_UTC", ""))
+    if start is None:
+        return {"valid": False, "reason": "invalid_start", "code": None,
+                 "start": None, "end": None}
+    end = _parse_utc_iso(os.getenv("TEMP_TEST_INVITE_END_UTC", ""))
+    if end is None:
+        return {"valid": False, "reason": "invalid_end", "code": None,
+                 "start": None, "end": None}
+    if end <= start:
+        return {"valid": False, "reason": "end_before_start", "code": None,
+                 "start": None, "end": None}
+    if (end - start) > _TEMP_TEST_INVITE_MAX_WINDOW:
+        return {"valid": False, "reason": "window_too_long", "code": None,
+                 "start": None, "end": None}
+    return {"valid": True, "reason": "ok", "code": code, "start": start, "end": end}
+
+
+def is_temp_test_invite_active(now: datetime | None = None) -> bool:
+    """ALL 9 conditions from the PR description. Convention: the active window
+    is [start, end) — inclusive of start, exclusive of end."""
+    try:
+        cfg = temp_test_invite_config()
+        if not cfg["valid"]:
+            return False
+        now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+        return cfg["start"] <= now < cfg["end"]
+    except Exception:
+        return False
+
+
+def grant_temp_test_access(uid: int, now: datetime | None = None) -> bool:
+    """Records a grant in memory for uid, valid until the invite window's end.
+    Only actually grants if is_temp_test_invite_active() right now. Returns
+    whether it granted."""
+    try:
+        if not is_temp_test_invite_active(now):
+            return False
+        cfg = temp_test_invite_config()
+        _TEMP_TEST_GRANTED_UNTIL[uid] = cfg["end"]
+        return True
+    except Exception:
+        return False
+
+
+def has_temp_test_access(uid: int, now: datetime | None = None) -> bool:
+    """True iff uid was previously granted AND the invite mechanism is still
+    active AND uid's own grant hasn't expired. Re-checks is_temp_test_invite_active
+    fresh so a grant never outlives the mechanism's own fail-closed conditions
+    (e.g. mode flipped away from controlled_clinical_test, or the window ended)."""
+    try:
+        if not is_temp_test_invite_active(now):
+            return False
+        until = _TEMP_TEST_GRANTED_UNTIL.get(uid)
+        if until is None:
+            return False
+        now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+        return now < until
+    except Exception:
+        return False
+
+
+def clear_expired_temp_test_access(now: datetime | None = None) -> None:
+    """Housekeeping — prune expired entries from the in-memory grant dict."""
+    try:
+        now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+        expired = [uid for uid, until in _TEMP_TEST_GRANTED_UNTIL.items() if now >= until]
+        for uid in expired:
+            del _TEMP_TEST_GRANTED_UNTIL[uid]
+    except Exception:
+        pass
