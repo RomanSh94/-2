@@ -116,8 +116,61 @@ def test_menu_renders_main_menu_with_all_sections():
     assert "Главное меню" in text
     kb = kw["reply_markup"]
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    assert callback_datas == [f"{key}:hub" for key, _, _ in navigation.MENU_SECTIONS]
-    assert callback_datas == ["tests:hub", "journals:hub", "results:hub", "privacy:hub", "about:hub"]
+    # fix/menu-tests-button-routes-to-questionnaire-core: "tests" now routes
+    # directly to "q:l" (the real Questionnaire Core), not "tests:hub" (the old
+    # Navigation Hub placeholder) -- was
+    # ["tests:hub", "journals:hub", "results:hub", "privacy:hub", "about:hub"].
+    # The other 4 entries are unchanged.
+    assert callback_datas == ["q:l", "journals:hub", "results:hub", "privacy:hub", "about:hub"]
+
+
+def test_other_four_menu_buttons_keep_original_hub_pattern():
+    """The fix only special-cases "tests" -- journals/results/privacy/about
+    must keep their original generic f"{key}:hub" callback_data, unchanged."""
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cmd_menu(msg))
+    kb = msg.answers[0][1]["reply_markup"]
+    callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    for key, _, _ in navigation.MENU_SECTIONS:
+        if key == "tests":
+            continue
+        assert f"{key}:hub" in callback_datas
+
+
+def test_menu_tests_button_reaches_real_questionnaire_core():
+    """Simulating a press of the menu's "tests" button (callback_data "q:l")
+    must reach the real cb_questionnaire_list handler and render
+    questionnaire_ux.list_text/_questionnaire_list_keyboard -- the same
+    content /questionnaire produces -- not navigation.tests_hub_text /
+    _hub_back_keyboard (the old placeholder)."""
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cmd_menu(msg))
+    kb = msg.answers[0][1]["reply_markup"]
+    callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    assert "q:l" in callback_datas
+    assert "tests:hub" not in callback_datas
+
+    cb = FakeCallback(user, msg, data="q:l")
+    asyncio.run(bot.cb_questionnaire_list(cb))
+    text, kw = msg.answers[-1]
+    assert text == bot.questionnaire_ux.list_text("ru")
+    assert "Скоро здесь будут доступны" not in text
+
+
+def test_cb_tests_hub_still_works_if_reached_directly():
+    """cb_tests_hub's own behavior is unchanged -- only its reachability from
+    the main menu changed. A stale/cached client still holding an old
+    "tests:hub" button must still get the same placeholder response as
+    before."""
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="tests:hub")
+    asyncio.run(bot.cb_tests_hub(cb))
+    text, kw = msg.answers[-1]
+    assert text == navigation.tests_hub_text("ru")
+    assert "Скоро здесь будут доступны" in text
 
 
 def test_tests_hub_has_non_diagnostic_framing():
