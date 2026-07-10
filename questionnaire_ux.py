@@ -30,10 +30,160 @@ def category_label(key: str, lang: str) -> str:
     return ru if lang == "ru" else en
 
 
+# ── Professional, manifest-driven catalog (replaces the old symptom-label
+# category list). The 6 root categories below are the catalog root; categories
+# 1-4 render governance-manifest instruments as INFO entries (never startable
+# here), self_observation lists the synthetic registry demos (the only
+# startable path), consultation_report reframes the old "Для специалиста".
+CATALOG_CATEGORIES = [
+    ("depression_mood_energy", "Депрессия, настроение и энергия", "Depression, mood & energy"),
+    ("anxiety", "Тревога", "Anxiety"),
+    ("stress", "Стресс", "Stress"),
+    ("specialized", "Специализированные шкалы", "Specialized scales"),
+    ("self_observation", "Самонаблюдение", "Self-observation"),
+    ("consultation_report", "Отчёт для консультации", "Consultation report"),
+]
+
+# Categories 1-4 render manifest instruments; 5-6 are handled specially.
+CATALOG_MANIFEST_CATEGORY_IDS = frozenset(
+    {"depression_mood_energy", "anxiety", "stress", "specialized"})
+
+_CATALOG_CATEGORY_LABELS = {key: (ru, en) for key, ru, en in CATALOG_CATEGORIES}
+
+
+def catalog_category_label(key: str, lang: str) -> str:
+    ru, en = _CATALOG_CATEGORY_LABELS.get(key, (key, key))
+    return ru if lang == "ru" else en
+
+
 def list_text(lang: str = "ru") -> str:
+    # Professional catalog root. Honest and non-diagnostic: opting a screening
+    # instrument into the catalog is explicitly NOT a claim that the bot can
+    # run it.
     if lang == "ru":
-        return "🧭 Опросники\n\nВыберите раздел:"
-    return "🧭 Questionnaires\n\nChoose a section:"
+        return ("☑️ Скрининговые шкалы и опросники\n\n"
+                "Здесь собраны инструменты самонаблюдения и скрининга.\n\n"
+                "Опросники не ставят диагноз и не заменяют консультацию специалиста.\n"
+                "Доступность конкретной методики зависит от её версии и прав на "
+                "цифровое использование.\n\n"
+                "Выберите раздел:")
+    return ("☑️ Screening scales and questionnaires\n\n"
+            "This is a set of self-observation and screening instruments.\n\n"
+            "Questionnaires do not diagnose and do not replace a consultation "
+            "with a specialist.\n"
+            "Whether a given method is available depends on its version and "
+            "digital-use rights.\n\n"
+            "Choose a section:")
+
+
+def catalog_category_text(category_id: str, lang: str = "ru") -> str:
+    label = catalog_category_label(category_id, lang)
+    if category_id == "consultation_report":
+        return consultation_report_text(lang)
+    if category_id == "self_observation":
+        if lang == "ru":
+            return (f"{label}\n\n"
+                    "Небольшие опросники для самонаблюдения, которые можно пройти "
+                    "прямо в боте.\nЭто не диагноз.")
+        return (f"{label}\n\n"
+                "Short self-observation questionnaires you can take right here in "
+                "the bot.\nThis is not a diagnosis.")
+    if lang == "ru":
+        return (f"{label}\n\n"
+                "Выберите методику, чтобы узнать о ней подробнее.\n"
+                "Активные опросники будут отдельно отмечены как доступные.")
+    return (f"{label}\n\n"
+            "Choose a method to learn more about it.\n"
+            "Active questionnaires will be marked separately as available.")
+
+
+def catalog_empty_text(category_id: str, lang: str = "ru") -> str:
+    label = catalog_category_label(category_id, lang)
+    # Never a bare dead end: the caller always attaches back/menu buttons.
+    if lang == "ru":
+        return f"{label}\n\nВ этом разделе пока нет проверенных методик."
+    return f"{label}\n\nThere are no verified methods in this section yet."
+
+
+_AVAILABILITY_STATUS_RU = {
+    "available": "доступно",
+    "information_only": "проводится специалистом",
+    "requires_license": "требуется лицензированная версия",
+    "version_under_review": "версия уточняется",
+    "unavailable": "недоступно",
+}
+_AVAILABILITY_STATUS_EN = {
+    "available": "available",
+    "information_only": "administered by a specialist",
+    "requires_license": "a licensed version is required",
+    "version_under_review": "version being clarified",
+    "unavailable": "unavailable",
+}
+
+
+def instrument_info_text(instrument, lang: str = "ru") -> str:
+    """Deterministic information screen for a manifest instrument. No score, no
+    result interpretation, no diagnosis, no clinical cutoff. `instrument` is a
+    clinical_instrument_catalog.CatalogInstrument."""
+    av = instrument.availability
+    clinician = instrument.administration_mode == "clinician_rated"
+    if lang == "ru":
+        title = instrument.title_ru or instrument.abbreviation
+        type_line = "оценка специалистом" if clinician else "самоотчёт"
+        status_line = _AVAILABILITY_STATUS_RU.get(av, "недоступно")
+        parts = [title, "", f"Тип: {type_line}", f"Статус: {status_line}"]
+        if instrument.population_note_ru:
+            parts.append(instrument.population_note_ru)
+        parts.append("")
+        if av == "available":
+            parts.append("Методика доступна для прохождения.")
+        else:
+            parts.append("Сейчас прохождение в боте недоступно.")
+        if clinician:
+            parts.append("Методика проводится обученным специалистом в формате интервью.")
+        if av == "requires_license":
+            parts.append("Наличие методики в каталоге не означает, что бот может "
+                         "законно воспроизводить её вопросы.")
+        parts.append("")
+        parts.append("Это не диагноз.")
+        return "\n".join(parts)
+    title = instrument.title_en or instrument.abbreviation
+    type_line = "clinician-rated" if clinician else "self-report"
+    status_line = _AVAILABILITY_STATUS_EN.get(av, "unavailable")
+    parts = [title, "", f"Type: {type_line}", f"Status: {status_line}"]
+    if instrument.population_note_ru:
+        parts.append("For pregnancy and the period after childbirth.")
+    parts.append("")
+    if av == "available":
+        parts.append("This method is available to take.")
+    else:
+        parts.append("Taking it in the bot is not available right now.")
+    if clinician:
+        parts.append("This method is administered by a trained specialist as an interview.")
+    if av == "requires_license":
+        parts.append("Listing a method in the catalog does not mean the bot may "
+                     "lawfully reproduce its questions.")
+    parts.append("")
+    parts.append("This is not a diagnosis.")
+    return "\n".join(parts)
+
+
+def consultation_report_text(lang: str = "ru") -> str:
+    # Reframe of the old "Для специалиста": the report is user-owned and never
+    # auto-sent to anyone.
+    if lang == "ru":
+        return ("📄 Отчёт для консультации\n\n"
+                "После прохождения опросника можно сформировать отчёт с твоими "
+                "ответами.\n\n"
+                "Ты сам решаешь, кому показать отчёт.\n"
+                "Бот никому не отправляет его автоматически.\n\n"
+                "Это не диагноз и не медицинское заключение.")
+    return ("📄 Consultation report\n\n"
+            "After completing a questionnaire you can generate a report with your "
+            "answers.\n\n"
+            "You decide who to show the report to.\n"
+            "The bot never sends it to anyone automatically.\n\n"
+            "This is not a diagnosis or a medical conclusion.")
 
 
 def category_text(category: str, definitions: list[dict], lang: str = "ru") -> str:

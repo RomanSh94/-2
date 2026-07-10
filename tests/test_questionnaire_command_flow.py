@@ -142,13 +142,23 @@ def test_questionnaire_list_shows_categories():
     assert "q:c:anxiety" in callback_datas
 
 
+# NOTE: synthetic registry demos now live under the professional catalog's
+# "self_observation" section (categories anxiety/stress/etc. render governance-
+# manifest INFO entries, not startable registry demos). These four tests were
+# updated to press q:c:self_observation; the registry hide/show invariants are
+# unchanged.
+def _button_texts(kw):
+    kb = kw["reply_markup"]
+    return [btn.text for row in kb.inline_keyboard for btn in row]
+
+
 def test_active_questionnaire_appears_in_category_list():
     user = FakeUser(1)
     msg = FakeMessage(user)
-    cb = FakeCallback(user, msg, data="q:c:anxiety")
+    cb = FakeCallback(user, msg, data="q:c:self_observation")
     asyncio.run(bot.cb_questionnaire_category(cb))
     text, kw = msg.answers[-1]
-    assert "Demo Anxiety Check" in text
+    assert "Demo Anxiety Check" in _button_texts(kw)
     kb = kw["reply_markup"]
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
     assert "q:d:demo_anxiety_v1" in callback_datas
@@ -157,28 +167,31 @@ def test_active_questionnaire_appears_in_category_list():
 def test_archived_questionnaire_hidden_from_category_list():
     user = FakeUser(1)
     msg = FakeMessage(user)
-    cb = FakeCallback(user, msg, data="q:c:anxiety")
+    cb = FakeCallback(user, msg, data="q:c:self_observation")
     asyncio.run(bot.cb_questionnaire_category(cb))
-    text, _ = msg.answers[-1]
+    text, kw = msg.answers[-1]
     assert "Demo Archived Check" not in text
+    assert "Demo Archived Check" not in _button_texts(kw)
 
 
 def test_restricted_questionnaire_hidden_from_category_list():
     user = FakeUser(1)
     msg = FakeMessage(user)
-    cb = FakeCallback(user, msg, data="q:c:mood")
+    cb = FakeCallback(user, msg, data="q:c:self_observation")
     asyncio.run(bot.cb_questionnaire_category(cb))
-    text, _ = msg.answers[-1]
+    text, kw = msg.answers[-1]
     assert "Demo Restricted Check" not in text
+    assert "Demo Restricted Check" not in _button_texts(kw)
 
 
 def test_draft_questionnaire_hidden_from_category_list():
     user = FakeUser(1)
     msg = FakeMessage(user)
-    cb = FakeCallback(user, msg, data="q:c:mood")
+    cb = FakeCallback(user, msg, data="q:c:self_observation")
     asyncio.run(bot.cb_questionnaire_category(cb))
-    text, _ = msg.answers[-1]
+    text, kw = msg.answers[-1]
     assert "Demo Draft Check" not in text
+    assert "Demo Draft Check" not in _button_texts(kw)
 
 
 def test_detail_screen_shows_start_and_back_buttons():

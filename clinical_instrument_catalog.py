@@ -26,9 +26,17 @@ Schema v2 design decisions (v6 governance corrections):
 Not integrated into bot.py in this PR.
 """
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 _VALID_ADMINISTRATION_MODES = {"self_report", "clinician_rated", "unknown"}
+# UI catalog category placement (distinct from `domain`: e.g. DASS is domain
+# depression_anxiety_stress but lives under "Стресс"; EPDS is domain depression
+# but lives under "Специализированные шкалы"). null is allowed only for
+# instruments that are NOT public_catalog_visible.
+_VALID_CATALOG_CATEGORY_IDS = {
+    "depression_mood_energy", "anxiety", "stress", "specialized",
+}
 _VALID_ACTIVATION_STATUSES = {"metadata_only", "blocked", "ready"}
 _VALID_IDENTITY_STATUSES = {
     "verified", "family_identified_version_incomplete",
@@ -179,6 +187,18 @@ def validate_instrument_metadata(item: dict) -> None:
         raise InstrumentManifestError(
             f"{instrument_id}: public_catalog_visible must be a bool")
 
+    # catalog_category_id: one of the 4 valid UI category ids or null. A
+    # public_catalog_visible instrument MUST carry a non-null placement, else
+    # it would render into no section (fail closed).
+    catalog_category_id = item.get("catalog_category_id")
+    if catalog_category_id is not None and catalog_category_id not in _VALID_CATALOG_CATEGORY_IDS:
+        raise InstrumentManifestError(
+            f"{instrument_id}: invalid catalog_category_id {catalog_category_id!r}")
+    if item.get("public_catalog_visible") and catalog_category_id is None:
+        raise InstrumentManifestError(
+            f"{instrument_id}: public_catalog_visible requires a non-null "
+            "catalog_category_id")
+
     _validate_rights(instrument_id, item)
     _validate_evidence(instrument_id, item)
 
@@ -251,3 +271,124 @@ def is_public_catalog_visible(item: dict) -> bool:
     except InstrumentManifestError:
         return False
     return bool(item.get("public_catalog_visible"))
+
+
+# ── catalog service layer (professional catalog UX) ──────────────────────────
+# Read-only presentation façade over the governance manifest. Renders honest
+# availability states from the governance fields — it does NOT activate any
+# instrument, does NOT load question/answer/scoring content, does NOT touch the
+# DB or the LLM. In THIS PR no instrument is ever 'available' (none is ready);
+# the `available` path exists but never fires.
+
+# Exact availability strings — do not add ad-hoc values.
+AVAILABILITY_AVAILABLE = "available"
+AVAILABILITY_INFORMATION_ONLY = "information_only"
+AVAILABILITY_REQUIRES_LICENSE = "requires_license"
+AVAILABILITY_VERSION_UNDER_REVIEW = "version_under_review"
+AVAILABILITY_UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class CatalogInstrument:
+    instrument_id: str
+    title_ru: str
+    title_en: str
+    abbreviation: str
+    category_id: str
+    availability: str          # one of the AVAILABILITY_* strings above
+    administration_mode: str
+    population_note_ru: str | None
+    blocker_note_ru: str | None
+
+
+def _derive_availability(item: dict) -> str:
+    """Deterministic mapping from governance fields to a user-facing
+    availability state. Order matters and encodes the policy:
+
+    1. ready + can_activate  -> available (never true in this PR).
+    2. digital_reproduction permission_required (BDI family) -> requires_license.
+    3. clinician_rated (HDRS) -> information_only (cannot self-administer).
+    4. otherwise public/visible -> version_under_review (identity/version
+       incomplete but shown honestly).
+    5. not public-visible -> unavailable (never rendered)."""
+    if item.get("activation_status") == "ready" and can_activate_instrument(item):
+        return AVAILABILITY_AVAILABLE
+    rights = item.get("rights", {}) or {}
+    if rights.get("digital_reproduction", {}).get("status") == "permission_required":
+        return AVAILABILITY_REQUIRES_LICENSE
+    if item.get("administration_mode") == "clinician_rated":
+        return AVAILABILITY_INFORMATION_ONLY
+    if is_public_catalog_visible(item):
+        return AVAILABILITY_VERSION_UNDER_REVIEW
+    return AVAILABILITY_UNAVAILABLE
+
+
+def _population_note_ru(item: dict) -> str | None:
+    population = item.get("population") or []
+    if "perinatal" in population or "postpartum" in population:
+        return "Для периода беременности и после рождения ребёнка."
+    return None
+
+
+def _to_catalog_instrument(item: dict) -> CatalogInstrument:
+    title_ru = item.get("display_name_ru") or item.get("abbreviation") or item.get("instrument_id")
+    title_en = item.get("display_name_en") or item.get("abbreviation") or item.get("instrument_id")
+    blockers = item.get("blockers") or []
+    blocker_note = blockers[0] if blockers else None
+    return CatalogInstrument(
+        instrument_id=item["instrument_id"],
+        title_ru=title_ru,
+        title_en=title_en,
+        abbreviation=item.get("abbreviation") or "",
+        category_id=item.get("catalog_category_id"),
+        availability=_derive_availability(item),
+        administration_mode=item.get("administration_mode"),
+        population_note_ru=_population_note_ru(item),
+        blocker_note_ru=blocker_note,
+    )
+
+
+def public_catalog_instruments(document: dict) -> tuple[CatalogInstrument, ...]:
+    """Every is_public_catalog_visible-true instrument as a CatalogInstrument.
+    Identity-incomplete / identity-conflict / non-visible entries (JAPS, STAS)
+    are excluded — they are never rendered."""
+    instruments = (document or {}).get("instruments", [])
+    return tuple(
+        _to_catalog_instrument(item)
+        for item in instruments
+        if is_public_catalog_visible(item)
+    )
+
+
+def catalog_instruments_by_category(document: dict, category_id: str) -> tuple[CatalogInstrument, ...]:
+    return tuple(
+        ci for ci in public_catalog_instruments(document)
+        if ci.category_id == category_id
+    )
+
+
+def get_catalog_instrument(document: dict, instrument_id: str) -> CatalogInstrument | None:
+    for ci in public_catalog_instruments(document):
+        if ci.instrument_id == instrument_id:
+            return ci
+    return None
+
+
+def catalog_activation_ready(item: dict, registry, questionnaire_id: str | None) -> bool:
+    """Availability double-gate for FUTURE activation. A catalog instrument may
+    route into the real questionnaire start flow ONLY when BOTH hold:
+
+      (a) can_activate_instrument(item) is True  (manifest fully cleared), AND
+      (b) a matching current registry definition exists and registry.can_start
+          returns True.
+
+    If either fails -> False (information screen only, no session, no answers).
+    Never fires in this PR (no manifest entry is 'ready'); the path exists so a
+    future activation PR only has to make an entry ready + supply a definition.
+    `registry` is duck-typed (anything exposing can_start) to avoid coupling
+    this governance module to questionnaires.py."""
+    if not can_activate_instrument(item):
+        return False
+    if registry is None or not questionnaire_id:
+        return False
+    return bool(registry.can_start(questionnaire_id))

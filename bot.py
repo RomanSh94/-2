@@ -8,6 +8,7 @@ X20 Bot — Основной файл
 """
 import asyncio
 import hmac
+import pathlib
 import sys
 
 # Windows consoles default to a legacy codepage (e.g. cp1251) that cannot encode
@@ -99,8 +100,22 @@ from database import (
 )
 import questionnaires
 import questionnaire_ux
+import clinical_instrument_catalog
 import navigation
 import emotion_map
+
+_CLINICAL_MANIFEST_PATH = pathlib.Path(__file__).with_name("clinical_instruments_manifest.json")
+
+
+def _load_catalog_document():
+    """Re-reads + validates the governance manifest from disk on each call
+    (never memoized), mirroring _load_registry_fresh's fail-closed contract.
+    Returns the validated document, or None on any manifest problem so callers
+    fail closed to a neutral 'not available' screen rather than crashing."""
+    try:
+        return clinical_instrument_catalog.load_instrument_manifest(_CLINICAL_MANIFEST_PATH)
+    except clinical_instrument_catalog.InstrumentManifestError:
+        return None
 
 class InterventionStates(StatesGroup):
     awaiting_after   = State()
@@ -1745,20 +1760,56 @@ def _questionnaire_item_keyboard(definition: dict, session_id: int, step: int, i
 
 
 def _questionnaire_list_keyboard(lang: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=questionnaire_ux.category_label(key, lang),
+    # Professional catalog root: 6 categories, one button per row, then a
+    # back-to-menu row. Category ids are short (well under 64 bytes).
+    rows = [[InlineKeyboardButton(text=questionnaire_ux.catalog_category_label(key, lang),
                                   callback_data=f"q:c:{key}")]
-            for key, _, _ in questionnaire_ux.CATEGORIES]
+            for key, _, _ in questionnaire_ux.CATALOG_CATEGORIES]
     rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
                                       callback_data="menu:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _questionnaire_category_keyboard(category: str, definitions: list, lang: str) -> InlineKeyboardMarkup:
+    # self_observation: synthetic registry demos -> real detail/start flow.
     rows = [[InlineKeyboardButton(text=d["title"], callback_data=f"q:d:{d['id']}")]
             for d in definitions]
     rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
                                       callback_data="q:l")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _catalog_manifest_category_keyboard(instruments, lang: str) -> InlineKeyboardMarkup:
+    # Manifest categories 1-4: each instrument is an INFO entry (q:i:<id>),
+    # never a start path. One button per row, then back to the catalog root.
+    rows = [[InlineKeyboardButton(
+                text=(ci.title_ru if lang == "ru" else ci.title_en) or ci.abbreviation,
+                callback_data=f"q:i:{ci.instrument_id}")]
+            for ci in instruments]
+    rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+                                      callback_data="q:l")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _catalog_nav_only_keyboard(lang: str) -> InlineKeyboardMarkup:
+    # Used for empty categories and the consultation_report info screen: never
+    # a dead end -- always a way back to the catalog root and the main menu.
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+                              callback_data="q:l")],
+        [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
+                              callback_data="menu:back")],
+    ])
+
+
+def _catalog_info_keyboard(category_id: str, lang: str) -> InlineKeyboardMarkup:
+    # Instrument information screen: back to its category, and home to menu.
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+                              callback_data=f"q:c:{category_id}")],
+        [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
+                              callback_data="menu:back")],
+    ])
 
 
 def _questionnaire_detail_keyboard(qid: str, lang: str) -> InlineKeyboardMarkup:
@@ -1912,15 +1963,102 @@ async def cb_questionnaire_category(callback: CallbackQuery):
         await callback.answer()
         return
     category = parts[2]
-    registry = _load_registry_fresh()
-    definitions = registry.list_active(category)
-    # "restricted" legal_status is hidden from listings in this PR too (not
-    # just blocked at start/answer time) -- future licensed-content PR may
-    # change that; not now (see CLAUDE.md task scope).
-    definitions = [d for d in definitions if d.get("legal_status") != "restricted"]
+
+    # ── Categories 1-4: governance-manifest instruments as INFO entries ──
+    if category in questionnaire_ux.CATALOG_MANIFEST_CATEGORY_IDS:
+        document = _load_catalog_document()
+        instruments = (
+            clinical_instrument_catalog.catalog_instruments_by_category(document, category)
+            if document is not None else ())
+        if not instruments:
+            await callback.message.answer(
+                questionnaire_ux.catalog_empty_text(category, lang),
+                reply_markup=_catalog_nav_only_keyboard(lang))
+            await callback.answer()
+            return
+        await callback.message.answer(
+            questionnaire_ux.catalog_category_text(category, lang),
+            reply_markup=_catalog_manifest_category_keyboard(instruments, lang))
+        await callback.answer()
+        return
+
+    # ── Category 6: consultation report (user-owned, never auto-sent) ──
+    if category == "consultation_report":
+        await callback.message.answer(
+            questionnaire_ux.consultation_report_text(lang),
+            reply_markup=_catalog_nav_only_keyboard(lang))
+        await callback.answer()
+        return
+
+    # ── Category 5: self_observation -> synthetic registry demos (startable) ──
+    if category == "self_observation":
+        registry = _load_registry_fresh()
+        # All active synthetic demos regardless of their internal `category`
+        # field; "restricted" legal_status stays hidden from listings (blocked
+        # at start/answer time too).
+        definitions = [d for d in registry.list_active()
+                       if d.get("legal_status") != "restricted"]
+        if not definitions:
+            await callback.message.answer(
+                questionnaire_ux.catalog_empty_text(category, lang),
+                reply_markup=_catalog_nav_only_keyboard(lang))
+            await callback.answer()
+            return
+        await callback.message.answer(
+            questionnaire_ux.catalog_category_text(category, lang),
+            reply_markup=_questionnaire_category_keyboard(category, definitions, lang))
+        await callback.answer()
+        return
+
+    # Unknown/stale category id: neutral empty screen, never a dead end.
     await callback.message.answer(
-        questionnaire_ux.category_text(category, definitions, lang),
-        reply_markup=_questionnaire_category_keyboard(category, definitions, lang))
+        questionnaire_ux.catalog_empty_text(category, lang),
+        reply_markup=_catalog_nav_only_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:i:"))
+async def cb_questionnaire_info(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    instrument_id = parts[2]
+    document = _load_catalog_document()
+    ci = (clinical_instrument_catalog.get_catalog_instrument(document, instrument_id)
+          if document is not None else None)
+    if ci is None:
+        # Unknown id, or a hidden instrument (JAPS/STAS, identity incomplete/
+        # conflict) -- never rendered. Neutral fail-closed message.
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    # Availability double-gate (future activation path, never fires in this
+    # PR): a manifest instrument may route into the real start flow ONLY when
+    # BOTH the manifest entry can activate AND a matching current registry
+    # definition passes can_start. No entry is 'ready' now, so this is dead.
+    if ci.availability == clinical_instrument_catalog.AVAILABILITY_AVAILABLE:
+        raw = next((i for i in document.get("instruments", [])
+                    if i.get("instrument_id") == instrument_id), None)
+        registry = _load_registry_fresh()
+        if raw is not None and clinical_instrument_catalog.catalog_activation_ready(
+                raw, registry, instrument_id):
+            await _send_questionnaire_step(
+                callback.message.answer, registry.get(instrument_id),
+                await start_questionnaire_session(
+                    uid, instrument_id, registry.get(instrument_id)["version"]),
+                0, lang)
+            await callback.answer()
+            return
+
+    await callback.message.answer(
+        questionnaire_ux.instrument_info_text(ci, lang),
+        reply_markup=_catalog_info_keyboard(ci.category_id, lang))
     await callback.answer()
 
 
