@@ -21,6 +21,29 @@ No instrument in this PR is marked `ready`. Activating any of them for real
 in-product use requires a separate, later PR with documented rights evidence
 that does not yet exist in this repository.
 
+**Rights are recorded as explicit status values, not booleans.** Each rights
+field in the machine-readable manifest is one of `unknown`,
+`permission_required`, `allowed`, `allowed_with_conditions`, `prohibited`, or
+`not_applicable` — because a boolean `false` would wrongly collapse "not
+investigated", "permission required", and "explicitly prohibited" into one
+value that a future reader could misread. Where this document says
+"permission required" or "metadata incomplete", that is a deliberate status,
+not a verified legal prohibition.
+
+**Identity is split into two distinct claims.** "Instrument family identified"
+(e.g. "this is some form of the Beck Depression Inventory") is recorded
+separately from "exact version verified" (BDI vs BDI-II). Every instrument
+below that is recognizable is `family_identified_version_incomplete`, never
+`verified` — none is implementation-ready on family identification alone.
+
+**Risk-sensitive item numbers below are descriptive research prose only.** The
+runtime manifest encodes **no executable `risk_item_ids`** and keeps
+`risk_item_metadata_status: "unverified"` for every instrument. A specific item
+number is meaningful only against an exact, approved version/translation, which
+does not exist here — so no crisis routing is or may be wired by instrument
+name or by a guessed item index. That wiring belongs to a future PR that has
+an approved definition, per the owner's §1.4 requirement.
+
 ---
 
 ## 1. BDI / BDI-II — Beck Depression Inventory
@@ -226,31 +249,31 @@ that does not yet exist in this repository.
 | Field | Value |
 |---|---|
 | Instrument ID | `japs` |
-| Exact full name | **metadata incomplete — identity not established** |
-| Abbreviation | JAPS |
-| Exact version | unknown |
-| Author/developer | unknown |
-| Year | unknown |
-| Construct/domain | unknown — the source URL path (`psytests.org/work/japs.html`) suggests an occupational/work-related construct, but this is inferred from the URL slug, not confirmed identity, and is explicitly **not** treated as sufficient identification per this PR's rules |
-| Self-report / clinician-rated | unknown |
-| Target population | unknown |
-| Age range | unknown |
-| Reference period | unknown |
-| Item count | unknown |
-| Subscales | unknown |
-| Score direction | unknown |
-| Known risk-sensitive item | unknown |
-| Primary/official source | **not found** — a targeted search for "JAPS" as a named psychometric instrument did not return a confirmed match. Several similarly-abbreviated but distinct instruments exist (Job Anxiety Scale, Job Attitude Scale, Job Accommodation Scale — none of which are abbreviated "JAPS" in the literature located), which is exactly the kind of confusion this governance process exists to prevent. |
-| Russian adaptation | unknown |
-| Copyright/license owner | unknown |
-| Digital reproduction status | not applicable — instrument not identified |
-| Commercial-use status | not applicable |
-| Translation-use status | not applicable |
+| Exact full name | Job Apathy Scale (Шкала профессиональной апатии) — **family identified by direct page inspection**, not from the URL slug |
+| Abbreviation | JAPS (the source also refers to the underlying instrument as JAS) |
+| Exact version | unknown — item count and specific version not stated on the page |
+| Author/developer | G. Schmidt et al. (per the source page); Russian adaptation attributed to A.A. Zolotareva |
+| Year | 2017 (original, per the source page); 2020 (Russian adaptation) |
+| Construct/domain | **Occupational** — work-related apathy (reduced enthusiasm/engagement and reduced motivation/energy at work). **Not a depression instrument** and not an anxiety instrument. |
+| Self-report / clinician-rated | Self-report (per the source page: "tested in online and offline formats") |
+| Target population | Working adults |
+| Age range | metadata incomplete |
+| Reference period | metadata incomplete |
+| Item count | unknown (not stated on the page) |
+| Subscales | Two dimensions described (work indifference/reduced enthusiasm; reduced motivation/energy) — not independently verified |
+| Score direction | metadata incomplete |
+| Known risk-sensitive item | metadata incomplete |
+| Primary/official source | Schmidt et al. (2017) — cited on the source page but **not independently verified** against the primary publication in this pass |
+| Russian adaptation | Zolotareva (2020), per the source page |
+| Copyright/license owner | metadata incomplete |
+| Digital reproduction status | unknown |
+| Commercial-use status | unknown |
+| Translation-use status | unknown |
 | Can be activated now? | **No** |
-| Evidence links | Owner-supplied: `https://psytests.org/work/japs.html` (identification attempt only; did not yield confirmed identity) |
-| Blocking uncertainty | **Full identity unconfirmed.** Per the owner's explicit instruction, no meaning is inferred from the abbreviation/slug alone. |
+| Evidence links | Owner-supplied `https://psytests.org/work/japs.html` was **inspected directly** and yielded the family identification above (identification/discovery support only, never rights/scoring evidence) |
+| Blocking uncertainty | Exact version/item count unverified; primary source not independently verified; **out of scope for the depression/anxiety catalog** (it is an occupational instrument) |
 
-**Classification: `metadata_incomplete`.** Not eligible for any further work (research, catalog inclusion beyond a placeholder, or activation) until identity is independently and reliably established.
+**Classification: `family_identified_version_incomplete`, `public_catalog_visible: false`.** The abbreviation was resolved by inspecting the page itself (Job Apathy Scale), not guessed from the slug — but it is an occupational instrument, not part of the depression/anxiety product surface, and its exact version is unverified, so it is not shown in the public catalog and cannot start.
 
 ---
 
@@ -280,10 +303,10 @@ that does not yet exist in this repository.
 | Commercial-use status | not applicable |
 | Translation-use status | not applicable |
 | Can be activated now? | **No** |
-| Evidence links | Owner-supplied: `https://psytests.org/depr/stas.html` (identification attempt; produced a category/name mismatch rather than a confirmed identity) |
-| Blocking uncertainty | **Category/name mismatch must be resolved before any further work.** Do not assume this is the anger scale merely because that's the most common "STAS"; do not assume it's a depression instrument merely because of the URL category. |
+| Evidence links | Owner-supplied `https://psytests.org/depr/stas.html` was **inspected directly**; the page content returned corrupted/unreadable (encoding errors), yielding only one extractable citation — an E.V. Ponevezhskaya 2024 dissertation on apathetic-syndrome characteristics — which matches neither the common "STAS = State-Trait Anger Scale" identity nor a depression instrument |
+| Blocking uncertainty | **Category/name mismatch unresolved even after direct page inspection.** The page's depression category, its only readable citation (apathy, 2024), and the most common literature meaning of "STAS" (Spielberger anger scale, 1980) all point in different directions. No identity is assumed. |
 
-**Classification: `metadata_incomplete`, do not confuse with the anger/anxiety instrument of the same abbreviation.** Blocked pending independent identity resolution.
+**Classification: `identity_conflict`, `public_catalog_visible: false`.** Direct inspection did not resolve the conflict (the page returned unreadable). Not confused with the anger scale, not forced into the depression category — blocked and hidden pending independent identity resolution.
 
 ---
 
@@ -297,7 +320,7 @@ that does not yet exist in this repository.
 | `zung_sds` | Depression | Self-report | `blocked` | Rights unverified |
 | `epds` | Depression (perinatal) | Self-report | `blocked` | Commercial-use confirmation; applicability gate not built |
 | `dass` | Depression/Anxiety/Stress | Self-report | `blocked` | Exact version (21 vs 42) unconfirmed; commercial-use restricted |
-| `japs` | unknown | unknown | `metadata_incomplete` | Identity not established |
-| `stas` | unknown | unknown | `metadata_incomplete` | Identity conflict (anger vs depression-categorized page) |
+| `japs` | occupational (out of catalog scope) | Self-report | `blocked`, hidden | Job Apathy Scale — family identified by page inspection; version unverified; not a depression/anxiety instrument |
+| `stas` | unknown | unknown | `blocked`, hidden | Identity conflict unresolved after direct page inspection (page returned corrupted) |
 
 **No instrument in this research pass can honestly be marked `ready`.** Every one requires further work — rights confirmation for the six identified instruments, and basic identity confirmation for JAPS and STAS — before any real content, scoring, or user-facing activation is possible.

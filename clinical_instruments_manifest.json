@@ -1,231 +1,333 @@
-[
-  {
-    "instrument_id": "bdi_ii",
-    "display_name_ru": "Шкала депрессии Бека",
-    "abbreviation": "BDI/BDI-II",
-    "version": null,
-    "domain": "depression",
-    "administration_mode": "self_report",
-    "population": ["adult"],
-    "reference_period": null,
-    "item_count": 21,
-    "subscales": [],
-    "source_page": "https://psytests.org/depr/bdi-run.html",
-    "primary_sources": [
-      "Beck AT et al. (1961/1996) Beck Depression Inventory / BDI-II, Pearson Assessments"
-    ],
-    "translation_id": null,
-    "license_status": "license_gated",
-    "digital_reproduction_allowed": false,
-    "commercial_use_allowed": false,
-    "translation_use_allowed": false,
-    "activation_status": "blocked",
-    "risk_item_metadata_status": "present_unverified_wording",
-    "score_direction": "higher_more_severe",
-    "trend_eligible": false,
-    "blockers": [
-      "exact_version_unconfirmed_bdi_vs_bdi_ii",
-      "no_license_evidence",
-      "russian_adaptation_rights_unconfirmed"
-    ]
-  },
-  {
-    "instrument_id": "hdrs",
-    "display_name_ru": "Шкала депрессии Гамильтона",
-    "abbreviation": "HDRS/HAM-D",
-    "version": null,
-    "domain": "depression",
-    "administration_mode": "clinician_rated",
-    "population": ["adult"],
-    "reference_period": null,
-    "item_count": null,
-    "subscales": [],
-    "source_page": "https://psytests.org/diag/hdrs-run.html",
-    "primary_sources": [
-      "Hamilton M. (1960) A rating scale for depression. J Neurol Neurosurg Psychiatry 23(1):56-62"
-    ],
-    "translation_id": null,
-    "license_status": "unknown",
-    "digital_reproduction_allowed": false,
-    "commercial_use_allowed": false,
-    "translation_use_allowed": false,
-    "activation_status": "blocked",
-    "risk_item_metadata_status": "present_clinician_rated_only",
-    "score_direction": "higher_more_severe",
-    "trend_eligible": false,
-    "blockers": [
-      "clinician_rated_not_a_self_test",
-      "exact_version_unconfirmed_17_vs_21_item",
-      "digital_commercial_rights_unverified"
-    ]
-  },
-  {
-    "instrument_id": "zung_sas",
-    "display_name_ru": "Шкала самооценки тревоги Цунга",
-    "abbreviation": "SAS/ZARS",
-    "version": "1971_original",
-    "domain": "anxiety",
-    "administration_mode": "self_report",
-    "population": ["adult"],
-    "reference_period": null,
-    "item_count": 20,
-    "subscales": [],
-    "source_page": "https://psytests.org/anxiety/zars.html",
-    "primary_sources": [
-      "Zung WW. (1971) A rating instrument for anxiety disorders. Psychosomatics 12(6):371-379"
-    ],
-    "translation_id": null,
-    "license_status": "unknown",
-    "digital_reproduction_allowed": false,
-    "commercial_use_allowed": false,
-    "translation_use_allowed": false,
-    "activation_status": "blocked",
-    "risk_item_metadata_status": "unverified",
-    "score_direction": "higher_more_severe",
-    "trend_eligible": false,
-    "blockers": [
-      "rights_status_unverified"
-    ]
-  },
-  {
-    "instrument_id": "zung_sds",
-    "display_name_ru": "Шкала самооценки депрессии Цунга",
-    "abbreviation": "SDS",
-    "version": "1965_original",
-    "domain": "depression",
-    "administration_mode": "self_report",
-    "population": ["adult"],
-    "reference_period": null,
-    "item_count": 20,
-    "subscales": [],
-    "source_page": "https://psytests.org/depr/zung.html",
-    "primary_sources": [
-      "Zung WW. (1965) A Self-Rating Depression Scale. Archives of General Psychiatry 12(1):63-70"
-    ],
-    "translation_id": null,
-    "license_status": "unknown",
-    "digital_reproduction_allowed": false,
-    "commercial_use_allowed": false,
-    "translation_use_allowed": false,
-    "activation_status": "blocked",
-    "risk_item_metadata_status": "unverified",
-    "score_direction": "higher_more_severe",
-    "trend_eligible": false,
-    "blockers": [
-      "rights_status_unverified",
-      "scoring_source_unverified"
-    ]
-  },
-  {
-    "instrument_id": "epds",
-    "display_name_ru": "Эдинбургская шкала послеродовой депрессии",
-    "abbreviation": "EPDS",
-    "version": "1987_original",
-    "domain": "depression",
-    "administration_mode": "self_report",
-    "population": ["perinatal", "postpartum"],
-    "reference_period": "past_7_days",
-    "item_count": 10,
-    "subscales": [],
-    "source_page": "https://psytests.org/depr/epds.html",
-    "primary_sources": [
-      "Cox JL, Holden JM, Sagovsky R. (1987) Detection of postnatal depression. British Journal of Psychiatry 150:782-786"
-    ],
-    "translation_id": null,
-    "license_status": "unknown",
-    "digital_reproduction_allowed": false,
-    "commercial_use_allowed": false,
-    "translation_use_allowed": false,
-    "activation_status": "blocked",
-    "risk_item_metadata_status": "present_unverified_wording",
-    "score_direction": "higher_more_severe",
-    "trend_eligible": false,
-    "blockers": [
-      "commercial_use_confirmation_needed",
-      "population_applicability_gate_not_built",
-      "risk_item_must_route_to_crisis_pipeline_before_scoring"
-    ]
-  },
-  {
-    "instrument_id": "dass",
-    "display_name_ru": "Шкалы депрессии, тревоги и стресса",
-    "abbreviation": "DASS",
-    "version": null,
-    "domain": "depression_anxiety_stress",
-    "administration_mode": "self_report",
-    "population": ["adult"],
-    "reference_period": "past_week",
-    "item_count": null,
-    "subscales": ["depression", "anxiety", "stress"],
-    "source_page": "https://psytests.org/depr/dass.html",
-    "primary_sources": [
-      "Lovibond SH, Lovibond PF. (1995) Manual for the Depression Anxiety Stress Scales (2nd ed). Psychology Foundation of Australia"
-    ],
-    "translation_id": null,
-    "license_status": "restricted_commercial_use",
-    "digital_reproduction_allowed": false,
-    "commercial_use_allowed": false,
-    "translation_use_allowed": false,
-    "activation_status": "blocked",
-    "risk_item_metadata_status": "unverified",
-    "score_direction": "higher_more_severe",
-    "trend_eligible": false,
-    "blockers": [
-      "exact_version_unconfirmed_dass21_vs_dass42",
-      "commercial_use_permission_not_confirmed"
-    ]
-  },
-  {
-    "instrument_id": "japs",
-    "display_name_ru": null,
-    "abbreviation": "JAPS",
-    "version": null,
-    "domain": "unknown",
-    "administration_mode": "unknown",
-    "population": [],
-    "reference_period": null,
-    "item_count": null,
-    "subscales": [],
-    "source_page": "https://psytests.org/work/japs.html",
-    "primary_sources": [],
-    "translation_id": null,
-    "license_status": "unknown",
-    "digital_reproduction_allowed": false,
-    "commercial_use_allowed": false,
-    "translation_use_allowed": false,
-    "activation_status": "metadata_incomplete",
-    "risk_item_metadata_status": "unverified",
-    "score_direction": null,
-    "trend_eligible": false,
-    "blockers": [
-      "identity_not_established"
-    ]
-  },
-  {
-    "instrument_id": "stas",
-    "display_name_ru": null,
-    "abbreviation": "STAS",
-    "version": null,
-    "domain": "unknown",
-    "administration_mode": "unknown",
-    "population": [],
-    "reference_period": null,
-    "item_count": null,
-    "subscales": [],
-    "source_page": "https://psytests.org/depr/stas.html",
-    "primary_sources": [],
-    "translation_id": null,
-    "license_status": "unknown",
-    "digital_reproduction_allowed": false,
-    "commercial_use_allowed": false,
-    "translation_use_allowed": false,
-    "activation_status": "metadata_incomplete",
-    "risk_item_metadata_status": "unverified",
-    "score_direction": null,
-    "trend_eligible": false,
-    "blockers": [
-      "identity_not_established",
-      "category_name_mismatch_with_common_state_trait_anger_scale_identity"
-    ]
-  }
-]
+{
+  "schema_version": 2,
+  "_comment": "Governance metadata only. No question text, answer options, scoring keys, norms, cutoffs, or translations. Rights use explicit status enums (unknown / permission_required / allowed / allowed_with_conditions / prohibited / not_applicable) -- a boolean 'false' would wrongly collapse 'not investigated' and 'explicitly prohibited' into one value. psytests.org source_page entries support identification/discovery ONLY, never license/rights/scoring evidence.",
+  "instruments": [
+    {
+      "instrument_id": "bdi_ii",
+      "display_name_ru": "Шкала депрессии Бека",
+      "abbreviation": "BDI/BDI-II",
+      "instrument_family": "Beck Depression Inventory",
+      "version": null,
+      "identity_status": "family_identified_version_incomplete",
+      "domain": "depression",
+      "administration_mode": "self_report",
+      "population": ["adult"],
+      "reference_period": null,
+      "item_count": 21,
+      "subscales": [],
+      "source_page": "https://psytests.org/depr/bdi-run.html",
+      "evidence": [
+        {
+          "kind": "primary_source",
+          "title": "Beck AT et al. Beck Depression Inventory (1961) / BDI-II (1996), Pearson Assessments",
+          "url": null,
+          "accessed_at": "2026-07-10",
+          "supports": ["identity", "administration_mode"],
+          "notes": "Family identification only. BDI (1961) vs BDI-II (1996) have different item sets; which one the source page reproduces was NOT verified -- exact version remains unresolved."
+        }
+      ],
+      "translation_id": null,
+      "rights": {
+        "digital_reproduction": {"status": "permission_required", "evidence": []},
+        "commercial_use": {"status": "permission_required", "evidence": []},
+        "translation_use": {"status": "permission_required", "evidence": []}
+      },
+      "activation_status": "blocked",
+      "public_catalog_visible": true,
+      "risk_item_metadata_status": "unverified",
+      "score_direction": "higher_more_severe",
+      "trend_eligible": false,
+      "blockers": [
+        "exact_version_unconfirmed_bdi_vs_bdi_ii",
+        "no_license_evidence",
+        "russian_adaptation_rights_unconfirmed"
+      ]
+    },
+    {
+      "instrument_id": "hdrs",
+      "display_name_ru": "Шкала депрессии Гамильтона",
+      "abbreviation": "HDRS/HAM-D",
+      "instrument_family": "Hamilton Depression Rating Scale",
+      "version": null,
+      "identity_status": "family_identified_version_incomplete",
+      "domain": "depression",
+      "administration_mode": "clinician_rated",
+      "population": ["adult"],
+      "reference_period": null,
+      "item_count": null,
+      "subscales": [],
+      "source_page": "https://psytests.org/diag/hdrs-run.html",
+      "evidence": [
+        {
+          "kind": "primary_source",
+          "title": "Hamilton M. (1960) A rating scale for depression. J Neurol Neurosurg Psychiatry 23(1):56-62",
+          "url": null,
+          "accessed_at": "2026-07-10",
+          "supports": ["identity", "administration_mode"],
+          "notes": "Clinician-rated structured interview. 17-item vs 21-item version at the source page NOT verified."
+        }
+      ],
+      "translation_id": null,
+      "rights": {
+        "digital_reproduction": {"status": "unknown", "evidence": []},
+        "commercial_use": {"status": "unknown", "evidence": []},
+        "translation_use": {"status": "unknown", "evidence": []}
+      },
+      "activation_status": "blocked",
+      "public_catalog_visible": true,
+      "risk_item_metadata_status": "unverified",
+      "score_direction": "higher_more_severe",
+      "trend_eligible": false,
+      "blockers": [
+        "clinician_rated_not_a_self_test",
+        "exact_version_unconfirmed_17_vs_21_item",
+        "rights_status_unverified"
+      ]
+    },
+    {
+      "instrument_id": "zung_sas",
+      "display_name_ru": "Шкала самооценки тревоги Цунга",
+      "abbreviation": "SAS/ZARS",
+      "instrument_family": "Zung Self-Rating Anxiety Scale",
+      "version": null,
+      "identity_status": "family_identified_version_incomplete",
+      "domain": "anxiety",
+      "administration_mode": "self_report",
+      "population": ["adult"],
+      "reference_period": null,
+      "item_count": 20,
+      "subscales": [],
+      "source_page": "https://psytests.org/anxiety/zars.html",
+      "evidence": [
+        {
+          "kind": "primary_source",
+          "title": "Zung WW. (1971) A rating instrument for anxiety disorders. Psychosomatics 12(6):371-379",
+          "url": null,
+          "accessed_at": "2026-07-10",
+          "supports": ["identity", "administration_mode"],
+          "notes": "Family identified. The specific Russian adaptation at the source page NOT verified."
+        }
+      ],
+      "translation_id": null,
+      "rights": {
+        "digital_reproduction": {"status": "unknown", "evidence": []},
+        "commercial_use": {"status": "unknown", "evidence": []},
+        "translation_use": {"status": "unknown", "evidence": []}
+      },
+      "activation_status": "blocked",
+      "public_catalog_visible": true,
+      "risk_item_metadata_status": "unverified",
+      "score_direction": "higher_more_severe",
+      "trend_eligible": false,
+      "blockers": [
+        "rights_status_unverified",
+        "russian_adaptation_unverified"
+      ]
+    },
+    {
+      "instrument_id": "zung_sds",
+      "display_name_ru": "Шкала самооценки депрессии Цунга",
+      "abbreviation": "SDS",
+      "instrument_family": "Zung Self-Rating Depression Scale",
+      "version": null,
+      "identity_status": "family_identified_version_incomplete",
+      "domain": "depression",
+      "administration_mode": "self_report",
+      "population": ["adult"],
+      "reference_period": null,
+      "item_count": 20,
+      "subscales": [],
+      "source_page": "https://psytests.org/depr/zung.html",
+      "evidence": [
+        {
+          "kind": "primary_source",
+          "title": "Zung WW. (1965) A Self-Rating Depression Scale. Archives of General Psychiatry 12(1):63-70",
+          "url": null,
+          "accessed_at": "2026-07-10",
+          "supports": ["identity", "administration_mode"],
+          "notes": "Family identified. The specific Russian adaptation at the source page NOT verified."
+        }
+      ],
+      "translation_id": null,
+      "rights": {
+        "digital_reproduction": {"status": "unknown", "evidence": []},
+        "commercial_use": {"status": "unknown", "evidence": []},
+        "translation_use": {"status": "unknown", "evidence": []}
+      },
+      "activation_status": "blocked",
+      "public_catalog_visible": true,
+      "risk_item_metadata_status": "unverified",
+      "score_direction": "higher_more_severe",
+      "trend_eligible": false,
+      "blockers": [
+        "rights_status_unverified",
+        "scoring_source_unverified",
+        "russian_adaptation_unverified"
+      ]
+    },
+    {
+      "instrument_id": "epds",
+      "display_name_ru": "Эдинбургская шкала послеродовой депрессии",
+      "abbreviation": "EPDS",
+      "instrument_family": "Edinburgh Postnatal Depression Scale",
+      "version": null,
+      "identity_status": "family_identified_version_incomplete",
+      "domain": "depression",
+      "administration_mode": "self_report",
+      "population": ["perinatal", "postpartum"],
+      "reference_period": "past_7_days",
+      "item_count": 10,
+      "subscales": [],
+      "source_page": "https://psytests.org/depr/epds.html",
+      "evidence": [
+        {
+          "kind": "primary_source",
+          "title": "Cox JL, Holden JM, Sagovsky R. (1987) Detection of postnatal depression. British Journal of Psychiatry 150:782-786",
+          "url": null,
+          "accessed_at": "2026-07-10",
+          "supports": ["identity", "administration_mode", "population"],
+          "notes": "Family identified; perinatal-specific by design. The instrument family is documented in the literature as containing risk-sensitive self-harm content, but no executable item mapping is encoded here -- the exact approved translation/definition must exist first, and any risk-sensitive response must route through the existing crisis pipeline before scoring."
+        }
+      ],
+      "translation_id": null,
+      "rights": {
+        "digital_reproduction": {"status": "unknown", "evidence": []},
+        "commercial_use": {"status": "permission_required", "evidence": []},
+        "translation_use": {"status": "unknown", "evidence": []}
+      },
+      "activation_status": "blocked",
+      "public_catalog_visible": true,
+      "risk_item_metadata_status": "unverified",
+      "score_direction": "higher_more_severe",
+      "trend_eligible": false,
+      "blockers": [
+        "commercial_use_confirmation_needed",
+        "population_applicability_gate_not_built",
+        "risk_item_must_route_to_crisis_pipeline_before_scoring",
+        "exact_translation_unverified"
+      ]
+    },
+    {
+      "instrument_id": "dass",
+      "display_name_ru": "Шкалы депрессии, тревоги и стресса",
+      "abbreviation": "DASS",
+      "instrument_family": "Depression Anxiety Stress Scales",
+      "version": null,
+      "identity_status": "family_identified_version_incomplete",
+      "domain": "depression_anxiety_stress",
+      "administration_mode": "self_report",
+      "population": ["adult"],
+      "reference_period": "past_week",
+      "item_count": null,
+      "subscales": ["depression", "anxiety", "stress"],
+      "source_page": "https://psytests.org/depr/dass.html",
+      "evidence": [
+        {
+          "kind": "primary_source",
+          "title": "Lovibond SH, Lovibond PF. (1995) Manual for the Depression Anxiety Stress Scales (2nd ed). Psychology Foundation of Australia",
+          "url": null,
+          "accessed_at": "2026-07-10",
+          "supports": ["identity", "administration_mode"],
+          "notes": "Family identified. DASS-21 vs DASS-42 at the source page NOT verified; the two use different scoring conventions and are not interchangeable. Official terms historically permit free non-commercial clinical/research use but restrict commercial use."
+        }
+      ],
+      "translation_id": null,
+      "rights": {
+        "digital_reproduction": {"status": "unknown", "evidence": []},
+        "commercial_use": {"status": "permission_required", "evidence": []},
+        "translation_use": {"status": "unknown", "evidence": []}
+      },
+      "activation_status": "blocked",
+      "public_catalog_visible": true,
+      "risk_item_metadata_status": "unverified",
+      "score_direction": "higher_more_severe",
+      "trend_eligible": false,
+      "blockers": [
+        "exact_version_unconfirmed_dass21_vs_dass42",
+        "commercial_use_permission_not_confirmed"
+      ]
+    },
+    {
+      "instrument_id": "japs",
+      "display_name_ru": "Шкала профессиональной апатии",
+      "abbreviation": "JAPS",
+      "instrument_family": "Job Apathy Scale",
+      "version": null,
+      "identity_status": "family_identified_version_incomplete",
+      "domain": "occupational",
+      "administration_mode": "self_report",
+      "population": ["adult_working"],
+      "reference_period": null,
+      "item_count": null,
+      "subscales": [],
+      "source_page": "https://psytests.org/work/japs.html",
+      "evidence": [
+        {
+          "kind": "adaptation_publication",
+          "title": "Job Apathy Scale (Schmidt et al., 2017); Russian adaptation A.A. Zolotareva (2020) -- identified by direct inspection of the owner-supplied source page",
+          "url": "https://psytests.org/work/japs.html",
+          "accessed_at": "2026-07-10",
+          "supports": ["identity", "administration_mode"],
+          "notes": "Occupational apathy instrument, NOT a depression instrument. Item count and exact version not stated on the page; primary source (Schmidt 2017) not independently verified. Not relevant to the depression/anxiety product categories."
+        }
+      ],
+      "translation_id": null,
+      "rights": {
+        "digital_reproduction": {"status": "unknown", "evidence": []},
+        "commercial_use": {"status": "unknown", "evidence": []},
+        "translation_use": {"status": "unknown", "evidence": []}
+      },
+      "activation_status": "blocked",
+      "public_catalog_visible": false,
+      "risk_item_metadata_status": "unverified",
+      "score_direction": null,
+      "trend_eligible": false,
+      "blockers": [
+        "exact_version_and_item_count_unverified",
+        "primary_source_not_independently_verified",
+        "rights_status_unverified",
+        "out_of_scope_for_depression_anxiety_catalog"
+      ]
+    },
+    {
+      "instrument_id": "stas",
+      "display_name_ru": null,
+      "abbreviation": "STAS",
+      "instrument_family": null,
+      "version": null,
+      "identity_status": "identity_conflict",
+      "domain": "unknown",
+      "administration_mode": "unknown",
+      "population": [],
+      "reference_period": null,
+      "item_count": null,
+      "subscales": [],
+      "source_page": "https://psytests.org/depr/stas.html",
+      "evidence": [
+        {
+          "kind": "primary_source",
+          "title": "Direct inspection of the owner-supplied source page (content retrieved corrupted/unreadable); only extractable citation: E.V. Ponevezhskaya dissertation (2024) on apathetic-syndrome characteristics",
+          "url": "https://psytests.org/depr/stas.html",
+          "accessed_at": "2026-07-10",
+          "supports": [],
+          "notes": "Identity NOT established. The page's category (depression) and its only readable citation (apathy-related, 2024) both conflict with the most common literature meaning of STAS (Spielberger State-Trait Anger Scale, 1980). Unresolved -- no identity is assumed."
+        }
+      ],
+      "translation_id": null,
+      "rights": {
+        "digital_reproduction": {"status": "unknown", "evidence": []},
+        "commercial_use": {"status": "unknown", "evidence": []},
+        "translation_use": {"status": "unknown", "evidence": []}
+      },
+      "activation_status": "blocked",
+      "public_catalog_visible": false,
+      "risk_item_metadata_status": "unverified",
+      "score_direction": null,
+      "trend_eligible": false,
+      "blockers": [
+        "identity_not_established",
+        "category_name_mismatch_with_common_state_trait_anger_scale_identity"
+      ]
+    }
+  ]
+}
