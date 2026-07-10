@@ -1,0 +1,231 @@
+[
+  {
+    "instrument_id": "bdi_ii",
+    "display_name_ru": "Шкала депрессии Бека",
+    "abbreviation": "BDI/BDI-II",
+    "version": null,
+    "domain": "depression",
+    "administration_mode": "self_report",
+    "population": ["adult"],
+    "reference_period": null,
+    "item_count": 21,
+    "subscales": [],
+    "source_page": "https://psytests.org/depr/bdi-run.html",
+    "primary_sources": [
+      "Beck AT et al. (1961/1996) Beck Depression Inventory / BDI-II, Pearson Assessments"
+    ],
+    "translation_id": null,
+    "license_status": "license_gated",
+    "digital_reproduction_allowed": false,
+    "commercial_use_allowed": false,
+    "translation_use_allowed": false,
+    "activation_status": "blocked",
+    "risk_item_metadata_status": "present_unverified_wording",
+    "score_direction": "higher_more_severe",
+    "trend_eligible": false,
+    "blockers": [
+      "exact_version_unconfirmed_bdi_vs_bdi_ii",
+      "no_license_evidence",
+      "russian_adaptation_rights_unconfirmed"
+    ]
+  },
+  {
+    "instrument_id": "hdrs",
+    "display_name_ru": "Шкала депрессии Гамильтона",
+    "abbreviation": "HDRS/HAM-D",
+    "version": null,
+    "domain": "depression",
+    "administration_mode": "clinician_rated",
+    "population": ["adult"],
+    "reference_period": null,
+    "item_count": null,
+    "subscales": [],
+    "source_page": "https://psytests.org/diag/hdrs-run.html",
+    "primary_sources": [
+      "Hamilton M. (1960) A rating scale for depression. J Neurol Neurosurg Psychiatry 23(1):56-62"
+    ],
+    "translation_id": null,
+    "license_status": "unknown",
+    "digital_reproduction_allowed": false,
+    "commercial_use_allowed": false,
+    "translation_use_allowed": false,
+    "activation_status": "blocked",
+    "risk_item_metadata_status": "present_clinician_rated_only",
+    "score_direction": "higher_more_severe",
+    "trend_eligible": false,
+    "blockers": [
+      "clinician_rated_not_a_self_test",
+      "exact_version_unconfirmed_17_vs_21_item",
+      "digital_commercial_rights_unverified"
+    ]
+  },
+  {
+    "instrument_id": "zung_sas",
+    "display_name_ru": "Шкала самооценки тревоги Цунга",
+    "abbreviation": "SAS/ZARS",
+    "version": "1971_original",
+    "domain": "anxiety",
+    "administration_mode": "self_report",
+    "population": ["adult"],
+    "reference_period": null,
+    "item_count": 20,
+    "subscales": [],
+    "source_page": "https://psytests.org/anxiety/zars.html",
+    "primary_sources": [
+      "Zung WW. (1971) A rating instrument for anxiety disorders. Psychosomatics 12(6):371-379"
+    ],
+    "translation_id": null,
+    "license_status": "unknown",
+    "digital_reproduction_allowed": false,
+    "commercial_use_allowed": false,
+    "translation_use_allowed": false,
+    "activation_status": "blocked",
+    "risk_item_metadata_status": "unverified",
+    "score_direction": "higher_more_severe",
+    "trend_eligible": false,
+    "blockers": [
+      "rights_status_unverified"
+    ]
+  },
+  {
+    "instrument_id": "zung_sds",
+    "display_name_ru": "Шкала самооценки депрессии Цунга",
+    "abbreviation": "SDS",
+    "version": "1965_original",
+    "domain": "depression",
+    "administration_mode": "self_report",
+    "population": ["adult"],
+    "reference_period": null,
+    "item_count": 20,
+    "subscales": [],
+    "source_page": "https://psytests.org/depr/zung.html",
+    "primary_sources": [
+      "Zung WW. (1965) A Self-Rating Depression Scale. Archives of General Psychiatry 12(1):63-70"
+    ],
+    "translation_id": null,
+    "license_status": "unknown",
+    "digital_reproduction_allowed": false,
+    "commercial_use_allowed": false,
+    "translation_use_allowed": false,
+    "activation_status": "blocked",
+    "risk_item_metadata_status": "unverified",
+    "score_direction": "higher_more_severe",
+    "trend_eligible": false,
+    "blockers": [
+      "rights_status_unverified",
+      "scoring_source_unverified"
+    ]
+  },
+  {
+    "instrument_id": "epds",
+    "display_name_ru": "Эдинбургская шкала послеродовой депрессии",
+    "abbreviation": "EPDS",
+    "version": "1987_original",
+    "domain": "depression",
+    "administration_mode": "self_report",
+    "population": ["perinatal", "postpartum"],
+    "reference_period": "past_7_days",
+    "item_count": 10,
+    "subscales": [],
+    "source_page": "https://psytests.org/depr/epds.html",
+    "primary_sources": [
+      "Cox JL, Holden JM, Sagovsky R. (1987) Detection of postnatal depression. British Journal of Psychiatry 150:782-786"
+    ],
+    "translation_id": null,
+    "license_status": "unknown",
+    "digital_reproduction_allowed": false,
+    "commercial_use_allowed": false,
+    "translation_use_allowed": false,
+    "activation_status": "blocked",
+    "risk_item_metadata_status": "present_unverified_wording",
+    "score_direction": "higher_more_severe",
+    "trend_eligible": false,
+    "blockers": [
+      "commercial_use_confirmation_needed",
+      "population_applicability_gate_not_built",
+      "risk_item_must_route_to_crisis_pipeline_before_scoring"
+    ]
+  },
+  {
+    "instrument_id": "dass",
+    "display_name_ru": "Шкалы депрессии, тревоги и стресса",
+    "abbreviation": "DASS",
+    "version": null,
+    "domain": "depression_anxiety_stress",
+    "administration_mode": "self_report",
+    "population": ["adult"],
+    "reference_period": "past_week",
+    "item_count": null,
+    "subscales": ["depression", "anxiety", "stress"],
+    "source_page": "https://psytests.org/depr/dass.html",
+    "primary_sources": [
+      "Lovibond SH, Lovibond PF. (1995) Manual for the Depression Anxiety Stress Scales (2nd ed). Psychology Foundation of Australia"
+    ],
+    "translation_id": null,
+    "license_status": "restricted_commercial_use",
+    "digital_reproduction_allowed": false,
+    "commercial_use_allowed": false,
+    "translation_use_allowed": false,
+    "activation_status": "blocked",
+    "risk_item_metadata_status": "unverified",
+    "score_direction": "higher_more_severe",
+    "trend_eligible": false,
+    "blockers": [
+      "exact_version_unconfirmed_dass21_vs_dass42",
+      "commercial_use_permission_not_confirmed"
+    ]
+  },
+  {
+    "instrument_id": "japs",
+    "display_name_ru": null,
+    "abbreviation": "JAPS",
+    "version": null,
+    "domain": "unknown",
+    "administration_mode": "unknown",
+    "population": [],
+    "reference_period": null,
+    "item_count": null,
+    "subscales": [],
+    "source_page": "https://psytests.org/work/japs.html",
+    "primary_sources": [],
+    "translation_id": null,
+    "license_status": "unknown",
+    "digital_reproduction_allowed": false,
+    "commercial_use_allowed": false,
+    "translation_use_allowed": false,
+    "activation_status": "metadata_incomplete",
+    "risk_item_metadata_status": "unverified",
+    "score_direction": null,
+    "trend_eligible": false,
+    "blockers": [
+      "identity_not_established"
+    ]
+  },
+  {
+    "instrument_id": "stas",
+    "display_name_ru": null,
+    "abbreviation": "STAS",
+    "version": null,
+    "domain": "unknown",
+    "administration_mode": "unknown",
+    "population": [],
+    "reference_period": null,
+    "item_count": null,
+    "subscales": [],
+    "source_page": "https://psytests.org/depr/stas.html",
+    "primary_sources": [],
+    "translation_id": null,
+    "license_status": "unknown",
+    "digital_reproduction_allowed": false,
+    "commercial_use_allowed": false,
+    "translation_use_allowed": false,
+    "activation_status": "metadata_incomplete",
+    "risk_item_metadata_status": "unverified",
+    "score_direction": null,
+    "trend_eligible": false,
+    "blockers": [
+      "identity_not_established",
+      "category_name_mismatch_with_common_state_trait_anger_scale_identity"
+    ]
+  }
+]
