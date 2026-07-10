@@ -52,6 +52,7 @@ def _minimal_valid(**overrides):
         "domain": "depression",
         "administration_mode": "self_report",
         "population": ["adult"],
+        "catalog_category_id": "depression_mood_energy",
         "activation_status": "blocked",
         "public_catalog_visible": True,
         "risk_item_metadata_status": "unverified",

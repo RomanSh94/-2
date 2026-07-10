@@ -5,6 +5,9 @@
     {
       "instrument_id": "bdi_ii",
       "display_name_ru": "Шкала депрессии Бека",
+      "display_name_en": "Beck Depression Inventory",
+      "catalog_category_id": "depression_mood_energy",
+      "questionnaire_definition_id": null,
       "abbreviation": "BDI/BDI-II",
       "instrument_family": "Beck Depression Inventory",
       "version": null,
@@ -46,6 +49,9 @@
     {
       "instrument_id": "hdrs",
       "display_name_ru": "Шкала депрессии Гамильтона",
+      "display_name_en": "Hamilton Depression Rating Scale",
+      "catalog_category_id": "depression_mood_energy",
+      "questionnaire_definition_id": null,
       "abbreviation": "HDRS/HAM-D",
       "instrument_family": "Hamilton Depression Rating Scale",
       "version": null,
@@ -87,6 +93,9 @@
     {
       "instrument_id": "zung_sas",
       "display_name_ru": "Шкала самооценки тревоги Цунга",
+      "display_name_en": "Zung Self-Rating Anxiety Scale",
+      "catalog_category_id": "anxiety",
+      "questionnaire_definition_id": null,
       "abbreviation": "SAS/ZARS",
       "instrument_family": "Zung Self-Rating Anxiety Scale",
       "version": null,
@@ -127,6 +136,9 @@
     {
       "instrument_id": "zung_sds",
       "display_name_ru": "Шкала самооценки депрессии Цунга",
+      "display_name_en": "Zung Self-Rating Depression Scale",
+      "catalog_category_id": "depression_mood_energy",
+      "questionnaire_definition_id": null,
       "abbreviation": "SDS",
       "instrument_family": "Zung Self-Rating Depression Scale",
       "version": null,
@@ -168,6 +180,9 @@
     {
       "instrument_id": "epds",
       "display_name_ru": "Эдинбургская шкала послеродовой депрессии",
+      "display_name_en": "Edinburgh Postnatal Depression Scale",
+      "catalog_category_id": "specialized",
+      "questionnaire_definition_id": null,
       "abbreviation": "EPDS",
       "instrument_family": "Edinburgh Postnatal Depression Scale",
       "version": null,
@@ -210,6 +225,9 @@
     {
       "instrument_id": "dass",
       "display_name_ru": "Шкалы депрессии, тревоги и стресса",
+      "display_name_en": "Depression Anxiety Stress Scales",
+      "catalog_category_id": "stress",
+      "questionnaire_definition_id": null,
       "abbreviation": "DASS",
       "instrument_family": "Depression Anxiety Stress Scales",
       "version": null,
@@ -250,6 +268,9 @@
     {
       "instrument_id": "japs",
       "display_name_ru": "Шкала профессиональной апатии",
+      "display_name_en": "Job Apathy Scale",
+      "catalog_category_id": null,
+      "questionnaire_definition_id": null,
       "abbreviation": "JAPS",
       "instrument_family": "Job Apathy Scale",
       "version": null,
@@ -292,6 +313,9 @@
     {
       "instrument_id": "stas",
       "display_name_ru": null,
+      "display_name_en": null,
+      "catalog_category_id": null,
+      "questionnaire_definition_id": null,
       "abbreviation": "STAS",
       "instrument_family": null,
       "version": null,
