@@ -179,7 +179,16 @@ async def a1_allowed(requester_uid: int) -> bool:
     personal_use and controlled_clinical_test. CLINICIAN_TESTER is allowed only
     when they currently have full access (acknowledged + reviewer-mapped) in
     controlled_clinical_test — i.e. A1 for a tester is a strict subset of
-    "tester is even allowed to use the product right now"."""
+    "tester is even allowed to use the product right now". An active
+    ordinary invite-registered user (PR A, `user_access` table) is allowed
+    too — same "A1 is a subset of ordinary product access" principle, not a
+    role: `resolve_role_safe` returns UNKNOWN for these uids (user_access
+    registration is a separate mechanism from the OWNER/CLINICIAN_* role
+    model), so this branch is checked explicitly rather than folded into the
+    role dispatch above it. Never grants OWNER/reviewer/cross-user/dashboard
+    access — this is exactly the same has_full_access() an ordinary user
+    already has for the rest of the product, nothing more. Fail-closed: any
+    DB lookup error -> False."""
     if not _mode_is_valid() or DEPLOYMENT_MODE == "public":
         return False
     role = resolve_role_safe(requester_uid)
@@ -192,7 +201,11 @@ async def a1_allowed(requester_uid: int) -> bool:
             return await has_full_access(requester_uid)
         except Exception:
             return False
-    return False
+    try:
+        import database
+        return await database.user_has_active_access(requester_uid)
+    except Exception:
+        return False
 
 
 class A1NotAllowed(PermissionError):

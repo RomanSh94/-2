@@ -99,11 +99,17 @@ def test_registered_user_is_not_owner(tmp_db, monkeypatch):
     uid = 5004
     asyncio.run(tmp_db.grant_user_access(uid, source="invite"))
     assert ac.resolve_role(uid) != ac.OWNER
-    # Never A1-equivalent either -- a1_allowed only checks role, never
-    # user_access, so a registered ordinary user must be denied.
-    assert asyncio.run(ac.a1_allowed(uid)) is False
-    with pytest.raises(ac.A1NotAllowed):
-        asyncio.run(ac.assert_a1_allowed(uid))
+    # MASTER EXECUTION ADDENDUM v3 -- this assertion is INTENTIONALLY flipped
+    # from the original PR #49 version (which asserted a1_allowed is False /
+    # A1NotAllowed is raised). That was the discovered gap: has_full_access()
+    # already passed ordinary invite-registered users, but a1_allowed() still
+    # denied them, silently breaking "Обсудить результат" for them. An active
+    # ordinary user is now A1-allowed too -- same "A1 is a strict subset of
+    # ordinary product access" principle already used for CLINICIAN_TESTER --
+    # while still never resolving as OWNER (role stays UNKNOWN; user_access is
+    # a separate mechanism from the OWNER/CLINICIAN_* role model).
+    assert asyncio.run(ac.a1_allowed(uid)) is True
+    asyncio.run(ac.assert_a1_allowed(uid))  # must not raise
 
 
 def test_owner_access_unchanged(tmp_db, monkeypatch):
@@ -207,3 +213,238 @@ def test_crisis_flow_unchanged_for_registered_user(tmp_db, monkeypatch):
     risk2 = detect_risk(text, detect_language(text))
     asyncio.run(bot_module.trigger_crisis(msg2, uid2, "u2", text, risk2, lang))
     assert len(msg2.answers) == 1
+
+
+# ── MASTER EXECUTION ADDENDUM v3 / PHASE 1 -- closing the ordinary-user A1 gap
+# a1_allowed()/assert_a1_allowed() previously denied every active
+# invite-registered user (role resolves UNKNOWN, and the old code only ever
+# checked role == OWNER / CLINICIAN_TESTER). This block proves the fix without
+# weakening any existing invariant: still no OWNER/reviewer/cross-user/
+# dashboard escalation, still fail-closed on any error, still gated the same
+# way has_full_access() already was.
+
+def test_active_registered_user_is_a1_allowed(tmp_db, monkeypatch):
+    uid = 9001
+    asyncio.run(tmp_db.grant_user_access(uid, source="invite"))
+    assert asyncio.run(ac.a1_allowed(uid)) is True
+
+
+def test_unknown_user_is_not_a1_allowed(tmp_db, monkeypatch):
+    uid = 9002  # never granted access at all
+    assert asyncio.run(ac.a1_allowed(uid)) is False
+
+
+def test_blocked_user_is_not_a1_allowed(tmp_db, monkeypatch):
+    uid = 9003
+    asyncio.run(tmp_db.grant_user_access(uid, source="invite"))
+    assert asyncio.run(ac.a1_allowed(uid)) is True
+    asyncio.run(tmp_db.block_user_access(uid))
+    assert asyncio.run(ac.a1_allowed(uid)) is False
+
+
+def test_user_access_db_failure_denies_a1(monkeypatch):
+    # Point database.DB at a path that cannot be opened for reads -- the
+    # lookup must raise, and a1_allowed must fail closed (False), never crash
+    # or accidentally grant.
+    monkeypatch.setattr(database, "DB", "/nonexistent-dir/does-not-exist.db")
+    uid = 9004
+    assert asyncio.run(ac.a1_allowed(uid)) is False
+
+
+def test_owner_a1_behavior_unchanged(tmp_db, monkeypatch):
+    # OWNER_USER_ID == 1 per the autouse fixture. No user_access row needed.
+    assert asyncio.run(ac.a1_allowed(1)) is True
+
+
+def test_clinician_tester_a1_behavior_unchanged(tmp_db, monkeypatch):
+    tester_uid = 9005
+    reviewer_uid = 9006
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "controlled_clinical_test")
+    monkeypatch.setattr(ac, "CLINICIAN_TESTER_IDS", {tester_uid})
+    monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", {reviewer_uid})
+    monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {tester_uid: [reviewer_uid]})
+    # Not acknowledged yet -> still denied, exactly as before this PR.
+    assert asyncio.run(ac.a1_allowed(tester_uid)) is False
+    asyncio.run(tmp_db.set_tester_acknowledged(tester_uid))
+    assert asyncio.run(ac.a1_allowed(tester_uid)) is True
+
+
+def test_public_mode_denies_registered_user_a1(tmp_db, monkeypatch):
+    uid = 9007
+    asyncio.run(tmp_db.grant_user_access(uid, source="invite"))
+    assert asyncio.run(ac.a1_allowed(uid)) is True
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    assert asyncio.run(ac.a1_allowed(uid)) is False
+
+
+def test_delete_all_removes_user_access(tmp_db, monkeypatch):
+    uid = 9008
+    asyncio.run(tmp_db.upsert_user(uid, "u", "U"))
+    asyncio.run(tmp_db.grant_user_access(uid, source="invite"))
+    assert asyncio.run(tmp_db.user_has_active_access(uid)) is True
+    assert asyncio.run(ac.a1_allowed(uid)) is True
+
+    asyncio.run(tmp_db.delete_all_personal_data(uid))
+
+    assert asyncio.run(tmp_db.user_has_active_access(uid)) is False
+    assert asyncio.run(ac.a1_allowed(uid)) is False
+    # Regaining access requires a fresh invite grant -- delete-all does not
+    # leave a dormant/blocked row that could be silently reactivated.
+    asyncio.run(tmp_db.grant_user_access(uid, source="invite"))
+    assert asyncio.run(tmp_db.user_has_active_access(uid)) is True
+
+
+def test_registered_user_crisis_content_not_alerted_to_owner_by_default(tmp_db, monkeypatch):
+    # crisis_alert_targets()/should_alert_owner() are role-based only (OWNER /
+    # CLINICIAN_REVIEWER) -- user_access registration does not change role
+    # resolution, so a registered ordinary user's crisis event must route the
+    # same as any other UNKNOWN-role uid: "none", never "owner". This PR does
+    # not touch crisis_alert_targets() at all -- this test proves the
+    # pre-existing behavior still holds unchanged with a user_access row
+    # present.
+    uid = 9009
+    asyncio.run(tmp_db.grant_user_access(uid, source="invite"))
+    assert ac.should_alert_owner(uid) is False
+    kind, targets = ac.crisis_alert_targets(uid)
+    assert kind == "none"
+    assert targets == []
+
+
+# ── discuss-menu/topic integration for a registered ordinary user ──────────
+# Uses tests/test_questionnaire_discuss.py's exact fixtures/helpers (FakeUser/
+# FakeMessage/FakeCallback, _complete_flow, the synthetic registry fixture
+# directory) rather than reinventing them here.
+def _discuss_test_env():
+    import importlib
+    return importlib.import_module("tests.test_questionnaire_discuss")
+
+
+def test_registered_user_can_open_discuss_menu(tmp_path, monkeypatch):
+    tqd = _discuss_test_env()
+    import bot as bot_module
+    import questionnaires
+
+    monkeypatch.setattr(database, "DB", str(tmp_path / "t2.db"))
+    asyncio.run(database.init_db())
+    monkeypatch.setattr(bot_module, "get_user_language", _const("ru"))
+    monkeypatch.setattr(bot_module, "get_active_crisis", _const(None))
+    monkeypatch.setattr(bot_module, "log_crisis_delivery", _const(None))
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "personal_use")
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 1)
+    monkeypatch.setattr(ac, "CLINICIAN_TESTER_IDS", set())
+    monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", set())
+    monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
+    monkeypatch.setattr(bot_module, "CallbackQuery", tqd.FakeCallback)
+    monkeypatch.setattr(bot_module, "_load_registry_fresh",
+                        lambda: questionnaires.load_registry(tqd.FIXTURE_DIR))
+    monkeypatch.setattr(config, "QUESTIONNAIRE_INTERPRETATION_ENABLED", True)
+
+    uid = 9101
+    asyncio.run(database.upsert_user(uid, "u", "U"))
+    asyncio.run(database.grant_user_access(uid, source="invite"))
+
+    user = tqd.FakeUser(uid)
+    msg = tqd.FakeMessage(user)
+    session_id = tqd._complete_flow(user, msg)
+    cb = tqd.FakeCallback(user, msg, data=f"q:m:{session_id}")
+    asyncio.run(bot_module.cb_questionnaire_discuss_menu(cb))
+    assert msg.answers
+    assert bot_module.questionnaire_ux.discuss_menu_text("ru") in msg.answers[-1][0]
+
+
+def test_registered_user_can_use_discuss_topic(tmp_path, monkeypatch):
+    tqd = _discuss_test_env()
+    import bot as bot_module
+    import questionnaires
+
+    monkeypatch.setattr(database, "DB", str(tmp_path / "t3.db"))
+    asyncio.run(database.init_db())
+    monkeypatch.setattr(bot_module, "get_user_language", _const("ru"))
+    monkeypatch.setattr(bot_module, "get_active_crisis", _const(None))
+    monkeypatch.setattr(bot_module, "log_crisis_delivery", _const(None))
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "personal_use")
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 1)
+    monkeypatch.setattr(ac, "CLINICIAN_TESTER_IDS", set())
+    monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", set())
+    monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
+    monkeypatch.setattr(bot_module, "CallbackQuery", tqd.FakeCallback)
+    monkeypatch.setattr(bot_module, "_load_registry_fresh",
+                        lambda: questionnaires.load_registry(tqd.FIXTURE_DIR))
+    monkeypatch.setattr(config, "QUESTIONNAIRE_INTERPRETATION_ENABLED", True)
+
+    calls = []
+
+    async def _fake_builder(**kwargs):
+        calls.append(kwargs)
+        await kwargs["send"]("TRACED-REPLY-FOR-REGISTERED-USER")
+        return "rid-fake"
+
+    monkeypatch.setattr(bot_module, "traced_response_builder", _fake_builder)
+
+    uid = 9102
+    asyncio.run(database.upsert_user(uid, "u", "U"))
+    asyncio.run(database.grant_user_access(uid, source="invite"))
+
+    user = tqd.FakeUser(uid)
+    msg = tqd.FakeMessage(user)
+    session_id = tqd._complete_flow(user, msg)
+    cb = tqd.FakeCallback(user, msg, data=f"q:m:{session_id}:why")
+    asyncio.run(bot_module.cb_questionnaire_discuss_topic(cb))
+
+    assert len(calls) == 1
+    assert calls[0]["user_id"] == uid
+    assert calls[0]["requester_uid"] == uid
+    assert msg.answers[-1][0] == "TRACED-REPLY-FOR-REGISTERED-USER"
+
+
+def test_registered_user_cannot_use_another_users_session(tmp_path, monkeypatch):
+    tqd = _discuss_test_env()
+    import bot as bot_module
+    import questionnaires
+
+    monkeypatch.setattr(database, "DB", str(tmp_path / "t4.db"))
+    asyncio.run(database.init_db())
+    monkeypatch.setattr(bot_module, "get_user_language", _const("ru"))
+    monkeypatch.setattr(bot_module, "get_active_crisis", _const(None))
+    monkeypatch.setattr(bot_module, "log_crisis_delivery", _const(None))
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "personal_use")
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 1)
+    monkeypatch.setattr(ac, "CLINICIAN_TESTER_IDS", set())
+    monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", set())
+    monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
+    monkeypatch.setattr(bot_module, "CallbackQuery", tqd.FakeCallback)
+    monkeypatch.setattr(bot_module, "_load_registry_fresh",
+                        lambda: questionnaires.load_registry(tqd.FIXTURE_DIR))
+    monkeypatch.setattr(config, "QUESTIONNAIRE_INTERPRETATION_ENABLED", True)
+
+    called = {"traced": False}
+
+    async def _fake_builder(**kwargs):
+        called["traced"] = True
+        return "rid-should-not-happen"
+
+    monkeypatch.setattr(bot_module, "traced_response_builder", _fake_builder)
+
+    uid_a, uid_b = 9103, 9104
+    asyncio.run(database.upsert_user(uid_a, "a", "A"))
+    asyncio.run(database.upsert_user(uid_b, "b", "B"))
+    asyncio.run(database.grant_user_access(uid_a, source="invite"))
+    asyncio.run(database.grant_user_access(uid_b, source="invite"))
+
+    user_a = tqd.FakeUser(uid_a)
+    msg_a = tqd.FakeMessage(user_a)
+    session_id = tqd._complete_flow(user_a, msg_a)
+
+    user_b = tqd.FakeUser(uid_b)
+    msg_b = tqd.FakeMessage(user_b)
+    cb = tqd.FakeCallback(user_b, msg_b, data=f"q:m:{session_id}:why")
+    asyncio.run(bot_module.cb_questionnaire_discuss_topic(cb))
+
+    assert called["traced"] is False
+    assert msg_b.answers == []  # silent no-op, no ownership/existence leak
+
+
+def _const(value):
+    async def _f(*a, **kw):
+        return value
+    return _f
