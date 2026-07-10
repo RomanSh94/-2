@@ -32,3 +32,15 @@ QUESTIONNAIRE_INTERPRETATION_ENABLED = (
     os.getenv("QUESTIONNAIRE_INTERPRETATION_ENABLED", "false").strip().lower()
     in ("1", "true", "yes", "on")
 )
+
+# PR A — private invite-based access for ordinary (non-owner, non-clinician)
+# product users. A real production feature (unlike TEMP_TEST_INVITE_*, which
+# is test-instance-only and time-boxed) — default OFF, and usable only once
+# access_control.user_invite_active() also confirms the code meets the
+# minimum-length bar. Never == compared directly at the call site in bot.py —
+# hmac.compare_digest() is used there, since this is reachable by strangers.
+USER_INVITE_ENABLED = (
+    os.getenv("USER_INVITE_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+USER_INVITE_CODE = os.getenv("USER_INVITE_CODE", "").strip()

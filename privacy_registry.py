@@ -267,6 +267,15 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
         retention_policy="Until user-requested delete-all.",
         log_policy="answer_id/answer_value are stable definition tokens, never the "
                   "original item/option display text — never in logs/alerts regardless."),
+
+    # PR A — ordinary-user private invite access. Account-status metadata, not
+    # content -- same STATE treatment as user_states/user_profiles.
+    "user_access": _e(
+        table="user_access", user_id_column="user_id", category="STATE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="status/source only — no free text; never in logs/alerts beyond "
+                  "internal DB read."),
 }
 
 
