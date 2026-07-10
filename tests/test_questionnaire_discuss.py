@@ -546,3 +546,73 @@ def test_prior_q_r_k_e_o_still_gated_by_crisis(monkeypatch):
         cb = FakeCallback(user, msg, data=f"{prefix}:{session_id}")
         asyncio.run(getattr(bot, handler_name)(cb))
         assert get_hotline("ru")["primary"] in msg.answers[-1][0]
+
+
+# ── registered ordinary user (PR A / user_access) reaches the same discuss
+# path as OWNER -- moved here from tests/test_user_invite_access.py so this
+# scenario uses this module's own fixtures directly instead of importing them
+# across test modules (audit finding: cross-test-module coupling).
+def test_registered_user_can_open_discuss_menu(monkeypatch):
+    uid = 9101
+    asyncio.run(database.upsert_user(uid, "u", "U"))
+    asyncio.run(database.grant_user_access(uid, source="invite"))
+    user = FakeUser(uid)
+    msg = FakeMessage(user)
+    session_id = _complete_flow(user, msg)
+    cb = FakeCallback(user, msg, data=f"q:m:{session_id}")
+    asyncio.run(bot.cb_questionnaire_discuss_menu(cb))
+    assert msg.answers
+    assert questionnaire_ux.discuss_menu_text("ru") in msg.answers[-1][0]
+
+
+def test_registered_user_can_use_discuss_topic(monkeypatch):
+    calls = []
+
+    async def _fake_builder(**kwargs):
+        calls.append(kwargs)
+        await kwargs["send"]("TRACED-REPLY-FOR-REGISTERED-USER")
+        return "rid-fake"
+
+    monkeypatch.setattr(bot, "traced_response_builder", _fake_builder)
+
+    uid = 9102
+    asyncio.run(database.upsert_user(uid, "u", "U"))
+    asyncio.run(database.grant_user_access(uid, source="invite"))
+    user = FakeUser(uid)
+    msg = FakeMessage(user)
+    session_id = _complete_flow(user, msg)
+    cb = FakeCallback(user, msg, data=f"q:m:{session_id}:why")
+    asyncio.run(bot.cb_questionnaire_discuss_topic(cb))
+
+    assert len(calls) == 1
+    assert calls[0]["user_id"] == uid
+    assert calls[0]["requester_uid"] == uid
+    assert msg.answers[-1][0] == "TRACED-REPLY-FOR-REGISTERED-USER"
+
+
+def test_registered_user_cannot_use_another_users_session(monkeypatch):
+    called = {"traced": False}
+
+    async def _fake_builder(**kwargs):
+        called["traced"] = True
+        return "rid-should-not-happen"
+
+    monkeypatch.setattr(bot, "traced_response_builder", _fake_builder)
+
+    uid_a, uid_b = 9103, 9104
+    asyncio.run(database.upsert_user(uid_a, "a", "A"))
+    asyncio.run(database.upsert_user(uid_b, "b", "B"))
+    asyncio.run(database.grant_user_access(uid_a, source="invite"))
+    asyncio.run(database.grant_user_access(uid_b, source="invite"))
+
+    user_a = FakeUser(uid_a)
+    msg_a = FakeMessage(user_a)
+    session_id = _complete_flow(user_a, msg_a)
+
+    user_b = FakeUser(uid_b)
+    msg_b = FakeMessage(user_b)
+    cb = FakeCallback(user_b, msg_b, data=f"q:m:{session_id}:why")
+    asyncio.run(bot.cb_questionnaire_discuss_topic(cb))
+
+    assert called["traced"] is False
+    assert msg_b.answers == []  # silent no-op, no ownership/existence leak
