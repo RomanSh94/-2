@@ -1802,14 +1802,23 @@ def _catalog_nav_only_keyboard(lang: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _catalog_info_keyboard(category_id: str, lang: str) -> InlineKeyboardMarkup:
-    # Instrument information screen: back to its category, and home to menu.
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
-                              callback_data=f"q:c:{category_id}")],
-        [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
-                              callback_data="menu:back")],
-    ])
+def _catalog_info_keyboard(category_id: str, lang: str,
+                           *, start_definition_id: str | None = None) -> InlineKeyboardMarkup:
+    # Instrument information screen. If (and only if) the availability
+    # double-gate resolved an explicit startable definition id, a "Пройти"
+    # button is shown that routes into the EXISTING q:d:<definition_id> detail
+    # flow -- q:i itself never starts anything. Never fires in this PR (no
+    # instrument is ready). Then back-to-category and home-to-menu.
+    rows: list = []
+    if start_definition_id:
+        rows.append([InlineKeyboardButton(
+            text=("▶️ Пройти" if lang == "ru" else "▶️ Start"),
+            callback_data=f"q:d:{start_definition_id}")])
+    rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+                                      callback_data=f"q:c:{category_id}")])
+    rows.append([InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
+                                      callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _questionnaire_detail_keyboard(qid: str, lang: str) -> InlineKeyboardMarkup:
@@ -1990,13 +1999,16 @@ async def cb_questionnaire_category(callback: CallbackQuery):
         await callback.answer()
         return
 
-    # ── Category 5: self_observation -> synthetic registry demos (startable) ──
+    # ── Category 5: self_observation -> ONLY definitions explicitly assigned
+    # to the self-observation product surface (registry category "selfobs").
+    # Deliberately NOT unfiltered list_active(): a future real clinical
+    # definition (category anxiety/mood/depression/etc.) must never surface
+    # here and bypass the manifest catalog's availability double-gate via the
+    # old q:d/q:s route. "restricted" legal_status stays hidden from listings
+    # (blocked at start/answer time too).
     if category == "self_observation":
         registry = _load_registry_fresh()
-        # All active synthetic demos regardless of their internal `category`
-        # field; "restricted" legal_status stays hidden from listings (blocked
-        # at start/answer time too).
-        definitions = [d for d in registry.list_active()
+        definitions = [d for d in registry.list_active("selfobs")
                        if d.get("legal_status") != "restricted"]
         if not definitions:
             await callback.message.answer(
@@ -2038,27 +2050,27 @@ async def cb_questionnaire_info(callback: CallbackQuery):
         await callback.answer()
         return
 
-    # Availability double-gate (future activation path, never fires in this
-    # PR): a manifest instrument may route into the real start flow ONLY when
-    # BOTH the manifest entry can activate AND a matching current registry
-    # definition passes can_start. No entry is 'ready' now, so this is dead.
+    # q:i is PERMANENTLY read-only: it NEVER creates a session, never saves
+    # answers, never calls start_questionnaire_session/_send_questionnaire_step.
+    # The availability double-gate only decides whether to render a "Пройти"
+    # button that routes into the EXISTING q:d:<definition_id> detail flow --
+    # those existing handlers remain the only code that creates sessions.
+    # catalog_start_definition_id returns None unless the manifest entry is
+    # fully activatable AND carries an explicit questionnaire_definition_id
+    # that the registry can start; no entry is 'ready' in this PR, so this is
+    # always None here.
+    start_definition_id = None
     if ci.availability == clinical_instrument_catalog.AVAILABILITY_AVAILABLE:
         raw = next((i for i in document.get("instruments", [])
                     if i.get("instrument_id") == instrument_id), None)
-        registry = _load_registry_fresh()
-        if raw is not None and clinical_instrument_catalog.catalog_activation_ready(
-                raw, registry, instrument_id):
-            await _send_questionnaire_step(
-                callback.message.answer, registry.get(instrument_id),
-                await start_questionnaire_session(
-                    uid, instrument_id, registry.get(instrument_id)["version"]),
-                0, lang)
-            await callback.answer()
-            return
+        if raw is not None:
+            start_definition_id = clinical_instrument_catalog.catalog_start_definition_id(
+                raw, _load_registry_fresh())
 
     await callback.message.answer(
         questionnaire_ux.instrument_info_text(ci, lang),
-        reply_markup=_catalog_info_keyboard(ci.category_id, lang))
+        reply_markup=_catalog_info_keyboard(ci.category_id, lang,
+                                            start_definition_id=start_definition_id))
     await callback.answer()
 
 

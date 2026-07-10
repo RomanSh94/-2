@@ -199,6 +199,18 @@ def validate_instrument_metadata(item: dict) -> None:
             f"{instrument_id}: public_catalog_visible requires a non-null "
             "catalog_category_id")
 
+    # questionnaire_definition_id: the EXPLICIT id of the concrete private
+    # questionnaire definition this instrument would start from. It is NEVER
+    # inferred from instrument_id (a family id like `zung_sds` is not the same
+    # as a concrete definition id like `zung_sds_ru_adaptation_x_v1`). Nullable
+    # for blocked/metadata-only entries; a `ready` entry MUST carry a
+    # non-empty one (see the ready-rules block below).
+    qdid = item.get("questionnaire_definition_id")
+    if qdid is not None and (not isinstance(qdid, str) or not qdid.strip()):
+        raise InstrumentManifestError(
+            f"{instrument_id}: questionnaire_definition_id must be a non-empty "
+            f"string or null, got {qdid!r}")
+
     _validate_rights(instrument_id, item)
     _validate_evidence(instrument_id, item)
 
@@ -248,6 +260,11 @@ def validate_instrument_metadata(item: dict) -> None:
         if item.get("risk_item_metadata_status") == "unverified":
             raise InstrumentManifestError(
                 f"{instrument_id}: ready requires verified risk-item metadata")
+        qdid = item.get("questionnaire_definition_id")
+        if not qdid or not str(qdid).strip():
+            raise InstrumentManifestError(
+                f"{instrument_id}: ready requires an explicit non-empty "
+                "questionnaire_definition_id (never inferred from instrument_id)")
 
 
 def can_activate_instrument(item: dict) -> bool:
@@ -305,19 +322,22 @@ def _derive_availability(item: dict) -> str:
     """Deterministic mapping from governance fields to a user-facing
     availability state. Order matters and encodes the policy:
 
-    1. ready + can_activate  -> available (never true in this PR).
-    2. digital_reproduction permission_required (BDI family) -> requires_license.
-    3. clinician_rated (HDRS) -> information_only (cannot self-administer).
+    1. ready + fully activatable -> available (never true in this PR).
+    2. clinician_rated -> information_only. This PRECEDES the license check:
+       a clinician-administered instrument (HDRS) can never be a normal
+       self-test regardless of its licensing status, so it must render as
+       information-only, not as "a self-test that's merely license-blocked".
+    3. digital_reproduction permission_required (BDI family) -> requires_license.
     4. otherwise public/visible -> version_under_review (identity/version
        incomplete but shown honestly).
     5. not public-visible -> unavailable (never rendered)."""
     if item.get("activation_status") == "ready" and can_activate_instrument(item):
         return AVAILABILITY_AVAILABLE
+    if item.get("administration_mode") == "clinician_rated":
+        return AVAILABILITY_INFORMATION_ONLY
     rights = item.get("rights", {}) or {}
     if rights.get("digital_reproduction", {}).get("status") == "permission_required":
         return AVAILABILITY_REQUIRES_LICENSE
-    if item.get("administration_mode") == "clinician_rated":
-        return AVAILABILITY_INFORMATION_ONLY
     if is_public_catalog_visible(item):
         return AVAILABILITY_VERSION_UNDER_REVIEW
     return AVAILABILITY_UNAVAILABLE
@@ -374,21 +394,37 @@ def get_catalog_instrument(document: dict, instrument_id: str) -> CatalogInstrum
     return None
 
 
-def catalog_activation_ready(item: dict, registry, questionnaire_id: str | None) -> bool:
-    """Availability double-gate for FUTURE activation. A catalog instrument may
-    route into the real questionnaire start flow ONLY when BOTH hold:
+def catalog_start_definition_id(item: dict, registry) -> str | None:
+    """Availability double-gate for FUTURE activation, expressed as BUTTON
+    VISIBILITY rather than start execution. Returns the EXPLICIT
+    questionnaire_definition_id to route a "Start" button at — but ONLY when
+    ALL of:
 
-      (a) can_activate_instrument(item) is True  (manifest fully cleared), AND
-      (b) a matching current registry definition exists and registry.can_start
+      (a) can_activate_instrument(item) is True   (manifest fully cleared), AND
+      (b) item carries an explicit non-empty questionnaire_definition_id
+          (never inferred from instrument_id), AND
+      (c) that definition exists in the registry and registry.can_start(it)
           returns True.
 
-    If either fails -> False (information screen only, no session, no answers).
-    Never fires in this PR (no manifest entry is 'ready'); the path exists so a
-    future activation PR only has to make an entry ready + supply a definition.
-    `registry` is duck-typed (anything exposing can_start) to avoid coupling
-    this governance module to questionnaires.py."""
+    Otherwise returns None -> no start button, information screen only, no
+    session, no answers. This function NEVER creates a session or starts a
+    questionnaire itself: it only tells the UI which existing q:d/q:s
+    definition id (if any) a Start button may point at. Those existing
+    handlers remain the ONLY code that creates sessions.
+
+    Never returns non-None in this PR (no manifest entry is 'ready'). `registry`
+    is duck-typed (anything exposing can_start) to avoid coupling this
+    governance module to questionnaires.py."""
     if not can_activate_instrument(item):
-        return False
-    if registry is None or not questionnaire_id:
-        return False
-    return bool(registry.can_start(questionnaire_id))
+        return None
+    definition_id = item.get("questionnaire_definition_id")
+    if not definition_id or not str(definition_id).strip():
+        return None
+    if registry is None:
+        return None
+    try:
+        if registry.can_start(definition_id):
+            return definition_id
+    except Exception:
+        return None
+    return None

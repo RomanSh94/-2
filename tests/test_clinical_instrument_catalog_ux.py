@@ -212,6 +212,10 @@ def _ready_item(**over):
         "administration_mode": "self_report",
         "population": ["adult"],
         "activation_status": "ready",
+        # Explicit concrete definition id -- deliberately NOT equal to
+        # instrument_id, proving the mapping is never inferred from the family
+        # id (governance §2.3).
+        "questionnaire_definition_id": "synthetic_ready_def_v1",
         "public_catalog_visible": True,
         "risk_item_metadata_status": "verified",
         "evidence": [{"kind": "primary_source", "title": "x", "url": None,
@@ -227,24 +231,49 @@ def _ready_item(**over):
 
 
 def test_ready_manifest_without_definition_does_not_start():
+    # ready manifest, explicit definition id present, but registry has no
+    # matching definition -> no start id.
     item = _ready_item()
     assert cat.can_activate_instrument(item) is True   # manifest side is clear
-    # ...but no matching registry definition -> must NOT start.
-    assert cat.catalog_activation_ready(item, _FakeRegistry(set()), "synthetic_ready") is False
+    assert cat.catalog_start_definition_id(item, _FakeRegistry(set())) is None
 
 
 def test_valid_definition_without_ready_manifest_does_not_start():
     blocked = _ready_item(activation_status="blocked")
     assert cat.can_activate_instrument(blocked) is False
     # Registry would happily start it, but the manifest gate is closed.
-    assert cat.catalog_activation_ready(
-        blocked, _FakeRegistry({"synthetic_ready"}), "synthetic_ready") is False
+    assert cat.catalog_start_definition_id(
+        blocked, _FakeRegistry({"synthetic_ready_def_v1"})) is None
+
+
+def test_ready_manifest_without_questionnaire_definition_id_has_no_start_button():
+    # ready is structurally impossible without an explicit definition id
+    # (validator rejects it) -> can_activate False, no start id.
+    no_mapping = _ready_item(questionnaire_definition_id=None)
+    assert cat.can_activate_instrument(no_mapping) is False
+    assert cat.catalog_start_definition_id(
+        no_mapping, _FakeRegistry({"synthetic_ready_def_v1"})) is None
+
+
+def test_definition_mapping_is_not_inferred_from_instrument_id():
+    item = _ready_item()  # instrument_id=synthetic_ready, def id=synthetic_ready_def_v1
+    # Registry knows only the FAMILY id -> not startable (mapping not inferred).
+    assert cat.catalog_start_definition_id(item, _FakeRegistry({"synthetic_ready"})) is None
+    # Registry knows the EXPLICIT definition id -> that exact id is returned.
+    assert cat.catalog_start_definition_id(
+        item, _FakeRegistry({"synthetic_ready_def_v1"})) == "synthetic_ready_def_v1"
+
+
+def test_ready_mapping_missing_from_registry_has_no_start_button():
+    item = _ready_item()
+    assert cat.catalog_start_definition_id(item, _FakeRegistry(set())) is None
 
 
 def test_start_requires_manifest_and_definition_both_ready():
     item = _ready_item()
-    assert cat.catalog_activation_ready(
-        item, _FakeRegistry({"synthetic_ready"}), "synthetic_ready") is True
+    # All gates true -> the explicit definition id is returned for the button.
+    assert cat.catalog_start_definition_id(
+        item, _FakeRegistry({"synthetic_ready_def_v1"})) == "synthetic_ready_def_v1"
 
 
 # ── blocked / info-only instruments create no session ────────────────────────
@@ -403,3 +432,131 @@ def test_catalog_info_has_no_db_write():
     assert _sessions_for(uid) == []
     data = asyncio.run(database.export_all_personal_data(uid))
     assert data["questionnaire_responses"] == []
+
+
+# ── §2.1 q:i is PERMANENTLY read-only (even when a synthetic item is ready) ──
+def _ready_catalog_document(definition_id="synthetic_ready_def_v1"):
+    """A single-entry manifest doc whose one instrument is fully activatable
+    (synthetic; never a real instrument), for exercising the dormant start
+    path without any real content."""
+    return {"schema_version": 2, "instruments": [_ready_item(
+        questionnaire_definition_id=definition_id)]}
+
+
+def test_q_i_is_permanently_read_only_even_when_synthetic_item_is_ready(monkeypatch):
+    # Force a ready synthetic catalog item AND a registry that can start its
+    # explicit definition id. Pressing q:i must still NOT start anything --
+    # it may only render a "Пройти" button routing to the existing q:d flow.
+    monkeypatch.setattr(bot, "_load_catalog_document", lambda: _ready_catalog_document())
+    monkeypatch.setattr(bot, "_load_registry_fresh",
+                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}))
+    msg = _press_info(1, "synthetic_ready")
+    assert _sessions_for(1) == []  # no session created by q:i
+    datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
+    # The start button routes to the EXISTING q:d:<definition_id> flow, using
+    # the explicit definition id (never the instrument_id).
+    assert "q:d:synthetic_ready_def_v1" in datas
+    assert "q:d:synthetic_ready" not in datas
+
+
+def test_q_i_never_calls_start_questionnaire_session(monkeypatch):
+    def _boom(*a, **kw):
+        raise AssertionError("q:i must never call start_questionnaire_session")
+    monkeypatch.setattr(bot, "start_questionnaire_session", _boom)
+    monkeypatch.setattr(bot, "_load_catalog_document", lambda: _ready_catalog_document())
+    monkeypatch.setattr(bot, "_load_registry_fresh",
+                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}))
+    _press_info(1, "synthetic_ready")
+    assert _sessions_for(1) == []
+
+
+def test_q_i_never_calls_send_questionnaire_step(monkeypatch):
+    def _boom(*a, **kw):
+        raise AssertionError("q:i must never call _send_questionnaire_step")
+    monkeypatch.setattr(bot, "_send_questionnaire_step", _boom)
+    monkeypatch.setattr(bot, "_load_catalog_document", lambda: _ready_catalog_document())
+    monkeypatch.setattr(bot, "_load_registry_fresh",
+                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}))
+    _press_info(1, "synthetic_ready")
+
+
+def test_available_item_renders_existing_q_d_start_button(monkeypatch):
+    monkeypatch.setattr(bot, "_load_catalog_document", lambda: _ready_catalog_document())
+    monkeypatch.setattr(bot, "_load_registry_fresh",
+                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}))
+    msg = _press_info(1, "synthetic_ready")
+    texts = [t for t, _ in _buttons(msg.answers[-1][1])]
+    assert any("Пройти" in t or "Start" in t for t in texts)
+
+
+# ── §2.2 self_observation uses an explicit category filter ───────────────────
+def test_self_observation_uses_explicit_category_filter():
+    # The synthetic demos are tagged category=selfobs; they list under
+    # self_observation via registry.list_active("selfobs").
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="q:c:self_observation")
+    asyncio.run(bot.cb_questionnaire_category(cb))
+    datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
+    assert "q:d:demo_anxiety_v1" in datas   # a selfobs-tagged active demo
+
+
+def test_active_non_self_observation_definition_not_listed_in_self_observation():
+    # demo_result_eligible_v1 is an ACTIVE definition tagged category=anxiety
+    # (not selfobs) -- it must never surface under self_observation.
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="q:c:self_observation")
+    asyncio.run(bot.cb_questionnaire_category(cb))
+    datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
+    assert "q:d:demo_result_eligible_v1" not in datas
+
+
+def test_active_non_self_observation_definition_cannot_start_from_self_observation_screen():
+    # Even reaching q:d for the anxiety-tagged definition renders its detail
+    # (start is its own gate), but it is simply NOT offered on the
+    # self_observation screen -- the screen never exposes a q:d/q:s for it.
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="q:c:self_observation")
+    asyncio.run(bot.cb_questionnaire_category(cb))
+    datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
+    assert not any(d.startswith("q:d:demo_result_eligible_v1")
+                   or d.startswith("q:s:demo_result_eligible_v1") for d in datas)
+
+
+def test_explicit_self_observation_synthetic_definition_still_starts():
+    # A selfobs-tagged active demo still starts through the unchanged q:s flow.
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="q:s:demo_anxiety_v1")
+    asyncio.run(bot.cb_questionnaire_start(cb))
+    assert _sessions_for(1)  # a session was created via the existing start flow
+
+
+# ── §2.5 availability precedence: clinician_rated before license ─────────────
+def test_clinician_rated_precedes_license_state():
+    # A synthetic clinician-rated item that ALSO has permission_required
+    # licensing must render information_only (cannot self-administer),
+    # never requires_license.
+    item = _ready_item(
+        instrument_id="synthetic_clinrated", activation_status="blocked",
+        administration_mode="clinician_rated", identity_status="verified",
+        questionnaire_definition_id=None)
+    item["rights"]["digital_reproduction"] = {"status": "permission_required", "evidence": []}
+    assert cat._derive_availability(item) == cat.AVAILABILITY_INFORMATION_ONLY
+
+
+# ── §2.6 no second reachable questionnaire category source ───────────────────
+def test_no_second_reachable_questionnaire_category_source():
+    # The old symptom-label CATEGORIES / category_label / category_text are
+    # gone; the root keyboard is built solely from CATALOG_CATEGORIES.
+    assert not hasattr(questionnaire_ux, "CATEGORIES")
+    assert not hasattr(questionnaire_ux, "category_label")
+    assert not hasattr(questionnaire_ux, "category_text")
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_list(FakeCallback(user, msg, data="q:l")))
+    datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
+    expected = [f"q:c:{key}" for key, _, _ in questionnaire_ux.CATALOG_CATEGORIES] + ["menu:back"]
+    assert datas == expected

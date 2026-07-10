@@ -12,24 +12,6 @@ discuss-with-bot. See CLAUDE.md / CLINICAL_BOUNDARY.md for why this is
 deliberately narrow.
 """
 
-# (category key, RU label, EN label) -- must match questionnaires.Registry
-# definitions' `category` field.
-CATEGORIES = [
-    ("anxiety", "😟 Тревога", "😟 Anxiety"),
-    ("mood", "🌧 Настроение", "🌧 Mood"),
-    ("sleep_stress", "💤 Сон / стресс", "💤 Sleep / stress"),
-    ("selfobs", "🧠 Самонаблюдение", "🧠 Self-observation"),
-    ("specialist", "📄 Для специалиста", "📄 For a specialist"),
-]
-
-_CATEGORY_LABELS = {key: (ru, en) for key, ru, en in CATEGORIES}
-
-
-def category_label(key: str, lang: str) -> str:
-    ru, en = _CATEGORY_LABELS.get(key, (key, key))
-    return ru if lang == "ru" else en
-
-
 # ── Professional, manifest-driven catalog (replaces the old symptom-label
 # category list). The 6 root categories below are the catalog root; categories
 # 1-4 render governance-manifest instruments as INFO entries (never startable
@@ -184,28 +166,6 @@ def consultation_report_text(lang: str = "ru") -> str:
             "You decide who to show the report to.\n"
             "The bot never sends it to anyone automatically.\n\n"
             "This is not a diagnosis or a medical conclusion.")
-
-
-def category_text(category: str, definitions: list[dict], lang: str = "ru") -> str:
-    label = category_label(category, lang)
-    if not definitions:
-        if lang == "ru":
-            return f"{label}\n\nВ этом разделе пока нет доступных опросников."
-        return f"{label}\n\nNo questionnaires are available in this section yet."
-    lines = []
-    for d in definitions:
-        minutes = d.get("estimated_minutes")
-        n_items = len(d.get("items", []))
-        if lang == "ru":
-            minutes_txt = f"{minutes} мин" if minutes else ""
-            lines.append(f"{d['title']} — {n_items} вопросов" + (f", {minutes_txt}" if minutes_txt else ""))
-        else:
-            minutes_txt = f"{minutes} min" if minutes else ""
-            lines.append(f"{d['title']} — {n_items} questions" + (f", {minutes_txt}" if minutes_txt else ""))
-    body = "\n".join(lines)
-    if lang == "ru":
-        return f"{label}\n\nДоступные опросники:\n\n{body}"
-    return f"{label}\n\nAvailable questionnaires:\n\n{body}"
 
 
 def detail_text(definition: dict, lang: str = "ru") -> str:
