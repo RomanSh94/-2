@@ -359,6 +359,24 @@ CREATE TABLE IF NOT EXISTS questionnaire_responses (
     answer_value     TEXT,
     answered_at      TEXT DEFAULT (datetime('now'))
 );
+
+-- PR A — ordinary-user private invite access. Lets the owner send a single
+-- invite link so a real Telegram user can self-register as an ordinary
+-- product user (NOT owner, NOT clinician tester/reviewer). Additive to
+-- access_control.has_full_access via user_has_active_access(); independent of
+-- the test-only temp-invite mechanism in access_control.py. A blocked user
+-- must stay blocked even if they reopen the invite link -- see
+-- grant_user_access()'s ON CONFLICT DO NOTHING below.
+CREATE TABLE IF NOT EXISTS user_access (
+    user_id    INTEGER PRIMARY KEY,
+    status     TEXT NOT NULL DEFAULT 'active',
+    source     TEXT NOT NULL DEFAULT 'invite',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK(status IN ('active', 'blocked')),
+    CHECK(source IN ('owner', 'invite', 'manual', 'migration'))
+);
+CREATE INDEX IF NOT EXISTS idx_user_access_status ON user_access(status);
 """
 
 # Additive column migrations (no migration system in this repo; ADD COLUMN is
@@ -931,6 +949,37 @@ async def set_tester_acknowledged(uid: int) -> None:
         await db.execute(
             "INSERT INTO tester_acknowledgments (user_id) VALUES (?) "
             "ON CONFLICT(user_id) DO NOTHING", (uid,))
+        await db.commit()
+
+
+# ── PR A — ordinary-user private invite access ──────────────────────────────
+async def grant_user_access(uid: int, source: str = "invite") -> None:
+    """Idempotent upsert. A genuinely NEW row is inserted as active. An
+    EXISTING row (active or blocked) is left completely untouched -- in
+    particular, a previously-blocked user does NOT get silently re-activated
+    by a repeat invite attempt; only an explicit future owner-driven unblock
+    path (not built in this PR) may do that. ON CONFLICT DO NOTHING is what
+    gives us this for free: the insert is a no-op whenever a row already
+    exists, regardless of its current status."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO user_access (user_id, status, source) VALUES (?, 'active', ?) "
+            "ON CONFLICT(user_id) DO NOTHING", (uid, source))
+        await db.commit()
+
+
+async def user_has_active_access(uid: int) -> bool:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM user_access WHERE user_id=? AND status='active'", (uid,))
+        return (await cur.fetchone()) is not None
+
+
+async def block_user_access(uid: int) -> None:
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE user_access SET status='blocked', updated_at=datetime('now') "
+            "WHERE user_id=?", (uid,))
         await db.commit()
 
 

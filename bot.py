@@ -7,6 +7,7 @@ X20 Bot — Основной файл
   Notifications → OutcomeTracking → User
 """
 import asyncio
+import hmac
 import sys
 
 # Windows consoles default to a legacy codepage (e.g. cp1251) that cannot encode
@@ -94,6 +95,7 @@ from database import (
     get_questionnaire_session, record_questionnaire_response,
     advance_questionnaire_session, complete_questionnaire_session,
     cancel_questionnaire_session, get_questionnaire_responses,
+    grant_user_access,
 )
 import questionnaires
 import questionnaire_ux
@@ -934,6 +936,21 @@ async def cmd_start(message: Message):
             grant_msg = (f"✅ Временный тестовый доступ выдан до {end_str}."
                          if lang == "ru" else
                          f"✅ Temporary test access granted until {end_str}.")
+            await message.answer(grant_msg)
+        # PR A — ordinary-user private invite access. A separate, permanent
+        # production mechanism (not test-instance-scoped, not time-boxed) --
+        # independent of the temp-invite branch above. In a real deployment
+        # the two codes differ, so at most one branch ever matches; both are
+        # tried without either taking precedence over the other. Uses
+        # hmac.compare_digest (not ==) since this is reachable by any
+        # stranger holding the link, not just a controlled test cohort.
+        # Non-disclosure: a wrong/disabled code falls through silently to the
+        # existing closed-test behavior below -- never reveals close/correct.
+        elif access_control.user_invite_active() and hmac.compare_digest(
+                payload.encode("utf-8"), config.USER_INVITE_CODE.encode("utf-8")):
+            await grant_user_access(uid, source="invite")
+            lang = await get_user_language(uid)
+            grant_msg = "✅ Доступ открыт." if lang == "ru" else "✅ Access granted."
             await message.answer(grant_msg)
     if not await ensure_full_access_or_closed_test(message, uid):
         return

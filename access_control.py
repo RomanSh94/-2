@@ -157,6 +157,19 @@ async def has_full_access(uid: int) -> bool:
     # enabled flag + valid window) — see access_control.py's temp-invite block.
     if has_temp_test_access(uid):
         return True
+    # PR A — ordinary-user private invite access. A permanent, production
+    # mechanism (unlike the temp-invite block above): once a uid has an
+    # active grant recorded in the `user_access` table (see
+    # database.grant_user_access / cmd_start's deep-link handling), it has
+    # ordinary product access forever, independent of role and of the
+    # temp-invite mechanism. Fail-closed on any lookup error -- a broken DB
+    # call must never accidentally grant access.
+    try:
+        import database
+        if await database.user_has_active_access(uid):
+            return True
+    except Exception:
+        pass
     return False
 
 
@@ -166,7 +179,16 @@ async def a1_allowed(requester_uid: int) -> bool:
     personal_use and controlled_clinical_test. CLINICIAN_TESTER is allowed only
     when they currently have full access (acknowledged + reviewer-mapped) in
     controlled_clinical_test — i.e. A1 for a tester is a strict subset of
-    "tester is even allowed to use the product right now"."""
+    "tester is even allowed to use the product right now". An active
+    ordinary invite-registered user (PR A, `user_access` table) is allowed
+    too — same "A1 is a subset of ordinary product access" principle, not a
+    role: `resolve_role_safe` returns UNKNOWN for these uids (user_access
+    registration is a separate mechanism from the OWNER/CLINICIAN_* role
+    model), so this branch is checked explicitly rather than folded into the
+    role dispatch above it. Never grants OWNER/reviewer/cross-user/dashboard
+    access — this is exactly the same has_full_access() an ordinary user
+    already has for the rest of the product, nothing more. Fail-closed: any
+    DB lookup error -> False."""
     if not _mode_is_valid() or DEPLOYMENT_MODE == "public":
         return False
     role = resolve_role_safe(requester_uid)
@@ -179,7 +201,11 @@ async def a1_allowed(requester_uid: int) -> bool:
             return await has_full_access(requester_uid)
         except Exception:
             return False
-    return False
+    try:
+        import database
+        return await database.user_has_active_access(requester_uid)
+    except Exception:
+        return False
 
 
 class A1NotAllowed(PermissionError):
@@ -411,3 +437,27 @@ def clear_expired_temp_test_access(now: datetime | None = None) -> None:
             del _TEMP_TEST_GRANTED_UNTIL[uid]
     except Exception:
         pass
+
+
+# ── PR A — private invite-based access for ordinary product users ──────────────
+# Permanent, production feature (contrast with the temp-invite block above,
+# which is test-instance-only and <=72h-capped). Grants ordinary product
+# access only -- never OWNER, never CLINICIAN_TESTER/REVIEWER, never A1. See
+# database.grant_user_access / user_has_active_access / block_user_access for
+# the persistence side, and bot.py's cmd_start for the deep-link call site
+# (which uses hmac.compare_digest against config.USER_INVITE_CODE, never a
+# plain == comparison, since this is reachable by any stranger with the link).
+
+def user_invite_active() -> bool:
+    """Whether the ordinary-user invite mechanism is currently usable: the
+    feature flag is on AND a real code of sufficient length is configured.
+    Re-checked fresh (no caching) every call, same discipline as
+    temp_test_invite_config -- a config change takes effect immediately.
+    Fail-closed: any lookup error -> False."""
+    try:
+        import config
+        if not config.USER_INVITE_ENABLED:
+            return False
+        return len(config.USER_INVITE_CODE) >= 24
+    except Exception:
+        return False
