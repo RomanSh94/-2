@@ -50,9 +50,37 @@ def test_non_owner_blocked(env):
     assert rt.dass21_runtime_status(2).reason_code == "not-owner"
 
 
-def test_owner_only_false_admits_non_owner(env, monkeypatch):
+def test_owner_only_cannot_be_disabled_by_env(env, monkeypatch):
+    # HARD boundary: DASS21_OWNER_ONLY=false NEVER broadens access -- it fails
+    # closed for everyone (owner included) until a later explicit PR defines
+    # non-owner access.
     monkeypatch.setattr(config, "DASS21_OWNER_ONLY", False)
-    assert rt.dass21_runtime_status(2).available
+    assert not rt.dass21_runtime_status(1).available
+    assert not rt.dass21_runtime_status(2).available
+
+
+def test_invited_user_denied_when_owner_only_env_false(env, monkeypatch):
+    monkeypatch.setattr(config, "DASS21_OWNER_ONLY", False)
+    invited_uid = 777  # an invited ordinary user is still not the owner
+    assert not rt.dass21_runtime_status(invited_uid).available
+
+
+def test_unknown_user_denied(env):
+    assert not rt.dass21_runtime_status(999999).available
+    assert rt.dass21_runtime_status(999999).reason_code == "not-owner"
+
+
+def test_owner_allowed_only_when_every_other_gate_passes(env, monkeypatch):
+    assert rt.dass21_runtime_status(1).available  # all gates green
+    monkeypatch.setattr(config, "DASS21_DEFINITION_SHA256", "0" * 64)
+    assert not rt.dass21_runtime_status(1).available  # owner alone is not enough
+
+
+def test_hash_comparison_uses_compare_digest():
+    src = pathlib.Path(rt.__file__).read_text(encoding="utf-8")
+    assert "hmac.compare_digest(" in src
+    assert ".hexdigest() != pinned" not in src  # no ordinary == / != compare
+    assert ".hexdigest() == pinned" not in src
 
 
 def test_missing_hash_blocks(env, monkeypatch):

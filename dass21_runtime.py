@@ -14,6 +14,7 @@ version/translation/scorer metadata; wrong item/answer shape; any risk
 metadata.
 """
 import hashlib
+import hmac
 import json
 import re
 from dataclasses import dataclass
@@ -90,8 +91,14 @@ def dass21_runtime_status(user_id) -> Dass21RuntimeStatus:
     the user the SAME neutral unavailable text for every code."""
     if not config.DASS21_ENABLED:
         return Dass21RuntimeStatus(False, "disabled")
-    if config.DASS21_OWNER_ONLY and (
-            access_control.OWNER_USER_ID is None
+    # HARD owner-only boundary (production canary rule): access ALWAYS
+    # requires the single existing access_control.OWNER_USER_ID. The
+    # DASS21_OWNER_ONLY env var is retained for forward compatibility only --
+    # setting it false NEVER broadens access (fails closed instead); opening
+    # DASS to invited ordinary users requires a later explicit PR.
+    if not config.DASS21_OWNER_ONLY:
+        return Dass21RuntimeStatus(False, "owner-only-cannot-be-disabled")
+    if (access_control.OWNER_USER_ID is None
             or user_id != access_control.OWNER_USER_ID):
         return Dass21RuntimeStatus(False, "not-owner")
     pinned = (config.DASS21_DEFINITION_SHA256 or "").strip().lower()
@@ -102,7 +109,7 @@ def dass21_runtime_status(user_id) -> Dass21RuntimeStatus:
         raw = path.read_bytes()
     except OSError:
         return Dass21RuntimeStatus(False, "definition-file-missing")
-    if hashlib.sha256(raw).hexdigest() != pinned:
+    if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), pinned):
         return Dass21RuntimeStatus(False, "hash-mismatch")
     try:
         definition = json.loads(raw.decode("utf-8"))

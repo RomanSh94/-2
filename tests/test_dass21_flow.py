@@ -323,3 +323,96 @@ def test_real_dass_text_absent_from_tracked_files():
         args += ["-e", n]
     out = subprocess.run(args, capture_output=True, text=True, cwd=repo)
     assert out.stdout.strip() == ""  # no tracked file carries real item text
+
+
+# ── A8 completion transaction ordering ────────────────────────────────────────
+def test_dass21_runtime_invalidation_at_completion_does_not_false_complete_session(
+        flow, monkeypatch):
+    _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _sessions_for(1)[0][0]
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    for step in range(20):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a1")))
+    # Invalidate the runtime gate between the last q:a gate check and the
+    # completion screen: hash pin flips right when scoring would run.
+    real_gate = dass21_runtime.dass21_runtime_status
+    calls = {"n": 0}
+    def flaky_gate(uid):
+        calls["n"] += 1
+        if calls["n"] > 1:   # q:a gate passes, completion-gate call fails
+            return dass21_runtime.Dass21RuntimeStatus(False, "hash-mismatch")
+        return real_gate(uid)
+    monkeypatch.setattr(bot.dass21_runtime, "dass21_runtime_status", flaky_gate)
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:20:a1")))
+    assert msg.answers[-1][0] == questionnaire_ux.not_available_text("ru")
+    session = asyncio.run(database.get_questionnaire_session(session_id))
+    assert session["status"] == "active"   # NOT falsely completed
+    assert session["current_index"] == 21  # answers preserved, recoverable
+
+
+def test_dass21_scoring_failure_does_not_false_complete_session(flow, monkeypatch):
+    _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _sessions_for(1)[0][0]
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    def boom(*a, **kw):
+        raise bot.clinical_scoring.ClinicalScoringError("synthetic failure")
+    monkeypatch.setattr(bot.clinical_scoring,
+                        "score_validated_clinical_definition", boom)
+    for step in range(21):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a0")))
+    text = msg.answers[-1][0]
+    assert text == questionnaire_ux.not_available_text("ru")
+    assert "Депрессия" not in text  # no partial result
+    session = asyncio.run(database.get_questionnaire_session(session_id))
+    assert session["status"] == "active"  # recoverable, not falsely completed
+    # Cancel still works on the stuck-at-completion session.
+    msg2 = _press(bot.cb_questionnaire_cancel, 1, f"q:x:{session_id}")
+    assert msg2.answers[-1][0] == questionnaire_ux.cancelled_text("ru")
+
+
+def test_successful_result_marks_session_completed_once(flow):
+    _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _sessions_for(1)[0][0]
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    for step in range(21):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a0")))
+    assert "Депрессия: 0" in msg.answers[-1][0]
+    session = asyncio.run(database.get_questionnaire_session(session_id))
+    assert session["status"] == "completed"
+
+
+def test_owner_recovers_result_after_transient_failure(flow, monkeypatch):
+    # Failure at completion leaves the session active; resuming via q:s
+    # retries the completion branch and now succeeds.
+    _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _sessions_for(1)[0][0]
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    for step in range(20):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a0")))
+    monkeypatch.setattr(config, "DASS21_DEFINITION_SHA256", "0" * 64)
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:20:a0")))
+    assert asyncio.run(
+        database.get_questionnaire_session(session_id))["status"] == "active"
+    # restore the correct pin -> resume - the same owned session completes
+    import hashlib as _h
+    monkeypatch.setattr(config, "DASS21_DEFINITION_SHA256",
+                        _h.sha256(pathlib.Path(
+                            config.DASS21_DEFINITION_PATH).read_bytes()).hexdigest())
+    # The q:a gate refused BEFORE saving answer 21, so resume re-shows item
+    # 21; answering it now completes the same owned session with the result.
+    msg2 = _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    assert "21" in msg2.answers[-1][0]  # back on the last question
+    msg3 = _press(bot.cb_questionnaire_answer, 1, f"q:a:{session_id}:20:a0")
+    assert "Депрессия: 0" in msg3.answers[-1][0]
+    assert asyncio.run(
+        database.get_questionnaire_session(session_id))["status"] == "completed"

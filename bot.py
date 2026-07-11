@@ -8,6 +8,7 @@ X20 Bot — Основной файл
 """
 import asyncio
 import hmac
+import logging
 import pathlib
 import sys
 
@@ -1926,6 +1927,9 @@ async def _send_dass21_result(send, definition: dict, session_id: int, lang: str
     failure: no partial output, neutral unavailable text, internal log without
     question content."""
     try:
+        # 1-4: owned session -> fresh gate -> complete validated responses ->
+        # all three scores computed and validated. NOTHING is marked
+        # completed until every step succeeds.
         session = await get_questionnaire_session(session_id)
         uid = session["user_id"]
         if not dass21_runtime.dass21_runtime_status(uid).available:
@@ -1938,9 +1942,13 @@ async def _send_dass21_result(send, definition: dict, session_id: int, lang: str
         registry.register(dass21_scorer.Dass21Scorer())
         result = clinical_scoring.score_validated_clinical_definition(
             definition, _load_catalog_document(), responses, registry)
+        # 5-6: only now mark completed, then render the complete result.
+        await complete_questionnaire_session(session_id)
         await send(questionnaire_ux.dass21_result_text(result.subscales, lang),
                    reply_markup=_questionnaire_completion_keyboard(session_id, lang))
     except Exception:
+        # Fail closed: session NOT completed (stays active/recoverable), no
+        # partial output, neutral text, log without question content.
         logging.exception("dass21 scoring failed (session_id=%s)", session_id)
         await send(questionnaire_ux.not_available_text(lang))
 
@@ -1968,16 +1976,20 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
     project convention (see send_crisis's `send` parameter)."""
     item = questionnaires.get_item(definition, step)
     if item is None:
+        if dass21_runtime.is_dass21_definition(definition):
+            # PR #55: exact DASS-21 completion. Ordering is load-bearing --
+            # the fresh gate, the complete validated responses and all three
+            # scores are computed FIRST; only on full success does
+            # _send_dass21_result mark the session completed. On any failure
+            # the session stays active (recoverable/cancellable), no partial
+            # result, neutral text. Never reaches the generic PR B path.
+            await _send_dass21_result(send, definition, session_id, lang)
+            return
         await complete_questionnaire_session(session_id)
         # PR B: kill-switch + eligibility gate on the completion branch. When
         # the flag is off (default) or the definition isn't eligible, this is
         # BYTE-FOR-BYTE PR A's completion screen -- never a score, never a
         # different keyboard.
-        if dass21_runtime.is_dass21_definition(definition):
-            # PR #55: exact DASS-21 result screen (fresh gate inside; fail
-            # closed to neutral text). Never reaches the generic PR B path.
-            await _send_dass21_result(send, definition, session_id, lang)
-            return
         if config.QUESTIONNAIRE_INTERPRETATION_ENABLED and questionnaires.is_result_eligible(definition):
             await _send_questionnaire_result(send, definition, session_id, lang)
             return
