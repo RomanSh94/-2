@@ -37,6 +37,15 @@ from pathlib import Path
 # byte budget).
 QUESTIONNAIRE_DEFINITION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# Exact-version scoring-contract identity tokens (PR #53). Same callback/URL-safe
+# ASCII token policy as the definition id (no colon, no whitespace, no non-ASCII),
+# bounded so they can never bloat a stored scorer key. These pin a future ready
+# instrument to ONE deterministic scorer + scorer revision; they are NEVER
+# inferred from instrument_id/version/family/item count. All current real
+# instruments carry null for both and stay blocked.
+SCORING_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+SCORING_TOKEN_MAXLEN = 64
+
 _VALID_ADMINISTRATION_MODES = {"self_report", "clinician_rated", "unknown"}
 # UI catalog category placement (distinct from `domain`: e.g. DASS is domain
 # depression_anxiety_stress but lives under "Стресс"; EPDS is domain depression
@@ -243,6 +252,26 @@ def validate_instrument_metadata(item: dict) -> None:
                 f"{instrument_id}: questionnaire_definition_id too long -- the whole "
                 f"q:d:<id> callback must be <=64 bytes: {qdid!r}")
 
+    # Exact-version scoring-contract tokens (nullable). When present, each must
+    # be a bounded callback/URL-safe ASCII token -- never a colon/whitespace/
+    # non-ASCII value, and never long enough to bloat a stored scorer key.
+    for field in ("scoring_contract_id", "scoring_version"):
+        value = item.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise InstrumentManifestError(
+                f"{instrument_id}: {field} must be a non-empty string or null, "
+                f"got {value!r}")
+        if not SCORING_TOKEN_RE.fullmatch(value):
+            raise InstrumentManifestError(
+                f"{instrument_id}: {field} must match {SCORING_TOKEN_RE.pattern} "
+                f"(ASCII letters/digits/_/-): {value!r}")
+        if len(value.encode("utf-8")) > SCORING_TOKEN_MAXLEN:
+            raise InstrumentManifestError(
+                f"{instrument_id}: {field} too long (>{SCORING_TOKEN_MAXLEN} bytes): "
+                f"{value!r}")
+
     _validate_rights(instrument_id, item)
     _validate_evidence(instrument_id, item)
 
@@ -301,6 +330,17 @@ def validate_instrument_metadata(item: dict) -> None:
             raise InstrumentManifestError(
                 f"{instrument_id}: ready requires an explicit non-empty "
                 "translation_id (exact approved translation must be pinned)")
+        # A ready instrument must pin its EXACT deterministic scorer + revision
+        # (PR #53). Both are required together so no ready instrument can ever be
+        # scored by an inferred or default scorer.
+        if not item.get("scoring_contract_id") or not str(item.get("scoring_contract_id")).strip():
+            raise InstrumentManifestError(
+                f"{instrument_id}: ready requires an explicit non-empty "
+                "scoring_contract_id (exact scorer must be pinned, never inferred)")
+        if not item.get("scoring_version") or not str(item.get("scoring_version")).strip():
+            raise InstrumentManifestError(
+                f"{instrument_id}: ready requires an explicit non-empty "
+                "scoring_version (exact scorer revision must be pinned)")
 
 
 def can_activate_instrument(item: dict) -> bool:

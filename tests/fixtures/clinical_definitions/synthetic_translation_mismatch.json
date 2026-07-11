@@ -15,15 +15,25 @@
     "instrument_version": "v1",
     "translation_id": "syn_ru_v2",
     "administration_mode": "self_report",
-    "manifest_schema_version": 2
+    "manifest_schema_version": 2,
+    "scoring_contract_id": "synthetic_linear_total",
+    "scoring_version": "1"
   },
   "items": [
     {
       "id": "s1",
       "text": "За последнюю неделю мне было сложнее сосредоточиться.",
       "options": [
-        {"id": "a0", "label": "0 — совсем нет", "value": "0"},
-        {"id": "a1", "label": "1 — иногда", "value": "1"}
+        {
+          "id": "a0",
+          "label": "0 — совсем нет",
+          "value": "0"
+        },
+        {
+          "id": "a1",
+          "label": "1 — иногда",
+          "value": "1"
+        }
       ]
     }
   ],

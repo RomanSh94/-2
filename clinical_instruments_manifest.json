@@ -14,7 +14,9 @@
       "identity_status": "family_identified_version_incomplete",
       "domain": "depression",
       "administration_mode": "self_report",
-      "population": ["adult"],
+      "population": [
+        "adult"
+      ],
       "reference_period": null,
       "item_count": 21,
       "subscales": [],
@@ -25,15 +27,27 @@
           "title": "Beck AT et al. Beck Depression Inventory (1961) / BDI-II (1996), Pearson Assessments",
           "url": null,
           "accessed_at": "2026-07-10",
-          "supports": ["identity", "administration_mode"],
+          "supports": [
+            "identity",
+            "administration_mode"
+          ],
           "notes": "Family identification only. BDI (1961) vs BDI-II (1996) have different item sets; which one the source page reproduces was NOT verified -- exact version remains unresolved."
         }
       ],
       "translation_id": null,
       "rights": {
-        "digital_reproduction": {"status": "permission_required", "evidence": []},
-        "commercial_use": {"status": "permission_required", "evidence": []},
-        "translation_use": {"status": "permission_required", "evidence": []}
+        "digital_reproduction": {
+          "status": "permission_required",
+          "evidence": []
+        },
+        "commercial_use": {
+          "status": "permission_required",
+          "evidence": []
+        },
+        "translation_use": {
+          "status": "permission_required",
+          "evidence": []
+        }
       },
       "activation_status": "blocked",
       "public_catalog_visible": true,
@@ -44,7 +58,9 @@
         "exact_version_unconfirmed_bdi_vs_bdi_ii",
         "no_license_evidence",
         "russian_adaptation_rights_unconfirmed"
-      ]
+      ],
+      "scoring_contract_id": null,
+      "scoring_version": null
     },
     {
       "instrument_id": "hdrs",
@@ -58,7 +74,9 @@
       "identity_status": "family_identified_version_incomplete",
       "domain": "depression",
       "administration_mode": "clinician_rated",
-      "population": ["adult"],
+      "population": [
+        "adult"
+      ],
       "reference_period": null,
       "item_count": null,
       "subscales": [],
@@ -69,15 +87,27 @@
           "title": "Hamilton M. (1960) A rating scale for depression. J Neurol Neurosurg Psychiatry 23(1):56-62",
           "url": null,
           "accessed_at": "2026-07-10",
-          "supports": ["identity", "administration_mode"],
+          "supports": [
+            "identity",
+            "administration_mode"
+          ],
           "notes": "Clinician-rated structured interview. 17-item vs 21-item version at the source page NOT verified."
         }
       ],
       "translation_id": null,
       "rights": {
-        "digital_reproduction": {"status": "unknown", "evidence": []},
-        "commercial_use": {"status": "unknown", "evidence": []},
-        "translation_use": {"status": "unknown", "evidence": []}
+        "digital_reproduction": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "commercial_use": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "translation_use": {
+          "status": "unknown",
+          "evidence": []
+        }
       },
       "activation_status": "blocked",
       "public_catalog_visible": true,
@@ -88,7 +118,9 @@
         "clinician_rated_not_a_self_test",
         "exact_version_unconfirmed_17_vs_21_item",
         "rights_status_unverified"
-      ]
+      ],
+      "scoring_contract_id": null,
+      "scoring_version": null
     },
     {
       "instrument_id": "zung_sas",
@@ -102,7 +134,9 @@
       "identity_status": "family_identified_version_incomplete",
       "domain": "anxiety",
       "administration_mode": "self_report",
-      "population": ["adult"],
+      "population": [
+        "adult"
+      ],
       "reference_period": null,
       "item_count": 20,
       "subscales": [],
@@ -113,15 +147,27 @@
           "title": "Zung WW. (1971) A rating instrument for anxiety disorders. Psychosomatics 12(6):371-379",
           "url": null,
           "accessed_at": "2026-07-10",
-          "supports": ["identity", "administration_mode"],
+          "supports": [
+            "identity",
+            "administration_mode"
+          ],
           "notes": "Family identified. The specific Russian adaptation at the source page NOT verified."
         }
       ],
       "translation_id": null,
       "rights": {
-        "digital_reproduction": {"status": "unknown", "evidence": []},
-        "commercial_use": {"status": "unknown", "evidence": []},
-        "translation_use": {"status": "unknown", "evidence": []}
+        "digital_reproduction": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "commercial_use": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "translation_use": {
+          "status": "unknown",
+          "evidence": []
+        }
       },
       "activation_status": "blocked",
       "public_catalog_visible": true,
@@ -131,7 +177,9 @@
       "blockers": [
         "rights_status_unverified",
         "russian_adaptation_unverified"
-      ]
+      ],
+      "scoring_contract_id": null,
+      "scoring_version": null
     },
     {
       "instrument_id": "zung_sds",
@@ -145,7 +193,9 @@
       "identity_status": "family_identified_version_incomplete",
       "domain": "depression",
       "administration_mode": "self_report",
-      "population": ["adult"],
+      "population": [
+        "adult"
+      ],
       "reference_period": null,
       "item_count": 20,
       "subscales": [],
@@ -156,15 +206,27 @@
           "title": "Zung WW. (1965) A Self-Rating Depression Scale. Archives of General Psychiatry 12(1):63-70",
           "url": null,
           "accessed_at": "2026-07-10",
-          "supports": ["identity", "administration_mode"],
+          "supports": [
+            "identity",
+            "administration_mode"
+          ],
           "notes": "Family identified. The specific Russian adaptation at the source page NOT verified."
         }
       ],
       "translation_id": null,
       "rights": {
-        "digital_reproduction": {"status": "unknown", "evidence": []},
-        "commercial_use": {"status": "unknown", "evidence": []},
-        "translation_use": {"status": "unknown", "evidence": []}
+        "digital_reproduction": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "commercial_use": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "translation_use": {
+          "status": "unknown",
+          "evidence": []
+        }
       },
       "activation_status": "blocked",
       "public_catalog_visible": true,
@@ -175,7 +237,9 @@
         "rights_status_unverified",
         "scoring_source_unverified",
         "russian_adaptation_unverified"
-      ]
+      ],
+      "scoring_contract_id": null,
+      "scoring_version": null
     },
     {
       "instrument_id": "epds",
@@ -189,7 +253,10 @@
       "identity_status": "family_identified_version_incomplete",
       "domain": "depression",
       "administration_mode": "self_report",
-      "population": ["perinatal", "postpartum"],
+      "population": [
+        "perinatal",
+        "postpartum"
+      ],
       "reference_period": "past_7_days",
       "item_count": 10,
       "subscales": [],
@@ -200,15 +267,28 @@
           "title": "Cox JL, Holden JM, Sagovsky R. (1987) Detection of postnatal depression. British Journal of Psychiatry 150:782-786",
           "url": null,
           "accessed_at": "2026-07-10",
-          "supports": ["identity", "administration_mode", "population"],
+          "supports": [
+            "identity",
+            "administration_mode",
+            "population"
+          ],
           "notes": "Family identified; perinatal-specific by design. The instrument family is documented in the literature as containing risk-sensitive self-harm content, but no executable item mapping is encoded here -- the exact approved translation/definition must exist first, and any risk-sensitive response must route through the existing crisis pipeline before scoring."
         }
       ],
       "translation_id": null,
       "rights": {
-        "digital_reproduction": {"status": "unknown", "evidence": []},
-        "commercial_use": {"status": "permission_required", "evidence": []},
-        "translation_use": {"status": "unknown", "evidence": []}
+        "digital_reproduction": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "commercial_use": {
+          "status": "permission_required",
+          "evidence": []
+        },
+        "translation_use": {
+          "status": "unknown",
+          "evidence": []
+        }
       },
       "activation_status": "blocked",
       "public_catalog_visible": true,
@@ -220,7 +300,9 @@
         "population_applicability_gate_not_built",
         "risk_item_must_route_to_crisis_pipeline_before_scoring",
         "exact_translation_unverified"
-      ]
+      ],
+      "scoring_contract_id": null,
+      "scoring_version": null
     },
     {
       "instrument_id": "dass",
@@ -234,10 +316,16 @@
       "identity_status": "family_identified_version_incomplete",
       "domain": "depression_anxiety_stress",
       "administration_mode": "self_report",
-      "population": ["adult"],
+      "population": [
+        "adult"
+      ],
       "reference_period": "past_week",
       "item_count": null,
-      "subscales": ["depression", "anxiety", "stress"],
+      "subscales": [
+        "depression",
+        "anxiety",
+        "stress"
+      ],
       "source_page": "https://psytests.org/depr/dass.html",
       "evidence": [
         {
@@ -245,15 +333,27 @@
           "title": "Lovibond SH, Lovibond PF. (1995) Manual for the Depression Anxiety Stress Scales (2nd ed). Psychology Foundation of Australia",
           "url": null,
           "accessed_at": "2026-07-10",
-          "supports": ["identity", "administration_mode"],
+          "supports": [
+            "identity",
+            "administration_mode"
+          ],
           "notes": "Family identified. DASS-21 vs DASS-42 at the source page NOT verified; the two use different scoring conventions and are not interchangeable. Official terms historically permit free non-commercial clinical/research use but restrict commercial use."
         }
       ],
       "translation_id": null,
       "rights": {
-        "digital_reproduction": {"status": "unknown", "evidence": []},
-        "commercial_use": {"status": "permission_required", "evidence": []},
-        "translation_use": {"status": "unknown", "evidence": []}
+        "digital_reproduction": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "commercial_use": {
+          "status": "permission_required",
+          "evidence": []
+        },
+        "translation_use": {
+          "status": "unknown",
+          "evidence": []
+        }
       },
       "activation_status": "blocked",
       "public_catalog_visible": true,
@@ -263,7 +363,9 @@
       "blockers": [
         "exact_version_unconfirmed_dass21_vs_dass42",
         "commercial_use_permission_not_confirmed"
-      ]
+      ],
+      "scoring_contract_id": null,
+      "scoring_version": null
     },
     {
       "instrument_id": "japs",
@@ -277,7 +379,9 @@
       "identity_status": "family_identified_version_incomplete",
       "domain": "occupational",
       "administration_mode": "self_report",
-      "population": ["adult_working"],
+      "population": [
+        "adult_working"
+      ],
       "reference_period": null,
       "item_count": null,
       "subscales": [],
@@ -288,15 +392,27 @@
           "title": "Job Apathy Scale (Schmidt et al., 2017); Russian adaptation A.A. Zolotareva (2020) -- identified by direct inspection of the owner-supplied source page",
           "url": "https://psytests.org/work/japs.html",
           "accessed_at": "2026-07-10",
-          "supports": ["identity", "administration_mode"],
+          "supports": [
+            "identity",
+            "administration_mode"
+          ],
           "notes": "Occupational apathy instrument, NOT a depression instrument. Item count and exact version not stated on the page; primary source (Schmidt 2017) not independently verified. Not relevant to the depression/anxiety product categories."
         }
       ],
       "translation_id": null,
       "rights": {
-        "digital_reproduction": {"status": "unknown", "evidence": []},
-        "commercial_use": {"status": "unknown", "evidence": []},
-        "translation_use": {"status": "unknown", "evidence": []}
+        "digital_reproduction": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "commercial_use": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "translation_use": {
+          "status": "unknown",
+          "evidence": []
+        }
       },
       "activation_status": "blocked",
       "public_catalog_visible": false,
@@ -308,7 +424,9 @@
         "primary_source_not_independently_verified",
         "rights_status_unverified",
         "out_of_scope_for_depression_anxiety_catalog"
-      ]
+      ],
+      "scoring_contract_id": null,
+      "scoring_version": null
     },
     {
       "instrument_id": "stas",
@@ -339,9 +457,18 @@
       ],
       "translation_id": null,
       "rights": {
-        "digital_reproduction": {"status": "unknown", "evidence": []},
-        "commercial_use": {"status": "unknown", "evidence": []},
-        "translation_use": {"status": "unknown", "evidence": []}
+        "digital_reproduction": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "commercial_use": {
+          "status": "unknown",
+          "evidence": []
+        },
+        "translation_use": {
+          "status": "unknown",
+          "evidence": []
+        }
       },
       "activation_status": "blocked",
       "public_catalog_visible": false,
@@ -351,7 +478,9 @@
       "blockers": [
         "identity_not_established",
         "category_name_mismatch_with_common_state_trait_anger_scale_identity"
-      ]
+      ],
+      "scoring_contract_id": null,
+      "scoring_version": null
     }
   ]
 }

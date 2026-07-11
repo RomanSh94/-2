@@ -76,6 +76,8 @@ def _ready_entry(**over):
         "population": ["adult"],
         "activation_status": "ready",
         "questionnaire_definition_id": "synthetic_ready_v1",
+        "scoring_contract_id": "synthetic_linear_total",
+        "scoring_version": "1",
         "public_catalog_visible": True,
         "risk_item_metadata_status": "verified",
         "evidence": [{"kind": "primary_source", "title": "x", "url": None,

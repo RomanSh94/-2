@@ -224,6 +224,8 @@ def _ready_item(**over):
         # instrument_id, proving the mapping is never inferred from the family
         # id (governance §2.3).
         "questionnaire_definition_id": "synthetic_ready_def_v1",
+        "scoring_contract_id": "synthetic_linear_total",
+        "scoring_version": "1",
         "public_catalog_visible": True,
         "risk_item_metadata_status": "verified",
         "evidence": [{"kind": "primary_source", "title": "x", "url": None,

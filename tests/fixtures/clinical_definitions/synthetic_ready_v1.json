@@ -15,7 +15,9 @@
     "instrument_version": "v1",
     "translation_id": "syn_ru_v1",
     "administration_mode": "self_report",
-    "manifest_schema_version": 2
+    "manifest_schema_version": 2,
+    "scoring_contract_id": "synthetic_linear_total",
+    "scoring_version": "1"
   },
   "items": [
     {

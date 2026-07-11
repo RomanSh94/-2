@@ -45,6 +45,7 @@ CLINICAL_METADATA_KEY = "clinical_instrument"
 CLINICAL_METADATA_FIELDS = (
     "instrument_id", "instrument_version", "translation_id",
     "administration_mode", "manifest_schema_version",
+    "scoring_contract_id", "scoring_version",
 )
 
 
@@ -147,6 +148,14 @@ def validate_clinical_definition_link(definition: dict,
         invalid_reasons.append("translation-id-mismatch")
     if meta.get("administration_mode") != entry.get("administration_mode"):
         invalid_reasons.append("administration-mode-mismatch")
+    # Exact-version scoring-contract identity (PR #53). The definition's pinned
+    # scorer + revision must match the manifest entry EXACTLY. null==null is a
+    # valid match (a not-yet-scoreable but otherwise consistent linkage); any
+    # divergence is a contradiction -> INVALID (never silently VALID).
+    if meta.get("scoring_contract_id") != entry.get("scoring_contract_id"):
+        invalid_reasons.append("scoring-contract-id-mismatch")
+    if meta.get("scoring_version") != entry.get("scoring_version"):
+        invalid_reasons.append("scoring-version-mismatch")
 
     # ── governance checks -> BLOCKED ──
     if entry.get("activation_status") != "ready":
