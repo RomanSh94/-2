@@ -179,6 +179,62 @@ class Registry:
         # not only at session start.
         return self.can_start(qid)
 
+    # ── clinical manifest-linkage composition (Layer 2) ──────────────────────
+    # These narrow helpers compose the existing Core gate (can_start/can_answer,
+    # UNCHANGED above) with the pure clinical linkage validator. The manifest
+    # document is always supplied FRESH by the caller (bot.py reloads it per
+    # safety-sensitive op) -- this class never reads files or caches a manifest.
+    def get_clinical_validation(self, definition_id: str, manifest_document):
+        """Pure linkage verdict for definition_id against manifest_document.
+        Passes the loaded definition (or a minimal {id} stub when the
+        definition failed Core validation and was excluded) so a mapped-but-
+        missing/invalid definition still fails closed rather than reading as
+        NOT_CLINICAL."""
+        import clinical_definition_validator as _cdv
+        definition = self.by_id.get(definition_id) or {"id": definition_id}
+        return _cdv.validate_clinical_definition_link(definition, manifest_document)
+
+    def clinical_can_start(self, definition_id: str, manifest_document) -> bool:
+        """True only when the clinical linkage is VALID. Does NOT authorize a
+        session on its own -- callers must AND this with can_start (see
+        combined_can_start)."""
+        import clinical_definition_validator as _cdv
+        return (self.get_clinical_validation(definition_id, manifest_document).status
+                == _cdv.ClinicalDefinitionStatus.VALID)
+
+    def combined_can_start(self, definition_id: str, manifest_document) -> bool:
+        """FINAL runtime start rule.
+
+        - NOT_CLINICAL definition: the existing can_start decides, UNCHANGED
+          (a missing/invalid manifest must not break these).
+        - clinical / manifest-linked definition: can_start AND linkage==VALID
+          both required. A valid private definition never bypasses a blocked
+          manifest entry; a ready manifest entry never bypasses an invalid /
+          missing definition."""
+        import clinical_definition_validator as _cdv
+        validation = self.get_clinical_validation(definition_id, manifest_document)
+        if validation.status == _cdv.ClinicalDefinitionStatus.NOT_CLINICAL:
+            return self.can_start(definition_id)
+        return (self.can_start(definition_id)
+                and validation.status == _cdv.ClinicalDefinitionStatus.VALID)
+
+    def combined_can_answer(self, definition_id: str, manifest_document) -> bool:
+        """Mirror of combined_can_start for the answer path -- re-checked fresh
+        on every answer so a mid-session manifest demotion / mapping change /
+        version or translation change fails closed on the very next answer."""
+        import clinical_definition_validator as _cdv
+        validation = self.get_clinical_validation(definition_id, manifest_document)
+        if validation.status == _cdv.ClinicalDefinitionStatus.NOT_CLINICAL:
+            return self.can_answer(definition_id)
+        return (self.can_answer(definition_id)
+                and validation.status == _cdv.ClinicalDefinitionStatus.VALID)
+
+    def list_clinically_startable(self, manifest_document) -> list[dict]:
+        """Optional helper: active definitions that pass the combined start
+        rule against manifest_document."""
+        return [d for d in self.by_id.values()
+                if self.combined_can_start(d["id"], manifest_document)]
+
 
 def load_registry(directory: str | pathlib.Path = PRIVATE_QUESTIONNAIRES_DIR) -> Registry:
     return Registry(directory)

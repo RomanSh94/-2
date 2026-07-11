@@ -1,0 +1,34 @@
+{
+  "id": "synthetic_translation_mismatch_v1",
+  "version": "v1",
+  "lang": "ru",
+  "title": "Synthetic Translation Mismatch",
+  "description": "Синтетическое определение, translation_id расходится с манифестом.",
+  "description_short": "2 вопроса",
+  "category": "selfobs",
+  "status": "active",
+  "legal_status": "synthetic",
+  "result_policy": "no_score",
+  "contains_risk_items": false,
+  "clinical_instrument": {
+    "instrument_id": "synthetic_scale",
+    "instrument_version": "v1",
+    "translation_id": "syn_ru_v2",
+    "administration_mode": "self_report",
+    "manifest_schema_version": 2
+  },
+  "items": [
+    {
+      "id": "s1",
+      "text": "За последнюю неделю мне было сложнее сосредоточиться.",
+      "options": [
+        {"id": "a0", "label": "0 — совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — иногда", "value": "1"}
+      ]
+    }
+  ],
+  "completion_message": {
+    "ru": "Готово. (Синтетический текст.)",
+    "en": "Done. (Synthetic text.)"
+  }
+}

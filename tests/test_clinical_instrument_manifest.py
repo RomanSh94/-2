@@ -371,3 +371,47 @@ def test_loader_rejects_malformed_json(tmp_path):
     p.write_text("{not valid json", encoding="utf-8")
     with pytest.raises(cat.InstrumentManifestError):
         cat.load_instrument_manifest(p)
+
+
+# ── §4.1 callback-safe questionnaire_definition_id (charset + byte length) ────
+def test_qdid_valid_boundary_accepted():
+    # Whole callback `q:d:<id>` must be <= 64 bytes. "q:d:" is 4 bytes, so a
+    # 60-char ASCII id is exactly at the boundary and must be accepted.
+    ok = _minimal_valid(questionnaire_definition_id="a" * 60)
+    cat.validate_instrument_metadata(ok)  # must not raise
+
+
+def test_qdid_one_byte_over_boundary_rejected():
+    with pytest.raises(cat.InstrumentManifestError):
+        cat.validate_instrument_metadata(
+            _minimal_valid(questionnaire_definition_id="a" * 61))
+
+
+def test_qdid_colon_rejected():
+    with pytest.raises(cat.InstrumentManifestError):
+        cat.validate_instrument_metadata(
+            _minimal_valid(questionnaire_definition_id="zung:sds"))
+
+
+def test_qdid_space_rejected():
+    with pytest.raises(cat.InstrumentManifestError):
+        cat.validate_instrument_metadata(
+            _minimal_valid(questionnaire_definition_id="zung sds"))
+
+
+def test_qdid_non_ascii_rejected():
+    with pytest.raises(cat.InstrumentManifestError):
+        cat.validate_instrument_metadata(
+            _minimal_valid(questionnaire_definition_id="цунг_v1"))
+
+
+def test_qdid_punctuation_outside_token_policy_rejected():
+    for bad in ("zung.sds", "zung/sds", "zung@v1", "zung+v1"):
+        with pytest.raises(cat.InstrumentManifestError):
+            cat.validate_instrument_metadata(
+                _minimal_valid(questionnaire_definition_id=bad))
+
+
+def test_qdid_valid_token_charset_accepted():
+    cat.validate_instrument_metadata(
+        _minimal_valid(questionnaire_definition_id="zung_sds_ru-verified_v1"))
