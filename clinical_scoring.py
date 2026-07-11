@@ -23,12 +23,23 @@ scorer-registry-based path that is NOT wired to any user-facing surface.
 Scope guardrails (see CLAUDE.md / task): no real instrument scorer, no real
 formula, no real item content, no scoring_contract_id/scoring_version mapped to
 any real ready instrument (the production registry is empty by default).
+
+Version semantics: `ClinicalScorerKey.scoring_version` is the SINGLE
+authoritative scorer revision. ClinicalScoreResult deliberately carries no
+separate algorithm/revision field, so two revision fields can never disagree.
 """
+import math
+import re
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
 import clinical_definition_validator as _cdv
 import clinical_instrument_catalog as _cat
+
+# Stable-token policy for identifiers appearing in scoring inputs/outputs
+# (subscale keys, item/answer ids): bounded ASCII token, no whitespace/colon.
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class ClinicalScoringError(ValueError):
@@ -59,7 +70,6 @@ class ClinicalScoreResult:
     transformed_total: int | float | None
     subscales: Mapping[str, int | float]
     scored_item_ids: tuple[str, ...]
-    algorithm_version: str
 
 
 @runtime_checkable
@@ -75,7 +85,12 @@ class ClinicalScorerRegistry:
     """Explicit, per-instance scorer registry. There is deliberately NO module
     level default/singleton registry: production code must construct an empty
     one and register only vetted exact-version scorers. Resolution is by the
-    complete ClinicalScorerKey — never a partial/fuzzy match."""
+    complete ClinicalScorerKey — never a partial/fuzzy match.
+
+    There is deliberately NO public .score() convenience method: executing a
+    scorer without linkage/response/result validation would be a bypass around
+    score_validated_clinical_definition(), which is the sole high-level
+    entrypoint."""
 
     def __init__(self) -> None:
         self._scorers: dict[ClinicalScorerKey, ClinicalScorer] = {}
@@ -94,9 +109,14 @@ class ClinicalScorerRegistry:
             raise ClinicalScoringError(f"no scorer registered for key {key}")
         return scorer
 
-    def score(self, key: ClinicalScorerKey, definition: dict,
-              responses: Sequence[ClinicalResponse]) -> ClinicalScoreResult:
-        return self.resolve(key).score(definition, responses)
+
+def _is_finite_number(value) -> bool:
+    """True for finite int/float; bool is explicitly NOT a number here."""
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
 
 
 def _mapped_ready_entry(definition: dict, manifest_document: dict) -> dict:
@@ -133,22 +153,72 @@ def _scorer_key_for(definition: dict, manifest_document: dict) -> ClinicalScorer
     return ClinicalScorerKey(**values)
 
 
+def _validated_definition_items(definition: dict) -> list[dict]:
+    """Fail-closed structural check of the definition's items/options: unique,
+    non-empty stable token ids, finite numeric option values. Never silently
+    normalizes an invalid identifier."""
+    items = definition.get("items", []) or []
+    if not items:
+        raise ClinicalScoringError("definition has no items")
+    seen_item_ids: set[str] = set()
+    for item in items:
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not _TOKEN_RE.fullmatch(item_id):
+            raise ClinicalScoringError(
+                f"definition item id is not a stable token: {item_id!r}")
+        if item_id in seen_item_ids:
+            raise ClinicalScoringError(f"duplicate definition item id {item_id!r}")
+        seen_item_ids.add(item_id)
+        seen_option_ids: set[str] = set()
+        for option in item.get("options", []) or []:
+            option_id = option.get("id")
+            if not isinstance(option_id, str) or not _TOKEN_RE.fullmatch(option_id):
+                raise ClinicalScoringError(
+                    f"option id in item {item_id!r} is not a stable token: "
+                    f"{option_id!r}")
+            if option_id in seen_option_ids:
+                raise ClinicalScoringError(
+                    f"duplicate option id {option_id!r} in item {item_id!r}")
+            seen_option_ids.add(option_id)
+            try:
+                option_value = float(option["value"])
+            except (TypeError, ValueError, KeyError):
+                raise ClinicalScoringError(
+                    f"non-numeric option value in item {item_id!r}")
+            if isinstance(option.get("value"), bool) or not math.isfinite(option_value):
+                raise ClinicalScoringError(
+                    f"non-finite option value in item {item_id!r}")
+    return items
+
+
 def validate_clinical_responses(
         definition: dict,
         responses: Sequence[ClinicalResponse]) -> tuple[ClinicalResponse, ...]:
     """Fail-closed completeness + integrity check. Every item answered exactly
-    once, every response's item_id/answer_id/answer_value matching the CURRENT
-    definition by STABLE TOKEN id (never label). Returns the responses in item
-    order. Never mutates its inputs."""
-    items = definition.get("items", []) or []
-    if not items:
-        raise ClinicalScoringError("definition has no items")
+    once, every response an actual ClinicalResponse whose item_id/answer_id/
+    answer_value match the CURRENT definition by STABLE TOKEN id (never label,
+    never position). Returns the responses in canonical item order. Never
+    mutates its inputs."""
+    items = _validated_definition_items(definition)
     if not responses:
         raise ClinicalScoringError("no responses")
 
     by_item: dict[str, ClinicalResponse] = {}
     valid_item_ids = {item["id"] for item in items}
     for r in responses:
+        if not isinstance(r, ClinicalResponse):
+            raise ClinicalScoringError(
+                f"response must be a ClinicalResponse, got {type(r).__name__}")
+        if not isinstance(r.item_id, str) or not _TOKEN_RE.fullmatch(r.item_id):
+            raise ClinicalScoringError(
+                f"response item_id is not a stable token: {r.item_id!r}")
+        if not isinstance(r.answer_id, str) or not _TOKEN_RE.fullmatch(r.answer_id):
+            raise ClinicalScoringError(
+                f"response answer_id is not a stable token: {r.answer_id!r}")
+        if not _is_finite_number(r.answer_value):
+            raise ClinicalScoringError(
+                f"answer_value for item {r.item_id!r} must be a finite number, "
+                f"got {r.answer_value!r}")
         if r.item_id not in valid_item_ids:
             raise ClinicalScoringError(f"unknown item_id {r.item_id!r}")
         if r.item_id in by_item:
@@ -156,8 +226,7 @@ def validate_clinical_responses(
         by_item[r.item_id] = r
 
     if len(by_item) != len(items):
-        # Missing and/or extra responses. (Extra unknown ids already rejected
-        # above; this catches count mismatch from missing items.)
+        # Missing responses (extra/unknown ids already rejected above).
         raise ClinicalScoringError(
             f"expected {len(items)} responses, got {len(by_item)}")
 
@@ -169,22 +238,68 @@ def validate_clinical_responses(
         if option is None:
             raise ClinicalScoringError(
                 f"answer_id {r.answer_id!r} not in item {item['id']!r}")
-        if isinstance(r.answer_value, bool) or not isinstance(
-                r.answer_value, (int, float)):
-            raise ClinicalScoringError(
-                f"answer_value for item {item['id']!r} must be numeric, "
-                f"got {r.answer_value!r}")
-        try:
-            option_value = float(option["value"])
-        except (TypeError, ValueError, KeyError):
-            raise ClinicalScoringError(
-                f"non-numeric option value in item {item['id']!r}")
-        if float(r.answer_value) != option_value:
+        if float(r.answer_value) != float(option["value"]):
             raise ClinicalScoringError(
                 f"answer_value {r.answer_value!r} does not match option "
                 f"{r.answer_id!r} value {option['value']!r}")
         ordered.append(r)
     return tuple(ordered)
+
+
+def validate_clinical_score_result(
+        result: object,
+        *,
+        expected_key: ClinicalScorerKey,
+        expected_item_ids: tuple[str, ...]) -> ClinicalScoreResult:
+    """Fail-closed validation of a scorer's OUTPUT (§4.2). A key match alone is
+    insufficient: a buggy scorer could return the wrong type, NaN/infinity,
+    booleans, missing/duplicate/misordered item ids, or a mutable shared
+    mapping. Returns a defensively-copied, immutable-mapping result -- never
+    the scorer-owned object graph."""
+    if not isinstance(result, ClinicalScoreResult):
+        raise ClinicalScoringError(
+            f"scorer must return ClinicalScoreResult, got {type(result).__name__}")
+    if result.scorer_key != expected_key:
+        raise ClinicalScoringError(
+            "scorer returned a result for a different scorer_key")
+    # Item ids: exactly the validated set, in canonical definition order.
+    if not isinstance(result.scored_item_ids, tuple):
+        raise ClinicalScoringError("scored_item_ids must be a tuple")
+    if len(set(result.scored_item_ids)) != len(result.scored_item_ids):
+        raise ClinicalScoringError("duplicate scored_item_ids")
+    if result.scored_item_ids != expected_item_ids:
+        raise ClinicalScoringError(
+            "scored_item_ids do not exactly match the validated responses "
+            "in canonical definition order")
+    # Numeric totals: finite int/float or None; bool rejected.
+    for name, value in (("raw_total", result.raw_total),
+                        ("transformed_total", result.transformed_total)):
+        if value is not None and not _is_finite_number(value):
+            raise ClinicalScoringError(
+                f"{name} must be a finite number or None, got {value!r}")
+    # Subscales: stable token keys, finite numeric values.
+    if not isinstance(result.subscales, Mapping):
+        raise ClinicalScoringError("subscales must be a mapping")
+    for key, value in result.subscales.items():
+        if not isinstance(key, str) or not _TOKEN_RE.fullmatch(key):
+            raise ClinicalScoringError(
+                f"subscale key is not a stable token: {key!r}")
+        if not _is_finite_number(value):
+            raise ClinicalScoringError(
+                f"subscale {key!r} value must be a finite number, got {value!r}")
+    # At least one numeric output must exist.
+    if (result.raw_total is None and result.transformed_total is None
+            and not result.subscales):
+        raise ClinicalScoringError(
+            "scorer produced no numeric output (raw_total, transformed_total "
+            "and subscales are all empty)")
+    # Defensive copy: never retain/return the scorer-owned mutable mapping.
+    return ClinicalScoreResult(
+        scorer_key=result.scorer_key,
+        raw_total=result.raw_total,
+        transformed_total=result.transformed_total,
+        subscales=MappingProxyType(dict(result.subscales)),
+        scored_item_ids=tuple(result.scored_item_ids))
 
 
 def score_validated_clinical_definition(
@@ -195,9 +310,10 @@ def score_validated_clinical_definition(
     """Pure orchestration. Order is load-bearing (see task §13): validate the
     manifest, require a VALID exact linkage, require self_report, reject a
     risk-bearing definition, derive the EXACT scorer key, require an exactly
-    registered scorer, validate responses, execute, and require the returned
-    key to equal the requested key. Data only -- no Telegram/DB/Registry/
-    persistence, no interpretation."""
+    registered scorer, validate responses, execute (failures normalized to
+    ClinicalScoringError), validate the RESULT, and return a defensively
+    copied result. Data only -- no Telegram/DB/Registry/persistence, no
+    interpretation."""
     # 1-3. Manifest + exact linkage must be VALID (this also enforces exact
     # scoring-contract/version match between definition metadata and manifest).
     validation = _cdv.validate_clinical_definition_link(definition, manifest_document)
@@ -212,9 +328,10 @@ def score_validated_clinical_definition(
         raise ClinicalScoringError(
             "only self_report definitions are scoreable in this product")
 
-    # 5. Risk-bearing definitions are refused before the scorer is called. Risk
-    # routing is a separate, exact-version concern (not implemented here).
-    if _cdv._definition_is_risk_bearing(definition):
+    # 5. Risk-bearing definitions are refused before the scorer is called (via
+    # the PUBLIC shared predicate -- single implementation, never weakened).
+    # Risk routing is a separate, exact-version concern (not implemented here).
+    if _cdv.definition_is_risk_bearing(definition):
         raise ClinicalScoringError("risk-bearing definition is not scoreable here")
 
     # 6-7. Exact scorer key from the manifest; require an exactly registered
@@ -225,13 +342,18 @@ def score_validated_clinical_definition(
     # 8. Response completeness/integrity (stable token ids only).
     ordered = validate_clinical_responses(definition, responses)
 
-    # 9. Execute the vetted scorer.
-    result = scorer.score(definition, ordered)
+    # 9. Execute the vetted scorer; normalize arbitrary failures (§4.6): a
+    # ClinicalScoringError passes through, anything else is wrapped fail-closed
+    # with the original exception preserved as __cause__. No partial result.
+    try:
+        result = scorer.score(definition, ordered)
+    except ClinicalScoringError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- normalize scorer bugs fail-closed
+        raise ClinicalScoringError("scorer raised an unexpected error") from exc
 
-    # 10. The scorer must not silently answer for a different key.
-    if result.scorer_key != key:
-        raise ClinicalScoringError(
-            "scorer returned a result for a different scorer_key")
-
-    # 11. Data only.
-    return result
+    # 10-11. Validate the RESULT (key, item ids, finiteness, shape) and return
+    # a defensively copied, immutable-mapping result. Data only.
+    return validate_clinical_score_result(
+        result, expected_key=key,
+        expected_item_ids=tuple(r.item_id for r in ordered))

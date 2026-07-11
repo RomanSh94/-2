@@ -271,6 +271,12 @@ def validate_instrument_metadata(item: dict) -> None:
             raise InstrumentManifestError(
                 f"{instrument_id}: {field} too long (>{SCORING_TOKEN_MAXLEN} bytes): "
                 f"{value!r}")
+    # Atomic pair rule: a half-configured scoring contract is never valid --
+    # either both tokens are null (not scoreable yet) or both are set.
+    if (item.get("scoring_contract_id") is None) != (item.get("scoring_version") is None):
+        raise InstrumentManifestError(
+            f"{instrument_id}: scoring_contract_id and scoring_version must be "
+            "configured together (both null or both non-empty tokens)")
 
     _validate_rights(instrument_id, item)
     _validate_evidence(instrument_id, item)

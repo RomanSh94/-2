@@ -84,8 +84,7 @@ class SyntheticLinearTotalScorer:
             raw_total=total,
             transformed_total=None,
             subscales={},
-            scored_item_ids=tuple(r.item_id for r in responses),
-            algorithm_version="synthetic_linear_total.1")
+            scored_item_ids=tuple(r.item_id for r in responses))
 
 
 def _responses_for(definition):
@@ -151,8 +150,7 @@ class _LyingScorer:
     def score(self, definition, responses):
         return cs.ClinicalScoreResult(
             scorer_key=_key(scoring_version="99"), raw_total=0,
-            transformed_total=None, subscales={}, scored_item_ids=(),
-            algorithm_version="x")
+            transformed_total=None, subscales={}, scored_item_ids=())
 
 
 def test_no_mutable_global_default_registry():
@@ -365,3 +363,311 @@ def test_module_has_no_forbidden_imports():
 def test_existing_compute_sum_score_unchanged():
     # The generic nonclinical scorer still exists and works independently.
     assert hasattr(questionnaires, "compute_sum_score")
+
+
+# ── §4.1 public risk predicate ────────────────────────────────────────────────
+def test_scoring_uses_public_risk_predicate_not_private_helper():
+    src = (REPO_ROOT / "clinical_scoring.py").read_text(encoding="utf-8")
+    assert "definition_is_risk_bearing(" in src
+    assert "_definition_is_risk_bearing" not in src  # no private cross-module use
+    # single shared implementation, public name, alias preserved for compat
+    assert cdv.definition_is_risk_bearing is cdv._definition_is_risk_bearing
+
+
+# ── §4.2 scorer result validation ─────────────────────────────────────────────
+class _ConfigurableScorer:
+    """Scorer whose result is injected by each test."""
+    key = _key()
+
+    def __init__(self, result_factory):
+        self._factory = result_factory
+
+    def score(self, definition, responses):
+        return self._factory(responses)
+
+
+def _score_with_result(result_factory):
+    d, m = _ready_pair()
+    reg = cs.ClinicalScorerRegistry()
+    reg.register(_ConfigurableScorer(result_factory))
+    return cs.score_validated_clinical_definition(
+        d, m, _responses_for(d), reg)
+
+
+def _good_result(responses, **over):
+    fields = dict(
+        scorer_key=_key(),
+        raw_total=float(sum(r.answer_value for r in responses)),
+        transformed_total=None,
+        subscales={},
+        scored_item_ids=tuple(r.item_id for r in responses))
+    fields.update(over)
+    return cs.ClinicalScoreResult(**fields)
+
+
+def test_scorer_must_return_clinical_score_result():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: {"raw_total": 1})
+
+
+def test_scorer_result_key_mismatch_rejected():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(
+            lambda rs: _good_result(rs, scorer_key=_key(scoring_version="99")))
+
+
+def test_scorer_result_missing_item_ids_rejected():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(rs, scored_item_ids=tuple(
+            r.item_id for r in rs[:-1])))
+
+
+def test_scorer_result_extra_item_ids_rejected():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(rs, scored_item_ids=tuple(
+            [r.item_id for r in rs] + ["ghost_item"])))
+
+
+def test_scorer_result_duplicate_item_ids_rejected():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(rs, scored_item_ids=tuple(
+            [rs[0].item_id] * len(rs))))
+
+
+def test_scorer_result_wrong_item_order_rejected():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(rs, scored_item_ids=tuple(
+            reversed([r.item_id for r in rs]))))
+
+
+def test_scorer_result_nan_rejected():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(rs, raw_total=float("nan")))
+
+
+def test_scorer_result_infinity_rejected():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(rs, raw_total=float("inf")))
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(
+            rs, transformed_total=float("-inf")))
+
+
+def test_scorer_result_bool_total_rejected():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(rs, raw_total=True))
+
+
+def test_scorer_result_invalid_subscale_value_rejected():
+    for bad in ({"sub1": float("nan")}, {"sub1": True}, {"sub1": "5"},
+                {"": 1.0}, {"bad key": 1.0}):
+        with pytest.raises(cs.ClinicalScoringError):
+            _score_with_result(lambda rs, b=bad: _good_result(rs, subscales=b))
+
+
+def test_scorer_result_mutable_mapping_is_defensively_copied():
+    scorer_owned = {"sub1": 1.0}
+    result = _score_with_result(
+        lambda rs: _good_result(rs, subscales=scorer_owned))
+    scorer_owned["sub1"] = 999.0          # later scorer-side mutation
+    assert result.subscales["sub1"] == 1.0  # returned result unaffected
+    with pytest.raises(TypeError):
+        result.subscales["sub1"] = 5.0    # returned mapping is immutable
+
+
+def test_scorer_result_version_mismatch_rejected():
+    # Single authoritative revision: ClinicalScoreResult has NO separate
+    # algorithm_version field; scorer_key.scoring_version is the only revision
+    # and any divergence is a key mismatch.
+    assert "algorithm_version" not in cs.ClinicalScoreResult.__dataclass_fields__
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(
+            rs, scorer_key=_key(scoring_version="2")))
+
+
+def test_scorer_result_requires_at_least_one_numeric_output():
+    with pytest.raises(cs.ClinicalScoringError):
+        _score_with_result(lambda rs: _good_result(
+            rs, raw_total=None, transformed_total=None, subscales={}))
+
+
+# ── §4.3 malformed runtime response objects ───────────────────────────────────
+def test_non_clinical_response_object_rejected():
+    d, _ = _ready_pair()
+    r = _responses_for(d)
+    r[0] = {"item_id": r[0].item_id, "answer_id": r[0].answer_id,
+            "answer_value": r[0].answer_value}  # dict, not ClinicalResponse
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(d, r)
+
+
+def test_response_bool_value_rejected():
+    d, _ = _ready_pair()
+    r = _responses_for(d)
+    r[0] = cs.ClinicalResponse(r[0].item_id, r[0].answer_id, True)
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(d, r)
+
+
+def test_response_nan_rejected():
+    d, _ = _ready_pair()
+    r = _responses_for(d)
+    r[0] = cs.ClinicalResponse(r[0].item_id, r[0].answer_id, float("nan"))
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(d, r)
+
+
+def test_response_infinity_rejected():
+    d, _ = _ready_pair()
+    r = _responses_for(d)
+    r[0] = cs.ClinicalResponse(r[0].item_id, r[0].answer_id, float("inf"))
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(d, r)
+
+
+def test_option_nan_rejected():
+    d, _ = _ready_pair()
+    d = copy.deepcopy(d)
+    d["items"][0]["options"][0]["value"] = "nan"  # float()-parseable NaN
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(
+            d, _responses_for(_load_def("synthetic_ready_v1.json")))
+
+
+def test_option_infinity_rejected():
+    d, _ = _ready_pair()
+    d = copy.deepcopy(d)
+    d["items"][0]["options"][0]["value"] = "inf"
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(
+            d, _responses_for(_load_def("synthetic_ready_v1.json")))
+
+
+def test_duplicate_definition_item_id_rejected():
+    d, _ = _ready_pair()
+    d = copy.deepcopy(d)
+    d["items"].append(copy.deepcopy(d["items"][0]))  # duplicate item id
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(
+            d, _responses_for(_load_def("synthetic_ready_v1.json")))
+
+
+def test_duplicate_definition_option_id_rejected():
+    d, _ = _ready_pair()
+    d = copy.deepcopy(d)
+    item = d["items"][0]
+    item["options"].append(copy.deepcopy(item["options"][0]))
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(
+            d, _responses_for(_load_def("synthetic_ready_v1.json")))
+
+
+def test_empty_item_id_rejected():
+    d, _ = _ready_pair()
+    r = _responses_for(d)
+    r[0] = cs.ClinicalResponse("", r[0].answer_id, r[0].answer_value)
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(d, r)
+
+
+def test_empty_answer_id_rejected():
+    d, _ = _ready_pair()
+    r = _responses_for(d)
+    r[0] = cs.ClinicalResponse(r[0].item_id, "", r[0].answer_value)
+    with pytest.raises(cs.ClinicalScoringError):
+        cs.validate_clinical_responses(d, r)
+
+
+# ── §4.4 atomic scoring token pairs ───────────────────────────────────────────
+def test_manifest_scoring_tokens_both_null_allowed():
+    entry = _ready_entry(activation_status="blocked",
+                         scoring_contract_id=None, scoring_version=None)
+    cat.validate_instrument_metadata(entry)  # must not raise
+
+
+def test_manifest_contract_without_version_rejected():
+    entry = _ready_entry(activation_status="blocked", scoring_version=None)
+    with pytest.raises(cat.InstrumentManifestError):
+        cat.validate_instrument_metadata(entry)
+
+
+def test_manifest_version_without_contract_rejected():
+    entry = _ready_entry(activation_status="blocked", scoring_contract_id=None)
+    with pytest.raises(cat.InstrumentManifestError):
+        cat.validate_instrument_metadata(entry)
+
+
+def test_definition_contract_without_version_fails_linkage():
+    d, m = _ready_pair()
+    d = copy.deepcopy(d)
+    d["clinical_instrument"]["scoring_version"] = None
+    res = cdv.validate_clinical_definition_link(d, m)
+    assert res.status is cdv.ClinicalDefinitionStatus.INVALID
+    assert "scoring-pair-not-atomic" in res.reason_codes
+
+
+def test_definition_version_without_contract_fails_linkage():
+    d, m = _ready_pair()
+    d = copy.deepcopy(d)
+    d["clinical_instrument"]["scoring_contract_id"] = None
+    res = cdv.validate_clinical_definition_link(d, m)
+    assert res.status is cdv.ClinicalDefinitionStatus.INVALID
+    assert "scoring-pair-not-atomic" in res.reason_codes
+
+
+def test_ready_requires_exact_scoring_pair():
+    for missing in ("scoring_contract_id", "scoring_version"):
+        entry = _ready_entry(**{missing: None})
+        with pytest.raises(cat.InstrumentManifestError):
+            cat.validate_instrument_metadata(entry)
+
+
+# ── §4.5 no unvalidated execution path ────────────────────────────────────────
+def test_no_public_unvalidated_scorer_execution_path():
+    # The registry exposes register/resolve only; execution goes through
+    # score_validated_clinical_definition which validates linkage, responses
+    # AND the returned result.
+    assert not hasattr(cs.ClinicalScorerRegistry, "score")
+    public = [n for n in dir(cs.ClinicalScorerRegistry) if not n.startswith("_")]
+    assert sorted(public) == ["register", "resolve"]
+
+
+# ── §4.6 scorer failure normalization ─────────────────────────────────────────
+class _CrashingScorer:
+    key = _key()
+
+    def score(self, definition, responses):
+        raise KeyError("scorer bug")
+
+
+class _RaisingClinicalErrorScorer:
+    key = _key()
+
+    def score(self, definition, responses):
+        raise cs.ClinicalScoringError("explicit refusal")
+
+
+def test_scorer_exception_wrapped_fail_closed():
+    d, m = _ready_pair()
+    reg = cs.ClinicalScorerRegistry()
+    reg.register(_CrashingScorer())
+    with pytest.raises(cs.ClinicalScoringError) as exc_info:
+        cs.score_validated_clinical_definition(d, m, _responses_for(d), reg)
+    assert isinstance(exc_info.value.__cause__, KeyError)
+
+
+def test_clinical_scoring_error_passes_through():
+    d, m = _ready_pair()
+    reg = cs.ClinicalScorerRegistry()
+    reg.register(_RaisingClinicalErrorScorer())
+    with pytest.raises(cs.ClinicalScoringError, match="explicit refusal"):
+        cs.score_validated_clinical_definition(d, m, _responses_for(d), reg)
+
+
+# ── §4.7 purity / no manifest mutation ────────────────────────────────────────
+def test_manifest_not_mutated():
+    d, m = _ready_pair()
+    snapshot = copy.deepcopy(m)
+    cs.score_validated_clinical_definition(d, m, _responses_for(d),
+                                           _registry_with_scorer())
+    assert m == snapshot

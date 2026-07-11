@@ -53,10 +53,11 @@ def _has_clinical_metadata(definition: dict) -> bool:
     return isinstance(definition.get(CLINICAL_METADATA_KEY), dict)
 
 
-def _definition_is_risk_bearing(definition: dict) -> bool:
-    """Mirror of the existing Questionnaire Core risk rejection (never
-    weakened): a definition carrying top-level contains_risk_items, or any item
-    / option risk_flag, is risk-bearing."""
+def definition_is_risk_bearing(definition: dict) -> bool:
+    """PUBLIC pure predicate — mirror of the existing Questionnaire Core risk
+    rejection (never weakened): a definition carrying top-level
+    contains_risk_items, or any item / option risk_flag, is risk-bearing.
+    Single implementation shared by this validator and clinical_scoring."""
     if definition.get("contains_risk_items"):
         return True
     for item in definition.get("items", []) or []:
@@ -66,6 +67,11 @@ def _definition_is_risk_bearing(definition: dict) -> bool:
             if option.get("risk_flag"):
                 return True
     return False
+
+
+# Backward-compatibility alias (pre-hardening name). New code must use the
+# public definition_is_risk_bearing.
+_definition_is_risk_bearing = definition_is_risk_bearing
 
 
 def _mapping_entries(definition_id, manifest_document: dict) -> list[dict]:
@@ -156,6 +162,11 @@ def validate_clinical_definition_link(definition: dict,
         invalid_reasons.append("scoring-contract-id-mismatch")
     if meta.get("scoring_version") != entry.get("scoring_version"):
         invalid_reasons.append("scoring-version-mismatch")
+    # Atomic pair rule (§4.4): the scoring tokens are configured together or
+    # not at all. A half-configured pair on the DEFINITION side is a
+    # contradiction even if it happens to mirror a (never-valid) half pair.
+    if (meta.get("scoring_contract_id") is None) != (meta.get("scoring_version") is None):
+        invalid_reasons.append("scoring-pair-not-atomic")
 
     # ── governance checks -> BLOCKED ──
     if entry.get("activation_status") != "ready":
@@ -173,7 +184,7 @@ def validate_clinical_definition_link(definition: dict,
     if entry.get("administration_mode") == "clinician_rated":
         blocked_reasons.append("administration-clinician-rated")
     # Preserve the existing Core risk rejection exactly: risk-bearing -> BLOCKED.
-    if _definition_is_risk_bearing(definition):
+    if definition_is_risk_bearing(definition):
         blocked_reasons.append("definition-risk-bearing")
 
     if invalid_reasons:
