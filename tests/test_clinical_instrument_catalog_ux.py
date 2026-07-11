@@ -125,7 +125,9 @@ def test_catalog_is_generated_from_manifest():
     ids = {ci.instrument_id for ci in instruments}
     # Exactly the 6 public-visible governance instruments, straight from the
     # manifest -- not a hand-maintained list.
-    assert ids == {"bdi_ii", "hdrs", "zung_sas", "zung_sds", "epds", "dass"}
+    # PR #55: dass became owner-only (public_catalog_visible=false) and left
+    # the public catalog; the other five governance instruments remain.
+    assert ids == {"bdi_ii", "hdrs", "zung_sas", "zung_sds", "epds"}
 
 
 def test_no_duplicate_manual_instrument_list_in_bot():
@@ -178,11 +180,15 @@ def test_epds_rendered_as_specialized_perinatal():
     assert ci in cat.catalog_instruments_by_category(_document(), "specialized")
 
 
-def test_dass_version_incomplete_not_available():
-    ci = cat.get_catalog_instrument(_document(), "dass")
-    assert ci.availability != "available"
-    assert ci.availability == "version_under_review"
-    assert ci.category_id == "stress"
+def test_dass_hidden_from_public_catalog_but_activatable():
+    # PR #55: dass is exact-version verified + ready, but owner-only --
+    # public_catalog_visible=false keeps it out of every public listing.
+    document = _document()
+    assert cat.get_catalog_instrument(document, "dass") is None
+    ids = {ci.instrument_id for ci in cat.public_catalog_instruments(document)}
+    assert "dass" not in ids
+    raw = next(i for i in document["instruments"] if i["instrument_id"] == "dass")
+    assert cat.can_activate_instrument(raw) is True
 
 
 # ── availability double-gate (future activation, never fires now) ────────────
@@ -356,7 +362,7 @@ def test_catalog_buttons_one_per_row():
 
 
 def test_information_screen_has_non_diagnostic_disclaimer():
-    for iid in ("bdi_ii", "hdrs", "epds", "dass", "zung_sas", "zung_sds"):
+    for iid in ("bdi_ii", "hdrs", "epds", "zung_sas", "zung_sds"):
         ci = cat.get_catalog_instrument(_document(), iid)
         for lang in ("ru", "en"):
             txt = questionnaire_ux.instrument_info_text(ci, lang)

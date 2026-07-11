@@ -244,10 +244,13 @@ def test_no_real_instrument_content_in_fixtures():
             assert token not in text, f"{path.name} contains banned token {token!r}"
 
 
-def test_no_current_real_manifest_entry_is_ready():
+def test_only_dass_ready_in_current_manifest():
+    # PR #55: dass (owner-only DASS-21) is the single ready entry; everything
+    # else stays non-ready.
     document = cat.load_instrument_manifest(MANIFEST_PATH)
-    for item in document["instruments"]:
-        assert item["activation_status"] != "ready"
+    ready = [i["instrument_id"] for i in document["instruments"]
+             if i["activation_status"] == "ready"]
+    assert ready == ["dass"]
 
 
 # ── registry composition (VALID alone never authorizes) ──────────────────────

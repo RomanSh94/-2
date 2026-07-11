@@ -102,6 +102,9 @@ import questionnaires
 import questionnaire_ux
 import clinical_instrument_catalog
 import clinical_definition_validator
+import clinical_scoring
+import dass21_runtime
+import dass21_scorer
 import navigation
 import emotion_map
 
@@ -1904,6 +1907,44 @@ async def _send_questionnaire_result(send, definition: dict, session_id: int, la
               reply_markup=_questionnaire_result_keyboard(session_id, lang))
 
 
+def _dass21_blocked(qid, uid: int) -> bool:
+    """PR #55 — extra FRESH gate for the exact owner-only DASS-21 definition:
+    feature flag + owner + file hash + identity, re-checked on every touch (no
+    cached authorization). Non-DASS definitions are never affected. Failure is
+    neutral: callers show the same not_available_text as every other refusal,
+    never disclosing whether the feature exists."""
+    if not dass21_runtime.is_dass21_definition_id(qid):
+        return False
+    return not dass21_runtime.dass21_runtime_status(uid).available
+
+
+async def _send_dass21_result(send, definition: dict, session_id: int, lang: str) -> None:
+    """PR #55 — exact DASS-21 completion: recompute the three subscale values
+    from the owned stored responses through the validated clinical scoring
+    path (explicit registry containing ONLY Dass21Scorer). Nothing is
+    persisted; no overall total, no cutoffs/severity/diagnosis, no LLM. On any
+    failure: no partial output, neutral unavailable text, internal log without
+    question content."""
+    try:
+        session = await get_questionnaire_session(session_id)
+        uid = session["user_id"]
+        if not dass21_runtime.dass21_runtime_status(uid).available:
+            await send(questionnaire_ux.not_available_text(lang))
+            return
+        rows = await get_questionnaire_responses(session_id)
+        responses = [clinical_scoring.ClinicalResponse(
+            r["item_id"], r["answer_id"], int(r["answer_value"])) for r in rows]
+        registry = clinical_scoring.ClinicalScorerRegistry()
+        registry.register(dass21_scorer.Dass21Scorer())
+        result = clinical_scoring.score_validated_clinical_definition(
+            definition, _load_catalog_document(), responses, registry)
+        await send(questionnaire_ux.dass21_result_text(result.subscales, lang),
+                   reply_markup=_questionnaire_completion_keyboard(session_id, lang))
+    except Exception:
+        logging.exception("dass21 scoring failed (session_id=%s)", session_id)
+        await send(questionnaire_ux.not_available_text(lang))
+
+
 async def _questionnaire_gate(entity, uid: int, lang: str) -> bool:
     """Same two gates as _nav_gate (journal_guard THEN
     ensure_full_access_or_closed_test), in the same order. A separate
@@ -1932,6 +1973,11 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
         # the flag is off (default) or the definition isn't eligible, this is
         # BYTE-FOR-BYTE PR A's completion screen -- never a score, never a
         # different keyboard.
+        if dass21_runtime.is_dass21_definition(definition):
+            # PR #55: exact DASS-21 result screen (fresh gate inside; fail
+            # closed to neutral text). Never reaches the generic PR B path.
+            await _send_dass21_result(send, definition, session_id, lang)
+            return
         if config.QUESTIONNAIRE_INTERPRETATION_ENABLED and questionnaires.is_result_eligible(definition):
             await _send_questionnaire_result(send, definition, session_id, lang)
             return
@@ -1941,6 +1987,30 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
     total = len(definition.get("items", []))
     text = questionnaire_ux.question_text(step, total, item["text"], lang)
     await send(text, reply_markup=_questionnaire_item_keyboard(definition, session_id, step, item, lang))
+
+
+@dp.message(Command("dass21"))
+async def cmd_dass21(message: Message):
+    """PR #55 — owner-only entry to the exact DASS-21 flow. Routes to the
+    EXISTING q:d detail screen (never creates a session directly); every
+    downstream step re-runs the same fresh gates. Disabled feature and
+    non-owner get the SAME neutral text -- no existence disclosure."""
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(message, uid, lang):
+        return
+    qid = dass21_runtime.DASS21_DEFINITION_ID
+    if _dass21_blocked(qid, uid):
+        await message.answer(questionnaire_ux.not_available_text(lang))
+        return
+    registry = _load_registry_fresh()
+    definition = registry.get(qid)
+    if (definition is None
+            or not registry.combined_can_start(qid, _load_catalog_document())):
+        await message.answer(questionnaire_ux.not_available_text(lang))
+        return
+    await message.answer(questionnaire_ux.detail_text(definition, lang),
+                         reply_markup=_questionnaire_detail_keyboard(qid, lang))
 
 
 @dp.message(Command("questionnaire"))
@@ -2116,6 +2186,10 @@ async def cb_questionnaire_detail(callback: CallbackQuery):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
+    if _dass21_blocked(qid, uid):
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
     await callback.message.answer(questionnaire_ux.detail_text(definition, lang),
                                   reply_markup=_questionnaire_detail_keyboard(qid, lang))
     await callback.answer()
@@ -2142,6 +2216,10 @@ async def cb_questionnaire_start(callback: CallbackQuery):
         # the SAME neutral message, never distinguishing the internal reason.
         # Ordinary nonclinical definitions behave exactly as before (combined
         # returns can_start for NOT_CLINICAL; a missing manifest is harmless).
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    if _dass21_blocked(qid, uid):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
@@ -2209,8 +2287,10 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
     if callback_step != session["current_index"]:
         registry = _load_registry_fresh()
         definition = registry.get(session["questionnaire_id"])
-        if definition is None or not registry.combined_can_answer(
-                session["questionnaire_id"], _load_catalog_document()):
+        if (definition is None
+                or not registry.combined_can_answer(
+                    session["questionnaire_id"], _load_catalog_document())
+                or _dass21_blocked(session["questionnaire_id"], uid)):
             await callback.message.answer(questionnaire_ux.not_available_text(lang))
             await callback.answer()
             return
@@ -2230,7 +2310,8 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
     # definitions) a still-VALID manifest linkage. A mid-session manifest
     # demotion / mapping change / version or translation change fails closed
     # here -- no answer saved, no advance, neutral message, no reason disclosed.
-    if not registry.combined_can_answer(session["questionnaire_id"], _load_catalog_document()):
+    if (not registry.combined_can_answer(session["questionnaire_id"], _load_catalog_document())
+            or _dass21_blocked(session["questionnaire_id"], uid)):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
@@ -2289,7 +2370,8 @@ async def cb_questionnaire_back(callback: CallbackQuery):
     # disclosed. Ordinary nonclinical sessions behave exactly as before
     # (combined returns can_answer for NOT_CLINICAL).
     registry = _load_registry_fresh()
-    if not registry.combined_can_answer(session["questionnaire_id"], _load_catalog_document()):
+    if (not registry.combined_can_answer(session["questionnaire_id"], _load_catalog_document())
+            or _dass21_blocked(session["questionnaire_id"], uid)):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
