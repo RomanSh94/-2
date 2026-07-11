@@ -1752,9 +1752,20 @@ def _load_registry_fresh() -> questionnaires.Registry:
 
 
 def _questionnaire_item_keyboard(definition: dict, session_id: int, step: int, item: dict, lang: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=opt["label"],
-                                  callback_data=f"q:a:{session_id}:{step}:{opt['id']}")]
-            for opt in item["options"]]
+    # PR #57 single-card UX: SHORT buttons (the option's numeric value) in one
+    # row -- Telegram truncates long labels on inline buttons. The FULL answer
+    # wording lives in the card text legend (questionnaire_ux.question_text).
+    # Falls back to one full-label button per row when values are missing or
+    # not unique (never two identical buttons for different answers).
+    values = [str(opt.get("value", "")) for opt in item["options"]]
+    if all(values) and len(set(values)) == len(values):
+        rows = [[InlineKeyboardButton(text=v,
+                                      callback_data=f"q:a:{session_id}:{step}:{opt['id']}")
+                 for v, opt in zip(values, item["options"])]]
+    else:
+        rows = [[InlineKeyboardButton(text=opt["label"],
+                                      callback_data=f"q:a:{session_id}:{step}:{opt['id']}")]
+                for opt in item["options"]]
     rows.append([
         InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
                              callback_data=f"q:b:{session_id}"),
@@ -1970,6 +1981,19 @@ async def _questionnaire_gate(entity, uid: int, lang: str) -> bool:
     return True
 
 
+def _edit_or_answer(message):
+    """PR #57 single-card UX: a `send` callable that EDITS the existing card
+    in place (one editable message per questionnaire run -- old questions do
+    not pile up in the chat) and falls back to a fresh message when editing
+    is impossible (message too old / identical content / non-editable)."""
+    async def _send(text, **kw):
+        try:
+            await message.edit_text(text, **kw)
+        except Exception:
+            await message.answer(text, **kw)
+    return _send
+
+
 async def _send_questionnaire_step(send, definition: dict, session_id: int, step: int, lang: str) -> None:
     """Send the item at `step`, or complete the session if none remains.
     `send` is message.answer / callback.message.answer, matching the existing
@@ -1997,7 +2021,8 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
                    reply_markup=_questionnaire_completion_keyboard(session_id, lang))
         return
     total = len(definition.get("items", []))
-    text = questionnaire_ux.question_text(step, total, item["text"], lang)
+    text = questionnaire_ux.question_text(step, total, item["text"], lang,
+                                          options=item.get("options"))
     await send(text, reply_markup=_questionnaire_item_keyboard(definition, session_id, step, item, lang))
 
 
@@ -2244,13 +2269,13 @@ async def cb_questionnaire_start(callback: CallbackQuery):
             await callback.message.answer(questionnaire_ux.not_available_text(lang))
             await callback.answer()
             return
-        await _send_questionnaire_step(callback.message.answer, definition, active["id"],
+        await _send_questionnaire_step(_edit_or_answer(callback.message), definition, active["id"],
                                        active["current_index"], lang)
         await callback.answer()
         return
 
     session_id = await start_questionnaire_session(uid, definition["id"], definition["version"])
-    await _send_questionnaire_step(callback.message.answer, definition, session_id, 0, lang)
+    await _send_questionnaire_step(_edit_or_answer(callback.message), definition, session_id, 0, lang)
     await callback.answer()
 
 
@@ -2307,7 +2332,7 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
             await callback.answer()
             return
         await callback.message.answer(questionnaire_ux.stale_answer_text(lang))
-        await _send_questionnaire_step(callback.message.answer, definition, session_id,
+        await _send_questionnaire_step(_edit_or_answer(callback.message), definition, session_id,
                                        session["current_index"], lang)
         await callback.answer()
         return
@@ -2349,11 +2374,9 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
         uid, session_id, definition["id"], item["id"], option["id"], option["value"])
     next_step = session["current_index"] + 1
     await advance_questionnaire_session(session_id, next_step)
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await _send_questionnaire_step(callback.message.answer, definition, session_id, next_step, lang)
+    # PR #57: the next question EDITS this same card, which also replaces the
+    # old keyboard -- no separate edit_reply_markup(None) call needed.
+    await _send_questionnaire_step(_edit_or_answer(callback.message), definition, session_id, next_step, lang)
     await callback.answer()
 
 
@@ -2391,7 +2414,7 @@ async def cb_questionnaire_back(callback: CallbackQuery):
 
     prev_step = max(0, session["current_index"] - 1)
     await advance_questionnaire_session(session_id, prev_step)
-    await _send_questionnaire_step(callback.message.answer, definition, session_id, prev_step, lang)
+    await _send_questionnaire_step(_edit_or_answer(callback.message), definition, session_id, prev_step, lang)
     await callback.answer()
 
 

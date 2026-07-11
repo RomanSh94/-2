@@ -196,13 +196,35 @@ def _progress_bar(step: int, total: int, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled) + f" {pct}%"
 
 
-def question_text(step: int, total: int, item_text: str, lang: str = "ru") -> str:
+def question_text(step: int, total: int, item_text: str, lang: str = "ru",
+                  options: list | None = None) -> str:
+    """Single-card question screen (PR #57). When `options` is given, the FULL
+    answer wording is rendered as a legend inside the card text, so the inline
+    buttons can stay short (Telegram truncates long button labels). The legend
+    text comes from the runtime definition — never hardcoded here."""
     bar = _progress_bar(step + 1, total)
+    legend = ""
+    if options:
+        legend = "\n" + "\n".join(
+            f"{o['value']} — {_legend_label(o)}" for o in options) + "\n"
     if lang == "ru":
         return (f"Вопрос {step + 1} из {total}\n{bar}\n\n"
-                f"«{item_text}»\n\nВыберите ответ:")
+                f"«{item_text}»\n{legend}\nВыберите ответ:")
     return (f"Question {step + 1} of {total}\n{bar}\n\n"
-            f"“{item_text}”\n\nChoose an answer:")
+            f"“{item_text}”\n{legend}\nChoose an answer:")
+
+
+def _legend_label(option: dict) -> str:
+    """Full option wording for the in-card legend, with a duplicated leading
+    "<value> —"/"<value> -" prefix stripped (many definitions already embed
+    the numeric anchor in the label)."""
+    label = option.get("label", "")
+    value = str(option.get("value", ""))
+    for sep in (" — ", " - ", " – "):
+        prefix = f"{value}{sep}"
+        if label.startswith(prefix):
+            return label[len(prefix):]
+    return label
 
 
 def completion_text(lang: str = "ru") -> str:
