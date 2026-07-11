@@ -25,6 +25,7 @@ from html import escape as _he
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -1751,14 +1752,52 @@ def _load_registry_fresh() -> questionnaires.Registry:
     return questionnaires.load_registry()
 
 
+# Telegram message text hard limit is 4096 chars; stay safely below it.
+_QUESTIONNAIRE_CARD_MAXLEN = 3900
+_COMPACT_BUTTON_MAXLEN = 16
+
+
+def _compact_button_token(value) -> str | None:
+    """A value is eligible as a SHORT answer button only if it is a plain,
+    non-empty, non-padded string of bounded length. None/bool/numbers/padded
+    or overlong strings return None -> the keyboard falls back to full-label
+    buttons (callback_data always uses the answer id, never this token)."""
+    if not isinstance(value, str) or isinstance(value, bool):
+        return None
+    if not value or value != value.strip():
+        return None
+    if len(value) > _COMPACT_BUTTON_MAXLEN:
+        return None
+    return value
+
+
+def _questionnaire_nav_row(session_id: int, lang: str) -> list:
+    return [
+        InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+                             callback_data=f"q:b:{session_id}"),
+        InlineKeyboardButton(text=("✖️ Прервать" if lang == "ru" else "✖️ Cancel"),
+                             callback_data=f"q:x:{session_id}"),
+    ]
+
+
+def _questionnaire_full_label_keyboard(definition: dict, session_id: int, step: int, item: dict, lang: str) -> InlineKeyboardMarkup:
+    """Pre-#57 layout: one FULL-label button per row. Used as the deterministic
+    fallback when compact values are unsafe or the legend card is too long."""
+    rows = [[InlineKeyboardButton(text=opt["label"],
+                                  callback_data=f"q:a:{session_id}:{step}:{opt['id']}")]
+            for opt in item["options"]]
+    rows.append(_questionnaire_nav_row(session_id, lang))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _questionnaire_item_keyboard(definition: dict, session_id: int, step: int, item: dict, lang: str) -> InlineKeyboardMarkup:
     # PR #57 single-card UX: SHORT buttons (the option's numeric value) in one
     # row -- Telegram truncates long labels on inline buttons. The FULL answer
     # wording lives in the card text legend (questionnaire_ux.question_text).
     # Falls back to one full-label button per row when values are missing or
     # not unique (never two identical buttons for different answers).
-    values = [str(opt.get("value", "")) for opt in item["options"]]
-    if all(values) and len(set(values)) == len(values):
+    values = [_compact_button_token(opt.get("value")) for opt in item["options"]]
+    if all(v is not None for v in values) and len(set(values)) == len(values):
         rows = [[InlineKeyboardButton(text=v,
                                       callback_data=f"q:a:{session_id}:{step}:{opt['id']}")
                  for v, opt in zip(values, item["options"])]]
@@ -1984,13 +2023,39 @@ async def _questionnaire_gate(entity, uid: int, lang: str) -> bool:
 def _edit_or_answer(message):
     """PR #57 single-card UX: a `send` callable that EDITS the existing card
     in place (one editable message per questionnaire run -- old questions do
-    not pile up in the chat) and falls back to a fresh message when editing
-    is impossible (message too old / identical content / non-editable)."""
+    not pile up in the chat).
+
+    Exception contract (deliberately narrow -- unexpected failures must
+    PROPAGATE, never be swallowed):
+    - TelegramBadRequest "message is not modified": treated as success (the
+      card already shows this content) -- no duplicate message is sent;
+    - any other TelegramBadRequest (too old / can't be edited / not found):
+      fall back to a fresh message, after best-effort disabling the stale
+      card's keyboard so old buttons don't linger active;
+    - anything else (network errors, programming errors): propagates.
+    A failure of the FALLBACK send also propagates. Logs carry only the
+    sanitized exception reason -- never the card/question text."""
     async def _send(text, **kw):
-        try:
-            await message.edit_text(text, **kw)
-        except Exception:
+        edit_text = getattr(message, "edit_text", None)
+        if edit_text is None:
+            # capability detection, not error handling: some call sites (and
+            # test fakes) hand in a message that cannot be edited at all.
             await message.answer(text, **kw)
+            return
+        try:
+            await edit_text(text, **kw)
+            return
+        except TelegramBadRequest as exc:
+            reason = str(exc)
+            if "message is not modified" in reason.lower():
+                return  # same content already on the card -- success, no-op
+            logging.info("questionnaire card edit failed (%s); sending a new card",
+                         type(exc).__name__)
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass  # best-effort only: the old keyboard may already be gone
+        await message.answer(text, **kw)
     return _send
 
 
@@ -2023,7 +2088,14 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
     total = len(definition.get("items", []))
     text = questionnaire_ux.question_text(step, total, item["text"], lang,
                                           options=item.get("options"))
-    await send(text, reply_markup=_questionnaire_item_keyboard(definition, session_id, step, item, lang))
+    keyboard = _questionnaire_item_keyboard(definition, session_id, step, item, lang)
+    if len(text) > _QUESTIONNAIRE_CARD_MAXLEN:
+        # Deterministic safe fallback (never a silent truncation of the
+        # protected wording): drop the in-card legend and show the FULL labels
+        # on the buttons instead -- the pre-#57 layout.
+        text = questionnaire_ux.question_text(step, total, item["text"], lang)
+        keyboard = _questionnaire_full_label_keyboard(definition, session_id, step, item, lang)
+    await send(text, reply_markup=keyboard)
 
 
 @dp.message(Command("dass21"))

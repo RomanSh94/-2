@@ -36,20 +36,21 @@ class FakeCardMessage:
     def __init__(self, user):
         self.from_user = user
         self.chat = types.SimpleNamespace(id=user.id)
-        self.answers = []      # NEW messages sent
-        self.edits = []        # in-place edits of THIS message
-        self.fail_edit = False
+        self.answers = []          # NEW messages sent
+        self.edits = []            # in-place edits of THIS message
+        self.edit_exc = None       # exception edit_text should raise
+        self.markup_cleared = 0    # edit_reply_markup(None) calls
 
     async def answer(self, text, **kw):
         self.answers.append((text, kw))
 
     async def edit_text(self, text, **kw):
-        if self.fail_edit:
-            raise RuntimeError("message can't be edited")
+        if self.edit_exc is not None:
+            raise self.edit_exc
         self.edits.append((text, kw))
 
     async def edit_reply_markup(self, **kw):
-        pass
+        self.markup_cleared += 1
 
 
 class FakeCallback:
@@ -226,19 +227,181 @@ def test_completion_result_edits_the_card(flow):
     assert msg.answers == []
 
 
-def test_edit_failure_falls_back_to_new_message(flow):
+def _session_id():
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    sid = con.execute("SELECT id FROM questionnaire_sessions").fetchone()[0]
+    con.close()
+    return sid
+
+
+def _bad_request(text):
+    from aiogram.exceptions import TelegramBadRequest
+    return TelegramBadRequest(method=None, message=text)
+
+
+def test_known_edit_failure_falls_back_to_new_message(flow):
     user = FakeUser(1)
     msg = FakeCardMessage(user)
     _start(user, msg)
-    import sqlite3
-    con = sqlite3.connect(database.DB)
-    session_id = con.execute("SELECT id FROM questionnaire_sessions").fetchone()[0]
-    con.close()
-    msg.fail_edit = True  # e.g. message too old for edit_text
+    session_id = _session_id()
+    msg.edit_exc = _bad_request("Bad Request: message can't be edited")
     asyncio.run(bot.cb_questionnaire_answer(
         FakeCallback(user, msg, data=f"q:a:{session_id}:0:a0")))
     assert msg.answers, "must fall back to a fresh message"
     assert "Вопрос 2 из 21" in msg.answers[-1][0]
+
+
+def test_message_not_modified_does_not_send_duplicate(flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    _start(user, msg)
+    session_id = _session_id()
+    msg.edit_exc = _bad_request("Bad Request: message is not modified")
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:0:a0")))
+    assert msg.answers == []           # treated as success: no duplicate card
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    idx = con.execute("SELECT current_index FROM questionnaire_sessions").fetchone()[0]
+    con.close()
+    assert idx == 1                    # DB still advanced (source of truth)
+
+
+def test_unexpected_edit_exception_is_not_swallowed(flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    _start(user, msg)
+    session_id = _session_id()
+    msg.edit_exc = RuntimeError("programming error")
+    with pytest.raises(RuntimeError):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:0:a0")))
+    assert msg.answers == []  # never half-handled into a fresh message
+
+
+def test_fallback_send_exception_is_not_swallowed(flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    _start(user, msg)
+    session_id = _session_id()
+    msg.edit_exc = _bad_request("Bad Request: message to edit not found")
+    async def broken_answer(text, **kw):
+        raise RuntimeError("send failed")
+    msg.answer = broken_answer
+    with pytest.raises(RuntimeError):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:0:a0")))
+
+
+def test_fallback_attempts_to_disable_old_keyboard(flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    _start(user, msg)
+    session_id = _session_id()
+    msg.edit_exc = _bad_request("Bad Request: message can't be edited")
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:0:a0")))
+    assert msg.markup_cleared >= 1  # stale card keyboard disabled best-effort
+
+
+def test_stale_answer_from_old_card_rejected(flow):
+    # After a fallback the OLD card may keep buttons for step 0; the session is
+    # already on step 1 -> the stale q:a is refused by the step guard and the
+    # answer is NOT overwritten/duplicated.
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    _start(user, msg)
+    session_id = _session_id()
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:0:a0")))
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:0:a3")))  # stale step 0
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    n, idx = con.execute(
+        "SELECT (SELECT COUNT(*) FROM questionnaire_responses), "
+        "(SELECT current_index FROM questionnaire_sessions)").fetchone()
+    vals = con.execute("SELECT answer_value FROM questionnaire_responses").fetchall()
+    con.close()
+    assert (n, idx) == (1, 1)
+    assert vals == [("0",)]  # first answer kept; stale a3 rejected
+
+
+def test_double_tap_same_answer_advances_once(flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    _start(user, msg)
+    session_id = _session_id()
+    for _ in range(2):  # double tap on the same step-0 button
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:0:a0")))
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    n, idx = con.execute(
+        "SELECT (SELECT COUNT(*) FROM questionnaire_responses), "
+        "(SELECT current_index FROM questionnaire_sessions)").fetchone()
+    con.close()
+    assert (n, idx) == (1, 1)  # advanced exactly once
+
+
+def test_back_then_old_answer_cannot_corrupt_state(flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    _start(user, msg)
+    session_id = _session_id()
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:0:a0")))
+    asyncio.run(bot.cb_questionnaire_back(
+        FakeCallback(user, msg, data=f"q:b:{session_id}")))  # back to step 0
+    # a stale step-1 button (from the pre-Back card) must be rejected
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:1:a2")))
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    idx = con.execute("SELECT current_index FROM questionnaire_sessions").fetchone()[0]
+    con.close()
+    assert idx == 0  # still on the replayed step; stale forward answer refused
+
+
+def test_overlong_generic_card_uses_safe_fallback(flow):
+    # A synthetic definition whose legend would exceed the Telegram limit must
+    # fall back deterministically: no legend, full-label buttons, no silent
+    # truncation of any label.
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    _start(user, msg)
+    session_id = _session_id()
+    big_item = {"id": "big", "text": "t",
+                "options": [{"id": f"a{i}", "label": "Д" * 1300, "value": str(i)}
+                            for i in range(4)]}
+    d = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    asyncio.run(bot._send_questionnaire_step(
+        bot._edit_or_answer(msg), {**d, "items": [big_item]}, session_id, 0, "ru"))
+    text, kw = msg.edits[-1]
+    assert len(text) <= bot._QUESTIONNAIRE_CARD_MAXLEN
+    labels = [b.text for row in kw["reply_markup"].inline_keyboard
+              for b in row if b.callback_data.startswith("q:a:")]
+    assert labels == ["Д" * 1300] * 4  # full labels on buttons, not truncated
+
+
+def test_dass_card_below_telegram_limit(flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    _start(user, msg)
+    text, _ = msg.edits[-1]
+    assert len(text) <= bot._QUESTIONNAIRE_CARD_MAXLEN
+
+
+def test_compact_token_validation():
+    f = bot._compact_button_token
+    assert f("0") == "0" and f("42") == "42"
+    assert f(None) is None
+    assert f(True) is None and f(False) is None
+    assert f(0) is None and f(3) is None      # non-string numerics
+    assert f("") is None and f(" 1") is None and f("1 ") is None
+    assert f("x" * 17) is None
+    assert f("x" * 16) == "x" * 16
 
 
 def test_callback_format_unchanged(flow):
