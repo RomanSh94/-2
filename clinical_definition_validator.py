@@ -167,6 +167,15 @@ def validate_clinical_definition_link(definition: dict,
     # contradiction even if it happens to mirror a (never-valid) half pair.
     if (meta.get("scoring_contract_id") is None) != (meta.get("scoring_version") is None):
         invalid_reasons.append("scoring-pair-not-atomic")
+    # Exact-version risk-contract identity (PR #54). Same semantics as the
+    # scoring pair: null==null is a valid match (blocked / non-risk
+    # instruments); any divergence or half-configured pair -> INVALID.
+    if meta.get("risk_contract_id") != entry.get("risk_contract_id"):
+        invalid_reasons.append("risk-contract-id-mismatch")
+    if meta.get("risk_contract_version") != entry.get("risk_contract_version"):
+        invalid_reasons.append("risk-contract-version-mismatch")
+    if (meta.get("risk_contract_id") is None) != (meta.get("risk_contract_version") is None):
+        invalid_reasons.append("risk-pair-not-atomic")
 
     # ── governance checks -> BLOCKED ──
     if entry.get("activation_status") != "ready":
