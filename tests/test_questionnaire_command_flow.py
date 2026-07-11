@@ -282,7 +282,7 @@ def test_questionnaire_start_stores_session_and_sends_first_question():
     assert qid == "demo_anxiety_v1" and version == "1" and status == "active" and index == 0
     text, kw = msg.answers[-1]
     assert "Вопрос 1 из 5" in text
-    assert "Мне было трудно расслабиться" in text
+    assert "Мне было непросто отдохнуть вечером (синтетический вопрос)" in text
 
 
 def test_answer_flow_moves_question_by_question():
