@@ -92,21 +92,58 @@ def _mapped_entry(definition: dict, manifest_document: dict) -> dict:
 
 
 def _linkage_acceptable(definition: dict, manifest_document: dict) -> None:
-    """The exact clinical linkage must be governance-consistent. VALID is
-    accepted. BLOCKED is accepted ONLY when the sole blocking reason is
-    definition-risk-bearing: a risk-bearing definition can never be VALID under
-    the loader (by design — it stays non-startable), yet the risk contract
-    exists precisely for such definitions. Every OTHER inconsistency
-    (mismatch/INVALID, or any additional governance blocker) fails closed."""
+    """A risk contract exists ONLY for a risk-bearing definition. The exact
+    clinical linkage must therefore be BLOCKED with definition-risk-bearing as
+    the SOLE blocking reason: a risk-bearing definition can never be VALID
+    under the loader (by design — it stays non-startable), and an ordinary
+    VALID linkage means the definition carries no executable risk, so a risk
+    contract on it is a contradiction. Every other state (INVALID mismatch, any
+    additional governance blocker, NOT_CLINICAL) fails closed."""
+    if not _cdv.definition_is_risk_bearing(definition):
+        raise ClinicalRiskContractError(
+            "risk contract requires a risk-bearing definition")
     validation = _cdv.validate_clinical_definition_link(definition, manifest_document)
-    if validation.status == _cdv.ClinicalDefinitionStatus.VALID:
-        return
     if (validation.status == _cdv.ClinicalDefinitionStatus.BLOCKED
             and set(validation.reason_codes) == {"definition-risk-bearing"}):
         return
     raise ClinicalRiskContractError(
         f"clinical linkage not acceptable for a risk contract "
         f"(status={validation.status.value}, reasons={validation.reason_codes})")
+
+
+def extract_option_risk_pairs(definition: dict) -> tuple[tuple[str, str], ...]:
+    """The definition's executable risk surface: every (item_id, answer_id)
+    whose OPTION carries risk_flag=true, in canonical definition order.
+
+    Fail-closed shape rules: executable risk exists only at option level. A
+    top-level contains_risk_items=true with no flagged option, or an item-level
+    risk_flag=true with no flagged option in that item, is ambiguous (there is
+    nothing exact to route) and rejected."""
+    if not isinstance(definition, dict):
+        raise ClinicalRiskContractError("definition must be an object")
+    if not definition.get("contains_risk_items"):
+        raise ClinicalRiskContractError(
+            "risk contract requires contains_risk_items=true")
+    pairs: list[tuple[str, str]] = []
+    for item in definition.get("items", []) or []:
+        item_id = item.get("id")
+        item_pairs = [(item_id, o.get("id"))
+                      for o in item.get("options", []) or []
+                      if o.get("risk_flag")]
+        if item.get("risk_flag") and not item_pairs:
+            raise ClinicalRiskContractError(
+                f"item {item_id!r} has item-level risk_flag but no risk-flagged "
+                "option -- ambiguous, nothing exact to route")
+        pairs.extend(item_pairs)
+    if not pairs:
+        raise ClinicalRiskContractError(
+            "contains_risk_items=true but no option carries risk_flag=true -- "
+            "ambiguous, nothing exact to route")
+    return tuple(pairs)
+
+
+_ALLOWED_CONTRACT_KEYS = frozenset({"contract_id", "contract_version", "triggers"})
+_ALLOWED_TRIGGER_KEYS = frozenset({"item_id", "answer_id", "action"})
 
 
 def validate_clinical_risk_contract(
@@ -116,9 +153,16 @@ def validate_clinical_risk_contract(
     load-bearing (task §15). Does NOT authorize runtime start, does NOT call
     the Registry, does NOT call the crisis system — it returns the exact key
     and nothing else."""
+    if not isinstance(definition, dict):
+        raise ClinicalRiskContractError("definition must be an object")
+    if not isinstance(manifest_document, dict):
+        raise ClinicalRiskContractError("manifest document must be an object")
+
     # 1-3. Manifest + exact clinical linkage (instrument/version/translation
     # and 4. risk_contract_id/version exact match are enforced inside the
     # linkage validator; a mismatch there is INVALID and rejected here).
+    # Includes the risk-bearing-only rule: linkage must be BLOCKED solely by
+    # definition-risk-bearing; ordinary VALID linkage is rejected.
     _linkage_acceptable(definition, manifest_document)
     entry = _mapped_entry(definition, manifest_document)
 
@@ -137,11 +181,17 @@ def validate_clinical_risk_contract(
         _require_token(value, name)
 
     # 5-6. The private definition must carry a clinical_risk_contract object
-    # whose contract_id/version EXACTLY match the manifest pair.
+    # whose contract_id/version EXACTLY match the manifest pair. Its schema is
+    # closed: an unknown field (message/phone/destination/severity/handler/...)
+    # is a contract violation, never silently ignored.
     contract = definition.get(RISK_CONTRACT_KEY)
     if not isinstance(contract, dict):
         raise ClinicalRiskContractError(
             "definition has no clinical_risk_contract object")
+    unknown = set(contract) - _ALLOWED_CONTRACT_KEYS
+    if unknown:
+        raise ClinicalRiskContractError(
+            f"unknown clinical_risk_contract fields: {sorted(unknown)}")
     if contract.get("contract_id") != key_values["risk_contract_id"]:
         raise ClinicalRiskContractError("risk contract_id mismatch")
     if contract.get("contract_version") != key_values["risk_contract_version"]:
@@ -164,6 +214,10 @@ def validate_clinical_risk_contract(
     for trigger in triggers:
         if not isinstance(trigger, dict):
             raise ClinicalRiskContractError("trigger must be an object")
+        unknown = set(trigger) - _ALLOWED_TRIGGER_KEYS
+        if unknown:
+            raise ClinicalRiskContractError(
+                f"unknown trigger fields: {sorted(unknown)}")
         item_id = _require_token(trigger.get("item_id"), "trigger item_id")
         answer_id = _require_token(trigger.get("answer_id"), "trigger answer_id")
         action = trigger.get("action")
@@ -182,6 +236,19 @@ def validate_clinical_risk_contract(
         if answer_id not in option_ids:
             raise ClinicalRiskContractError(
                 f"trigger answer {answer_id!r} does not belong to item {item_id!r}")
+
+    # Exact option-level coverage: the trigger pair set must EQUAL the
+    # definition's risk-flagged option pair set. Every risk option has exactly
+    # one trigger (duplicates already rejected), no trigger points at an
+    # unflagged option, and no risk option is left unrouted.
+    risk_pairs = set(extract_option_risk_pairs(definition))
+    if seen_pairs != risk_pairs:
+        unrouted = sorted(risk_pairs - seen_pairs)
+        unflagged = sorted(seen_pairs - risk_pairs)
+        raise ClinicalRiskContractError(
+            f"trigger set must exactly equal the risk-flagged option set "
+            f"(unrouted risk options: {unrouted}, "
+            f"triggers on unflagged options: {unflagged})")
 
     # 12. Return the exact key. Nothing else. No start authorization.
     return ClinicalRiskContractKey(**key_values)

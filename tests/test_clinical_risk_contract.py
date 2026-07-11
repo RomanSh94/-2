@@ -399,6 +399,9 @@ def test_inputs_not_mutated():
 def test_trigger_order_does_not_change_decision():
     d, m = _valid_pair()
     d2 = copy.deepcopy(d)
+    # Flag a second option so the exact-coverage rule expects both triggers.
+    item1 = next(i for i in d2["items"] if i["id"] == "synthetic_item_1")
+    next(o for o in item1["options"] if o["id"] == "answer_b")["risk_flag"] = True
     d2["clinical_risk_contract"]["triggers"] = [
         {"item_id": "synthetic_item_1", "answer_id": "answer_b", "action": "crisis"},
         {"item_id": "synthetic_item_2", "answer_id": "synthetic_answer_crisis",
@@ -441,3 +444,191 @@ def test_existing_questionnaire_risk_rejection_unchanged():
         {"items": [{"options": [{"risk_flag": True}]}]})
     assert not cdv.definition_is_risk_bearing(
         {"items": [{"options": [{"id": "a"}]}]})
+
+
+# ── A2 hardening: risk contract requires a risk-bearing definition ────────────
+def test_non_risk_bearing_definition_with_risk_contract_is_rejected():
+    d, m = _valid_pair()
+    d = copy.deepcopy(d)
+    d["contains_risk_items"] = False
+    for item in d["items"]:
+        item.pop("risk_flag", None)
+        for o in item["options"]:
+            o.pop("risk_flag", None)
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d, m)
+
+
+def test_valid_linkage_is_not_sufficient_for_risk_contract():
+    # A non-risk definition with an otherwise VALID linkage must be rejected:
+    # the risk contract exists only for risk-bearing definitions.
+    d = _load_def("synthetic_ready_v1.json")
+    d = copy.deepcopy(d)
+    d["clinical_instrument"]["risk_contract_id"] = "synthetic_crisis_route"
+    d["clinical_instrument"]["risk_contract_version"] = "1"
+    m = _manifest([_risk_entry(
+        instrument_id="synthetic_scale", translation_id="syn_ru_v1",
+        questionnaire_definition_id="synthetic_ready_v1")])
+    with pytest.raises(crc.ClinicalRiskContractError,
+                       match="risk-bearing"):
+        crc.validate_clinical_risk_contract(d, m)
+
+
+def test_only_definition_risk_bearing_block_is_accepted():
+    d, m = _valid_pair()
+    res = cdv.validate_clinical_definition_link(d, m)
+    assert res.status is cdv.ClinicalDefinitionStatus.BLOCKED
+    assert set(res.reason_codes) == {"definition-risk-bearing"}
+    key = crc.validate_clinical_risk_contract(d, m)
+    assert key.risk_contract_id == "synthetic_crisis_route"
+
+
+def test_additional_blocker_besides_risk_bearing_is_rejected():
+    d, _ = _valid_pair()
+    # identity not verified -> a second governance blocker joins
+    # definition-risk-bearing -> rejected.
+    m = _manifest([_risk_entry(identity_status="family_identified_version_incomplete")])
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d, m)
+
+
+# ── A2 hardening: exact option-level coverage ────────────────────────────────
+def test_trigger_must_point_to_risk_flagged_option():
+    # The valid fixture's single trigger targets the single risk-flagged
+    # option -- moving the flag to a different option breaks equality.
+    d, m = _valid_pair()
+    d = copy.deepcopy(d)
+    item2 = next(i for i in d["items"] if i["id"] == "synthetic_item_2")
+    next(o for o in item2["options"]
+         if o["id"] == "synthetic_answer_crisis").pop("risk_flag")
+    next(o for o in item2["options"]
+         if o["id"] == "synthetic_answer_plain")["risk_flag"] = True
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d, m)
+
+
+def test_unflagged_option_cannot_be_trigger():
+    d, m = _valid_pair()
+    d = copy.deepcopy(d)
+    d["clinical_risk_contract"]["triggers"].append(
+        {"item_id": "synthetic_item_1", "answer_id": "answer_a",
+         "action": "crisis"})
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d, m)
+
+
+def test_every_risk_flagged_option_must_be_mapped():
+    d, m = _valid_pair()
+    d = copy.deepcopy(d)
+    item1 = next(i for i in d["items"] if i["id"] == "synthetic_item_1")
+    next(o for o in item1["options"] if o["id"] == "answer_b")["risk_flag"] = True
+    # second risk option now exists but has no trigger -> unrouted -> rejected
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d, m)
+
+
+def test_extra_trigger_for_nonrisk_option_rejected():
+    d, m = _valid_pair()
+    d = copy.deepcopy(d)
+    d["clinical_risk_contract"]["triggers"].append(
+        {"item_id": "synthetic_item_2", "answer_id": "synthetic_answer_plain",
+         "action": "crisis"})
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d, m)
+
+
+def test_top_level_risk_without_option_flags_rejected():
+    d, m = _valid_pair()
+    d = copy.deepcopy(d)
+    for item in d["items"]:
+        item.pop("risk_flag", None)
+        for o in item["options"]:
+            o.pop("risk_flag", None)
+    # contains_risk_items stays True -> ambiguous, nothing exact to route.
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.extract_option_risk_pairs(d)
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d, m)
+
+
+def test_item_level_risk_flag_is_ambiguous_and_rejected():
+    d, m = _valid_pair()
+    d = copy.deepcopy(d)
+    item2 = next(i for i in d["items"] if i["id"] == "synthetic_item_2")
+    assert item2.get("risk_flag") is True  # item-level flag stays
+    next(o for o in item2["options"]
+         if o["id"] == "synthetic_answer_crisis").pop("risk_flag")
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.extract_option_risk_pairs(d)
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d, m)
+
+
+def test_two_risk_options_require_two_exact_triggers():
+    d, m = _valid_pair()
+    d = copy.deepcopy(d)
+    item1 = next(i for i in d["items"] if i["id"] == "synthetic_item_1")
+    next(o for o in item1["options"] if o["id"] == "answer_b")["risk_flag"] = True
+    # one trigger only -> rejected
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d, m)
+    # both exact triggers -> accepted, and both routes fire
+    d["clinical_risk_contract"]["triggers"].append(
+        {"item_id": "synthetic_item_1", "answer_id": "answer_b",
+         "action": "crisis"})
+    crc.validate_clinical_risk_contract(d, m)
+    assert crc.evaluate_clinical_risk_answer(
+        d, m, item_id="synthetic_item_1",
+        answer_id="answer_b").action is crc.ClinicalRiskAction.CRISIS
+
+
+def test_trigger_set_equals_option_risk_pair_set():
+    d, m = _valid_pair()
+    crc.validate_clinical_risk_contract(d, m)
+    trigger_pairs = {(t["item_id"], t["answer_id"])
+                     for t in d["clinical_risk_contract"]["triggers"]}
+    assert trigger_pairs == set(crc.extract_option_risk_pairs(d))
+
+
+# ── A2 hardening: closed schemas ──────────────────────────────────────────────
+def test_unknown_contract_field_rejected():
+    d, m = _valid_pair()
+    for bad_field in ("message", "phone", "destination", "owner_id",
+                      "severity", "handler", "callback", "score",
+                      "threshold", "metadata"):
+        d2 = copy.deepcopy(d)
+        d2["clinical_risk_contract"][bad_field] = "x"
+        with pytest.raises(crc.ClinicalRiskContractError):
+            crc.validate_clinical_risk_contract(d2, m)
+
+
+def test_unknown_trigger_field_rejected():
+    d, m = _valid_pair()
+    for bad_field in ("message", "phone", "destination", "owner_id",
+                      "severity", "handler", "callback", "score",
+                      "threshold", "metadata"):
+        d2 = copy.deepcopy(d)
+        d2["clinical_risk_contract"]["triggers"][0][bad_field] = "x"
+        with pytest.raises(crc.ClinicalRiskContractError):
+            crc.validate_clinical_risk_contract(d2, m)
+
+
+def test_non_dict_inputs_rejected():
+    d, m = _valid_pair()
+    for bad in (None, [], "x", 5):
+        with pytest.raises(crc.ClinicalRiskContractError):
+            crc.validate_clinical_risk_contract(bad, m)
+        with pytest.raises(crc.ClinicalRiskContractError):
+            crc.validate_clinical_risk_contract(d, bad)
+    d2 = copy.deepcopy(d)
+    d2["clinical_risk_contract"]["triggers"] = ["not-a-dict"]
+    with pytest.raises(crc.ClinicalRiskContractError):
+        crc.validate_clinical_risk_contract(d2, m)
+
+
+def test_runtime_ids_must_be_strings_no_coercion():
+    d, m = _valid_pair()
+    for bad in (2, None, ["synthetic_item_2"], " synthetic_item_2 "):
+        with pytest.raises(crc.ClinicalRiskContractError):
+            crc.evaluate_clinical_risk_answer(
+                d, m, item_id=bad, answer_id="synthetic_answer_crisis")
