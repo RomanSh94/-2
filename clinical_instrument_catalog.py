@@ -252,10 +252,12 @@ def validate_instrument_metadata(item: dict) -> None:
                 f"{instrument_id}: questionnaire_definition_id too long -- the whole "
                 f"q:d:<id> callback must be <=64 bytes: {qdid!r}")
 
-    # Exact-version scoring-contract tokens (nullable). When present, each must
-    # be a bounded callback/URL-safe ASCII token -- never a colon/whitespace/
-    # non-ASCII value, and never long enough to bloat a stored scorer key.
-    for field in ("scoring_contract_id", "scoring_version"):
+    # Exact-version scoring-contract tokens (PR #53) and risk-contract tokens
+    # (PR #54), all nullable. When present, each must be a bounded callback/
+    # URL-safe ASCII token -- never a colon/whitespace/non-ASCII value, and
+    # never long enough to bloat a stored contract key.
+    for field in ("scoring_contract_id", "scoring_version",
+                  "risk_contract_id", "risk_contract_version"):
         value = item.get(field)
         if value is None:
             continue
@@ -276,6 +278,11 @@ def validate_instrument_metadata(item: dict) -> None:
     if (item.get("scoring_contract_id") is None) != (item.get("scoring_version") is None):
         raise InstrumentManifestError(
             f"{instrument_id}: scoring_contract_id and scoring_version must be "
+            "configured together (both null or both non-empty tokens)")
+    # Same atomic pair rule for the exact-version risk contract (PR #54).
+    if (item.get("risk_contract_id") is None) != (item.get("risk_contract_version") is None):
+        raise InstrumentManifestError(
+            f"{instrument_id}: risk_contract_id and risk_contract_version must be "
             "configured together (both null or both non-empty tokens)")
 
     _validate_rights(instrument_id, item)

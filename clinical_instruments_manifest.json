@@ -60,7 +60,9 @@
         "russian_adaptation_rights_unconfirmed"
       ],
       "scoring_contract_id": null,
-      "scoring_version": null
+      "scoring_version": null,
+      "risk_contract_id": null,
+      "risk_contract_version": null
     },
     {
       "instrument_id": "hdrs",
@@ -120,7 +122,9 @@
         "rights_status_unverified"
       ],
       "scoring_contract_id": null,
-      "scoring_version": null
+      "scoring_version": null,
+      "risk_contract_id": null,
+      "risk_contract_version": null
     },
     {
       "instrument_id": "zung_sas",
@@ -179,7 +183,9 @@
         "russian_adaptation_unverified"
       ],
       "scoring_contract_id": null,
-      "scoring_version": null
+      "scoring_version": null,
+      "risk_contract_id": null,
+      "risk_contract_version": null
     },
     {
       "instrument_id": "zung_sds",
@@ -239,7 +245,9 @@
         "russian_adaptation_unverified"
       ],
       "scoring_contract_id": null,
-      "scoring_version": null
+      "scoring_version": null,
+      "risk_contract_id": null,
+      "risk_contract_version": null
     },
     {
       "instrument_id": "epds",
@@ -302,7 +310,9 @@
         "exact_translation_unverified"
       ],
       "scoring_contract_id": null,
-      "scoring_version": null
+      "scoring_version": null,
+      "risk_contract_id": null,
+      "risk_contract_version": null
     },
     {
       "instrument_id": "dass",
@@ -365,7 +375,9 @@
         "commercial_use_permission_not_confirmed"
       ],
       "scoring_contract_id": null,
-      "scoring_version": null
+      "scoring_version": null,
+      "risk_contract_id": null,
+      "risk_contract_version": null
     },
     {
       "instrument_id": "japs",
@@ -426,7 +438,9 @@
         "out_of_scope_for_depression_anxiety_catalog"
       ],
       "scoring_contract_id": null,
-      "scoring_version": null
+      "scoring_version": null,
+      "risk_contract_id": null,
+      "risk_contract_version": null
     },
     {
       "instrument_id": "stas",
@@ -480,7 +494,9 @@
         "category_name_mismatch_with_common_state_trait_anger_scale_identity"
       ],
       "scoring_contract_id": null,
-      "scoring_version": null
+      "scoring_version": null,
+      "risk_contract_id": null,
+      "risk_contract_version": null
     }
   ]
 }

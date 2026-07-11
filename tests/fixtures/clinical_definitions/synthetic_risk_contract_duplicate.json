@@ -1,0 +1,76 @@
+{
+  "id": "synthetic_risk_contract_dup_v1",
+  "version": "v1",
+  "lang": "ru",
+  "title": "Synthetic Risk Contract Check",
+  "description": "Полностью синтетическое определение для проверки риск-контракта. Не клинический инструмент, не реальные формулировки.",
+  "description_short": "2 нейтральных вопроса",
+  "category": "selfobs",
+  "status": "active",
+  "legal_status": "synthetic",
+  "result_policy": "no_score",
+  "contains_risk_items": true,
+  "clinical_instrument": {
+    "instrument_id": "synthetic_risk_scale",
+    "instrument_version": "v1",
+    "translation_id": "synrisk_ru_v1",
+    "administration_mode": "self_report",
+    "manifest_schema_version": 2,
+    "scoring_contract_id": "synthetic_linear_total",
+    "scoring_version": "1",
+    "risk_contract_id": "synthetic_crisis_route",
+    "risk_contract_version": "1"
+  },
+  "clinical_risk_contract": {
+    "contract_id": "synthetic_crisis_route",
+    "contract_version": "1",
+    "triggers": [
+      {
+        "item_id": "synthetic_item_2",
+        "answer_id": "synthetic_answer_crisis",
+        "action": "crisis"
+      },
+      {
+        "item_id": "synthetic_item_2",
+        "answer_id": "synthetic_answer_crisis",
+        "action": "crisis"
+      }
+    ]
+  },
+  "items": [
+    {
+      "id": "synthetic_item_1",
+      "text": "Синтетический нейтральный вопрос номер один.",
+      "options": [
+        {
+          "id": "answer_a",
+          "label": "вариант А",
+          "value": "0"
+        },
+        {
+          "id": "answer_b",
+          "label": "вариант Б",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "synthetic_item_2",
+      "text": "Синтетический нейтральный вопрос номер два.",
+      "risk_flag": true,
+      "options": [
+        {
+          "id": "synthetic_answer_plain",
+          "label": "нейтральный вариант",
+          "value": "0"
+        },
+        {
+          "id": "synthetic_answer_crisis",
+          "label": "синтетический маркерный вариант",
+          "value": "1",
+          "risk_flag": true
+        }
+      ]
+    }
+  ]
+}
