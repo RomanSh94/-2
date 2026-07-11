@@ -319,18 +319,18 @@
       "display_name_ru": "Шкалы депрессии, тревоги и стресса",
       "display_name_en": "Depression Anxiety Stress Scales",
       "catalog_category_id": "stress",
-      "questionnaire_definition_id": null,
+      "questionnaire_definition_id": "dass21_ru_fattakhov_2024",
       "abbreviation": "DASS",
       "instrument_family": "Depression Anxiety Stress Scales",
-      "version": null,
-      "identity_status": "family_identified_version_incomplete",
+      "version": "DASS-21",
+      "identity_status": "verified",
       "domain": "depression_anxiety_stress",
       "administration_mode": "self_report",
       "population": [
         "adult"
       ],
       "reference_period": "past_week",
-      "item_count": null,
+      "item_count": 21,
       "subscales": [
         "depression",
         "anxiety",
@@ -348,34 +348,118 @@
             "administration_mode"
           ],
           "notes": "Family identified. DASS-21 vs DASS-42 at the source page NOT verified; the two use different scoring conventions and are not interchangeable. Official terms historically permit free non-commercial clinical/research use but restrict commercial use."
+        },
+        {
+          "kind": "official_publisher",
+          "title": "Official UNSW DASS website: DASS questionnaire is in the public domain",
+          "url": "https://www2.psy.unsw.edu.au/dass/",
+          "accessed_at": "2026-07-11",
+          "supports": [
+            "identity",
+            "license"
+          ],
+          "notes": "'The DASS questionnaire is in the public domain, and may be downloaded from this website.'"
+        },
+        {
+          "kind": "license_terms",
+          "title": "Official UNSW DASS download page: forms may be downloaded and copied without restriction; scales may not be modified or sold for profit",
+          "url": "https://www2.psy.unsw.edu.au/dass/down.htm",
+          "accessed_at": "2026-07-11",
+          "supports": [
+            "digital_reproduction",
+            "commercial_use",
+            "translation_use"
+          ],
+          "notes": "Conditions honoured by X20: wording and scoring unmodified; DASS-21 not sold as a separate product and no separate per-test fee."
+        },
+        {
+          "kind": "official_publisher",
+          "title": "Official UNSW Russian translations page lists the Fattakhov translation of DASS and DASS21",
+          "url": "https://www2.psy.unsw.edu.au/dass/Russian/Russian.htm",
+          "accessed_at": "2026-07-11",
+          "supports": [
+            "identity",
+            "translation_use"
+          ],
+          "notes": "Exact PDF: I.M. Fattakhov, E.A. Gorobets, 2024 (Fattakhov_DASS-21_rus.pdf). LIMITATION: UNSW hosts third-party translations without assuring their adequacy/validity; translation quality is the translators' responsibility."
+        },
+        {
+          "kind": "official_publisher",
+          "title": "Official UNSW DASS overview: none of the DASS items refers to suicidal tendencies; DASS21 has 7 items per scale",
+          "url": "https://www2.psy.unsw.edu.au/dass/over.htm",
+          "accessed_at": "2026-07-11",
+          "supports": [
+            "identity",
+            "risk_item_metadata"
+          ],
+          "notes": "Basis for risk_item_metadata_status=verified with contains_risk_items=false and no risk contract."
+        },
+        {
+          "kind": "official_publisher",
+          "title": "Official UNSW DASS scoring template: subscale sums; for the 21-item version multiply sum by 2",
+          "url": "https://www2.psy.unsw.edu.au/dass/Download%20files/Dass_template.pdf",
+          "accessed_at": "2026-07-11",
+          "supports": [
+            "official_scoring"
+          ],
+          "notes": "Defines the S/A/D item assignment used by scoring contract dass21_official_subscales/unsw_template_v1."
         }
       ],
-      "translation_id": null,
+      "translation_id": "fattakhov_ru_2024",
       "rights": {
         "digital_reproduction": {
-          "status": "unknown",
-          "evidence": []
+          "status": "allowed",
+          "evidence": [
+            {
+              "kind": "license_terms",
+              "title": "Official UNSW DASS download page (public domain; no modification; not sold for profit)",
+              "url": "https://www2.psy.unsw.edu.au/dass/down.htm",
+              "accessed_at": "2026-07-11",
+              "supports": [
+                "digital_reproduction"
+              ]
+            }
+          ]
         },
         "commercial_use": {
-          "status": "permission_required",
-          "evidence": []
+          "status": "allowed_with_conditions",
+          "evidence": [
+            {
+              "kind": "license_terms",
+              "title": "Official UNSW DASS download page (public domain; no modification; not sold for profit)",
+              "url": "https://www2.psy.unsw.edu.au/dass/down.htm",
+              "accessed_at": "2026-07-11",
+              "supports": [
+                "commercial_use"
+              ],
+              "notes": "Allowed within the product; the scale itself is not modified, not sold for profit, and not charged per-test."
+            }
+          ]
         },
         "translation_use": {
-          "status": "unknown",
-          "evidence": []
+          "status": "allowed",
+          "evidence": [
+            {
+              "kind": "license_terms",
+              "title": "Official UNSW DASS download page (public domain; no modification; not sold for profit)",
+              "url": "https://www2.psy.unsw.edu.au/dass/down.htm",
+              "accessed_at": "2026-07-11",
+              "supports": [
+                "translation_use"
+              ],
+              "notes": "Fattakhov RU translation hosted on the official UNSW site; UNSW does not assure translation adequacy/validity."
+            }
+          ]
         }
       },
-      "activation_status": "blocked",
-      "public_catalog_visible": true,
-      "risk_item_metadata_status": "unverified",
+      "activation_status": "ready",
+      "public_catalog_visible": false,
+      "risk_item_metadata_status": "verified",
       "score_direction": "higher_more_severe",
       "trend_eligible": false,
-      "blockers": [
-        "exact_version_unconfirmed_dass21_vs_dass42",
-        "commercial_use_permission_not_confirmed"
-      ],
-      "scoring_contract_id": null,
-      "scoring_version": null,
+      "blockers": [],
+      "scoring_contract_id": "dass21_official_subscales",
+      "scoring_version": "unsw_template_v1",
       "risk_contract_id": null,
       "risk_contract_version": null
     },

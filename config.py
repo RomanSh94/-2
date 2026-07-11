@@ -44,3 +44,22 @@ USER_INVITE_ENABLED = (
     in ("1", "true", "yes", "on")
 )
 USER_INVITE_CODE = os.getenv("USER_INVITE_CODE", "").strip()
+
+# PR #55 — owner-only Russian DASS-21 (Fattakhov translation, official UNSW
+# source). Disabled by default; the real definition file lives OUTSIDE Git
+# (private_questionnaires/ is gitignored) and is integrity-pinned by SHA-256.
+# An empty/malformed hash, a missing file, a hash mismatch, or wrong metadata
+# inside the file all fail closed (see dass21_runtime.py) — there is never a
+# fallback to another DASS definition.
+DASS21_ENABLED = (
+    os.getenv("DASS21_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+DASS21_OWNER_ONLY = (
+    os.getenv("DASS21_OWNER_ONLY", "true").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+DASS21_DEFINITION_PATH = os.getenv(
+    "DASS21_DEFINITION_PATH",
+    "private_questionnaires/dass21_ru_fattakhov_2024.json").strip()
+DASS21_DEFINITION_SHA256 = os.getenv("DASS21_DEFINITION_SHA256", "").strip().lower()

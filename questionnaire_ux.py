@@ -456,3 +456,23 @@ def discuss_topic_prompt(title: str, score: int, max_score: int, intensity: str,
     return (f"Questionnaire: {title}\nResult: {score} / {max_score}\n"
             f"Intensity: {intensity}\nTopic: {topic_id}\n\n"
             f"{topic_line}\n\n{boundary}")
+
+
+def dass21_result_text(subscales, lang: str) -> str:
+    """PR #55 — owner-only DASS-21 completion screen: three numeric subscale
+    values ONLY. Deliberately no overall total, no cutoffs, no severity
+    labels, no probability, no diagnosis, no treatment plan, no LLM text."""
+    dep, anx, stress = subscales["depression"], subscales["anxiety"], subscales["stress"]
+    if lang == "en":
+        return (f"DASS-21 — self-report results\n\n"
+                f"Depression: {dep}\n"
+                f"Anxiety: {anx}\n"
+                f"Stress: {stress}\n\n"
+                "These are self-report results for the past week, not a diagnosis.\n"
+                "For clinical conclusions, please discuss the result with a specialist.")
+    return (f"DASS-21 — результаты самооценки\n\n"
+            f"Депрессия: {dep}\n"
+            f"Тревога: {anx}\n"
+            f"Стресс: {stress}\n\n"
+            "Это результаты самооценки за последнюю неделю, а не диагноз.\n"
+            "Для клинических выводов результат следует обсуждать со специалистом.")

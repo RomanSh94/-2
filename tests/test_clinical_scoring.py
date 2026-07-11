@@ -331,13 +331,18 @@ def test_clinician_rated_definition_denied():
                                                _registry_with_scorer())
 
 
-def test_no_real_manifest_instrument_ready_or_scorer_mapped():
+def test_only_dass_ready_and_scorer_mapped():
+    # PR #55: dass is the single ready + scorer-mapped entry (exact pinned
+    # scorer dass21_official_subscales/unsw_template_v1); no other real
+    # instrument is ready or scorer-mapped.
     doc = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-    ready = [x for x in doc["instruments"] if x.get("activation_status") == "ready"]
-    mapped = [x for x in doc["instruments"]
+    ready = [x["instrument_id"] for x in doc["instruments"]
+             if x.get("activation_status") == "ready"]
+    mapped = [(x["instrument_id"], x.get("scoring_contract_id"),
+               x.get("scoring_version")) for x in doc["instruments"]
               if x.get("scoring_contract_id") or x.get("scoring_version")]
-    assert ready == []
-    assert mapped == []
+    assert ready == ["dass"]
+    assert mapped == [("dass", "dass21_official_subscales", "unsw_template_v1")]
 
 
 def test_no_named_real_scorer_registered_by_default():
