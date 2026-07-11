@@ -415,3 +415,29 @@ def test_qdid_punctuation_outside_token_policy_rejected():
 def test_qdid_valid_token_charset_accepted():
     cat.validate_instrument_metadata(
         _minimal_valid(questionnaire_definition_id="zung_sds_ru-verified_v1"))
+
+
+# ── PR #53: scoring-contract token fields (nullable, callback/URL-safe) ───────
+def test_scoring_tokens_null_accepted_on_nonready_entry():
+    cat.validate_instrument_metadata(
+        _minimal_valid(scoring_contract_id=None, scoring_version=None))
+
+
+def test_scoring_contract_id_bad_charset_rejected():
+    for bad in ("has space", "has:colon", "цирилл", "dot.ted", "a" * 65):
+        with pytest.raises(cat.InstrumentManifestError):
+            cat.validate_instrument_metadata(_minimal_valid(scoring_contract_id=bad))
+
+
+def test_scoring_version_bad_charset_rejected():
+    for bad in ("1 2", "v:1", "", "  "):
+        with pytest.raises(cat.InstrumentManifestError):
+            cat.validate_instrument_metadata(_minimal_valid(scoring_version=bad))
+
+
+def test_scoring_tokens_valid_charset_accepted():
+    cat.validate_instrument_metadata(
+        _minimal_valid(scoring_contract_id="synthetic_linear_total-v1",
+                       scoring_version="1"))
+    # (ready-level "both scoring tokens required" is covered end-to-end in
+    # tests/test_clinical_scoring.py::test_ready_manifest_requires_scoring_contract_and_version)
