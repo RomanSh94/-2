@@ -30,6 +30,7 @@ import access_control as ac
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 MANIFEST_PATH = REPO_ROOT / "clinical_instruments_manifest.json"
 FIXTURE_DIR = pathlib.Path(__file__).parent / "fixtures" / "registry"
+_EMPTY_MANIFEST = {"schema_version": 2, "instruments": []}
 
 
 def _document():
@@ -192,6 +193,12 @@ class _FakeRegistry:
     def can_start(self, qid):
         return qid in self._startable
 
+    def combined_can_start(self, qid, manifest_document):
+        # Stand-in for the full registry composition: this fake represents a
+        # definition that is fully startable (Core + clinical linkage) when it
+        # is in the startable set.
+        return qid in self._startable
+
     def get(self, qid):
         return {"id": qid, "version": "v1"}
 
@@ -207,6 +214,7 @@ def _ready_item(**over):
         "catalog_category_id": "anxiety",
         "abbreviation": "SYN",
         "version": "v1",
+        "translation_id": "syn_ru_v1",
         "identity_status": "verified",
         "domain": "anxiety",
         "administration_mode": "self_report",
@@ -235,7 +243,7 @@ def test_ready_manifest_without_definition_does_not_start():
     # matching definition -> no start id.
     item = _ready_item()
     assert cat.can_activate_instrument(item) is True   # manifest side is clear
-    assert cat.catalog_start_definition_id(item, _FakeRegistry(set())) is None
+    assert cat.catalog_start_definition_id(item, _FakeRegistry(set()), _EMPTY_MANIFEST) is None
 
 
 def test_valid_definition_without_ready_manifest_does_not_start():
@@ -243,7 +251,7 @@ def test_valid_definition_without_ready_manifest_does_not_start():
     assert cat.can_activate_instrument(blocked) is False
     # Registry would happily start it, but the manifest gate is closed.
     assert cat.catalog_start_definition_id(
-        blocked, _FakeRegistry({"synthetic_ready_def_v1"})) is None
+        blocked, _FakeRegistry({"synthetic_ready_def_v1"}), _EMPTY_MANIFEST) is None
 
 
 def test_ready_manifest_without_questionnaire_definition_id_has_no_start_button():
@@ -252,28 +260,28 @@ def test_ready_manifest_without_questionnaire_definition_id_has_no_start_button(
     no_mapping = _ready_item(questionnaire_definition_id=None)
     assert cat.can_activate_instrument(no_mapping) is False
     assert cat.catalog_start_definition_id(
-        no_mapping, _FakeRegistry({"synthetic_ready_def_v1"})) is None
+        no_mapping, _FakeRegistry({"synthetic_ready_def_v1"}), _EMPTY_MANIFEST) is None
 
 
 def test_definition_mapping_is_not_inferred_from_instrument_id():
     item = _ready_item()  # instrument_id=synthetic_ready, def id=synthetic_ready_def_v1
     # Registry knows only the FAMILY id -> not startable (mapping not inferred).
-    assert cat.catalog_start_definition_id(item, _FakeRegistry({"synthetic_ready"})) is None
+    assert cat.catalog_start_definition_id(item, _FakeRegistry({"synthetic_ready"}), _EMPTY_MANIFEST) is None
     # Registry knows the EXPLICIT definition id -> that exact id is returned.
     assert cat.catalog_start_definition_id(
-        item, _FakeRegistry({"synthetic_ready_def_v1"})) == "synthetic_ready_def_v1"
+        item, _FakeRegistry({"synthetic_ready_def_v1"}), _EMPTY_MANIFEST) == "synthetic_ready_def_v1"
 
 
 def test_ready_mapping_missing_from_registry_has_no_start_button():
     item = _ready_item()
-    assert cat.catalog_start_definition_id(item, _FakeRegistry(set())) is None
+    assert cat.catalog_start_definition_id(item, _FakeRegistry(set()), _EMPTY_MANIFEST) is None
 
 
 def test_start_requires_manifest_and_definition_both_ready():
     item = _ready_item()
     # All gates true -> the explicit definition id is returned for the button.
     assert cat.catalog_start_definition_id(
-        item, _FakeRegistry({"synthetic_ready_def_v1"})) == "synthetic_ready_def_v1"
+        item, _FakeRegistry({"synthetic_ready_def_v1"}), _EMPTY_MANIFEST) == "synthetic_ready_def_v1"
 
 
 # ── blocked / info-only instruments create no session ────────────────────────
@@ -449,7 +457,7 @@ def test_q_i_is_permanently_read_only_even_when_synthetic_item_is_ready(monkeypa
     # it may only render a "Пройти" button routing to the existing q:d flow.
     monkeypatch.setattr(bot, "_load_catalog_document", lambda: _ready_catalog_document())
     monkeypatch.setattr(bot, "_load_registry_fresh",
-                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}))
+                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}), _EMPTY_MANIFEST)
     msg = _press_info(1, "synthetic_ready")
     assert _sessions_for(1) == []  # no session created by q:i
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
@@ -465,7 +473,7 @@ def test_q_i_never_calls_start_questionnaire_session(monkeypatch):
     monkeypatch.setattr(bot, "start_questionnaire_session", _boom)
     monkeypatch.setattr(bot, "_load_catalog_document", lambda: _ready_catalog_document())
     monkeypatch.setattr(bot, "_load_registry_fresh",
-                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}))
+                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}), _EMPTY_MANIFEST)
     _press_info(1, "synthetic_ready")
     assert _sessions_for(1) == []
 
@@ -476,14 +484,14 @@ def test_q_i_never_calls_send_questionnaire_step(monkeypatch):
     monkeypatch.setattr(bot, "_send_questionnaire_step", _boom)
     monkeypatch.setattr(bot, "_load_catalog_document", lambda: _ready_catalog_document())
     monkeypatch.setattr(bot, "_load_registry_fresh",
-                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}))
+                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}), _EMPTY_MANIFEST)
     _press_info(1, "synthetic_ready")
 
 
 def test_available_item_renders_existing_q_d_start_button(monkeypatch):
     monkeypatch.setattr(bot, "_load_catalog_document", lambda: _ready_catalog_document())
     monkeypatch.setattr(bot, "_load_registry_fresh",
-                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}))
+                        lambda: _FakeRegistry({"synthetic_ready_def_v1"}), _EMPTY_MANIFEST)
     msg = _press_info(1, "synthetic_ready")
     texts = [t for t, _ in _buttons(msg.answers[-1][1])]
     assert any("Пройти" in t or "Start" in t for t in texts)
@@ -560,3 +568,20 @@ def test_no_second_reachable_questionnaire_category_source():
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
     expected = [f"q:c:{key}" for key, _, _ in questionnaire_ux.CATALOG_CATEGORIES] + ["menu:back"]
     assert datas == expected
+
+
+# ── §4.2 catalog_start_definition_id is the single combined gate ──────────────
+class _RejectingRegistry:
+    """combined_can_start always False -- proves the helper itself refuses to
+    return an id when the clinical/combined gate fails, so bot.py needs no
+    second authorization check."""
+    def combined_can_start(self, qid, manifest_document):
+        return False
+
+
+def test_catalog_start_definition_id_none_when_combined_gate_fails():
+    item = _ready_item()  # manifest side fully activatable
+    assert cat.can_activate_instrument(item) is True
+    # But the registry's combined gate refuses -> no start id.
+    assert cat.catalog_start_definition_id(
+        item, _RejectingRegistry(), _EMPTY_MANIFEST) is None

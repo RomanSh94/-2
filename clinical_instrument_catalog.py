@@ -26,8 +26,16 @@ Schema v2 design decisions (v6 governance corrections):
 Not integrated into bot.py in this PR.
 """
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+# questionnaire_definition_id is embedded into `q:d:<id>` callback_data. Telegram
+# caps callback_data at 64 BYTES (UTF-8), so we bound the WHOLE callback, not
+# just the id, and restrict to an ASCII stable-token charset (no colon, no
+# whitespace, no non-ASCII/punctuation that could break parsing or exceed the
+# byte budget).
+QUESTIONNAIRE_DEFINITION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _VALID_ADMINISTRATION_MODES = {"self_report", "clinician_rated", "unknown"}
 # UI catalog category placement (distinct from `domain`: e.g. DASS is domain
@@ -87,12 +95,23 @@ def validate_manifest_document(document: dict) -> None:
         raise InstrumentManifestError("manifest must contain a non-empty 'instruments' array")
 
     seen_ids: set[str] = set()
+    seen_ready_definition_ids: set[str] = set()
     for item in instruments:
         validate_instrument_metadata(item)
         iid = item["instrument_id"]
         if iid in seen_ids:
             raise InstrumentManifestError(f"duplicate instrument_id: {iid!r}")
         seen_ids.add(iid)
+        # No two `ready` entries may map to the same private definition id --
+        # an ambiguous ready mapping is rejected at the document level so the
+        # linkage bridge can trust that a ready definition id resolves to
+        # exactly one instrument.
+        if item.get("activation_status") == "ready":
+            qdid = item.get("questionnaire_definition_id")
+            if qdid in seen_ready_definition_ids:
+                raise InstrumentManifestError(
+                    f"duplicate ready questionnaire_definition_id: {qdid!r}")
+            seen_ready_definition_ids.add(qdid)
 
 
 def _validate_rights(instrument_id: str, item: dict) -> None:
@@ -206,10 +225,23 @@ def validate_instrument_metadata(item: dict) -> None:
     # for blocked/metadata-only entries; a `ready` entry MUST carry a
     # non-empty one (see the ready-rules block below).
     qdid = item.get("questionnaire_definition_id")
-    if qdid is not None and (not isinstance(qdid, str) or not qdid.strip()):
-        raise InstrumentManifestError(
-            f"{instrument_id}: questionnaire_definition_id must be a non-empty "
-            f"string or null, got {qdid!r}")
+    if qdid is not None:
+        if not isinstance(qdid, str) or not qdid.strip():
+            raise InstrumentManifestError(
+                f"{instrument_id}: questionnaire_definition_id must be a non-empty "
+                f"string or null, got {qdid!r}")
+        # Callback-safe stable token: ASCII [A-Za-z0-9_-] only (no colon, no
+        # whitespace, no non-ASCII/punctuation) AND the full `q:d:<id>`
+        # callback_data must fit Telegram's 64-BYTE limit (UTF-8).
+        if not QUESTIONNAIRE_DEFINITION_ID_RE.fullmatch(qdid):
+            raise InstrumentManifestError(
+                f"{instrument_id}: questionnaire_definition_id must match "
+                f"{QUESTIONNAIRE_DEFINITION_ID_RE.pattern} (ASCII letters/digits/_/-): "
+                f"{qdid!r}")
+        if len(f"q:d:{qdid}".encode("utf-8")) > 64:
+            raise InstrumentManifestError(
+                f"{instrument_id}: questionnaire_definition_id too long -- the whole "
+                f"q:d:<id> callback must be <=64 bytes: {qdid!r}")
 
     _validate_rights(instrument_id, item)
     _validate_evidence(instrument_id, item)
@@ -265,6 +297,10 @@ def validate_instrument_metadata(item: dict) -> None:
             raise InstrumentManifestError(
                 f"{instrument_id}: ready requires an explicit non-empty "
                 "questionnaire_definition_id (never inferred from instrument_id)")
+        if not item.get("translation_id") or not str(item.get("translation_id")).strip():
+            raise InstrumentManifestError(
+                f"{instrument_id}: ready requires an explicit non-empty "
+                "translation_id (exact approved translation must be pinned)")
 
 
 def can_activate_instrument(item: dict) -> bool:
@@ -394,7 +430,7 @@ def get_catalog_instrument(document: dict, instrument_id: str) -> CatalogInstrum
     return None
 
 
-def catalog_start_definition_id(item: dict, registry) -> str | None:
+def catalog_start_definition_id(item: dict, registry, manifest_document) -> str | None:
     """Availability double-gate for FUTURE activation, expressed as BUTTON
     VISIBILITY rather than start execution. Returns the EXPLICIT
     questionnaire_definition_id to route a "Start" button at — but ONLY when
@@ -403,17 +439,20 @@ def catalog_start_definition_id(item: dict, registry) -> str | None:
       (a) can_activate_instrument(item) is True   (manifest fully cleared), AND
       (b) item carries an explicit non-empty questionnaire_definition_id
           (never inferred from instrument_id), AND
-      (c) that definition exists in the registry and registry.can_start(it)
-          returns True.
+      (c) the registry's COMBINED clinical gate passes for that definition id
+          against this SAME fresh manifest_document — i.e. the Core can_start
+          AND the clinical linkage is VALID.
 
-    Otherwise returns None -> no start button, information screen only, no
-    session, no answers. This function NEVER creates a session or starts a
-    questionnaire itself: it only tells the UI which existing q:d/q:s
-    definition id (if any) a Start button may point at. Those existing
-    handlers remain the ONLY code that creates sessions.
+    This centralizes the whole authorization here: a caller (bot.py) never has
+    to repeat a second combined check after this returns. Otherwise returns
+    None -> no start button, information screen only, no session, no answers.
+    This function NEVER creates a session or starts a questionnaire itself: it
+    only tells the UI which existing q:d/q:s definition id (if any) a Start
+    button may point at. Those existing handlers remain the ONLY code that
+    creates sessions.
 
     Never returns non-None in this PR (no manifest entry is 'ready'). `registry`
-    is duck-typed (anything exposing can_start) to avoid coupling this
+    is duck-typed (anything exposing combined_can_start) to avoid coupling this
     governance module to questionnaires.py."""
     if not can_activate_instrument(item):
         return None
@@ -423,7 +462,7 @@ def catalog_start_definition_id(item: dict, registry) -> str | None:
     if registry is None:
         return None
     try:
-        if registry.can_start(definition_id):
+        if registry.combined_can_start(definition_id, manifest_document):
             return definition_id
     except Exception:
         return None

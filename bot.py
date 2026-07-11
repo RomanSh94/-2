@@ -101,6 +101,7 @@ from database import (
 import questionnaires
 import questionnaire_ux
 import clinical_instrument_catalog
+import clinical_definition_validator
 import navigation
 import emotion_map
 
@@ -2008,8 +2009,15 @@ async def cb_questionnaire_category(callback: CallbackQuery):
     # (blocked at start/answer time too).
     if category == "self_observation":
         registry = _load_registry_fresh()
+        # Ordinary nonclinical self-observation surface ONLY. A definition
+        # carrying clinical_instrument metadata must never appear here even if
+        # it is (accidentally or maliciously) tagged category="selfobs" -- it
+        # is reachable only through the manifest-driven clinical catalog after
+        # all combined gates pass. Exclude any clinical-metadata-bearing
+        # definition, in addition to the existing category + restricted filter.
         definitions = [d for d in registry.list_active("selfobs")
-                       if d.get("legal_status") != "restricted"]
+                       if d.get("legal_status") != "restricted"
+                       and not isinstance(d.get("clinical_instrument"), dict)]
         if not definitions:
             await callback.message.answer(
                 questionnaire_ux.catalog_empty_text(category, lang),
@@ -2064,8 +2072,13 @@ async def cb_questionnaire_info(callback: CallbackQuery):
         raw = next((i for i in document.get("instruments", [])
                     if i.get("instrument_id") == instrument_id), None)
         if raw is not None:
+            # catalog_start_definition_id now performs the FULL combined gate
+            # (manifest activatable + Core can_start + clinical linkage VALID)
+            # against this same fresh manifest `document` -- no second
+            # authorization check is needed here. Fails closed to no button;
+            # q:i stays read-only regardless.
             start_definition_id = clinical_instrument_catalog.catalog_start_definition_id(
-                raw, _load_registry_fresh())
+                raw, _load_registry_fresh(), document)
 
     await callback.message.answer(
         questionnaire_ux.instrument_info_text(ci, lang),
@@ -2091,6 +2104,18 @@ async def cb_questionnaire_detail(callback: CallbackQuery):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
+    # Clinical definitions (carrying clinical_instrument metadata OR mapped by a
+    # manifest entry) must additionally pass the FRESH combined manifest-linkage
+    # gate before their detail/start screen renders. Ordinary nonclinical
+    # definitions are unaffected (validation returns NOT_CLINICAL). No internal
+    # reason is ever disclosed -- same neutral not_available_text.
+    manifest_document = _load_catalog_document()
+    validation = registry.get_clinical_validation(qid, manifest_document)
+    if (validation.status != clinical_definition_validator.ClinicalDefinitionStatus.NOT_CLINICAL
+            and not registry.combined_can_start(qid, manifest_document)):
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
     await callback.message.answer(questionnaire_ux.detail_text(definition, lang),
                                   reply_markup=_questionnaire_detail_keyboard(qid, lang))
     await callback.answer()
@@ -2108,10 +2133,15 @@ async def cb_questionnaire_start(callback: CallbackQuery):
         return
     qid = parts[2]
     registry = _load_registry_fresh()
-    if not registry.can_start(qid):
+    manifest_document = _load_catalog_document()
+    if not registry.combined_can_start(qid, manifest_document):
         # Covers: unknown id, draft, archived, restricted, or an invalid
-        # (schema-broken/risk-bearing) definition -- all fail closed with the
-        # SAME neutral message, never distinguishing the internal reason.
+        # (schema-broken/risk-bearing) definition -- AND, for a clinical /
+        # manifest-linked definition, any non-VALID linkage (blocked/demoted
+        # manifest, mapping/version/translation mismatch). All fail closed with
+        # the SAME neutral message, never distinguishing the internal reason.
+        # Ordinary nonclinical definitions behave exactly as before (combined
+        # returns can_start for NOT_CLINICAL; a missing manifest is harmless).
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
@@ -2179,7 +2209,8 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
     if callback_step != session["current_index"]:
         registry = _load_registry_fresh()
         definition = registry.get(session["questionnaire_id"])
-        if definition is None or not registry.can_answer(session["questionnaire_id"]):
+        if definition is None or not registry.combined_can_answer(
+                session["questionnaire_id"], _load_catalog_document()):
             await callback.message.answer(questionnaire_ux.not_available_text(lang))
             await callback.answer()
             return
@@ -2195,7 +2226,11 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
     # session start and a later answer (archived/draft/restricted/schema
     # invalidated) -- fail closed: don't save, don't advance, end gracefully.
     registry = _load_registry_fresh()
-    if not registry.can_answer(session["questionnaire_id"]):
+    # Fresh combined re-check: Core validity AND (for clinical/manifest-linked
+    # definitions) a still-VALID manifest linkage. A mid-session manifest
+    # demotion / mapping change / version or translation change fails closed
+    # here -- no answer saved, no advance, neutral message, no reason disclosed.
+    if not registry.combined_can_answer(session["questionnaire_id"], _load_catalog_document()):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
@@ -2246,8 +2281,15 @@ async def cb_questionnaire_back(callback: CallbackQuery):
         await callback.answer()
         return
 
+    # Back changes persisted session state (current_index), so for a clinical/
+    # manifest-linked session it must pass the FRESH combined gate (Core
+    # can_answer AND still-VALID linkage) before moving. A mid-session manifest
+    # demotion / mapping / version / translation change fails closed here: no
+    # backward movement, session stays active, neutral message, no reason
+    # disclosed. Ordinary nonclinical sessions behave exactly as before
+    # (combined returns can_answer for NOT_CLINICAL).
     registry = _load_registry_fresh()
-    if not registry.can_answer(session["questionnaire_id"]):
+    if not registry.combined_can_answer(session["questionnaire_id"], _load_catalog_document()):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
