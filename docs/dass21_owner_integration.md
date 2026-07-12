@@ -84,3 +84,22 @@ no cutoffs, no severity labels, no diagnosis, no LLM involvement, and no score
 persistence** (recomputed from owned stored responses on the completion
 screen). Scoring runs through `clinical_scoring.score_validated_clinical_definition`
 with an explicit registry containing only `Dass21Scorer`.
+
+## Invited-user access (PR #59)
+
+Authorization is split in two layers:
+
+- `dass21_runtime.dass21_integrity_status()` — pure, user-independent:
+  feature flag, config sanity (`DASS21_OWNER_ONLY=false` fails closed for
+  everyone), SHA-256 pin, file, exact identity/shape.
+- `dass21_access.authorize_dass21_user(user_id)` — async product gate:
+  **owner** (always, while integrity holds) OR **active invited user**
+  (existing `user_access` row) behind `DASS21_INVITED_USERS_ENABLED`
+  (default `false`). `/dass21` never grants access; decisions are fresh on
+  every entry/callback/result, so revoking access blocks the next
+  write/back/result while Cancel stays available.
+
+Conditional visibility: when the rollout flag is on, an authorized user sees
+a DASS-21 entry in the «Стресс» catalog section (per-user; never globally
+public — `public_catalog_visible` stays `false`). The owner keeps the direct
+`/dass21` command regardless of catalog visibility.

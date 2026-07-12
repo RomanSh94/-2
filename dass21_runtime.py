@@ -85,22 +85,21 @@ def _definition_shape_ok(d: dict) -> bool:
     return True
 
 
-def dass21_runtime_status(user_id) -> Dass21RuntimeStatus:
-    """FRESH gate: feature flag -> owner -> hash pin -> file -> hash ->
-    definition identity/shape. Reason codes are internal only — callers show
-    the user the SAME neutral unavailable text for every code."""
+def dass21_integrity_status() -> Dass21RuntimeStatus:
+    """PURE, user-independent integrity gate (PR #59 split): feature flag ->
+    config sanity -> hash pin -> file -> hash -> definition identity/shape.
+    WHO may use DASS is decided separately by dass21_access.authorize_dass21_
+    user (owner OR active invited user behind the rollout flag) -- this
+    function never authorizes anyone by itself. Reason codes are internal
+    only; users always see the same neutral unavailable text."""
     if not config.DASS21_ENABLED:
         return Dass21RuntimeStatus(False, "disabled")
-    # HARD owner-only boundary (production canary rule): access ALWAYS
-    # requires the single existing access_control.OWNER_USER_ID. The
-    # DASS21_OWNER_ONLY env var is retained for forward compatibility only --
-    # setting it false NEVER broadens access (fails closed instead); opening
-    # DASS to invited ordinary users requires a later explicit PR.
+    # Config-sanity hard boundary (kept from the PR #55 canary rule):
+    # DASS21_OWNER_ONLY=false NEVER broadens access -- it fails closed for
+    # everyone. Invited-user access is opened ONLY via the separate
+    # DASS21_INVITED_USERS_ENABLED rollout flag (see dass21_access).
     if not config.DASS21_OWNER_ONLY:
         return Dass21RuntimeStatus(False, "owner-only-cannot-be-disabled")
-    if (access_control.OWNER_USER_ID is None
-            or user_id != access_control.OWNER_USER_ID):
-        return Dass21RuntimeStatus(False, "not-owner")
     pinned = (config.DASS21_DEFINITION_SHA256 or "").strip().lower()
     if not _SHA256_RE.fullmatch(pinned):
         return Dass21RuntimeStatus(False, "hash-pin-missing-or-malformed")
@@ -117,4 +116,17 @@ def dass21_runtime_status(user_id) -> Dass21RuntimeStatus:
         return Dass21RuntimeStatus(False, "definition-unparseable")
     if not isinstance(definition, dict) or not _definition_shape_ok(definition):
         return Dass21RuntimeStatus(False, "definition-identity-mismatch")
+    return Dass21RuntimeStatus(True, "ok")
+
+
+def dass21_runtime_status(user_id) -> Dass21RuntimeStatus:
+    """Backward-compatible owner-scoped gate: integrity AND exact owner.
+    Retained for the owner-only fast path and existing tests; the product
+    authorization surface (owner OR invited) lives in dass21_access."""
+    status = dass21_integrity_status()
+    if not status.available:
+        return status
+    if (access_control.OWNER_USER_ID is None
+            or user_id != access_control.OWNER_USER_ID):
+        return Dass21RuntimeStatus(False, "not-owner")
     return Dass21RuntimeStatus(True, "ok")

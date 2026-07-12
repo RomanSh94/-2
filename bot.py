@@ -106,6 +106,7 @@ import clinical_instrument_catalog
 import clinical_definition_validator
 import clinical_scoring
 import dass21_runtime
+import dass21_access
 import dass21_scorer
 import navigation
 import emotion_map
@@ -1958,15 +1959,18 @@ async def _send_questionnaire_result(send, definition: dict, session_id: int, la
               reply_markup=_questionnaire_result_keyboard(session_id, lang))
 
 
-def _dass21_blocked(qid, uid: int) -> bool:
-    """PR #55 — extra FRESH gate for the exact owner-only DASS-21 definition:
-    feature flag + owner + file hash + identity, re-checked on every touch (no
-    cached authorization). Non-DASS definitions are never affected. Failure is
-    neutral: callers show the same not_available_text as every other refusal,
-    never disclosing whether the feature exists."""
+async def _dass21_blocked(qid, uid: int) -> bool:
+    """PR #55/#59 — extra FRESH gate for the exact DASS-21 definition:
+    integrity (feature flag + file hash + identity) AND product authorization
+    (owner OR active invited user behind DASS21_INVITED_USERS_ENABLED),
+    re-checked on every touch -- no cached authorization, so revoking an
+    invited user's access blocks the very next write/back/result. Non-DASS
+    definitions are never affected. Failure is neutral: callers show the same
+    not_available_text as every other refusal."""
     if not dass21_runtime.is_dass21_definition_id(qid):
         return False
-    return not dass21_runtime.dass21_runtime_status(uid).available
+    decision = await dass21_access.authorize_dass21_user(uid)
+    return not decision.allowed
 
 
 async def _send_dass21_result(send, definition: dict, session_id: int, lang: str) -> None:
@@ -1982,7 +1986,8 @@ async def _send_dass21_result(send, definition: dict, session_id: int, lang: str
         # completed until every step succeeds.
         session = await get_questionnaire_session(session_id)
         uid = session["user_id"]
-        if not dass21_runtime.dass21_runtime_status(uid).available:
+        decision = await dass21_access.authorize_dass21_user(uid)
+        if not decision.allowed:
             await send(questionnaire_ux.not_available_text(lang))
             return
         rows = await get_questionnaire_responses(session_id)
@@ -2109,7 +2114,7 @@ async def cmd_dass21(message: Message):
     if not await _questionnaire_gate(message, uid, lang):
         return
     qid = dass21_runtime.DASS21_DEFINITION_ID
-    if _dass21_blocked(qid, uid):
+    if await _dass21_blocked(qid, uid):
         await message.answer(questionnaire_ux.not_available_text(lang))
         return
     registry = _load_registry_fresh()
@@ -2159,15 +2164,32 @@ async def cb_questionnaire_category(callback: CallbackQuery):
         instruments = (
             clinical_instrument_catalog.catalog_instruments_by_category(document, category)
             if document is not None else ())
-        if not instruments:
+        # PR #59 — PER-USER conditional DASS entry under "Стресс". Shown ONLY
+        # when the invited rollout flag is on AND this exact user is
+        # authorized (owner or active invited). DASS never becomes globally
+        # public: public_catalog_visible stays false, unknown/blocked users
+        # see nothing, and the q:d/q:s/q:a/q:b gates re-authorize anyway.
+        extra_rows = []
+        if (category == "stress" and config.DASS21_INVITED_USERS_ENABLED):
+            decision = await dass21_access.authorize_dass21_user(uid)
+            if decision.allowed:
+                extra_rows.append([InlineKeyboardButton(
+                    text=("DASS-21 — депрессия, тревога, стресс" if lang == "ru"
+                          else "DASS-21 — depression, anxiety, stress"),
+                    callback_data=f"q:d:{dass21_runtime.DASS21_DEFINITION_ID}")])
+        if not instruments and not extra_rows:
             await callback.message.answer(
                 questionnaire_ux.catalog_empty_text(category, lang),
                 reply_markup=_catalog_nav_only_keyboard(lang))
             await callback.answer()
             return
+        keyboard = _catalog_manifest_category_keyboard(instruments, lang)
+        if extra_rows:
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=extra_rows + keyboard.inline_keyboard)
         await callback.message.answer(
             questionnaire_ux.catalog_category_text(category, lang),
-            reply_markup=_catalog_manifest_category_keyboard(instruments, lang))
+            reply_markup=keyboard)
         await callback.answer()
         return
 
@@ -2295,7 +2317,7 @@ async def cb_questionnaire_detail(callback: CallbackQuery):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
-    if _dass21_blocked(qid, uid):
+    if await _dass21_blocked(qid, uid):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
@@ -2328,7 +2350,7 @@ async def cb_questionnaire_start(callback: CallbackQuery):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
-    if _dass21_blocked(qid, uid):
+    if await _dass21_blocked(qid, uid):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
@@ -2399,7 +2421,7 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
         if (definition is None
                 or not registry.combined_can_answer(
                     session["questionnaire_id"], _load_catalog_document())
-                or _dass21_blocked(session["questionnaire_id"], uid)):
+                or await _dass21_blocked(session["questionnaire_id"], uid)):
             await callback.message.answer(questionnaire_ux.not_available_text(lang))
             await callback.answer()
             return
@@ -2420,7 +2442,7 @@ async def cb_questionnaire_answer(callback: CallbackQuery):
     # demotion / mapping change / version or translation change fails closed
     # here -- no answer saved, no advance, neutral message, no reason disclosed.
     if (not registry.combined_can_answer(session["questionnaire_id"], _load_catalog_document())
-            or _dass21_blocked(session["questionnaire_id"], uid)):
+            or await _dass21_blocked(session["questionnaire_id"], uid)):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
@@ -2478,7 +2500,7 @@ async def cb_questionnaire_back(callback: CallbackQuery):
     # (combined returns can_answer for NOT_CLINICAL).
     registry = _load_registry_fresh()
     if (not registry.combined_can_answer(session["questionnaire_id"], _load_catalog_document())
-            or _dass21_blocked(session["questionnaire_id"], uid)):
+            or await _dass21_blocked(session["questionnaire_id"], uid)):
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
