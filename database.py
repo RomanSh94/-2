@@ -9,6 +9,7 @@ Tables:
   ab_assignments
 """
 import aiosqlite, sqlite3, json
+import logging
 from datetime import datetime, timezone
 
 DB = "x20.db"
@@ -409,10 +410,44 @@ async def _apply_migrations(db) -> None:
             await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
+async def _migrate_questionnaire_response_uniqueness(db) -> None:
+    """PR #58 -- enforce the invariant UNIQUE(session_id, item_id): one CURRENT
+    answer per item per session. Two idempotent steps, safe to rerun on every
+    boot (same convention as _apply_migrations), inside init_db's transaction:
+
+    1. Deterministic dedupe of legacy duplicates (produced by the pre-#58
+       Back->revise INSERT bug): per (session_id, item_id) group keep ONLY the
+       row with the highest primary-key id -- the most recent answer, since id
+       is AUTOINCREMENT and a replacement always happened later. Older
+       duplicate rows are removed; distinct items, other sessions, sessions
+       themselves and current_index are untouched.
+    2. Create the UNIQUE index so a duplicate can never be inserted again
+       (record_questionnaire_response upserts through this constraint).
+
+    Logs only aggregate counts -- never response values or user ids."""
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM questionnaire_responses WHERE id NOT IN ("
+        "  SELECT MAX(id) FROM questionnaire_responses"
+        "  GROUP BY session_id, item_id)")
+    stale = (await cur.fetchone())[0]
+    if stale:
+        await db.execute(
+            "DELETE FROM questionnaire_responses WHERE id NOT IN ("
+            "  SELECT MAX(id) FROM questionnaire_responses"
+            "  GROUP BY session_id, item_id)")
+        logging.info(
+            "questionnaire_responses dedupe: removed %d older duplicate row(s)",
+            stale)
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_qresponses_session_item "
+        "ON questionnaire_responses(session_id, item_id)")
+
+
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.executescript(SCHEMA)
         await _apply_migrations(db)
+        await _migrate_questionnaire_response_uniqueness(db)
         await db.commit()
 
 # ── Users ─────────────────────────────────────────────────────────────────────
@@ -1500,11 +1535,26 @@ async def get_questionnaire_session(session_id: int) -> dict | None:
 
 async def record_questionnaire_response(uid: int, session_id: int, questionnaire_id: str,
                                         item_id: str, answer_id: str, answer_value: str) -> None:
+    # Idempotent per (session_id, item_id): re-answering an item -- e.g. after
+    # pressing Back to REVISE an earlier answer -- must REPLACE the prior row,
+    # not append a second one. A duplicate row would (a) inflate the generic
+    # sum score and (b) make the exact clinical scorer (DASS) reject the
+    # session as having a duplicate item, so it could never complete. A single
+    # atomic UPSERT through the UNIQUE(session_id, item_id) index (created in
+    # _migrate_questionnaire_response_uniqueness): no delete/insert window, no
+    # answer loss on failure, race-safe under interleaved callbacks. Immutable
+    # identity (user_id/session_id/questionnaire_id/item_id) is never updated.
+    # Single-timestamp rule: answered_at reflects the LATEST answer time.
+    # The stale-step guard in bot.py remains the step-level protection.
     async with aiosqlite.connect(DB) as db:
         await db.execute(
             "INSERT INTO questionnaire_responses "
             "(user_id, session_id, questionnaire_id, item_id, answer_id, answer_value) "
-            "VALUES (?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(session_id, item_id) DO UPDATE SET "
+            "  answer_id = excluded.answer_id, "
+            "  answer_value = excluded.answer_value, "
+            "  answered_at = datetime('now')",
             (uid, session_id, questionnaire_id, item_id, answer_id, answer_value))
         await db.commit()
 
