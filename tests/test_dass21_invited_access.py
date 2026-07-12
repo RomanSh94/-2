@@ -175,12 +175,14 @@ def _neutral():
 
 # ── flags / access ────────────────────────────────────────────────────────────
 def test_invited_rollout_defaults_false():
-    import importlib, os
-    assert os.getenv("DASS21_INVITED_USERS_ENABLED") is None or True
-    # the config parser itself: unset -> False (validated at import in prod;
-    # here assert the documented default literal)
-    src = pathlib.Path("config.py").read_text(encoding="utf-8")
-    assert 'os.getenv("DASS21_INVITED_USERS_ENABLED", "false")' in src
+    # Real proof lives in test_invited_rollout_config_default_and_parsing_
+    # subprocess (isolated subprocess, env var removed). Here: the live parsed
+    # value with no env override must be False.
+    import os
+    if os.getenv("DASS21_INVITED_USERS_ENABLED") is None:
+        import importlib, config as _c
+        importlib.reload(_c)
+        assert _c.DASS21_INVITED_USERS_ENABLED is False
 
 
 def test_owner_allowed_when_invited_rollout_false(flow, monkeypatch):
@@ -429,3 +431,87 @@ def test_access_module_has_no_llm_or_telegram_imports():
     for banned in ("import openai", "from openai", "import aiogram", "from aiogram",
                    "import bot", "from bot"):
         assert banned not in src
+
+
+# ── A4 hardening: real config default + env parsing (subprocess-isolated) ─────
+def test_invited_rollout_config_default_and_parsing_subprocess():
+    """Real isolated proof (not source grep): with the env var absent the
+    parsed config value is False; documented truthy/falsy spellings parse
+    correctly."""
+    import subprocess, sys, os
+    script = (
+        "import os, importlib\n"
+        "os.environ.pop('DASS21_INVITED_USERS_ENABLED', None)\n"
+        "import config\n"
+        "assert config.DASS21_INVITED_USERS_ENABLED is False, 'default must be False'\n"
+        "for v, want in [('true',True),('1',True),('yes',True),('on',True),\n"
+        "                ('false',False),('0',False),('no',False),('off',False),\n"
+        "                ('',False),('bogus',False)]:\n"
+        "    os.environ['DASS21_INVITED_USERS_ENABLED'] = v\n"
+        "    importlib.reload(config)\n"
+        "    assert config.DASS21_INVITED_USERS_ENABLED is want, (v, want)\n"
+        "print('CONFIG_PARSING_OK')\n")
+    env = dict(os.environ)
+    env.pop("DASS21_INVITED_USERS_ENABLED", None)
+    out = subprocess.run([sys.executable, "-c", script],
+                         capture_output=True, text=True, env=env,
+                         cwd=str(pathlib.Path(config.__file__).parent))
+    assert "CONFIG_PARSING_OK" in out.stdout, out.stderr
+
+
+def test_owner_only_false_fails_closed_for_owner_and_invited(flow, monkeypatch):
+    # The legacy flag is a config-sanity guard, never an access opener.
+    monkeypatch.setattr(config, "DASS21_OWNER_ONLY", False)
+    assert not _auth(OWNER).allowed
+    assert not _auth(INVITED).allowed
+
+
+# ── A4 hardening: direct q:i cannot expose DASS ───────────────────────────────
+def test_direct_q_i_does_not_expose_dass(flow):
+    """Structural guarantee under test: get_catalog_instrument only iterates
+    public_catalog_instruments, and the DASS manifest entry keeps
+    public_catalog_visible=false -- so a direct q:i:dass callback resolves to
+    None and every caller (owner, invited, blocked, unknown) gets the same
+    neutral text; no start path is ever rendered from q:i."""
+    import clinical_instrument_catalog as cat
+    document = bot._load_catalog_document()
+    assert cat.get_catalog_instrument(document, "dass") is None
+    for uid in (OWNER, INVITED, BLOCKED, UNKNOWN):
+        msg = _press(bot.cb_questionnaire_info, uid, "q:i:dass")
+        assert msg.answers[-1][0] == _neutral()
+        assert _buttons(msg.answers[-1][1]) == []
+
+
+# ── A4 hardening: user_access semantics (real schema, no expiry column) ───────
+def test_users_row_without_user_access_denied(flow):
+    # A user known to the bot (users table) but WITHOUT a user_access row is
+    # still denied -- presence in `users` is not an entitlement.
+    asyncio.run(database.upsert_user(555, "u", "U"))
+    assert not asyncio.run(database.user_has_active_access(555))
+    assert not _auth(555).allowed
+
+
+def test_revoked_access_denied_by_real_schema(flow):
+    # user_access has exactly active|blocked (no expiry column) -- revocation
+    # is block_user_access, and the gate consults ONLY user_access, so any
+    # temporary/test invite mechanism grants nothing here.
+    asyncio.run(database.block_user_access(INVITED2))
+    assert not _auth(INVITED2).allowed
+
+
+# ── A4 hardening: Cancel ownership after revocation ───────────────────────────
+def test_revoked_owner_can_cancel_but_others_cannot(flow):
+    sid = _start_session(INVITED)
+    asyncio.run(database.block_user_access(INVITED))
+    # another invited user cannot cancel it: silent no-op
+    msg = _press(bot.cb_questionnaire_cancel, INVITED2, f"q:x:{sid}")
+    assert msg.answers == []
+    assert asyncio.run(database.get_questionnaire_session(sid))["status"] == "active"
+    # unknown user cannot cancel it either
+    msg = _press(bot.cb_questionnaire_cancel, UNKNOWN, f"q:x:{sid}")
+    assert msg.answers == []
+    assert asyncio.run(database.get_questionnaire_session(sid))["status"] == "active"
+    # the revoked OWNER of the session still can
+    msg = _press(bot.cb_questionnaire_cancel, INVITED, f"q:x:{sid}")
+    assert msg.answers[-1][0] == questionnaire_ux.cancelled_text("ru")
+    assert asyncio.run(database.get_questionnaire_session(sid))["status"] == "cancelled"
