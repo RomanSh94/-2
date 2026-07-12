@@ -1500,7 +1500,18 @@ async def get_questionnaire_session(session_id: int) -> dict | None:
 
 async def record_questionnaire_response(uid: int, session_id: int, questionnaire_id: str,
                                         item_id: str, answer_id: str, answer_value: str) -> None:
+    # Idempotent per (session_id, item_id): re-answering an item -- e.g. after
+    # pressing Back to REVISE an earlier answer -- must REPLACE the prior row,
+    # not append a second one. A duplicate row would (a) inflate the generic
+    # sum score and (b) make an exact clinical scorer (DASS) reject the session
+    # as having a duplicate item, so it could never complete. There is no
+    # migration system here, so we do delete-then-insert rather than rely on a
+    # UNIQUE constraint. The stale-step guard in bot.py ensures only the
+    # current item can be (re)answered.
     async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "DELETE FROM questionnaire_responses WHERE session_id=? AND item_id=?",
+            (session_id, item_id))
         await db.execute(
             "INSERT INTO questionnaire_responses "
             "(user_id, session_id, questionnaire_id, item_id, answer_id, answer_value) "

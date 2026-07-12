@@ -416,3 +416,52 @@ def test_owner_recovers_result_after_transient_failure(flow, monkeypatch):
     assert "Депрессия: 0" in msg3.answers[-1][0]
     assert asyncio.run(
         database.get_questionnaire_session(session_id))["status"] == "completed"
+
+
+# ── regression: Back → revise answer must not duplicate the response row ───────
+def test_back_then_revise_answer_does_not_duplicate_and_completes(flow):
+    # Reproduces the production finding (session s4: 4 responses / 3 distinct):
+    # answering an item, going Back, and re-answering it used to INSERT a second
+    # row for the same item. For DASS the exact scorer rejects duplicate items,
+    # so such a session could never complete. After the fix the revised answer
+    # REPLACES the old one: exactly one row per item, and the session completes
+    # with the revised value reflected in the score.
+    _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _sessions_for(1)[0][0]
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    for step in (0, 1, 2):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a0")))
+    asyncio.run(bot.cb_questionnaire_back(
+        FakeCallback(user, msg, data=f"q:b:{session_id}")))          # idx 3 -> 2
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:2:a1")))     # revise item 2
+    for step in range(3, 21):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a0")))
+    session = asyncio.run(database.get_questionnaire_session(session_id))
+    assert session["status"] == "completed"
+    rows = asyncio.run(database.get_questionnaire_responses(session_id))
+    assert len(rows) == 21                                # no duplicate row
+    assert len({r["item_id"] for r in rows}) == 21        # one per item
+    # step 2 == dass21_03 (a depression item); revised a1 (=1) -> depression 1*2=2
+    text = msg.answers[-1][0]
+    assert "Депрессия: 2" in text
+    assert "Тревога: 0" in text and "Стресс: 0" in text
+
+
+def test_answer_same_item_twice_keeps_latest_value(flow):
+    _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _sessions_for(1)[0][0]
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:0:a2")))
+    asyncio.run(bot.cb_questionnaire_back(
+        FakeCallback(user, msg, data=f"q:b:{session_id}")))
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, msg, data=f"q:a:{session_id}:0:a0")))
+    rows = asyncio.run(database.get_questionnaire_responses(session_id))
+    item0 = [r for r in rows if r["item_id"] == "dass21_01"]
+    assert len(item0) == 1 and item0[0]["answer_value"] == "0"  # latest wins
