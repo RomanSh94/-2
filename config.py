@@ -63,3 +63,12 @@ DASS21_DEFINITION_PATH = os.getenv(
     "DASS21_DEFINITION_PATH",
     "private_questionnaires/dass21_ru_fattakhov_2024.json").strip()
 DASS21_DEFINITION_SHA256 = os.getenv("DASS21_DEFINITION_SHA256", "").strip().lower()
+
+# PR #59 — controlled invited-user DASS access. Default OFF. This is the ONLY
+# switch that can admit non-owner users to DASS (an active user_access row is
+# additionally required per user); DASS21_OWNER_ONLY=false never opens access
+# (it fails closed for everyone -- see dass21_runtime/dass21_access).
+DASS21_INVITED_USERS_ENABLED = (
+    os.getenv("DASS21_INVITED_USERS_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)

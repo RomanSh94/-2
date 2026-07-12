@@ -337,14 +337,14 @@ def test_dass21_runtime_invalidation_at_completion_does_not_false_complete_sessi
             FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a1")))
     # Invalidate the runtime gate between the last q:a gate check and the
     # completion screen: hash pin flips right when scoring would run.
-    real_gate = dass21_runtime.dass21_runtime_status
+    real_gate = dass21_runtime.dass21_integrity_status
     calls = {"n": 0}
-    def flaky_gate(uid):
+    def flaky_gate():
         calls["n"] += 1
         if calls["n"] > 1:   # q:a gate passes, completion-gate call fails
             return dass21_runtime.Dass21RuntimeStatus(False, "hash-mismatch")
-        return real_gate(uid)
-    monkeypatch.setattr(bot.dass21_runtime, "dass21_runtime_status", flaky_gate)
+        return real_gate()
+    monkeypatch.setattr(dass21_runtime, "dass21_integrity_status", flaky_gate)
     asyncio.run(bot.cb_questionnaire_answer(
         FakeCallback(user, msg, data=f"q:a:{session_id}:20:a1")))
     assert msg.answers[-1][0] == questionnaire_ux.not_available_text("ru")
