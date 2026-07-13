@@ -99,6 +99,7 @@ from database import (
     advance_questionnaire_session, complete_questionnaire_session,
     cancel_questionnaire_session, get_questionnaire_responses,
     grant_user_access,
+    unblock_user_access,
 )
 import questionnaires
 import questionnaire_ux
@@ -1272,6 +1273,41 @@ async def cb_privacy_delete(callback: CallbackQuery):
 # (a CLINICIAN_REVIEWER has zero ordinary product access but must still be
 # able to use this for a mapped tester). Denial text is deliberately generic —
 # no raw data, no confirmation the target exists, no role/mapping detail.
+@dp.message(Command("unblock"))
+async def cmd_unblock(message: Message):
+    """Owner-only reactivation of a previously blocked user_access row (the
+    canonical revoke->reactivate completion). Non-owner gets a neutral denial
+    with no feature disclosure. Uses the same raw-uid owner workflow as
+    /review_pack. Never grants access to an unknown/never-invited user
+    (unblock_user_access only flips an EXISTING blocked row). Result codes are
+    sanitized; no user id is echoed beyond the owner's own argument."""
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    if access_control.OWNER_USER_ID is None or uid != access_control.OWNER_USER_ID:
+        # Neutral denial -- same class as any other unauthorized command.
+        await message.answer(
+            "Команда недоступна." if lang == "ru" else "Command not available.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+        await message.answer(
+            "Использование: /unblock <user_id>" if lang == "ru" else
+            "Usage: /unblock <user_id>")
+        return
+    target_uid = int(parts[1].strip())
+    result = await unblock_user_access(target_uid)
+    messages = {
+        "reactivated": ("✅ Доступ восстановлен." if lang == "ru"
+                        else "✅ Access reactivated."),
+        "already-active": ("Доступ уже активен." if lang == "ru"
+                           else "Access is already active."),
+        "no-existing-access": ("У пользователя нет записи доступа (не приглашён)."
+                               if lang == "ru" else
+                               "No access record for this user (never invited)."),
+    }
+    await message.answer(messages[result])
+
+
 @dp.message(Command("review_pack"))
 async def cmd_review_pack(message: Message):
     import json, io

@@ -1018,6 +1018,37 @@ async def block_user_access(uid: int) -> None:
         await db.commit()
 
 
+async def unblock_user_access(uid: int) -> str:
+    """Owner-driven reactivation of a previously blocked user (the explicit
+    unblock path that grant_user_access deliberately does NOT provide). Only
+    ever transitions an EXISTING blocked row back to active; it never inserts
+    a row, so it cannot grant access to an unknown user or to a users-table
+    row that was never invited. Idempotent. Returns a sanitized result code
+    (never a user id):
+
+        "reactivated"        blocked -> active (the one real state change)
+        "already-active"     row already active (no-op)
+        "no-existing-access" no user_access row exists (unknown/never-invited)
+
+    Authorization (owner-only) is enforced by the caller, not here -- this is
+    a pure data operation, mirroring grant/block."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT status FROM user_access WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+        if row is None:
+            return "no-existing-access"
+        if row[0] == "active":
+            return "already-active"
+        # WHERE status='blocked' makes concurrent double-unblock safe: only the
+        # first flips the row; the PK guarantees no duplicate row is created.
+        await db.execute(
+            "UPDATE user_access SET status='active', updated_at=datetime('now') "
+            "WHERE user_id=? AND status='blocked'", (uid,))
+        await db.commit()
+        return "reactivated"
+
+
 async def save_cbt_entry(uid: int, data: dict, lang: str = "ru") -> int:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
