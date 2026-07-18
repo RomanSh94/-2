@@ -53,13 +53,15 @@ def build_keyboard(step: int, lang: str = "ru",
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_keyboard_privacy_only(lang: str = "ru",
+def build_keyboard_privacy_only(notice_version: str, lang: str = "ru",
                                 privacy_policy_url: str = "") -> InlineKeyboardMarkup:
     """Same conversion as build_keyboard, sourced from
     oc.button_spec_privacy_only instead of oc.button_spec -- see that
-    function for why the primary button's callback differs."""
+    function for why the primary button's callback differs. `notice_version`
+    must be the CURRENT PRIVACY_NOTICE_VERSION being rendered -- it is baked
+    into the callback so a stale card cannot acknowledge a different one."""
     rows = []
-    for spec_row in oc.button_spec_privacy_only(lang, privacy_policy_url):
+    for spec_row in oc.button_spec_privacy_only(notice_version, lang, privacy_policy_url):
         row = []
         for b in spec_row:
             if "url" in b:

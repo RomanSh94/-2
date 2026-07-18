@@ -230,7 +230,7 @@ def test_legacy_user_privacy_ack_settles_no_reprompt_on_next_start(tmp_db, fake_
     assert run(database.has_privacy_notice_ack(uid, oc.PRIVACY_NOTICE_VERSION)) is False
     # Acknowledge via the REAL privacy-only callback -- record_notice_acknowledgement,
     # never complete_onboarding (there is no row to complete).
-    _tap(uid, oc.CB_PRIVACY_ONLY_START)
+    _tap(uid, oc.cb_privacy_only_start(oc.PRIVACY_NOTICE_VERSION))
     assert run(database.has_privacy_notice_ack(uid, oc.PRIVACY_NOTICE_VERSION)) is True
     fake_bot.sent.clear(); fake_bot.edits.clear()
     _start(uid)
@@ -1183,7 +1183,7 @@ def test_privacy_only_ack_callback_cross_user_cannot_leak(tmp_db, fake_bot):
     a, b = 7303, 7304
     _authorized(a)
     _authorized(b)
-    _tap(a, oc.CB_PRIVACY_ONLY_START)
+    _tap(a, oc.cb_privacy_only_start(oc.PRIVACY_NOTICE_VERSION))
     assert run(database.has_privacy_notice_ack(a, oc.PRIVACY_NOTICE_VERSION)) is True
     assert run(database.has_privacy_notice_ack(b, oc.PRIVACY_NOTICE_VERSION)) is False
 
@@ -1191,10 +1191,10 @@ def test_privacy_only_ack_callback_cross_user_cannot_leak(tmp_db, fake_bot):
 def test_privacy_only_ack_double_tap_does_not_reopen_mood_entry(tmp_db, fake_bot):
     uid = 7305
     _authorized(a := uid)
-    cb1 = _tap(uid, oc.CB_PRIVACY_ONLY_START)
+    cb1 = _tap(uid, oc.cb_privacy_only_start(oc.PRIVACY_NOTICE_VERSION))
     assert any("Я не терапевт" in t for t in cb1.message.rendered_texts())
     cb1.message.answers.clear()
-    cb2 = _tap(uid, oc.CB_PRIVACY_ONLY_START)
+    cb2 = _tap(uid, oc.cb_privacy_only_start(oc.PRIVACY_NOTICE_VERSION))
     assert cb2.message.answers == []  # double tap: no second mood entry
 
 
@@ -1202,6 +1202,57 @@ def test_privacy_only_ack_answers_callback_even_when_flag_off(monkeypatch, tmp_d
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", False)
     uid = 7306
     _authorized(uid)
-    cb = _tap(uid, oc.CB_PRIVACY_ONLY_START)
+    cb = _tap(uid, oc.cb_privacy_only_start(oc.PRIVACY_NOTICE_VERSION))
     assert cb.answered >= 1
     assert run(database.has_privacy_notice_ack(uid, oc.PRIVACY_NOTICE_VERSION)) is False
+
+
+# ── Privacy-only callback version binding (real P1 found during integration:
+# the callback must be bound to the EXACT notice_version rendered on the
+# card, never to whatever PRIVACY_NOTICE_VERSION happens to be current at tap
+# time -- otherwise a stale v1 card left open across a v1->v2 bump could tap
+# into a handler that blindly records an acknowledgement for v2, a notice the
+# user never actually saw). ─────────────────────────────────────────────────
+def test_privacy_only_current_version_callback_succeeds(tmp_db, fake_bot):
+    uid = 7307
+    _authorized(uid)
+    _tap(uid, oc.cb_privacy_only_start(oc.PRIVACY_NOTICE_VERSION))
+    assert run(database.has_privacy_notice_ack(uid, oc.PRIVACY_NOTICE_VERSION)) is True
+
+
+def test_privacy_only_stale_notice_callback_does_not_acknowledge_current_version(
+        tmp_db, fake_bot, monkeypatch):
+    # Card was rendered under notice v1; the requirement then bumps to v2
+    # (PRIVACY_NOTICE_VERSION changes) BEFORE the user taps the old card.
+    uid = 7308
+    _authorized(uid)
+    stale_data = oc.cb_privacy_only_start("v1")
+    monkeypatch.setattr(oc, "PRIVACY_NOTICE_VERSION", "v2")
+    monkeypatch.setattr("bot.PRIVACY_NOTICE_VERSION", "v2")
+    _tap(uid, stale_data)
+    # The dangerous outcome this test forbids: a v1 card creating a v2 ack.
+    assert run(database.has_privacy_notice_ack(uid, "v2")) is False
+    # The safe outcome: rejected entirely, not even recorded as a v1 ack --
+    # the user still owes an explicit look at whatever v2 actually says.
+    assert run(database.has_privacy_notice_ack(uid, "v1")) is False
+
+
+def test_privacy_only_forged_future_version_fails_closed(tmp_db, fake_bot):
+    uid = 7309
+    _authorized(uid)
+    _tap(uid, oc.cb_privacy_only_start("v99-never-real"))
+    assert run(database.has_privacy_notice_ack(uid, "v99-never-real")) is False
+    assert run(database.has_privacy_notice_ack(uid, oc.PRIVACY_NOTICE_VERSION)) is False
+
+
+def test_privacy_only_forged_notice_id_cannot_be_named_via_callback(tmp_db, fake_bot):
+    # notice_id is a fixed literal inside the handler ("privacy_notice"),
+    # never parsed from callback data -- there is no way for callback_data to
+    # name a different notice id at all. A hand-crafted callback trying to do
+    # so simply does not match CB_PRIVACY_ONLY_START_PREFIX and is a no-op.
+    uid = 7310
+    _authorized(uid)
+    forged = f"onb:{oc.ONBOARDING_VERSION}:privacy_only_start_OTHER_NOTICE:{oc.PRIVACY_NOTICE_VERSION}"
+    _tap(uid, forged)
+    assert run(database.has_notice_acknowledgement(uid, "privacy_notice", oc.PRIVACY_NOTICE_VERSION)) is False
+    assert run(database.has_notice_acknowledgement(uid, "some_other_notice", oc.PRIVACY_NOTICE_VERSION)) is False

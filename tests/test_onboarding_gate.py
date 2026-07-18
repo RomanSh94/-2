@@ -293,7 +293,7 @@ def test_text_reaches_ordinary_pipeline_after_onboarding_completed(monkeypatch, 
     run(database.grant_user_access(uid, source="invite"))
     run(database.start_or_get_onboarding(uid, "v1"))
     run(database.skip_onboarding_to_privacy(uid, "v1"))
-    run(database.complete_onboarding(uid, "v1"))
+    run(database.complete_onboarding(uid, "v1", privacy_notice_version="v1"))
     calls = {}
     _spy_upsert(monkeypatch, calls)
 
@@ -336,7 +336,7 @@ def test_mood_callback_reaches_pipeline_after_onboarding_completed(monkeypatch, 
     run(database.grant_user_access(uid, source="invite"))
     run(database.start_or_get_onboarding(uid, "v1"))
     run(database.skip_onboarding_to_privacy(uid, "v1"))
-    run(database.complete_onboarding(uid, "v1"))
+    run(database.complete_onboarding(uid, "v1", privacy_notice_version="v1"))
     calls = {"pipeline": 0}
 
     async def spy_pipeline(*a, **kw):

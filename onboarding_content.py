@@ -56,7 +56,22 @@ CB_PRIVACY = f"{CB_PREFIX}privacy"
 # cb_onboarding's row-based CB_START branch. Still inside the "onb:" prefix
 # (still exempt from OnboardingGateMiddleware; still rejected as a safe no-op
 # by cb_onboarding for any other onboarding_version).
-CB_PRIVACY_ONLY_START = f"{CB_PREFIX}privacy_only_start"
+#
+# CRITICAL: bound to the EXACT notice_version rendered on the card, not just
+# ONBOARDING_VERSION -- PRIVACY_NOTICE_VERSION is an INDEPENDENT axis (see
+# that constant's comment) that can bump while ONBOARDING_VERSION stays the
+# same. Without embedding notice_version here, a stale v1 card left open
+# across a v1->v2 bump could tap into a handler that blindly acknowledges
+# whatever PRIVACY_NOTICE_VERSION is CURRENT at tap time -- i.e. the user
+# would be recorded as having acknowledged v2 content they never saw. The
+# handler (bot.cb_onboarding) parses the embedded version back out and
+# rejects the tap as a safe no-op unless it exactly matches the CURRENT
+# PRIVACY_NOTICE_VERSION.
+CB_PRIVACY_ONLY_START_PREFIX = f"{CB_PREFIX}privacy_only_start:"
+
+
+def cb_privacy_only_start(notice_version: str) -> str:
+    return f"{CB_PRIVACY_ONLY_START_PREFIX}{notice_version}"
 
 
 def cb_next(target_step: int) -> str:
@@ -370,14 +385,18 @@ def privacy_summary(lang: str = "ru") -> str:
     return _PRIVACY_SUMMARY[_lang(lang)]
 
 
-def button_spec_privacy_only(lang: str = "ru", privacy_policy_url: str = "") -> list[list[dict]]:
+def button_spec_privacy_only(notice_version: str, lang: str = "ru",
+                             privacy_policy_url: str = "") -> list[list[dict]]:
     """Same layout as button_spec(LAST_STEP, ...) -- identical caption/data
-    button -- but the primary button's callback is CB_PRIVACY_ONLY_START
+    button -- but the primary button's callback is cb_privacy_only_start(...)
     instead of CB_START, since this screen is not backed by any onboarding
-    row (see determine_onboarding_requirement's PRIVACY_NOTICE_ONLY result)."""
+    row (see determine_onboarding_requirement's PRIVACY_NOTICE_ONLY result).
+    `notice_version` MUST be the exact version being rendered right now (the
+    caller's current PRIVACY_NOTICE_VERSION) -- it is baked into the
+    callback so a stale card cannot later acknowledge a different version."""
     L = _lang(lang)
     spec = button_spec(LAST_STEP, lang, privacy_policy_url)
-    spec[0] = [{"text": _PRIMARY[L][LAST_STEP], "cb": CB_PRIVACY_ONLY_START}]
+    spec[0] = [{"text": _PRIMARY[L][LAST_STEP], "cb": cb_privacy_only_start(notice_version)}]
     return spec
 
 

@@ -999,33 +999,56 @@ async def _render_privacy_notice_only_card(uid: int, chat_id: int, lang: str, *,
     await onboarding.send_or_edit_onboarding_card(
         bot, chat_id, LAST_STEP, lang, message_id=message_id,
         privacy_policy_url=config.PRIVACY_POLICY_URL,
-        keyboard=onboarding.build_keyboard_privacy_only(lang, config.PRIVACY_POLICY_URL))
+        keyboard=onboarding.build_keyboard_privacy_only(
+            PRIVACY_NOTICE_VERSION, lang, config.PRIVACY_POLICY_URL))
 
 
 async def _onboarding_blocks_ordinary_entry(uid: int) -> bool:
     """True iff the mandatory onboarding gate (spec item A) must block
-    ordinary product entry (text/voice/mood) for uid right now: the flag is on
-    AND uid has an ACTIVE onboarding row (any version — an active OLDER
-    version is only retired by cmd_start's /start path; until the user runs
-    /start again it must still block, same as an active current-version row)."""
+    ordinary product entry (text/voice/mood, AND any other product command
+    like /dass21 or a q:m callback) for uid right now. Reuses the EXACT same
+    decision as bot.cmd_start (onboarding_content.determine_onboarding_requirement)
+    -- NOT only "has an active row": a user who owes the CURRENT privacy
+    notice (PRIVACY_NOTICE_ONLY) is blocked too, even though that flow
+    deliberately creates no onboarding row. Fixed gap found during DASS
+    integration: the previous version only checked for an active row, so a
+    user who bypassed /start (going straight to another product command)
+    while owing an independent privacy re-acknowledgment was never gated at
+    all -- this closes that."""
     if not config.FIRST_USER_ONBOARDING_ENABLED:
         return False
-    return await get_active_onboarding_state(uid) is not None
+    active_state = await get_active_onboarding_state(uid)
+    if active_state is not None:
+        return True
+    current_version_row = await get_onboarding_state(uid, ONBOARDING_VERSION)
+    eligibility = await get_onboarding_eligibility(uid)
+    notice_acked = await has_privacy_notice_ack(uid, PRIVACY_NOTICE_VERSION)
+    requirement = onboarding_content.determine_onboarding_requirement(
+        eligibility=eligibility, has_active_state=False,
+        has_current_version_row=current_version_row is not None,
+        notice_acknowledged=notice_acked)
+    return requirement != onboarding_content.NOT_REQUIRED
 
 
 async def _resume_onboarding_card(chat_id: int, uid: int) -> None:
-    """Re-show the user's current onboarding card IN PLACE (edit if possible,
-    else send exactly one replacement) instead of silently dropping their
-    message and instead of flooding the chat with a new card per message.
-    Never advances state — only re-renders the current step. Uses the
-    onboarding's OWN stored language (not whatever the blocked message
-    happened to be written in)."""
+    """Re-show the user's current onboarding/privacy-only card IN PLACE (edit
+    if possible, else send exactly one replacement) instead of silently
+    dropping their message and instead of flooding the chat with a new card
+    per message. Never advances state — only re-renders the current step (or,
+    for a privacy-only-pending user with no row at all, the privacy-only
+    screen). Uses the onboarding's OWN stored language (not whatever the
+    blocked message happened to be written in)."""
     state = await get_active_onboarding_state(uid)
-    if state is None:
-        return  # gate raced away (e.g. just completed) -- nothing to show
+    if state is not None:
+        lang = await get_user_language(uid)
+        await _render_onboarding_card(uid, chat_id, state["current_step"], lang,
+                                      message_id=state.get("card_message_id"))
+        return
+    if not await _onboarding_blocks_ordinary_entry(uid):
+        return  # gate raced away (e.g. just settled) -- nothing to show
+    # Blocked with no active row -> a privacy-only acknowledgment is owed.
     lang = await get_user_language(uid)
-    await _render_onboarding_card(uid, chat_id, state["current_step"], lang,
-                                  message_id=state.get("card_message_id"))
+    await _render_privacy_notice_only_card(uid, chat_id, lang, message_id=None)
 
 
 # ── C: ONE reusable guard for the WHOLE ordinary product surface ────────────
@@ -1394,17 +1417,28 @@ async def cb_onboarding(callback: CallbackQuery):
         return
     lang = await get_user_language(uid)
 
-    if data == onboarding_content.CB_PRIVACY_ONLY_START:
+    if data.startswith(onboarding_content.CB_PRIVACY_ONLY_START_PREFIX):
         # Privacy-notice-only acknowledgement (spec item F correction): this
         # screen is NOT backed by any user_onboarding_state row (see
         # bot.cmd_start / determine_onboarding_requirement), so it is answered
         # here, independently of the active-onboarding-state gate below.
         # Identity is callback.from_user.id (never trusted from callback
-        # data); the notice id/version are the fixed current constants, never
-        # read from the callback payload, so a stale/forged callback cannot
-        # name an arbitrary notice or version. record_notice_acknowledgement
-        # is idempotent (INSERT OR IGNORE) and returns False on a double tap,
-        # which must not re-open mood entry a second time.
+        # data). notice_id is a fixed literal ("privacy_notice"), never read
+        # from the callback payload, so a forged callback cannot name an
+        # arbitrary notice. The notice VERSION, however, IS embedded in the
+        # callback (baked in at render time) and MUST be compared against the
+        # CURRENT PRIVACY_NOTICE_VERSION here -- otherwise a stale card left
+        # open across a version bump (or a hand-crafted future/forged
+        # version) could silently acknowledge a notice the user never saw.
+        # A mismatch is a safe, silent no-op: no ack recorded, no mood entry
+        # opened, no error text (never confirms/denies whether the version
+        # was "close").
+        rendered_version = data[len(onboarding_content.CB_PRIVACY_ONLY_START_PREFIX):]
+        if rendered_version != PRIVACY_NOTICE_VERSION:
+            return
+        # record_notice_acknowledgement is idempotent (INSERT OR IGNORE) and
+        # returns False on a double tap, which must not re-open mood entry a
+        # second time.
         if not await record_notice_acknowledgement(uid, "privacy_notice", PRIVACY_NOTICE_VERSION):
             return
         chat_id = callback.message.chat.id
