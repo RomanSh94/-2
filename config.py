@@ -1,4 +1,5 @@
 import os
+import urllib.parse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -83,3 +84,67 @@ DASS21_DISCUSSION_ENABLED = (
     os.getenv("DASS21_DISCUSSION_ENABLED", "false").strip().lower()
     in ("1", "true", "yes", "on")
 )
+
+# First-user illustrated onboarding (5 screens) — default OFF so /start behaves
+# byte-for-byte as before. When true it affects ONLY genuinely new authorized
+# users (see bot.cmd_start eligibility); returning and legacy users are never
+# forced through it. Rollback = set false; no onboarding metadata is deleted and
+# questionnaires are unaffected. Same safe boolean parser as every flag above.
+FIRST_USER_ONBOARDING_ENABLED = (
+    os.getenv("FIRST_USER_ONBOARDING_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+# Optional real Privacy Policy URL for the onboarding privacy screen's secondary
+# button. Empty by default — the screen then shows a deterministic in-bot privacy
+# summary ("About data and privacy" / "О данных и приватности" — NOT labeled as
+# the Privacy Policy, since none is configured) and the existing
+# /privacy_export_all / /privacy_delete_all commands instead of a dead or
+# invented link. Never hardcode a fake URL here.
+#
+# Validated at load time: only an absolute http(s) URL with a non-empty host is
+# accepted as "a real policy URL"; anything else (empty, malformed, javascript:,
+# a bare path, a URL with no host) is normalized to "" so the rest of the code
+# can trust PRIVACY_POLICY_URL is either "" or safe-to-render. The raw env value
+# is deliberately never logged (a malformed value could contain anything).
+def _validate_privacy_policy_url(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    return raw
+
+
+PRIVACY_POLICY_URL = _validate_privacy_policy_url(os.getenv("PRIVACY_POLICY_URL", ""))
+
+# Explicit, centralized, truthful onboarding rollout policy (spec item F
+# correction). The name and behavior must actually match at runtime: full
+# onboarding is shown ONLY to genuinely new users (bot.cmd_start's eligibility
+# check via database.get_onboarding_eligibility) -- every returning/legacy
+# user is independently, mandatorily re-checked for the CURRENT privacy
+# notice (database.has_privacy_notice_ack), never silently exempted by an old
+# onboarding-version completion/exemption row. The PREVIOUS name
+# "MANDATORY_ALL" was misleading: it never actually forced returning users
+# through the full 5-screen flow, only through an independent privacy check
+# -- "NEW_USERS_ONLY" is what the runtime has always actually done.
+# Only ONE policy has ever been implemented and tested; an unrecognized
+# configured value is rejected deterministically at import time rather than
+# silently falling back to a default the deployer never asked for.
+_SUPPORTED_ONBOARDING_ROLLOUT_POLICIES = ("NEW_USERS_ONLY",)
+
+
+def _validate_rollout_policy(raw: str) -> str:
+    value = (raw or "").strip()
+    if value not in _SUPPORTED_ONBOARDING_ROLLOUT_POLICIES:
+        raise ValueError(
+            f"Unsupported ONBOARDING_ROLLOUT_POLICY={value!r}; "
+            f"supported values: {_SUPPORTED_ONBOARDING_ROLLOUT_POLICIES}")
+    return value
+
+
+ONBOARDING_ROLLOUT_POLICY = _validate_rollout_policy(
+    os.getenv("ONBOARDING_ROLLOUT_POLICY", "NEW_USERS_ONLY"))

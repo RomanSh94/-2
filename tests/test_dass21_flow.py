@@ -465,3 +465,84 @@ def test_answer_same_item_twice_keeps_latest_value(flow):
     rows = asyncio.run(database.get_questionnaire_responses(session_id))
     item0 = [r for r in rows if r["item_id"] == "dass21_01"]
     assert len(item0) == 1 and item0[0]["answer_value"] == "0"  # latest wins
+
+
+# ── Onboarding-PR regression (spec item J/D): real authorized DASS completion,
+# does the final keyboard actually contain q:m:<session_id>? ─────────────────
+#
+# This is an HONEST regression, not an aspirational one, and NOT a claim that
+# the current state is correct or acceptable: a full, real, owner-authorized
+# DASS-21 completion is driven end-to-end (all 21 answers) and the ACTUAL
+# final reply_markup is inspected. Today q:m:<session_id> is NOT present.
+# This is a REAL PRODUCT GAP -- the owner requirement is that a DASS-21
+# result also gets "💬 Обсудить результат" via the existing q:m:<session_id>
+# namespace -- and it is NOT fixed in this PR because it cannot be fixed
+# safely without a dedicated adapter (see the missing-contracts list in
+# docs/first_user_onboarding.md's DASS section and this correction round's
+# report). Concretely, today:
+#
+#   * DASS-21 completion always renders through bot._send_dass21_result, which
+#     uses bot._questionnaire_completion_keyboard (PR A's plain completion
+#     keyboard: specialist report + navigation) and explicitly documents
+#     "Never reaches the generic PR B path" (the one that DOES add q:m).
+#   * The q:m discuss flow's own gate (_discuss_gate_and_load, step 6) fails
+#     closed via questionnaires.is_result_eligible(definition), which requires
+#     legal_status == "synthetic" and scoring.type == "sum". The real DASS-21
+#     definition has legal_status == "public_domain" and result_policy ==
+#     "no_score" (subscale-only scoring -- see CLAUDE.md and this file's other
+#     tests asserting no "Итог"/"Общий"/severity wording anywhere in a DASS
+#     result).
+#   * Even if a q:m button were added to DASS's keyboard as-is, pressing it
+#     would hit that gate and fail closed to questionnaire_ux.not_available_text
+#     -- a dead-end button, not a working discuss flow -- because
+#     _discuss_gate_and_load computes a single compute_sum_score, which is not
+#     meaningful for DASS's three independent subscales.
+#
+# This PR does NOT implement the fix (it would require either loosening
+# is_result_eligible for a licensed, subscale-only clinical instrument -- a
+# protected clinical-safety boundary explicitly out of scope here -- or a new
+# DASS-aware scoring/eligibility adapter feeding q:m, which is its own
+# reviewable piece of work). This test locks in the CURRENT state as a known,
+# reported gap so it cannot silently regress further or be papered over.
+def test_dass21_completion_keyboard_missing_qm_button_tracked_gap(flow, monkeypatch):
+    monkeypatch.setattr(config, "QUESTIONNAIRE_INTERPRETATION_ENABLED", True)
+    _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _sessions_for(1)[0][0]
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    for step in range(21):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a1")))
+    text, kw = msg.answers[-1]
+    kb = kw.get("reply_markup")
+    assert kb is not None
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert f"q:m:{session_id}" not in datas
+    # What IS actually there: specialist report + navigation (PR A's
+    # completion keyboard), proving this is the real, exercised path.
+    assert f"q:o:{session_id}" in datas
+    assert "q:l" in datas and "menu:back" in datas
+    # Independent confirmation of WHY: the real DASS definition fails the
+    # generic sum-score eligibility gate that q:m depends on.
+    definition = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    assert definition["legal_status"] != "synthetic"
+    assert definition["result_policy"] == "no_score"
+    assert questionnaires.is_result_eligible(definition) is False
+
+
+def test_generic_eligible_questionnaire_still_shows_qm_button_unaffected(flow, monkeypatch):
+    """Contrast case, using the repo's real generic-eligible fixture pattern
+    (see tests/test_questionnaire_discuss.py) -- proves the gap above is
+    DASS-specific, not a regression the onboarding PR introduced into the
+    generic q:m path."""
+    import tests.test_questionnaire_discuss as qd
+    monkeypatch.setattr(config, "QUESTIONNAIRE_INTERPRETATION_ENABLED", True)
+    monkeypatch.setattr(bot, "_load_registry_fresh",
+                        lambda: questionnaires.load_registry(qd.FIXTURE_DIR))
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = qd._complete_flow(user, msg)
+    text, kw = msg.answers[-1]
+    kb = kw.get("reply_markup")
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert f"q:m:{session_id}" in datas

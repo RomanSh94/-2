@@ -418,6 +418,104 @@ CREATE TABLE IF NOT EXISTS user_access (
     CHECK(source IN ('owner', 'invite', 'manual', 'migration'))
 );
 CREATE INDEX IF NOT EXISTS idx_user_access_status ON user_access(status);
+
+-- First-user illustrated onboarding state (5-screen intro shown before the
+-- existing mood entry). REAL VERSIONING: PRIMARY KEY is (user_id,
+-- onboarding_version), NOT user_id alone -- a user can accumulate a row per
+-- onboarding version across deployments (e.g. a legacy_exempt 'v1' row AND
+-- a later 'v2' row), which a single-column PK could never represent. The
+-- partial UNIQUE index below is the actual database invariant requested by
+-- the versioning spec: "at most one ACTIVE onboarding per user, regardless of
+-- version" -- SQLite enforces this at the engine level, not just in
+-- application code, so even a bug in the Python layer cannot create two
+-- concurrently-active rows for the same user.
+--
+-- card_chat_id/card_message_id/card_rendered_step persist WHICH Telegram
+-- message is the user's current visible onboarding card and what step it
+-- actually shows. This is what makes /start (and the ordinary-entry gate)
+-- restart-safe AND flood-safe: resume always tries to EDIT that exact
+-- message first, and only sends a new one if the edit fails -- see
+-- onboarding.send_or_edit_onboarding_card. card_rendered_step can trail
+-- BEHIND current_step (recoverable-pending state): a transition is committed
+-- to current_step FIRST, then delivery is attempted; if delivery raises a
+-- genuine network error, current_step is already correct but
+-- card_rendered_step/card_message_id still point at the OLD card, so the next
+-- /start (or gate hit) naturally retries delivering the untouched target step
+-- by editing that same old card -- no separate "pending" flag needed.
+--
+-- Written ONLY when config.FIRST_USER_ONBOARDING_ENABLED is on:
+--   * a genuinely new authorized user starts at ONBOARDING_VERSION, status
+--     'active', current_step 1 and advances/skips through the screens;
+--   * a legacy user with meaningful prior product use (see
+--     database.get_onboarding_eligibility) is recorded as 'legacy_exempt'
+--     so they are NEVER retro-forced through onboarding.
+-- current_step is DB-range-checked (1..5) and status is a closed CHECK set, so
+-- a stale/corrupt transition cannot land out of range. user_id declaratively
+-- REFERENCES users(id): this repo does not enable SQLite FK enforcement on its
+-- connections (no PRAGMA foreign_keys=ON anywhere), so the reference documents
+-- intent only — actual erasure is driven by privacy_registry CASCADE_DELETE
+-- (delete_all_personal_data), NOT by an FK cascade, exactly like every other
+-- user-scoped table here.
+-- Status lifecycle (spec item F -- an HONEST set, not a euphemism):
+--   active           -- in progress, current_step is where the user is now.
+--   completed        -- the user actually pressed Start on the final privacy
+--                       step of THIS version. Only ever set by
+--                       complete_onboarding(); never for an interrupted flow.
+--   legacy_exempt    -- the user was EXEMPTED from ever seeing this version's
+--                       screens (meaningful prior product use predates this
+--                       version) -- they never went through it, so this is
+--                       NOT "completed" under a different name.
+--   superseded       -- this row WAS active, but a newer mandatory
+--                       onboarding_version replaced it before the user
+--                       finished -- never "completed", the user did not
+--                       complete the flow.
+--   cancelled        -- reserved for a future explicit user/owner cancel
+--                       action; not produced by any code path today.
+CREATE TABLE IF NOT EXISTS user_onboarding_state (
+    user_id                        INTEGER NOT NULL REFERENCES users(id),
+    onboarding_version             TEXT NOT NULL,
+    status                         TEXT NOT NULL DEFAULT 'active',
+    current_step                   INTEGER NOT NULL DEFAULT 1,
+    started_at                     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at                     TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at                   TEXT,
+    skipped_information_at         TEXT,
+    privacy_notice_acknowledged_at TEXT,
+    privacy_notice_version         TEXT,
+    card_chat_id                   INTEGER,
+    card_message_id                INTEGER,
+    card_rendered_step             INTEGER,
+    PRIMARY KEY (user_id, onboarding_version),
+    CHECK(status IN ('active', 'completed', 'legacy_exempt', 'superseded', 'cancelled')),
+    CHECK(current_step BETWEEN 1 AND 5)
+);
+-- The real "no double onboarding" invariant: at most one ACTIVE row per user,
+-- across ALL versions. A partial unique index (WHERE status='active') allows
+-- unlimited completed/legacy_exempt/superseded rows (one per version, over time) while
+-- making a second concurrently-active row an IntegrityError at the engine
+-- level.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_onboarding_one_active_per_user
+    ON user_onboarding_state(user_id) WHERE status='active';
+
+-- Independent, notice-scoped acknowledgement ledger. Corrects a real gap: the
+-- previous design stored privacy_notice_version/privacy_notice_acknowledged_at
+-- ONLY on user_onboarding_state rows, so acknowledgement was entangled with
+-- onboarding_version/status/completed_at/legacy_exempt/superseded/active-row
+-- bookkeeping -- a future PRIVACY_NOTICE_VERSION bump could not safely
+-- re-prompt a user already settled on the same onboarding_version (that row's
+-- primary key is taken; INSERT OR IGNORE would no-op). This table is keyed
+-- ONLY by (user_id, notice_id, notice_version) -- no onboarding_version, no
+-- status -- so an acknowledgement is a standalone fact, independent of
+-- onboarding-content history entirely. One bounded notice_id ("privacy_notice")
+-- is used today; the table is generic enough for a future second notice
+-- without a schema change, but no multi-notice framework exists yet.
+CREATE TABLE IF NOT EXISTS user_notice_acknowledgements (
+    user_id         INTEGER NOT NULL REFERENCES users(id),
+    notice_id       TEXT NOT NULL,
+    notice_version  TEXT NOT NULL,
+    acknowledged_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, notice_id, notice_version)
+);
 """
 
 # Additive column migrations (no migration system in this repo; ADD COLUMN is
@@ -439,6 +537,13 @@ _MIGRATIONS = [
     # stage 3 was entered (drives the 5-10 min follow-up).
     ("crisis_events", "crisis_stage", "INTEGER DEFAULT 0"),
     ("crisis_events", "stage3_at", "TEXT"),
+    # Spec item F: the onboarding-content version and the privacy-notice
+    # version are separate axes (a content-only screen fix must not force a
+    # privacy re-acknowledgment, and vice versa). Additive/nullable, so the
+    # generic ADD-COLUMN pass handles it regardless of which prior shape of
+    # user_onboarding_state a given database has (fresh CREATE TABLE already
+    # includes it; the pre-versioning-schema migration backfills it as NULL).
+    ("user_onboarding_state", "privacy_notice_version", "TEXT"),
 ]
 
 
@@ -483,11 +588,117 @@ async def _migrate_questionnaire_response_uniqueness(db) -> None:
         "ON questionnaire_responses(session_id, item_id)")
 
 
+# ── Onboarding real-versioning migration (spec item E) ──────────────────────
+# The FIRST shape user_onboarding_state ever shipped with had
+# PRIMARY KEY(user_id) alone (one row per user, no per-version history, no
+# card_chat_id/card_message_id/card_rendered_step columns). The CURRENT shape
+# (see SCHEMA above) has PRIMARY KEY(user_id, onboarding_version) plus those
+# three card_* columns and the one-active-per-user partial unique index.
+# SQLite cannot ALTER a PRIMARY KEY in place, so this is a real two-step
+# migration (rename-old -> let SCHEMA's CREATE TABLE IF NOT EXISTS build the
+# new one -> copy rows across -> drop the renamed old table), NOT just an
+# additive ALTER TABLE ADD COLUMN like _MIGRATIONS above.
+#
+# Both steps are individually idempotent and crash-safe to rerun (same
+# "safe on every boot" convention as _apply_migrations /
+# _migrate_questionnaire_response_uniqueness):
+#   * step 1 (BEFORE executescript) only renames if the OLD shape is detected
+#     (single-column PK, or missing a card_* column) -- a no-op if the table
+#     doesn't exist yet, or already has the current shape;
+#   * step 2 (AFTER executescript, once the new-shape table definitely
+#     exists) only copies if the renamed old table is present, uses
+#     INSERT OR IGNORE keyed on the real (user_id, onboarding_version)
+#     primary key so a second run after a crash between the copy and the
+#     final DROP TABLE never double-inserts, and only drops the renamed
+#     table at the very end -- if the process dies between rename and drop,
+#     the original data is still sitting intact under the renamed name and
+#     the next init_db() call finishes the job from wherever it left off.
+_OLD_ONBOARDING_TABLE = "_onboarding_state_pre_versioning"
+
+
+async def _rename_old_onboarding_state_if_needed(db) -> None:
+    cur = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='user_onboarding_state'")
+    if not await cur.fetchone():
+        return  # no table yet -- executescript's CREATE TABLE IF NOT EXISTS makes a fresh one
+    cur = await db.execute("PRAGMA table_info(user_onboarding_state)")
+    cols = await cur.fetchall()
+    pk_cols = [c[1] for c in cols if c[5] > 0]  # col[5] = pk index, 0 = not part of PK
+    col_names = {c[1] for c in cols}
+    if pk_cols == ["user_id", "onboarding_version"] and "card_chat_id" in col_names:
+        return  # already on the current shape -- nothing to migrate
+    await db.execute(
+        f"ALTER TABLE user_onboarding_state RENAME TO {_OLD_ONBOARDING_TABLE}")
+    logging.info("user_onboarding_state: old schema detected, renamed for migration")
+
+
+async def _finish_onboarding_state_migration(db) -> None:
+    cur = await db.execute(
+        f"SELECT name FROM sqlite_master WHERE type='table' AND name='{_OLD_ONBOARDING_TABLE}'")
+    if not await cur.fetchone():
+        return  # nothing was renamed in step 1 -- no old-schema table existed
+    cur = await db.execute(f"PRAGMA table_info({_OLD_ONBOARDING_TABLE})")
+    old_cols = {r[1] for r in await cur.fetchall()}
+
+    def col_or_null(name: str) -> str:
+        return name if name in old_cols else "NULL"
+
+    cur = await db.execute(f"SELECT COUNT(*) FROM {_OLD_ONBOARDING_TABLE}")
+    total = (await cur.fetchone())[0]
+    # status enum rename (spec item F, honest lifecycle): the old schema's
+    # 'legacy_completed' meant "exempted from onboarding due to prior product
+    # use, never actually went through the flow" -- the CURRENT schema calls
+    # that 'legacy_exempt' instead (it was never "completed"). Every other old
+    # status value ('active', 'completed') is unchanged and still valid.
+    await db.execute(
+        "INSERT OR IGNORE INTO user_onboarding_state "
+        "(user_id, onboarding_version, status, current_step, started_at, "
+        " updated_at, completed_at, skipped_information_at, "
+        " privacy_notice_acknowledged_at, privacy_notice_version, "
+        " card_chat_id, card_message_id, card_rendered_step) "
+        "SELECT user_id, onboarding_version, "
+        "CASE status WHEN 'legacy_completed' THEN 'legacy_exempt' ELSE status END, "
+        "current_step, started_at, "
+        "updated_at, completed_at, skipped_information_at, "
+        f"privacy_notice_acknowledged_at, {col_or_null('privacy_notice_version')}, "
+        f"{col_or_null('card_chat_id')}, "
+        f"{col_or_null('card_message_id')}, {col_or_null('card_rendered_step')} "
+        f"FROM {_OLD_ONBOARDING_TABLE}")
+    cur = await db.execute("SELECT changes()")
+    inserted = (await cur.fetchone())[0]
+    await db.execute(f"DROP TABLE {_OLD_ONBOARDING_TABLE}")
+    logging.info(
+        "user_onboarding_state migration: %d/%d row(s) copied to the new schema "
+        "(remainder, if any, already present from a prior interrupted run)",
+        inserted, total)
+
+
+async def _backfill_notice_acknowledgements(db) -> None:
+    """Conservative, proof-only backfill into user_notice_acknowledgements:
+    copies an acknowledgement ONLY from a user_onboarding_state row that
+    already recorded a REAL privacy_notice_acknowledged_at timestamp for a
+    specific privacy_notice_version -- never inferred from status alone (a
+    legacy_exempt row never showed the notice at all; an old completed row
+    may have acknowledged a DIFFERENT notice version than the current one).
+    Idempotent: INSERT OR IGNORE on the (user_id, notice_id, notice_version)
+    primary key is a safe no-op on every subsequent boot."""
+    await db.execute(
+        "INSERT OR IGNORE INTO user_notice_acknowledgements "
+        "(user_id, notice_id, notice_version, acknowledged_at) "
+        "SELECT user_id, 'privacy_notice', privacy_notice_version, "
+        "privacy_notice_acknowledged_at FROM user_onboarding_state "
+        "WHERE privacy_notice_version IS NOT NULL "
+        "AND privacy_notice_acknowledged_at IS NOT NULL")
+
+
 async def init_db():
     async with aiosqlite.connect(DB) as db:
+        await _rename_old_onboarding_state_if_needed(db)
         await db.executescript(SCHEMA)
+        await _finish_onboarding_state_migration(db)
         await _apply_migrations(db)
         await _migrate_questionnaire_response_uniqueness(db)
+        await _backfill_notice_acknowledgements(db)
         await db.commit()
 
 # ── Users ─────────────────────────────────────────────────────────────────────
@@ -507,6 +718,18 @@ async def get_user_language(uid: int) -> str:
         cur = await db.execute("SELECT language FROM users WHERE id=?", (uid,))
         row = await cur.fetchone()
         return row[0] if row else "ru"
+
+async def get_stored_user_language(uid: int) -> str | None:
+    """Raw stored language, or None if no `users` row exists yet -- distinct
+    from get_user_language's "ru" default, which cannot tell a genuinely new
+    user apart from one explicitly stored as ru. Used by cmd_start to decide
+    whether to PRESERVE an existing explicit preference vs. resolve a fresh
+    one from Telegram's language_code (a brand-new row, or an invalid/legacy
+    stored value)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT language FROM users WHERE id=?", (uid,))
+        row = await cur.fetchone()
+    return row[0] if row else None
 
 # ── Messages ──────────────────────────────────────────────────────────────────
 
@@ -1087,6 +1310,331 @@ async def unblock_user_access(uid: int) -> str:
             "WHERE user_id=? AND status='blocked'", (uid,))
         await db.commit()
         return "reactivated"
+
+
+# ── First-user illustrated onboarding state ─────────────────────────────────
+# All transitions are single atomic UPDATEs guarded by a WHERE clause on the
+# expected prior state (status/current_step/version). This is what makes stale
+# callbacks, double taps and two concurrent callbacks safe WITHOUT an app-level
+# lock: at most one UPDATE matches the guard, the rest are no-ops (rowcount 0).
+# No transition ever moves current_step backward — each guard names the exact
+# step it advances FROM. Onboarding metadata carries no personal content, so
+# nothing here is logged.
+#
+# Real versioning (composite PK, see SCHEMA comment above): a user can have AT
+# MOST ONE active row (any version, DB-enforced by the partial unique index),
+# plus any number of completed/legacy_exempt/superseded rows (one per version
+# they ever touched). Read helpers below distinguish "the row for THIS exact
+# version" from "whatever row currently matters for this user".
+
+_ONBOARDING_COLUMNS = (
+    "user_id, onboarding_version, status, current_step, started_at, updated_at, "
+    "completed_at, skipped_information_at, privacy_notice_acknowledged_at, "
+    "privacy_notice_version, card_chat_id, card_message_id, card_rendered_step")
+
+
+def _onboarding_row_to_dict(row) -> dict:
+    return {
+        "user_id": row[0], "onboarding_version": row[1], "status": row[2],
+        "current_step": row[3], "started_at": row[4], "updated_at": row[5],
+        "completed_at": row[6], "skipped_information_at": row[7],
+        "privacy_notice_acknowledged_at": row[8], "privacy_notice_version": row[9],
+        "card_chat_id": row[10], "card_message_id": row[11],
+        "card_rendered_step": row[12],
+    }
+
+
+async def get_active_onboarding_state(uid: int) -> dict | None:
+    """The single ACTIVE row for this user, any version, or None. At most one
+    can ever exist (idx_onboarding_one_active_per_user) -- this is the real
+    versioning invariant: "at most one active onboarding per user"."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"SELECT {_ONBOARDING_COLUMNS} FROM user_onboarding_state "
+            "WHERE user_id=? AND status='active'", (uid,))
+        row = await cur.fetchone()
+    return _onboarding_row_to_dict(row) if row else None
+
+
+async def get_any_onboarding_row(uid: int) -> dict | None:
+    """The most recently updated row for this user, ANY version/status, or
+    None if this user has never touched onboarding at all. Used to decide
+    "has this user EVER been through/seen onboarding (any version)" without
+    caring which specific version."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"SELECT {_ONBOARDING_COLUMNS} FROM user_onboarding_state "
+            "WHERE user_id=? ORDER BY updated_at DESC, onboarding_version DESC LIMIT 1",
+            (uid,))
+        row = await cur.fetchone()
+    return _onboarding_row_to_dict(row) if row else None
+
+
+async def get_onboarding_state(uid: int, version: str | None = None) -> dict | None:
+    """version=<str> -> the exact (uid, version) row, or None (does NOT fall
+    back to another version). version=None -> "whatever matters right now":
+    the active row if one exists (any version), else the most recent row
+    (any version), else None. Kept for callers (including tests) that just
+    want "the current state" without caring about version bookkeeping."""
+    if version is not None:
+        async with aiosqlite.connect(DB) as db:
+            cur = await db.execute(
+                f"SELECT {_ONBOARDING_COLUMNS} FROM user_onboarding_state "
+                "WHERE user_id=? AND onboarding_version=?", (uid, version))
+            row = await cur.fetchone()
+        return _onboarding_row_to_dict(row) if row else None
+    active = await get_active_onboarding_state(uid)
+    if active is not None:
+        return active
+    return await get_any_onboarding_row(uid)
+
+
+async def start_or_get_onboarding(uid: int, version: str) -> dict:
+    """Atomically ensure an ACTIVE onboarding row exists for (uid, version),
+    then return the row that actually represents this user's state now.
+    INSERT OR IGNORE is the atomic primitive -- SQLite silently ignores this
+    INSERT on EITHER conflict: the (user_id, onboarding_version) primary key
+    (a concurrent /start racing to create the same row, OR a row already
+    settled for this exact version), OR the partial unique index (another
+    version is already active for this user -- must not happen in the normal
+    call path, since callers only invoke this after confirming no active row
+    exists, but stays safe under a race). Always starts at step 1 -- the
+    privacy-notice-only flow (a settled/legacy user missing only the current
+    privacy-notice acknowledgement) does NOT use this function at all; it
+    never creates or touches an onboarding row (see
+    onboarding_content.determine_onboarding_requirement /
+    database.record_notice_acknowledgement). Callers must never call this
+    without having already verified eligibility/absence of any row -- this
+    function itself does not decide eligibility."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO user_onboarding_state "
+            "(user_id, onboarding_version, status, current_step) "
+            "VALUES (?, ?, 'active', 1)", (uid, version))
+        await db.commit()
+    state = await get_onboarding_state(uid, version)
+    if state is not None:
+        return state
+    # The insert was ignored because ANOTHER version was already active
+    # (race) -- surface whatever is actually active now, never raise.
+    state = await get_active_onboarding_state(uid)
+    assert state is not None
+    return state
+
+
+async def mark_onboarding_legacy_exempt(uid: int, version: str) -> dict:
+    """Record a legacy user (meaningful prior product use, no row for this
+    version) as legacy_exempt: they are EXEMPTED from ever seeing this
+    version's onboarding screens, they did not "complete" anything (spec item
+    F: an honest status, not a euphemism -- see the SCHEMA comment on
+    user_onboarding_state). Idempotent via INSERT OR IGNORE — never clobbers
+    an existing row for this exact version. completed_at is intentionally
+    left NULL (nothing was completed); privacy_notice_version is also left
+    NULL (the notice was never shown, so nothing was acknowledged)."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO user_onboarding_state "
+            "(user_id, onboarding_version, status, current_step) "
+            "VALUES (?, ?, 'legacy_exempt', 5)", (uid, version))
+        await db.commit()
+    state = await get_onboarding_state(uid, version)
+    assert state is not None
+    return state
+
+
+async def supersede_onboarding_version(uid: int, version: str) -> bool:
+    """Mark a STALE ACTIVE row for an OLDER onboarding_version as superseded
+    (spec item F): a deployment bumped ONBOARDING_VERSION -- a mandatory
+    update, e.g. a new privacy notice -- while this user's onboarding was in
+    flight. This is deliberately NOT 'completed' and NOT 'legacy_exempt': the
+    user did not finish the flow and was not exempt from it, the flow itself
+    was superseded out from under them. Guarded to `version` AND
+    status='active' so it can never touch the current version's row or an
+    already-closed row. Returns True iff it actually superseded a row.
+    Callers are responsible for then starting the CURRENT mandatory version
+    for this user (see bot.cmd_start) -- this function only closes out the
+    old row, it never starts a new one itself."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE user_onboarding_state SET status='superseded', "
+            "updated_at=datetime('now') "
+            "WHERE user_id=? AND onboarding_version=? AND status='active'",
+            (uid, version))
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def advance_onboarding_step(uid: int, version: str,
+                                  from_step: int, to_step: int) -> bool:
+    """Move an ACTIVE onboarding from exactly `from_step` to `to_step`. Returns
+    True iff this call performed the move. The WHERE guard on current_step makes
+    it idempotent (a replayed/stale callback whose from_step no longer matches is
+    a no-op) and forward-only (callers only ever pass to_step > from_step)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE user_onboarding_state SET current_step=?, updated_at=datetime('now') "
+            "WHERE user_id=? AND onboarding_version=? AND status='active' "
+            "AND current_step=?",
+            (to_step, uid, version, from_step))
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def skip_onboarding_to_privacy(uid: int, version: str, last_step: int = 5) -> bool:
+    """Jump an ACTIVE onboarding from any informational step (< last_step) straight
+    to the final privacy step. Records skipped_information_at once (COALESCE keeps
+    the first skip timestamp). Never completes onboarding and never bypasses the
+    privacy step. Idempotent: a second skip once already at last_step is a no-op."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE user_onboarding_state SET current_step=?, "
+            "skipped_information_at=COALESCE(skipped_information_at, datetime('now')), "
+            "updated_at=datetime('now') "
+            "WHERE user_id=? AND onboarding_version=? AND status='active' "
+            "AND current_step<?",
+            (last_step, uid, version, last_step))
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def complete_onboarding(uid: int, version: str, last_step: int = 5,
+                              privacy_notice_version: str | None = None) -> bool:
+    """Finalize onboarding from the ACTIVE final step exactly once. Records
+    completed_at AND privacy_notice_acknowledged_at/privacy_notice_version on
+    THIS row (audit-trail context: which onboarding flow the user completed
+    when they acknowledged it) AND, independently, an entry in
+    user_notice_acknowledgements (the actual source of truth read by
+    has_privacy_notice_ack -- see that table's SCHEMA comment). Returns True
+    only for the single call that actually completes it; a double-tapped
+    Start returns False (rowcount 0) and must not re-open mood entry nor
+    insert a second acknowledgement."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE user_onboarding_state SET status='completed', "
+            "completed_at=datetime('now'), "
+            "privacy_notice_acknowledged_at=datetime('now'), "
+            "privacy_notice_version=?, "
+            "updated_at=datetime('now') "
+            "WHERE user_id=? AND onboarding_version=? AND status='active' "
+            "AND current_step=?",
+            (privacy_notice_version, uid, version, last_step))
+        completed = cur.rowcount == 1
+        if completed and privacy_notice_version:
+            await db.execute(
+                "INSERT OR IGNORE INTO user_notice_acknowledgements "
+                "(user_id, notice_id, notice_version) VALUES (?, ?, ?)",
+                (uid, _NOTICE_ID_PRIVACY, privacy_notice_version))
+        await db.commit()
+        return completed
+
+
+# ── Independent, notice-scoped acknowledgement (spec item F correction) ────
+# Backed by user_notice_acknowledgements, NOT user_onboarding_state -- see
+# that table's SCHEMA comment for why this must not depend on
+# onboarding_version/status/completed_at/legacy_exempt/superseded/active rows.
+_NOTICE_ID_PRIVACY = "privacy_notice"
+
+
+async def record_notice_acknowledgement(uid: int, notice_id: str, notice_version: str) -> bool:
+    """Idempotent: INSERT OR IGNORE on the (user_id, notice_id, notice_version)
+    primary key. Returns True only for the call that actually inserted a new
+    row; a double tap returns False so the caller can refuse to re-run
+    downstream progression (matches complete_onboarding's rowcount contract)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO user_notice_acknowledgements "
+            "(user_id, notice_id, notice_version) VALUES (?, ?, ?)",
+            (uid, notice_id, notice_version))
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def has_notice_acknowledgement(uid: int, notice_id: str, notice_version: str) -> bool:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM user_notice_acknowledgements "
+            "WHERE user_id=? AND notice_id=? AND notice_version=? LIMIT 1",
+            (uid, notice_id, notice_version))
+        return (await cur.fetchone()) is not None
+
+
+async def has_privacy_notice_ack(uid: int, notice_version: str) -> bool:
+    """True iff this user has EVER acknowledged this EXACT privacy-notice
+    version -- backed solely by user_notice_acknowledgements, independent of
+    onboarding_version, status, completed_at, legacy_exempt, superseded, or
+    any active onboarding row (spec item F correction: the previous
+    implementation scanned user_onboarding_state rows directly, which
+    structurally could not survive an independent notice-version bump)."""
+    return await has_notice_acknowledgement(uid, _NOTICE_ID_PRIVACY, notice_version)
+
+
+async def set_onboarding_card_ref(uid: int, version: str, step: int,
+                                  chat_id: int, message_id: int) -> None:
+    """Persist WHICH Telegram message is the user's current visible onboarding
+    card, and what step it shows. Called ONLY after a confirmed-successful
+    render (see onboarding.send_or_edit_onboarding_card / bot._render_onboarding).
+    This is the durable half of the render/state recovery contract (spec item
+    H): the transition (advance/skip/start/complete) is committed to
+    current_step BEFORE delivery is attempted; this call records what was
+    ACTUALLY delivered, so a delivery failure leaves card_rendered_step
+    trailing current_step -- a safely resumable state, not corruption.
+    Idempotent overwrite; guarded to the specific (uid, version) row so it can
+    never attach a card reference to the wrong row."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE user_onboarding_state SET card_chat_id=?, card_message_id=?, "
+            "card_rendered_step=?, updated_at=datetime('now') "
+            "WHERE user_id=? AND onboarding_version=?",
+            (chat_id, message_id, step, uid, version))
+        await db.commit()
+
+
+# ── Onboarding eligibility (spec item C) ────────────────────────────────────
+# Signal tables checked for "meaningful prior product use". Deliberately does
+# NOT include `user_access` -- a user who was just invited (has an active
+# user_access row) but has never actually used the product must still count
+# as genuinely new. MUST be called BEFORE upsert_user() creates/touches the
+# `users` row for this call, otherwise the users-row check is meaningless
+# (upsert would have just created it, making every user "legacy").
+_ONBOARDING_LEGACY_SIGNAL_TABLES = (
+    ("messages", "user_id"),
+    ("questionnaire_sessions", "user_id"),
+    ("emotion_journal_entries", "user_id"),
+    ("cbt_journal_entries", "user_id"),
+    # `user_profiles` (the OLDER profile table, columns primary_issue/
+    # severity_level/effective_scenarios/...) is written ONLY by
+    # update_user_profile, which has no caller anywhere in the codebase --
+    # checking it here can never actually fire. `user_psychology_profile` is
+    # the table the LIVE product writes to (psychology_profile.py's
+    # save_profile/maybe_update_profile, called from bot.pipeline() and from
+    # bot.py's post-crisis bookkeeping) -- that is the real "does this user
+    # have a profile" legacy signal. Both are listed: user_profiles is kept
+    # in case anything is ever pointed back at it, but user_psychology_profile
+    # is what makes "profile-only history counts as legacy" actually true
+    # today, not just documented.
+    ("user_profiles", "user_id"),
+    ("user_psychology_profile", "user_id"),
+    ("user_states", "user_id"),
+    ("summaries", "user_id"),
+)
+
+
+async def get_onboarding_eligibility(uid: int) -> str:
+    """Returns "new" or "legacy". "legacy" (meaningful prior product use) if
+    ANY of: an existing `users` row, or any row in one of
+    _ONBOARDING_LEGACY_SIGNAL_TABLES (messages, questionnaire sessions,
+    emotion/CBT journal entries, profile, state, summary). "new" only when
+    NONE of these exist -- in particular, a user who merely holds an active
+    user_access invite grant but has never used the product returns "new"."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT 1 FROM users WHERE id=?", (uid,))
+        if await cur.fetchone():
+            return "legacy"
+        for table, col in _ONBOARDING_LEGACY_SIGNAL_TABLES:
+            cur = await db.execute(f"SELECT 1 FROM {table} WHERE {col}=? LIMIT 1", (uid,))
+            if await cur.fetchone():
+                return "legacy"
+    return "new"
 
 
 async def save_cbt_entry(uid: int, data: dict, lang: str = "ru") -> int:
