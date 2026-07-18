@@ -285,6 +285,40 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
         retention_policy="Until user-requested delete-all.",
         log_policy="status/source only — no free text; never in logs/alerts beyond "
                   "internal DB read."),
+
+    # First-user illustrated onboarding. This is consent/acknowledgment state
+    # (privacy_notice_acknowledged_at) plus progress metadata — semantically the
+    # same shape as tester_acknowledgments, hence CONSENT (not STATE): the row
+    # records that the user was shown and acknowledged the privacy notice, which
+    # is a consent-adjacent fact, not therapeutic content. CASCADE_DELETE (not
+    # RETAIN): it is NOT a safety-audit record, so a delete-all request removes
+    # it in full — the spec forbids retaining onboarding metadata past delete-all
+    # without a documented justified reason, and there is none. No raw content
+    # lives here (timestamps, a version tag, an integer step), so it is only ever
+    # read back through the owner's own privacy export.
+    "user_onboarding_state": _e(
+        table="user_onboarding_state", user_id_column="user_id", category="CONSENT",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all — no special retention; "
+                         "onboarding/consent-acknowledgment state, not a safety-audit "
+                         "record, so it does NOT get CRISIS_SAFETY RETAIN treatment.",
+        log_policy="Version tag, status, integer step and timestamps only — no raw "
+                  "content of any kind; never in logs/alerts."),
+
+    # Independent, notice-scoped acknowledgement ledger (spec item F
+    # correction) — deliberately NOT keyed by onboarding_version/status, so a
+    # future privacy-notice-version bump can prompt a settled onboarding user
+    # without needing a second onboarding row. Same CONSENT/CASCADE_DELETE
+    # treatment as user_onboarding_state: this is consent-adjacent state, not
+    # a safety-audit record, so a delete-all request removes it in full. No
+    # raw content lives here (a notice id, a version tag, a timestamp).
+    "user_notice_acknowledgements": _e(
+        table="user_notice_acknowledgements", user_id_column="user_id", category="CONSENT",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all — no special retention; "
+                         "consent-acknowledgment state, not a safety-audit record.",
+        log_policy="Notice id, version tag and timestamp only — no raw content of "
+                  "any kind; never in logs/alerts."),
 }
 
 

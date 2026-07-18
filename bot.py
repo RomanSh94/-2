@@ -25,6 +25,7 @@ for _stream in (sys.stdout, sys.stderr):
 from html import escape as _he
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.filters import Command
 from aiogram.exceptions import (
     TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter,
@@ -51,7 +52,7 @@ from humanization import (
     pick_greeting, typing_delay, has_robotic_phrase, rephrase_instruction,
 )
 from risk_detector import detect_risk, amplify_ambiguity_by_context, detect_protective_factors
-from language_detector import detect_language
+from language_detector import detect_language, normalize_telegram_language_code
 from stage_detector import detect_stage
 from state_engine import (
     DEFAULT_STATE, update_state, choose_scenario, get_emotional_trajectory,
@@ -105,7 +106,16 @@ from database import (
     claim_dass21_discuss_reply, transition_dass21_discuss_claim,
     grant_user_access,
     unblock_user_access,
+    get_onboarding_state, get_active_onboarding_state,
+    start_or_get_onboarding, mark_onboarding_legacy_exempt,
+    supersede_onboarding_version, advance_onboarding_step, skip_onboarding_to_privacy,
+    complete_onboarding, set_onboarding_card_ref, get_onboarding_eligibility,
+    get_stored_user_language, has_privacy_notice_ack,
+    record_notice_acknowledgement,
 )
+import onboarding
+import onboarding_content
+from onboarding_content import ONBOARDING_VERSION, PRIVACY_NOTICE_VERSION, FIRST_STEP, LAST_STEP
 import questionnaires
 import questionnaire_ux
 import clinical_instrument_catalog
@@ -520,6 +530,22 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # get the closed-test/tester-acknowledgment screen instead, and NOTHING
     # ordinary is written about them.
     if not await ensure_full_access_or_closed_test(message, uid):
+        return
+
+    # 4.2 Mandatory onboarding gate (spec item A) — strictly AFTER both crisis
+    # paths AND the access gate, and BEFORE any ordinary product persistence.
+    # A user with an ACTIVE first-user onboarding must not reach ordinary text/
+    # voice conversation by typing through it — this re-shows their current
+    # onboarding card (editing it in place, never flooding the chat) instead of
+    # silently dropping the message or letting it fall into the pipeline.
+    # Unconditional (not skipped when called from cb_mood, which already runs
+    # this same check before ever calling pipeline()) -- a second read of the
+    # same DB state here is a harmless no-op when already blocked/cleared
+    # upstream, and this way pipeline() is safe to call from ANY entrypoint
+    # without relying on a caller-specific signal to know whether the gate was
+    # already checked.
+    if await _onboarding_blocks_ordinary_entry(uid):
+        await _resume_onboarding_card(message.chat.id, uid)
         return
 
     # 5. Ordinary persistence — only now that access is confirmed.
@@ -937,6 +963,190 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
 
 # ────────────────────────────────────────────────────────────────────────────
 
+async def _render_onboarding_card(uid: int, chat_id: int, step: int, lang: str, *,
+                                  message_id: int | None) -> None:
+    """Render+persist ONE onboarding card (spec items G/H): delivers `step` by
+    editing `message_id` if given (falls back to a fresh card on
+    TelegramBadRequest — see onboarding.send_or_edit_onboarding_card), then
+    persists the (chat_id, message_id, step) that is now actually visible.
+
+    Recovery contract: the caller's DB transition (start/advance/skip/retire)
+    is ALREADY committed before this runs. If delivery itself raises (a real
+    network error), that exception propagates uncaught (never swallowed by a
+    blanket except) — current_step is already correct in the DB but the card
+    reference is NOT updated, so the next /start or gate-hit naturally retries
+    delivering the same already-decided step by editing the same old card."""
+    ref = await onboarding.send_or_edit_onboarding_card(
+        bot, chat_id, step, lang, message_id=message_id,
+        privacy_policy_url=config.PRIVACY_POLICY_URL)
+    if ref is not None:
+        await set_onboarding_card_ref(uid, ONBOARDING_VERSION, step, ref[0], ref[1])
+
+
+async def _render_privacy_notice_only_card(uid: int, chat_id: int, lang: str, *,
+                                           message_id: int | None) -> None:
+    """Render the PRIVACY_NOTICE_ONLY screen (determine_onboarding_requirement)
+    for a user who does not need full onboarding but has not acknowledged the
+    CURRENT privacy notice. Deliberately does NOT create or touch any
+    user_onboarding_state row and does NOT call set_onboarding_card_ref --
+    there is no row to persist a card reference to. This means this screen is
+    best-effort, not restart-resumable-by-edit like full onboarding: if
+    delivery fails or the user simply /starts again before acknowledging, the
+    next attempt sends a fresh card rather than editing a remembered one.
+    That is an accepted, explicitly documented trade-off (not exactly-once
+    delivery) for avoiding a fake onboarding row -- see
+    docs/first_user_onboarding.md."""
+    await onboarding.send_or_edit_onboarding_card(
+        bot, chat_id, LAST_STEP, lang, message_id=message_id,
+        privacy_policy_url=config.PRIVACY_POLICY_URL,
+        keyboard=onboarding.build_keyboard_privacy_only(lang, config.PRIVACY_POLICY_URL))
+
+
+async def _onboarding_blocks_ordinary_entry(uid: int) -> bool:
+    """True iff the mandatory onboarding gate (spec item A) must block
+    ordinary product entry (text/voice/mood) for uid right now: the flag is on
+    AND uid has an ACTIVE onboarding row (any version — an active OLDER
+    version is only retired by cmd_start's /start path; until the user runs
+    /start again it must still block, same as an active current-version row)."""
+    if not config.FIRST_USER_ONBOARDING_ENABLED:
+        return False
+    return await get_active_onboarding_state(uid) is not None
+
+
+async def _resume_onboarding_card(chat_id: int, uid: int) -> None:
+    """Re-show the user's current onboarding card IN PLACE (edit if possible,
+    else send exactly one replacement) instead of silently dropping their
+    message and instead of flooding the chat with a new card per message.
+    Never advances state — only re-renders the current step. Uses the
+    onboarding's OWN stored language (not whatever the blocked message
+    happened to be written in)."""
+    state = await get_active_onboarding_state(uid)
+    if state is None:
+        return  # gate raced away (e.g. just completed) -- nothing to show
+    lang = await get_user_language(uid)
+    await _render_onboarding_card(uid, chat_id, state["current_step"], lang,
+                                  message_id=state.get("card_message_id"))
+
+
+# ── C: ONE reusable guard for the WHOLE ordinary product surface ────────────
+# Registered as OUTER middleware on both dp.message and dp.callback_query.
+# Outer middleware runs BEFORE any specific handler's filters are evaluated
+# (aiogram's TelegramEventObserver.wrap_outer_middleware wraps
+# Router.propagate_event, which resolves filters/handlers only afterward) --
+# so this is a single, non-scattered interception point in front of every
+# command and every callback in the bot: mood, emotion map, menu navigation,
+# questionnaires, journals, profile, reports, the specialist report, the
+# discuss-with-bot topics, check-ins, mute settings, timezone settings, the
+# practice before/after/quality flow -- everything.
+#
+# Classification is DEFAULT-DENY for commands and callbacks: anything not
+# explicitly exempted below is blocked while onboarding is active. This fails
+# closed for any future command/callback added later without being added to
+# the exempt list, rather than silently leaking through an unmaintained
+# blocklist.
+#
+# Free-text and voice MESSAGES are the one deliberate exception: they are
+# EXEMPT from this middleware's own judgment (always passed through), and are
+# instead gated inside bot.pipeline() itself, AFTER its active-crisis and RED
+# checks -- see bot.pipeline's "4.2 Mandatory onboarding gate" comment.
+# Whether a plain-text message is an active-crisis reply is content/state
+# dependent (get_active_crisis + risk detection); a static, content-blind
+# middleware classifier cannot safely make that judgment BEFORE pipeline()
+# runs its own crisis checks, so blocking free text here would risk silently
+# swallowing a genuine crisis disclosure. A command name or callback data
+# string, by contrast, is never itself a crisis disclosure, so every other
+# entrypoint IS fully covered here, uniformly, with no such exception needed.
+
+_ONBOARDING_EXEMPT_COMMANDS = {
+    "start",               # the onboarding entry/resume mechanism itself
+    "forget_all",          # privacy self-service
+    "privacy_export_all",  # privacy self-service
+    "privacy_delete_all",  # privacy self-service
+    "help",                # deterministic help information
+    "unblock",             # owner-only access-control admin action
+    "review_pack",         # reviewer-facing crisis review pack (crisis-adjacent)
+}
+
+_ONBOARDING_EXEMPT_CALLBACK_PREFIXES = (
+    "crisis:",          # active-crisis callbacks
+    "onb:",             # onboarding's own namespace
+    "tester_ack:",      # access/tester acknowledgment
+    "forget:",          # /forget_all confirm step
+    "privacy_delete:",  # /privacy_delete_all confirm step
+    "privacy:hub",      # deterministic privacy information menu entry
+)
+
+
+def _command_name(text: str | None) -> str | None:
+    """"/start payload" -> "start"; "/start@BotName" -> "start"; None for any
+    non-command text (including None, e.g. a voice message has no .text)."""
+    if not text or not text.startswith("/"):
+        return None
+    first = text.split(maxsplit=1)[0][1:]
+    return first.split("@")[0].lower() or None
+
+
+def _message_is_onboarding_exempt(message) -> bool:
+    """Commands are judged here (default-deny against
+    _ONBOARDING_EXEMPT_COMMANDS). Non-command messages (plain text, voice --
+    .text is None for a voice message) are always "exempt" from THIS
+    middleware -- they are gated inside pipeline() instead, see module note
+    above."""
+    cmd = _command_name(getattr(message, "text", None))
+    if cmd is None:
+        return True
+    return cmd in _ONBOARDING_EXEMPT_COMMANDS
+
+
+def _callback_is_onboarding_exempt(callback) -> bool:
+    data = getattr(callback, "data", None) or ""
+    if not data:
+        return False
+    return any(data == p or data.startswith(p) for p in _ONBOARDING_EXEMPT_CALLBACK_PREFIXES)
+
+
+class OnboardingGateMiddleware(BaseMiddleware):
+    """Blocks ordinary product commands/callbacks while the caller has an
+    ACTIVE first-user onboarding, re-rendering their current onboarding card
+    instead of running the real handler. `is_exempt(event)` classifies the
+    event using the static tables above. `kind` ("message" or "callback")
+    picks how to answer/locate the chat to render into -- deliberately NOT an
+    `isinstance(event, CallbackQuery)` check, which would only work against
+    real aiogram objects and silently do nothing for the duck-typed Fake
+    doubles this whole test suite uses (and unit-testing this middleware
+    without real Telegram objects is the entire point)."""
+
+    def __init__(self, is_exempt, kind):
+        self._is_exempt = is_exempt
+        self._kind = kind
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        uid = user.id if user is not None else None
+        if uid is None or self._is_exempt(event):
+            return await handler(event, data)
+        if not await _onboarding_blocks_ordinary_entry(uid):
+            return await handler(event, data)
+        # Blocked: neutralize the event and resume the onboarding card.
+        if self._kind == "callback":
+            answer = getattr(event, "answer", None)
+            if answer is not None:
+                await answer()
+            message = getattr(event, "message", None)
+            chat = getattr(message, "chat", None) if message is not None else None
+        else:
+            chat = getattr(event, "chat", None)
+        if chat is not None:
+            await _resume_onboarding_card(chat.id, uid)
+        return None
+
+
+dp.message.outer_middleware(
+    OnboardingGateMiddleware(_message_is_onboarding_exempt, kind="message"))
+dp.callback_query.outer_middleware(
+    OnboardingGateMiddleware(_callback_is_onboarding_exempt, kind="callback"))
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     from datetime import datetime, timezone
@@ -948,6 +1158,22 @@ async def cmd_start(message: Message):
     # the whole feature a dead branch. This codebase has no existing deep-link
     # parsing helper (verified: no `deep_link`/`start_param` hits anywhere),
     # so we do plain string parsing on message.text ourselves.
+    # Language resolution (spec item B correction), done ONCE, up front,
+    # before the invite-grant messages below (which fire before upsert_user
+    # ever runs, so a "read it back after upsert" call would see either the
+    # pre-upsert "ru" default for a brand-new user, or -- worse -- clobber an
+    # existing explicit preference). Policy: PRESERVE a valid existing stored
+    # preference; only resolve fresh from Telegram's language_code for a
+    # brand-new user (no `users` row yet) or an invalid/malformed stored
+    # value (deterministic repair). This is what makes both the invite/grant
+    # messages AND upsert_user's write use the SAME, correctly-resolved value.
+    stored_lang = await get_stored_user_language(uid)
+    if stored_lang in ("ru", "en"):
+        lang = stored_lang
+    else:
+        lang = normalize_telegram_language_code(
+            getattr(message.from_user, "language_code", None))
+
     parts = (message.text or "").split(maxsplit=1)
     payload = parts[1].strip() if len(parts) > 1 else ""
     if payload:
@@ -961,7 +1187,6 @@ async def cmd_start(message: Message):
         if cfg.get("valid") and cfg.get("code") is not None and payload == cfg["code"] \
                 and access_control.is_temp_test_invite_active():
             access_control.grant_temp_test_access(uid)
-            lang = await get_user_language(uid)
             end_str = cfg["end"].strftime("%Y-%m-%d %H:%M UTC")
             grant_msg = (f"✅ Временный тестовый доступ выдан до {end_str}."
                          if lang == "ru" else
@@ -979,40 +1204,145 @@ async def cmd_start(message: Message):
         elif access_control.user_invite_active() and hmac.compare_digest(
                 payload.encode("utf-8"), config.USER_INVITE_CODE.encode("utf-8")):
             await grant_user_access(uid, source="invite")
-            lang = await get_user_language(uid)
             grant_msg = "✅ Доступ открыт." if lang == "ru" else "✅ Access granted."
             await message.answer(grant_msg)
     if not await ensure_full_access_or_closed_test(message, uid):
         return
     overview = await get_memory_overview(uid)          # before upsert: 0 msgs == first time
     is_first = overview["message_count"] == 0
-    await upsert_user(uid, message.from_user.username or "", message.from_user.first_name or "")
-    lang = await get_user_language(uid)
-    text, buttons = get_onboarding(lang)
+    # Onboarding eligibility (spec item C) MUST be inspected BEFORE upsert_user
+    # creates/touches the `users` row below -- otherwise "does a users row
+    # already exist" is meaningless (upsert would have just created it).
+    # Computed unconditionally (cheap indexed lookups) so flag-off/flag-on
+    # ordering can never silently diverge depending on which branch runs first.
+    eligibility = await get_onboarding_eligibility(uid)
+    await upsert_user(uid, message.from_user.username or "", message.from_user.first_name or "",
+                      lang)
+    # First-user illustrated onboarding (flag-gated). This whole block is entered
+    # ONLY when config.FIRST_USER_ONBOARDING_ENABLED is on -> with the flag off,
+    # /start behaves byte-for-byte as before. It runs AFTER the access gate and
+    # the upsert, so a blocked/unauthorized user never reaches it, and it can
+    # never itself grant access (access is granted only in the invite branches
+    # above). See onboarding.py / onboarding_content.py.
+    if config.FIRST_USER_ONBOARDING_ENABLED:
+        # Real versioning policy (spec item F): VERSION EQUALITY IS THE GATE.
+        # A user is "settled" for onboarding purposes only once they have a
+        # row for the CURRENT ONBOARDING_VERSION specifically (completed,
+        # legacy_exempt, or superseded all count as settled -- only 'active'
+        # keeps them mid-flow). This is deliberately NOT "has this user ever
+        # touched onboarding, any version" -- that older policy would make a
+        # completed OLD version a PERMANENT exemption from every future
+        # MANDATORY version bump (e.g. a new required privacy notice), which
+        # is exactly the bug being corrected here.
+        active_state = await get_active_onboarding_state(uid)
+        current_version_row = (
+            None if active_state is not None
+            else await get_onboarding_state(uid, ONBOARDING_VERSION))
+        # Independent privacy-notice acknowledgement (spec item F correction):
+        # backed solely by user_notice_acknowledgements, never by
+        # onboarding_version/status/completed_at/legacy_exempt/superseded/
+        # active-row bookkeeping (see database.has_privacy_notice_ack /
+        # database.record_notice_acknowledgement). This is what lets a future
+        # PRIVACY_NOTICE_VERSION bump reach a settled user even if
+        # ONBOARDING_VERSION never changes.
+        notice_acked = await has_privacy_notice_ack(uid, PRIVACY_NOTICE_VERSION)
+        requirement = onboarding_content.determine_onboarding_requirement(
+            eligibility=eligibility,
+            has_active_state=active_state is not None,
+            has_current_version_row=current_version_row is not None,
+            notice_acknowledged=notice_acked)
+
+        if requirement == onboarding_content.FULL_ONBOARDING:
+            if active_state is not None:
+                if active_state["onboarding_version"] == ONBOARDING_VERSION:
+                    # Resume in-progress onboarding at the stored step, editing
+                    # the persisted card in place when possible (spec item G)
+                    # instead of always sending a fresh one.
+                    await _render_onboarding_card(
+                        uid, message.chat.id, active_state["current_step"], lang,
+                        message_id=active_state.get("card_message_id"))
+                    return
+                # An ACTIVE row for an OLDER version means a deployment bumped
+                # ONBOARDING_VERSION (a mandatory update) while this user's
+                # onboarding was in flight. This is NOT "completed" and NOT
+                # "legacy_exempt" -- the user did not finish it, and they were
+                # not exempt from it either. Supersede the stale row, then
+                # ALWAYS start the new version's active flow immediately --
+                # no further eligibility re-check (they were already actively
+                # engaging with onboarding).
+                await supersede_onboarding_version(uid, active_state["onboarding_version"])
+            await start_or_get_onboarding(uid, ONBOARDING_VERSION)
+            await _render_onboarding_card(
+                uid, message.chat.id, FIRST_STEP, lang, message_id=None)
+            return
+
+        if requirement == onboarding_content.PRIVACY_NOTICE_ONLY:
+            # Renders the privacy-notice-only screen WITHOUT creating or
+            # touching any user_onboarding_state row -- there is no
+            # onboarding-content settling to do here, only the CURRENT
+            # privacy notice is missing. The acknowledgement itself is
+            # recorded independently by cb_onboarding's CB_PRIVACY_ONLY_START
+            # branch via database.record_notice_acknowledgement, never by
+            # complete_onboarding (there is no row to complete).
+            await _render_privacy_notice_only_card(
+                uid, message.chat.id, lang, message_id=None)
+            return
+
+        # NOT_REQUIRED: settle bookkeeping if this exact version row doesn't
+        # exist yet (a legacy user who already independently acknowledged the
+        # current privacy notice but never got a row for THIS
+        # onboarding_version) -- purely a bookkeeping completion, never shown.
+        if current_version_row is None:
+            await mark_onboarding_legacy_exempt(uid, ONBOARDING_VERSION)
+        # settled for the current onboarding_version AND the current privacy
+        # notice is acknowledged -> fall through to the ordinary greeting.
+
+    text, _ = get_onboarding(lang)
     # §7.1 returning users get a time-varied greeting — in their LOCAL time, not
     # UTC (otherwise a daytime user gets a "поздно, не спится?" night line).
     if not is_first:
         tz_off, tz_set, ulang = await get_user_tz(uid)
         local_hour = (datetime.now(timezone.utc).hour + effective_tz(tz_off, tz_set, ulang)) % 24
         text = pick_greeting(False, local_hour, lang)
+    await _send_mood_entry(message, lang, text)
+
+
+def _mood_entry_keyboard(lang: str, buttons: list) -> InlineKeyboardMarkup:
     # Inline-кнопки вместо reply-клавиатуры: iOS прячет reply-клавиатуру за
     # иконкой у поля ввода, и пользователи её не видят. Inline видна везде.
     # Onboarding asks "как ты себя чувствуешь" -- Emotion Map helper row added
     # (deterministic vocabulary aid, not a new gate/flow; opening it never
     # stores anything, see cb_emotion_map).
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=b, callback_data=f"mood:{i}")]
         for i, b in enumerate(buttons)
     ] + [[InlineKeyboardButton(
         text=("🗺 Карта эмоций" if lang == "ru" else "🗺 Emotion map"), callback_data="emotion:map")]])
-    await message.answer(text + "\n\n⚠️ " + ("Я не терапевт." if lang == "ru" else "I'm not a therapist."),
-                         reply_markup=kb)
+
+
+async def _send_mood_entry(target, lang: str, text: str) -> None:
+    """Render the existing mood-selection entry (mood buttons + emotion-map row +
+    the '⚠️ Я не терапевт.' line). Shared verbatim by cmd_start and the
+    first-user onboarding Start button, so the mood entry stays byte-identical
+    whichever path opened it."""
+    _, buttons = get_onboarding(lang)
+    kb = _mood_entry_keyboard(lang, buttons)
+    await target.answer(
+        text + "\n\n⚠️ " + ("Я не терапевт." if lang == "ru" else "I'm not a therapist."),
+        reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("mood:"))
 async def cb_mood(callback: CallbackQuery, state: FSMContext):
-    """Кнопка состояния из онбординга → обычный проход по pipeline."""
-    lang = await get_user_language(callback.from_user.id)
+    """Кнопка состояния из онбординга → обычный проход по pipeline.
+
+    An old/leftover mood button cannot reach this handler at all while
+    onboarding is active -- OnboardingGateMiddleware (spec item C) intercepts
+    every callback_query BEFORE handler dispatch and re-renders the onboarding
+    card instead. No inline gate check needed here (a redundant one would be
+    exactly the "scattered check" the middleware exists to avoid)."""
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
     _, buttons = get_onboarding(lang)
     try:
         choice = buttons[int(callback.data.split(":")[1])]
@@ -1026,6 +1356,122 @@ async def cb_mood(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     await pipeline(callback.message, choice, state, tg_user=callback.from_user)
+
+
+@dp.callback_query(F.data.startswith("onb:"))
+async def cb_onboarding(callback: CallbackQuery):
+    """First-user illustrated onboarding navigation (Continue / Skip / Start /
+    Privacy Policy). One handler for the WHOLE "onb:" namespace regardless of
+    version (spec item D) — NOT just the current ONBOARDING_VERSION — so that
+    a callback carrying an old (or, after a downgrade, a future) version
+    always reaches a handler that answers it and no-ops, rather than being
+    left completely unmatched (which would leave Telegram's client-side
+    loading spinner hanging on the button with no answer ever sent).
+
+    Every branch: (1) answers the callback; (2) rejects any version other than
+    the CURRENT ONBOARDING_VERSION as a safe no-op (old-version callbacks fail
+    safely — never try to interpret content from an unknown version's
+    namespace); (3) rechecks access — onboarding is a product surface, and it
+    can never GRANT access (that only happens in cmd_start's invite branches);
+    (4) loads state by callback.from_user.id and NEVER trusts callback data as
+    identity/ownership; (5) verifies the expected step; (6) mutates state
+    through an atomic, guarded UPDATE so stale taps, double taps and
+    concurrent taps are no-ops rather than corruption or backward movement;
+    (7) never leaks internal failure detail to the user.
+    """
+    uid = callback.from_user.id
+    data = callback.data or ""
+    await callback.answer()
+    if not config.FIRST_USER_ONBOARDING_ENABLED:
+        return
+    if not data.startswith(onboarding_content.CB_PREFIX):
+        return  # old/future-version callback -- answered above, safe no-op
+    # Access recheck (defense in depth). Fail closed & neutral — no error text.
+    try:
+        if not await access_control.has_full_access(uid):
+            return
+    except Exception:
+        return
+    lang = await get_user_language(uid)
+
+    if data == onboarding_content.CB_PRIVACY_ONLY_START:
+        # Privacy-notice-only acknowledgement (spec item F correction): this
+        # screen is NOT backed by any user_onboarding_state row (see
+        # bot.cmd_start / determine_onboarding_requirement), so it is answered
+        # here, independently of the active-onboarding-state gate below.
+        # Identity is callback.from_user.id (never trusted from callback
+        # data); the notice id/version are the fixed current constants, never
+        # read from the callback payload, so a stale/forged callback cannot
+        # name an arbitrary notice or version. record_notice_acknowledgement
+        # is idempotent (INSERT OR IGNORE) and returns False on a double tap,
+        # which must not re-open mood entry a second time.
+        if not await record_notice_acknowledgement(uid, "privacy_notice", PRIVACY_NOTICE_VERSION):
+            return
+        chat_id = callback.message.chat.id
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=callback.message.message_id, reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        text, _ = get_onboarding(lang)
+        await _send_mood_entry(callback.message, lang, text)
+        return
+
+    state = await get_active_onboarding_state(uid)
+    # Neutral no-op unless there's an ACTIVE onboarding of the current version.
+    if state is None or state["onboarding_version"] != ONBOARDING_VERSION:
+        return
+    step = state["current_step"]
+    chat_id = callback.message.chat.id
+    card_message_id = state.get("card_message_id") or callback.message.message_id
+
+    if data == onboarding_content.CB_SKIP:
+        # Skip informational screens 1–4 -> the privacy screen (5). Never
+        # completes onboarding and never bypasses the privacy notice.
+        if await skip_onboarding_to_privacy(uid, ONBOARDING_VERSION, LAST_STEP):
+            await _render_onboarding_card(uid, chat_id, LAST_STEP, lang,
+                                          message_id=card_message_id)
+        return
+
+    if data == onboarding_content.CB_PRIVACY:
+        # Informational only: deterministic in-bot privacy summary. Does NOT
+        # change state and does NOT complete onboarding. (When a real
+        # PRIVACY_POLICY_URL is configured, this is a URL button and the handler
+        # is never reached.)
+        await callback.message.answer(onboarding_content.privacy_summary(lang))
+        return
+
+    if data == onboarding_content.CB_START:
+        # Valid only on the final privacy step; completes exactly once.
+        if step != LAST_STEP:
+            return
+        if not await complete_onboarding(uid, ONBOARDING_VERSION, LAST_STEP,
+                                         privacy_notice_version=PRIVACY_NOTICE_VERSION):
+            return  # double tap / already completed -> do NOT re-open mood entry
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=card_message_id,
+                                                reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        # Open the existing mood-selection entry (first-time greeting text). No
+        # therapeutic response is generated until the user chooses/writes.
+        text, _ = get_onboarding(lang)
+        await _send_mood_entry(callback.message, lang, text)
+        return
+
+    if data.startswith(onboarding_content.CB_PREFIX + "next:"):
+        try:
+            target = int(data.rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            return
+        # Valid advance targets are 2..LAST_STEP, each from exactly target-1. A
+        # stale/replayed tap whose from-step no longer matches is a silent no-op.
+        if target < FIRST_STEP + 1 or target > LAST_STEP:
+            return
+        if await advance_onboarding_step(uid, ONBOARDING_VERSION, target - 1, target):
+            await _render_onboarding_card(uid, chat_id, target, lang,
+                                          message_id=card_message_id)
+        return
 
 
 @dp.message(Command("profile"))
