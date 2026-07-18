@@ -361,6 +361,46 @@ CREATE TABLE IF NOT EXISTS questionnaire_responses (
     answered_at      TEXT DEFAULT (datetime('now'))
 );
 
+-- Workstream B (corrective pass) — atomic delivery claim for one DASS-21
+-- discuss topic reply, keyed to the exact MENU CARD (source_chat_id +
+-- source_message_id), not just (user_id, session_id, topic_id) -- otherwise
+-- each topic would be usable only ONCE for the entire questionnaire session.
+-- Reopening the discuss menu sends a NEW Telegram message (a new
+-- source_message_id), which is a fresh, legitimate logical attempt.
+--
+-- 5-state machine (CHECK-constrained -- an unknown status value is rejected
+-- at the DB layer regardless of application logic):
+--   pending_before_send -> send_started -> delivered
+--                       -> failed_before_send (retryable on the SAME card)
+--   send_started        -> delivery_uncertain (Telegram raised; unknown
+--                          whether it actually sent -- NEVER auto-reclaimed
+--                          on this card; a NEW card can still retry)
+--
+-- No response text/prompt/LLM answer/subscale values are stored here, only
+-- delivery bookkeeping (claim_dass21_discuss_reply / transition_dass21_
+-- discuss_claim in database.py). No FOREIGN KEY: this codebase never enables
+-- `PRAGMA foreign_keys` per connection (see e.g. crisis_events, which is
+-- deliberately FK-less for the same reason), so a declared FK here would be
+-- silently unenforced -- consistent with every other table in this schema.
+CREATE TABLE IF NOT EXISTS dass21_discuss_claims (
+    user_id           INTEGER NOT NULL,
+    session_id        INTEGER NOT NULL,
+    topic_id          TEXT NOT NULL
+                       CHECK (topic_id IN ('measures', 'relate', 'next', 'specialist')),
+    source_chat_id    INTEGER NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending_before_send'
+                       CHECK (status IN (
+                           'pending_before_send', 'send_started', 'delivered',
+                           'failed_before_send', 'delivery_uncertain')),
+    response_id       TEXT NOT NULL CHECK (length(response_id) > 0),
+    created_at        TEXT DEFAULT (datetime('now')),
+    updated_at        TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, session_id, topic_id, source_chat_id, source_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dass21_discuss_claims_stale
+    ON dass21_discuss_claims(status, updated_at);
+
 -- PR A — ordinary-user private invite access. Lets the owner send a single
 -- invite link so a real Telegram user can self-register as an ordinary
 -- product user (NOT owner, NOT clinician tester/reviewer). Additive to
@@ -1624,6 +1664,112 @@ async def cancel_questionnaire_session(session_id: int) -> None:
             "UPDATE questionnaire_sessions SET status='cancelled', completed_at=datetime('now') "
             "WHERE id=?", (session_id,))
         await db.commit()
+
+
+# Workstream B (corrective pass) — bounded 5-state claim machine, Python-side
+# mirror of the DB CHECK constraint on dass21_discuss_claims.status. Every
+# transition this module performs is validated against BOTH this table AND
+# the SQL WHERE clause (exact expected current status) -- a stale worker
+# holding an old response_id, or an out-of-order transition, changes 0 rows.
+DASS21_CLAIM_STATUSES = frozenset({
+    "pending_before_send", "send_started", "delivered",
+    "failed_before_send", "delivery_uncertain",
+})
+_DASS21_CLAIM_TRANSITIONS = frozenset({
+    ("pending_before_send", "send_started"),
+    ("pending_before_send", "failed_before_send"),
+    ("send_started", "delivered"),
+    ("send_started", "delivery_uncertain"),
+})
+# A pending_before_send claim whose lease has expired (the process almost
+# certainly crashed/died before ever contacting Telegram) is provably safe to
+# reclaim -- send_started/delivery_uncertain never are (Telegram may already
+# have been contacted; an automatic retry there could duplicate a message we
+# cannot prove was never sent).
+#
+# Margin: bot._dass21_discuss_build_response caps the LLM call at
+# timeout=20s; the installed openai SDK (1.35.10) defaults max_retries=2, so
+# the worst-case LLM time for one legitimate build is ~20s * 3 = 60s.
+# persist_influence_trace and safety validation are near-instant local
+# DB/CPU work. 180s leaves a 3x margin over that worst case, so a normal
+# in-flight build never loses its lease to a reclaim.
+_DASS21_CLAIM_LEASE_SECONDS = 180
+
+# Storage-layer contract: the ONLY topic_ids this table may ever hold (mirrors
+# the DB CHECK constraint above). This is deliberately a SEPARATE constant from
+# bot._DASS21_DISCUSS_TOPICS (the presentation-layer contract, which buttons to
+# show) to avoid a database.py <-> bot.py import cycle -- keep them in sync by
+# hand if the DASS discuss topic set ever changes.
+_DASS21_VALID_TOPIC_IDS = frozenset({"measures", "relate", "next", "specialist"})
+
+
+async def claim_dass21_discuss_reply(user_id: int, session_id: int, topic_id: str,
+                                     source_chat_id: int, source_message_id: int,
+                                     response_id: str) -> bool:
+    """ATOMIC claim of the logical action
+    (user_id, session_id, topic_id, source_chat_id, source_message_id) --
+    the exact menu CARD's topic button, not the topic in general (reopening
+    the menu sends a NEW Telegram message with a new message_id, which is a
+    fresh, legitimate attempt). One UPSERT: inserts a fresh
+    'pending_before_send' row, or -- if a row already exists for this exact
+    card -- reclaims it ONLY when it is 'failed_before_send' (a genuine
+    retry, Telegram provably never contacted), or a 'pending_before_send'
+    whose lease has expired (the process likely crashed before ever reaching
+    _send). 'send_started'/'delivered'/'delivery_uncertain' are NEVER
+    reclaimed here. Returns True iff THIS call won the claim (caller must
+    proceed); False means another delivery already owns this exact card+
+    topic -- caller must not call the LLM or send a second reply. Same
+    once-only-guard pattern as bump_crisis_stage.
+
+    Raises ValueError for a topic_id outside _DASS21_VALID_TOPIC_IDS -- a
+    repository-level check in addition to the DB's own CHECK constraint;
+    callers (bot.py) already validate this before calling, so this is
+    defense in depth, not the primary gate."""
+    if topic_id not in _DASS21_VALID_TOPIC_IDS:
+        raise ValueError(f"invalid DASS-21 discuss topic_id: {topic_id!r}")
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "INSERT INTO dass21_discuss_claims "
+            "(user_id, session_id, topic_id, source_chat_id, source_message_id, "
+            " status, response_id) "
+            "VALUES (?, ?, ?, ?, ?, 'pending_before_send', ?) "
+            "ON CONFLICT(user_id, session_id, topic_id, source_chat_id, source_message_id) "
+            "DO UPDATE SET status='pending_before_send', response_id=excluded.response_id, "
+            "  updated_at=datetime('now') "
+            "WHERE dass21_discuss_claims.status='failed_before_send' "
+            "   OR (dass21_discuss_claims.status='pending_before_send' "
+            "       AND dass21_discuss_claims.updated_at <= datetime('now', ?))",
+            (user_id, session_id, topic_id, source_chat_id, source_message_id, response_id,
+             f"-{_DASS21_CLAIM_LEASE_SECONDS} seconds"))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def transition_dass21_discuss_claim(user_id: int, session_id: int, topic_id: str,
+                                          source_chat_id: int, source_message_id: int,
+                                          response_id: str, from_status: str,
+                                          to_status: str) -> bool:
+    """Bounded, token-checked state transition for one already-claimed card.
+    Requires the EXACT claim token (response_id) and EXACT expected current
+    status -- a stale worker holding an old response_id, or attempting an
+    out-of-order transition, changes 0 rows (verified by rowcount, never
+    assumed). Raises ValueError for an unknown status or a transition not in
+    _DASS21_CLAIM_TRANSITIONS -- a Python-side check independent of (and in
+    addition to) the DB's own CHECK constraint on the status column."""
+    if from_status not in DASS21_CLAIM_STATUSES or to_status not in DASS21_CLAIM_STATUSES:
+        raise ValueError(f"unknown claim status in transition {from_status!r} -> {to_status!r}")
+    if (from_status, to_status) not in _DASS21_CLAIM_TRANSITIONS:
+        raise ValueError(f"invalid claim transition {from_status!r} -> {to_status!r}")
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE dass21_discuss_claims SET status=?, updated_at=datetime('now') "
+            "WHERE user_id=? AND session_id=? AND topic_id=? AND source_chat_id=? "
+            "  AND source_message_id=? AND response_id=? AND status=?",
+            (to_status, user_id, session_id, topic_id, source_chat_id, source_message_id,
+             response_id, from_status))
+        await db.commit()
+        return cur.rowcount > 0
+
 
 # ── Sync helpers (Flask) ──────────────────────────────────────────────────────
 

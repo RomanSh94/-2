@@ -413,13 +413,14 @@ def specialist_report_text(title: str, completed_at: str | None,
     return "\n".join(parts)
 
 
-# ── PR C2 — discuss-with-bot menu (deterministic, no LLM) ────────────────────
-# Dormant unless bot.py's gate (same eligibility chain as q:r/q:o) allows it.
-# This module holds ONLY the fixed menu text/topic prompt strings; the actual
-# LLM call and trace-builder wiring live in bot.py. No new button is added to
-# _questionnaire_result_keyboard/_questionnaire_completion_keyboard in this PR
-# -- q:m is reachable only by direct callback in PR C2 (see CLAUDE.md / this
-# PR's scope notes; the visible button is deferred to C2.1).
+# ── discuss-with-bot menu (deterministic, no LLM) ────────────────────────────
+# Dormant unless bot.py's gate allows it: the generic path behind
+# config.QUESTIONNAIRE_INTERPRETATION_ENABLED + questionnaires.is_result_
+# eligible (button wired into _questionnaire_result_keyboard), and the
+# DASS-21 path behind config.DASS21_DISCUSSION_ENABLED + dass21_access
+# authorization (button wired into bot._dass21_completion_keyboard). This
+# module holds ONLY the fixed menu text/topic prompt strings; the actual LLM
+# call and trace-builder wiring live in bot.py.
 
 def discuss_menu_text(lang: str = "ru") -> str:
     if lang == "ru":
@@ -456,7 +457,7 @@ def discuss_topic_prompt(title: str, score: int, max_score: int, intensity: str,
                           "задать специалисту, опираясь на этот результат как ориентир "
                           "для разговора -- не вместо специалиста.",
         }
-        topic_line = topic_lines.get(topic_id, topic_lines["why"])
+        topic_line = topic_lines[topic_id]
         return (f"Опросник: {title}\nРезультат: {score} / {max_score}\n"
                 f"Выраженность: {intensity}\nТема: {topic_id}\n\n"
                 f"{topic_line}\n\n{boundary}")
@@ -474,10 +475,80 @@ def discuss_topic_prompt(title: str, score: int, max_score: int, intensity: str,
                       "specialist, using this result as a talking-point marker -- not "
                       "a substitute for a specialist.",
     }
-    topic_line = topic_lines.get(topic_id, topic_lines["why"])
+    topic_line = topic_lines[topic_id]
     return (f"Questionnaire: {title}\nResult: {score} / {max_score}\n"
             f"Intensity: {intensity}\nTopic: {topic_id}\n\n"
             f"{topic_line}\n\n{boundary}")
+
+
+def dass21_discuss_topic_prompt(instrument_version: str, translation_id: str,
+                                 subscales, topic_id: str, lang: str = "ru") -> str:
+    """Workstream B — data-minimized DASS-21 discuss prompt. Contains ONLY
+    instrument_version/translation_id, the three subscale ints, and topic_id
+    -- never raw stored answer text, item wording, answer labels, an overall
+    total, or a severity/diagnosis label (the scorer contract provides
+    neither). Topic ids are the DASS-specific, non-causal set
+    (bot._DASS21_DISCUSS_TOPICS): measures/relate/next/specialist -- NOT the
+    generic "why did this happen" framing, which would imply the scores
+    establish a cause."""
+    dep, anx, stress = subscales["depression"], subscales["anxiety"], subscales["stress"]
+    if lang == "ru":
+        boundary = ("Это не диагноз и не медицинское заключение. Шкалы описывают "
+                     "проявления за последнюю неделю, а не причины -- не утверждай, "
+                     "что результат ЧТО-ТО ВЫЗВАЛ. Не ставь диагнозов, не называй "
+                     "расстройств, не оценивай вероятность заболевания, не "
+                     "назначай лечение или лекарства и не давай медицинских "
+                     "советов. Связь с недавним опытом -- только предположительная. "
+                     "Дай один короткий, законченный ответ на выбранную тему; там, "
+                     "где уместно, мягко упомяни, что разговор со специалистом "
+                     "может быть полезен.")
+        topic_lines = {
+            "measures": "Объясни простыми словами, что именно измеряют шкалы "
+                        "депрессии, тревоги и стресса за последнюю неделю -- НЕ что "
+                        "их вызвало.",
+            "relate": "Предложи спокойно, необвинительно и предположительно "
+                      "посмотреть, как эти шкалы могли бы соотноситься с недавним "
+                      "опытом человека -- явно как повод для самонаблюдения, а не "
+                      "как причинное объяснение.",
+            "next": "Предложи один разумный следующий шаг и что стоит понаблюдать "
+                    "за собой дальше -- мягко, без давления.",
+            "specialist": "Помоги сформулировать 2-3 вопроса, которые человек мог "
+                          "бы задать специалисту, и мягко обозначь, когда обращение "
+                          "к специалисту может быть уместным. Профессиональную "
+                          "терминологию (депрессия/тревога/стресс как названия "
+                          "шкал) можно использовать, не ставя диагноз.",
+        }
+        topic_line = topic_lines[topic_id]
+        return (f"Опросник: {instrument_version} (перевод {translation_id})\n"
+                f"Шкала депрессии: {dep}\nШкала тревоги: {anx}\nШкала стресса: {stress}\n"
+                f"Тема: {topic_id}\n\n{topic_line}\n\n{boundary}")
+    boundary = ("This is not a diagnosis or a medical conclusion. The scales "
+                "describe the past week, not causes -- do not claim the result "
+                "CAUSED anything. Do not diagnose, do not name disorders, do not "
+                "estimate probability of illness, do not prescribe treatment or "
+                "medication, and do not give medical advice. Any relation to recent "
+                "experience is tentative only. Give one short, complete answer for "
+                "the chosen topic; where relevant, gently note that speaking with a "
+                "specialist may be useful.")
+    topic_lines = {
+        "measures": "Explain in plain language what the depression, anxiety, and "
+                    "stress scales actually measure over the past week -- NOT what "
+                    "caused them.",
+        "relate": "Invite a calm, non-blaming, tentative look at how these scales "
+                  "might relate to the person's recent experience -- explicitly as a "
+                  "prompt for self-observation, not a causal explanation.",
+        "next": "Suggest one reasonable next step and what to keep observing -- "
+                "gently, without pressure.",
+        "specialist": "Help phrase 2-3 questions the person could bring to a "
+                      "specialist, and gently note when seeing a specialist may be "
+                      "worthwhile. Professional terminology (depression/anxiety/"
+                      "stress as scale names) may be used without assigning a "
+                      "diagnosis.",
+    }
+    topic_line = topic_lines[topic_id]
+    return (f"Instrument: {instrument_version} (translation {translation_id})\n"
+            f"Depression scale: {dep}\nAnxiety scale: {anx}\nStress scale: {stress}\n"
+            f"Topic: {topic_id}\n\n{topic_line}\n\n{boundary}")
 
 
 def dass21_result_text(subscales, lang: str) -> str:

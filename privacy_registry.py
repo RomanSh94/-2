@@ -268,6 +268,15 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
         log_policy="answer_id/answer_value are stable definition tokens, never the "
                   "original item/option display text — never in logs/alerts regardless."),
 
+    # Workstream B — DASS-21 discuss-reply delivery claims (dedup bookkeeping
+    # only; no response text/subscale values stored here).
+    "dass21_discuss_claims": _e(
+        table="dass21_discuss_claims", user_id_column="user_id", category="QUESTIONNAIRE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="status/response_id/topic_id only — no reply text, no subscale "
+                  "values; never in logs/alerts beyond internal DB read."),
+
     # PR A — ordinary-user private invite access. Account-status metadata, not
     # content -- same STATE treatment as user_states/user_profiles.
     "user_access": _e(

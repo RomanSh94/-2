@@ -72,3 +72,14 @@ DASS21_INVITED_USERS_ENABLED = (
     os.getenv("DASS21_INVITED_USERS_ENABLED", "false").strip().lower()
     in ("1", "true", "yes", "on")
 )
+
+# Workstream B — DASS-21 "discuss result" via the existing q:m:<session_id>
+# namespace (no new callback namespace). Default OFF. Gates ONLY the visible
+# discuss button on the DASS-21 completion screen and the q:m gate for DASS-21
+# sessions; product access itself is still governed by dass21_access. The
+# generic (synthetic, non-DASS) q:m flow is unaffected by this flag -- it
+# keeps using QUESTIONNAIRE_INTERPRETATION_ENABLED as before.
+DASS21_DISCUSSION_ENABLED = (
+    os.getenv("DASS21_DISCUSSION_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)

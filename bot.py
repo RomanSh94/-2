@@ -10,6 +10,7 @@ import asyncio
 import hmac
 import logging
 import pathlib
+import secrets
 import sys
 
 # Windows consoles default to a legacy codepage (e.g. cp1251) that cannot encode
@@ -25,10 +26,13 @@ from html import escape as _he
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+import openai
 from openai import AsyncOpenAI
 
 import access_control
@@ -98,6 +102,7 @@ from database import (
     get_questionnaire_session, record_questionnaire_response,
     advance_questionnaire_session, complete_questionnaire_session,
     cancel_questionnaire_session, get_questionnaire_responses,
+    claim_dass21_discuss_reply, transition_dass21_discuss_claim,
     grant_user_access,
     unblock_user_access,
 )
@@ -109,6 +114,8 @@ import clinical_scoring
 import dass21_runtime
 import dass21_access
 import dass21_scorer
+import discussion_adapters
+import aiosqlite
 import navigation
 import emotion_map
 
@@ -1937,6 +1944,24 @@ def _questionnaire_completion_keyboard(session_id: int, lang: str) -> InlineKeyb
     ])
 
 
+def _dass21_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
+    # Workstream B — same specialist-report row as _questionnaire_completion_
+    # keyboard, plus the discuss-result row (q:m:<sid>), gated entirely by
+    # config.DASS21_DISCUSSION_ENABLED at the _send_dass21_result call site
+    # (default off -- the plain _questionnaire_completion_keyboard is used
+    # instead, byte-for-byte unchanged from before this PR).
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("🧾 Отчёт специалисту" if lang == "ru" else "🧾 Specialist report"),
+                              callback_data=f"q:o:{session_id}")],
+        [InlineKeyboardButton(text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss the result"),
+                              callback_data=f"q:m:{session_id}")],
+        [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
+                              callback_data="q:l")],
+        [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
+                              callback_data="menu:back")],
+    ])
+
+
 # ── PR B — result / calculations / explanation screens (dormant unless
 # config.QUESTIONNAIRE_INTERPRETATION_ENABLED is true AND the definition is
 # eligible; see questionnaires.is_result_eligible). PR C1.1 added the
@@ -2035,13 +2060,67 @@ async def _send_dass21_result(send, definition: dict, session_id: int, lang: str
             definition, _load_catalog_document(), responses, registry)
         # 5-6: only now mark completed, then render the complete result.
         await complete_questionnaire_session(session_id)
+        keyboard = (_dass21_completion_keyboard(session_id, lang)
+                    if config.DASS21_DISCUSSION_ENABLED
+                    else _questionnaire_completion_keyboard(session_id, lang))
         await send(questionnaire_ux.dass21_result_text(result.subscales, lang),
-                   reply_markup=_questionnaire_completion_keyboard(session_id, lang))
+                   reply_markup=keyboard)
     except Exception:
         # Fail closed: session NOT completed (stays active/recoverable), no
         # partial output, neutral text, log without question content.
         logging.exception("dass21 scoring failed (session_id=%s)", session_id)
         await send(questionnaire_ux.not_available_text(lang))
+
+
+async def _dass21_recompute_result_or_none(session: dict):
+    """Workstream B (final pass) — the ONE shared registry-reload + fresh-
+    authorization + validated-clinical-scoring recompute used by BOTH the
+    DASS-21 discuss gate and the read-only back-to-result path, so the
+    fail-closed DB-error boundary lives in exactly one place instead of two
+    duplicated try/except blocks. Returns a discussion_adapters.
+    DiscussionResult on success, or None on ANY failure -- including a real
+    aiosqlite.Error from the authorization read (database.
+    user_has_active_access) or the response fetch (get_questionnaire_
+    responses). questionnaires.Registry._load already catches per-FILE
+    problems (json.JSONDecodeError/OSError/DefinitionError, never raised),
+    but its directory-level enumeration (Path.exists/Path.glob) is NOT
+    wrapped there -- a real filesystem failure at that level (permission
+    denied, a network-drive glitch, the directory vanishing mid-scan) can
+    still raise OSError, so it is caught here too, at the ONE DASS-specific
+    boundary, without touching the shared questionnaires.py module."""
+    try:
+        registry = _load_registry_fresh()
+        definition = registry.get(session["questionnaire_id"])
+        if definition is None or definition.get("version") != session["questionnaire_version"]:
+            return None
+        adapter = discussion_adapters.Dass21DiscussionAdapter()
+        if not adapter.supports(definition):
+            return None
+        auth = await adapter.authorize(session)
+        if not auth.allowed:
+            return None
+        responses = await get_questionnaire_responses(session_id=session["id"])
+        return adapter.recompute_result(definition, _load_catalog_document(), responses, session)
+    except (aiosqlite.Error, OSError):
+        return None
+
+
+async def _send_dass21_back_to_result(send, session: dict, lang: str) -> None:
+    """Workstream B — read-only DASS-21 "back to result" (q:r on an already-
+    completed DASS-21 session). Recomputes the three subscales fresh through
+    the SAME Dass21DiscussionAdapter the discuss flow uses (fresh
+    authorization + integrity + validated clinical-scoring recompute).
+    NEVER mutates the session (no complete_questionnaire_session call --
+    calling it again would be a second, spurious completion write) and NEVER
+    calls the LLM. On any failure: neutral text, no partial output."""
+    result = await _dass21_recompute_result_or_none(session)
+    if result is None:
+        await send(questionnaire_ux.not_available_text(lang))
+        return
+    keyboard = (_dass21_completion_keyboard(session["id"], lang)
+                if config.DASS21_DISCUSSION_ENABLED
+                else _questionnaire_completion_keyboard(session["id"], lang))
+    await send(questionnaire_ux.dass21_result_text(result.subscales, lang), reply_markup=keyboard)
 
 
 async def _questionnaire_gate(entity, uid: int, lang: str) -> bool:
@@ -2620,8 +2699,16 @@ async def _load_owned_session(session_id: int, uid: int):
     """Like _load_owned_active_session, but does NOT require status=='active'
     -- result/calculations/explanation screens are shown AFTER a session is
     completed, so they must still work post-completion. Still enforces
-    ownership (same silent no-op non-disclosure convention)."""
-    session = await get_questionnaire_session(session_id)
+    ownership (same silent no-op non-disclosure convention). A real
+    aiosqlite.Error from the session read (shared by q:r/q:k/q:e/q:o and
+    both q:m entry points, generic and DASS alike) is treated identically to
+    "not found" -- every caller already fails closed to a silent no-op or
+    not_available_text on None, so this is a uniform hardening, not a new
+    behavior branch."""
+    try:
+        session = await get_questionnaire_session(session_id)
+    except aiosqlite.Error:
+        return None
     if not session or session["user_id"] != uid:
         return None
     return session
@@ -2641,6 +2728,11 @@ async def cb_questionnaire_result(callback: CallbackQuery):
 
     session = await _load_owned_session(session_id, uid)            # 3
     if session is None:
+        await callback.answer()
+        return
+
+    if dass21_runtime.is_dass21_definition_id(session["questionnaire_id"]):
+        await _send_dass21_back_to_result(callback.message.answer, session, lang)
         await callback.answer()
         return
 
@@ -2902,7 +2994,37 @@ class DiscussOutputRejected(Exception):
     traced_response_builder, which routes it to neutral_fallback."""
 
 
-_DISCUSS_TOPICS = ("why", "next", "specialist")
+_GENERIC_DISCUSS_TOPICS = frozenset({"why", "next", "specialist"})
+_DASS21_DISCUSS_TOPICS = frozenset({"measures", "relate", "next", "specialist"})
+_ALL_DISCUSS_TOPIC_TOKENS = _GENERIC_DISCUSS_TOPICS | _DASS21_DISCUSS_TOPICS
+
+
+def _dass21_discuss_menu_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
+    # Workstream B corrective pass — DASS-specific labels: unlike the generic
+    # "Why did this come out this way?" button, none of these imply the
+    # questionnaire result ESTABLISHES a cause (see questionnaire_ux.
+    # dass21_discuss_topic_prompt's non-causal boundary instruction).
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("📊 Что измеряют эти шкалы?" if lang == "ru" else "📊 What do these scales measure?"),
+            callback_data=f"q:m:{session_id}:measures")],
+        [InlineKeyboardButton(
+            text=("🔎 Как это может быть связано с последней неделей?" if lang == "ru"
+                  else "🔎 How might this relate to the past week?"),
+            callback_data=f"q:m:{session_id}:relate")],
+        [InlineKeyboardButton(
+            text=("➡️ Что можно сделать дальше?" if lang == "ru" else "➡️ What can I do next?"),
+            callback_data=f"q:m:{session_id}:next")],
+        [InlineKeyboardButton(
+            text=("👩‍⚕️ Вопросы специалисту" if lang == "ru" else "👩‍⚕️ Questions for a specialist"),
+            callback_data=f"q:m:{session_id}:specialist")],
+        [InlineKeyboardButton(
+            text=("⬅️ Назад к результату" if lang == "ru" else "⬅️ Back to result"),
+            callback_data=f"q:r:{session_id}")],
+        [InlineKeyboardButton(
+            text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
+            callback_data="menu:back")],
+    ])
 
 
 def _discuss_menu_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
@@ -2957,6 +3079,27 @@ async def _discuss_gate_and_load(session: dict, lang: str):
     return definition, score, max_score, intensity
 
 
+async def _dass21_discuss_gate_and_load(session: dict, lang: str):
+    """Workstream B — DASS-21 counterpart to _discuss_gate_and_load.
+    questionnaires.is_result_eligible always rejects the real (non-synthetic)
+    DASS-21 definition by design, so DASS-21 discussion cannot reuse the
+    generic gate above; it needs its own fresh authorization + recompute,
+    mirroring _send_dass21_result's ordering: kill-switch -> fresh registry
+    reload + version match -> fresh product authorization (integrity + owner/
+    invited, re-run on every call, no cache) -> completed-status requirement
+    -> the three subscales recomputed through the SAME validated clinical-
+    scoring path the completion screen uses (clinical_scoring.score_
+    validated_clinical_definition + the sole registered Dass21Scorer).
+    Returns a discussion_adapters.DiscussionResult on success, or None on ANY
+    failure -- caller must send questionnaire_ux.not_available_text and
+    return, never a partial result. The registry/DB fail-closed boundary
+    itself lives in the shared _dass21_recompute_result_or_none (used
+    identically by _send_dass21_back_to_result)."""
+    if not config.DASS21_DISCUSSION_ENABLED:
+        return None
+    return await _dass21_recompute_result_or_none(session)
+
+
 def _is_bare_discuss_menu_data(data: str) -> bool:
     """True only for q:m:<sid> (exactly 3 parts, digit session id) -- NOT for
     a topic callback q:m:<sid>:<topic>, so this filter and the topic filter
@@ -2969,11 +3112,17 @@ def _is_bare_discuss_menu_data(data: str) -> bool:
 
 
 def _is_discuss_topic_data(data: str) -> bool:
-    """True only for q:m:<sid>:<topic> with topic in _DISCUSS_TOPICS."""
+    """Syntax-only filter: q:m:<sid>:<topic> with topic in the UNION of the
+    generic and DASS-21 topic sets. This is deliberately loose -- it only
+    proves the callback COULD be a discuss-topic callback for SOME adapter.
+    Which exact set applies is an adapter-specific decision made after the
+    session is loaded (see cb_questionnaire_discuss_topic), so a DASS session
+    tapped with a generic-only topic (or vice versa) is rejected there, not
+    here."""
     if not data.startswith("q:m:"):
         return False
     parts = data.split(":")
-    return len(parts) == 4 and parts[3] in _DISCUSS_TOPICS
+    return len(parts) == 4 and parts[3] in _ALL_DISCUSS_TOPIC_TOKENS
 
 
 @dp.callback_query(lambda c: _is_bare_discuss_menu_data(c.data or ""))
@@ -2994,16 +3143,20 @@ async def cb_questionnaire_discuss_menu(callback: CallbackQuery):
         await callback.answer()
         return
 
-    loaded = await _discuss_gate_and_load(session, lang)                  # 4-6
-    if loaded is None:
+    is_dass = dass21_runtime.is_dass21_definition_id(session["questionnaire_id"])
+    if is_dass:
+        ok = (await _dass21_discuss_gate_and_load(session, lang)) is not None
+    else:
+        ok = (await _discuss_gate_and_load(session, lang)) is not None    # 4-6
+    if not ok:
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
 
     # Deterministic menu -- NO LLM call at all.
-    await callback.message.answer(
-        questionnaire_ux.discuss_menu_text(lang),
-        reply_markup=_discuss_menu_keyboard(session_id, lang))
+    keyboard = (_dass21_discuss_menu_keyboard(session_id, lang) if is_dass
+                else _discuss_menu_keyboard(session_id, lang))
+    await callback.message.answer(questionnaire_ux.discuss_menu_text(lang), reply_markup=keyboard)
     await callback.answer()
 
 
@@ -3045,6 +3198,294 @@ async def _discuss_build_response(title: str, score: int, max_score: int,
     return answer
 
 
+# Named bound (not a repeated magic number): the ONE hard wall-clock ceiling
+# for the whole DASS discuss LLM operation, used both as the per-call SDK
+# timeout hint and as asyncio.wait_for's outer timeout. Honest retry note:
+# the shared `client` object still has its default max_retries=2 (NOT
+# disabled -- an earlier with_options(max_retries=0) attempt was reverted
+# because it silently broke every test that monkeypatches
+# bot.client.chat.completions.create, since with_options() returns a
+# DIFFERENT client instance). Retries may still begin internally, but
+# asyncio.wait_for cancels the ENTIRE awaited call -- retries included --
+# once this many seconds pass, regardless of what the SDK is doing
+# internally. database._DASS21_CLAIM_LEASE_SECONDS (180s) is a 9x margin
+# over this bound, and _run_dass21_discuss_topic rechecks claim ownership
+# via transition_dass21_discuss_claim immediately before ever contacting
+# Telegram, independent of how long the build took.
+_DASS21_LLM_TIMEOUT_SECONDS = 20.0
+
+
+def _dass21_extract_llm_text(response) -> str:
+    """Bounded validation of the OpenAI response SHAPE (not content) --
+    rejects None response, non-list/empty choices, a choice with no
+    message, and non-string/empty content. Raises DiscussBuildFailed (the
+    same fail-closed exception as any other build failure) rather than
+    letting an AttributeError/IndexError/TypeError escape as an
+    unrelated-looking crash. Never logs the response content."""
+    choices = getattr(response, "choices", None) if response is not None else None
+    if not choices or not isinstance(choices, (list, tuple)):
+        raise DiscussBuildFailed("LLM response had no usable choices")
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None) if message is not None else None
+    if not isinstance(content, str) or not content.strip():
+        raise DiscussBuildFailed("LLM response had no usable content")
+    return content
+
+
+async def _dass21_discuss_build_response(subscales, instrument_version: str,
+                                          translation_id: str, topic_id: str, lang: str) -> str:
+    """Workstream B — DASS-21 counterpart to _discuss_build_response. Same
+    raise-or-return-valid-text contract (DiscussBuildFailed /
+    DiscussOutputRejected, both propagate uncaught to traced_response_
+    builder), same deterministic neutral risk shape, same validator call. The
+    prompt (questionnaire_ux.dass21_discuss_topic_prompt) never includes raw
+    stored answer text, item wording, answer labels, an overall total, or a
+    severity/diagnosis label."""
+    prompt_text = questionnaire_ux.dass21_discuss_topic_prompt(
+        instrument_version, translation_id, subscales, topic_id, lang)
+    messages = [
+        {"role": "system", "content": get_system_prompt("open_chat", lang)},
+        {"role": "user", "content": prompt_text},
+    ]
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="gpt-4o-mini", messages=messages, temperature=0.65, max_tokens=300,
+                timeout=_DASS21_LLM_TIMEOUT_SECONDS),
+            timeout=_DASS21_LLM_TIMEOUT_SECONDS)
+    except openai.OpenAIError as e:
+        # The real SDK exception hierarchy: every operational failure
+        # (connection, timeout, rate limit, 4xx/5xx API status) is an
+        # openai.OpenAIError subclass -- a precise catch, not a blanket
+        # except Exception. Never logs the prompt/messages.
+        raise DiscussBuildFailed(f"LLM call failed: {type(e).__name__}") from e
+    except asyncio.TimeoutError as e:
+        # Outer hard-bound hit (belt-and-suspenders beyond the per-call
+        # timeout above) -- same fail-closed contract. No late send follows:
+        # wait_for cancels the inner coroutine, so it never returns a value
+        # here, and _run_dass21_discuss_topic never learns of a "result" to
+        # act on after this point.
+        raise DiscussBuildFailed("LLM call exceeded the outer hard timeout") from e
+
+    answer = _dass21_extract_llm_text(response)
+
+    neutral_risk = {"score": 0, "level": "low", "categories": [],
+                     "implicit": False, "ambiguous_phrases": []}
+    is_safe, reason = validate_response_with_context(answer, prompt_text, neutral_risk, lang)
+    if not is_safe:
+        raise DiscussOutputRejected(f"validator rejected: {reason}")
+    return answer
+
+
+async def _send_discuss_reply(callback: CallbackQuery, uid: int, influence: Influence,
+                               build_response, lang: str, response_id: str | None = None) -> str | None:
+    """Shared traced-delivery wiring for BOTH the generic and DASS-21 discuss
+    topic replies -- only `influence` and `build_response` differ per
+    adapter; the traced_response_builder contract itself (PR #43: fail-closed
+    on trace-persistence failure, build failure, or validator rejection, all
+    to the SAME neutral_fallback) is never duplicated. Returns the response_id
+    on success (latent reply actually sent), or None on any fail-closed
+    degrade (callers that need to distinguish success/failure, e.g. the DASS-
+    21 delivery-claim finalizer, use this return value)."""
+    async def _send(text):
+        await callback.message.answer(text)
+
+    async def _neutral_fallback():
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+
+    try:
+        return await traced_response_builder(
+            user_id=uid, requester_uid=uid,
+            influences=[influence],
+            build_response=build_response,
+            send=_send,
+            persist_trace=persist_influence_trace,
+            neutral_fallback=_neutral_fallback,
+            response_id=response_id,
+        )
+    except access_control.A1NotAllowed:
+        await _neutral_fallback()
+        return None
+
+
+class _Dass21ClaimNotOwned(Exception):
+    """Raised internally by _deliver_dass21_claimed_message's caller closures
+    to signal traced_response_builder that NOTHING was sent (lost claim
+    ownership, or a Telegram failure already recorded as delivery_uncertain)
+    -- never let traced_response_builder treat this worker's send() as a
+    success. Always caught locally in _run_dass21_discuss_topic; never
+    propagates further."""
+
+
+async def _deliver_dass21_claimed_message(
+        callback: CallbackQuery, uid: int, session_id: int, topic_id: str,
+        source_chat_id: int, source_message_id: int, response_id: str,
+        text: str, response_kind: str) -> bool:
+    """The ONE claim-checked Telegram delivery path for a DASS-21 discuss
+    reply -- used for BOTH the real LLM answer and its neutral-fallback
+    substitute (response_kind is "answer" or "neutral_fallback", used only
+    for log context; the ownership contract is identical for both, so a
+    double tap cannot produce two visible replies regardless of which kind
+    the first one was).
+
+    A send is IMPOSSIBLE unless the atomic pending_before_send -> send_started
+    transition returns True. If it returns False (another worker already
+    reclaimed/owns this exact card+topic) or raises aiosqlite.Error, this
+    function returns False WITHOUT EVER calling Telegram -- a stale worker
+    that has lost claim ownership can never deliver a message. The transition
+    call's return value is the ONLY thing that gates the send; nothing here
+    proceeds to `callback.message.answer` on a caught exception the way an
+    earlier, buggy version of this function did.
+
+    Returns True iff Telegram confirmed the send (state -> delivered)."""
+    try:
+        owns_send = await transition_dass21_discuss_claim(
+            uid, session_id, topic_id, source_chat_id, source_message_id,
+            response_id, "pending_before_send", "send_started")
+    except aiosqlite.Error:
+        owns_send = False
+    if not owns_send:
+        # Either a DB error, or another response_id now owns this card+topic
+        # (a concurrent claim, or a reclaim after this worker's lease
+        # expired) -- no Telegram contact at all.
+        return False
+
+    try:
+        await callback.message.answer(text)
+    except (TelegramBadRequest, TelegramForbiddenError,
+            TelegramNetworkError, TelegramRetryAfter) as exc:
+        logging.warning("dass21 discuss %s send failed (session_id=%s, topic=%s): %s",
+                        response_kind, session_id, topic_id, type(exc).__name__)
+        try:
+            await transition_dass21_discuss_claim(
+                uid, session_id, topic_id, source_chat_id, source_message_id,
+                response_id, "send_started", "delivery_uncertain")
+        except aiosqlite.Error:
+            pass  # best-effort bookkeeping only; Telegram's own outcome is
+                  # already unknown regardless of whether this write lands
+        return False
+
+    try:
+        await transition_dass21_discuss_claim(
+            uid, session_id, topic_id, source_chat_id, source_message_id,
+            response_id, "send_started", "delivered")
+    except aiosqlite.Error:
+        pass  # Telegram send already succeeded; a bookkeeping failure here
+              # only means a future reclaim decision is best-effort -- the
+              # message is neither undelivered nor eligible for auto-resend
+              # (the row stays non-reclaimable at 'send_started').
+    return True
+
+
+async def _run_dass21_discuss_topic(callback: CallbackQuery, uid: int, session_id: int,
+                                    topic_id: str, dass_result, lang: str) -> None:
+    """Workstream B (corrective pass) — DASS-21 topic reply delivery.
+
+    Idempotency key is the exact MENU CARD's button:
+    (uid, session_id, topic_id, source_chat_id, source_message_id) --
+    source_chat_id/source_message_id identify the Telegram message the tapped
+    button lives on. A double tap on the SAME card claims at most once;
+    reopening the discuss menu sends a NEW Telegram message (a new
+    message_id), so tapping the same topic on that new card is a fresh,
+    legitimate attempt -- this is NOT a permanent one-topic-per-session lock.
+
+    5-state claim machine (dass21_discuss_claims.status, DB CHECK-
+    constrained, see database.py):
+      pending_before_send -> send_started -> delivered
+                          -> failed_before_send  (any failure BEFORE Telegram
+                             is ever contacted -- retryable on the same card,
+                             including via an expired-lease reclaim)
+      send_started        -> delivery_uncertain  (Telegram raised; unknown
+                             whether the message went out -- NEVER auto-
+                             reclaimed on this card; a NEW card can retry)
+
+    Both the real answer AND its neutral-fallback substitute go through
+    _deliver_dass21_claimed_message -- there is no separate unchecked send
+    path for the fallback, so a lost/reclaimed claim cannot deliver ANY
+    message, of either kind.
+
+    Telegram and SQLite are two separate systems, not one transaction --
+    delivery is therefore best-effort/at-most-once-PER-CARD, never claimed
+    exact-once."""
+    source_chat_id = callback.message.chat.id
+    source_message_id = callback.message.message_id
+    response_id = f"dass21-discuss-{session_id}-{topic_id}-{secrets.token_hex(8)}"
+
+    try:
+        claimed = await claim_dass21_discuss_reply(
+            uid, session_id, topic_id, source_chat_id, source_message_id, response_id)
+    except aiosqlite.Error:
+        # Claim-insert failure before anything else happened (no DB-backed
+        # action exists yet) -- fail closed with NO new chat message (a
+        # repeated tap during a DB outage must not flood the chat): a
+        # bounded callback alert only, using the SAME existing neutral copy,
+        # no internal detail (no "database"/"SQLite"/session id).
+        try:
+            await callback.answer(questionnaire_ux.not_available_text(lang), show_alert=True)
+        except (TelegramBadRequest, TelegramForbiddenError,
+                TelegramNetworkError, TelegramRetryAfter):
+            pass
+        return
+    if not claimed:
+        # Another delivery already owns this exact card+topic (pending,
+        # send_started, delivered, or delivery_uncertain) -- silent no-op,
+        # same non-disclosure convention as a stale/cross-user callback.
+        await callback.answer()
+        return
+
+    influence = Influence(
+        "questionnaire_result", session_id,
+        f"reply drew on DASS-21 session {session_id} subscales "
+        f"depression={dass_result.subscales['depression']} "
+        f"anxiety={dass_result.subscales['anxiety']} "
+        f"stress={dass_result.subscales['stress']}, topic={topic_id}",
+    )
+
+    async def _build():
+        return await _dass21_discuss_build_response(
+            dass_result.subscales, dass_result.instrument_version,
+            dass_result.translation_id, topic_id, lang)
+
+    async def _send(text):
+        delivered = await _deliver_dass21_claimed_message(
+            callback, uid, session_id, topic_id, source_chat_id, source_message_id,
+            response_id, text, "answer")
+        if not delivered:
+            # Signal upward that nothing was actually sent -- propagates
+            # uncaught out of traced_response_builder (it does not inspect
+            # send()'s return value), caught once below.
+            raise _Dass21ClaimNotOwned()
+
+    async def _neutral_fallback():
+        await _deliver_dass21_claimed_message(
+            callback, uid, session_id, topic_id, source_chat_id, source_message_id,
+            response_id, questionnaire_ux.not_available_text(lang), "neutral_fallback")
+
+    try:
+        await traced_response_builder(
+            user_id=uid, requester_uid=uid, influences=[influence],
+            build_response=_build, send=_send,
+            persist_trace=persist_influence_trace, neutral_fallback=_neutral_fallback,
+            response_id=response_id,
+        )
+    except access_control.A1NotAllowed:
+        # A1NotAllowed is raised BEFORE _send/_neutral_fallback are ever
+        # invoked (traced_response_builder's very first check), so the claim
+        # is still pending_before_send -- route through the SAME claim-
+        # checked path as every other fallback.
+        await _neutral_fallback()
+    except _Dass21ClaimNotOwned:
+        # Already fully handled inside _deliver_dass21_claimed_message
+        # (either no Telegram contact at all, or delivery_uncertain recorded
+        # after a Telegram failure). No further send of any kind.
+        pass
+
+    try:
+        await callback.answer()
+    except (TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter):
+        pass
+
+
 @dp.callback_query(lambda c: _is_discuss_topic_data(c.data or ""))
 async def cb_questionnaire_discuss_topic(callback: CallbackQuery):
     uid = callback.from_user.id
@@ -3052,7 +3493,7 @@ async def cb_questionnaire_discuss_topic(callback: CallbackQuery):
     if not await _questionnaire_gate(callback, uid, lang):            # 1, 2
         return
     parts = callback.data.split(":")
-    if len(parts) != 4 or not parts[2].isdigit() or parts[3] not in _DISCUSS_TOPICS:
+    if len(parts) != 4 or not parts[2].isdigit() or parts[3] not in _ALL_DISCUSS_TOPIC_TOKENS:
         await callback.answer()
         return
     session_id = int(parts[2])
@@ -3062,6 +3503,29 @@ async def cb_questionnaire_discuss_topic(callback: CallbackQuery):
     if session is None:
         # Silent no-op -- same non-disclosure convention as q:r/q:k/q:e/q:o.
         await callback.answer()
+        return
+
+    is_dass = dass21_runtime.is_dass21_definition_id(session["questionnaire_id"])
+    # Adapter-exact topic enforcement -- _is_discuss_topic_data only proved the
+    # topic is valid for SOME adapter (the union). A DASS session tapped with a
+    # generic-only topic (e.g. "why"), or a generic session tapped with a
+    # DASS-only topic ("measures"/"relate"), is a forged/cross-adapter
+    # callback: silent no-op, BEFORE any gate/claim/trace/LLM call -- same
+    # non-disclosure convention as an unowned session.
+    if is_dass and topic_id not in _DASS21_DISCUSS_TOPICS:
+        await callback.answer()
+        return
+    if not is_dass and topic_id not in _GENERIC_DISCUSS_TOPICS:
+        await callback.answer()
+        return
+
+    if is_dass:
+        dass_result = await _dass21_discuss_gate_and_load(session, lang)
+        if dass_result is None:
+            await callback.message.answer(questionnaire_ux.not_available_text(lang))
+            await callback.answer()
+            return
+        await _run_dass21_discuss_topic(callback, uid, session_id, topic_id, dass_result, lang)
         return
 
     loaded = await _discuss_gate_and_load(session, lang)                  # 4-6
@@ -3081,23 +3545,7 @@ async def cb_questionnaire_discuss_topic(callback: CallbackQuery):
         return await _discuss_build_response(
             definition["title"], score, max_score, intensity, topic_id, lang)
 
-    async def _send(text):
-        await callback.message.answer(text)
-
-    async def _neutral_fallback():
-        await callback.message.answer(questionnaire_ux.not_available_text(lang))
-
-    try:
-        await traced_response_builder(
-            user_id=uid, requester_uid=uid,
-            influences=[influence],
-            build_response=_build,
-            send=_send,
-            persist_trace=persist_influence_trace,
-            neutral_fallback=_neutral_fallback,
-        )
-    except access_control.A1NotAllowed:
-        await _neutral_fallback()
+    await _send_discuss_reply(callback, uid, influence, _build, lang)
     await callback.answer()
 
 
