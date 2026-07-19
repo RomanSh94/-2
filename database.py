@@ -615,8 +615,48 @@ async def _migrate_intervention_baseline_uniqueness(db) -> None:
     values (rows predating this migration) are excluded from the
     constraint -- SQLite treats NULL as distinct in a UNIQUE index, so
     historical rows never collide with each other or with new rows.
-    start_intervention's INSERT OR IGNORE relies on this index; a rowcount
-    of 0 there means "lost the atomic claim", not an error."""
+    start_intervention's narrow ON CONFLICT(...) DO NOTHING target relies
+    on this exact index; a rowcount of 0 there means "lost the atomic
+    claim", not an error -- see start_intervention's docstring.
+
+    Defensive dedupe before creating the index: this exact duplicate shape
+    -- two existing rows already sharing a non-NULL (user_id, source_chat_id,
+    source_message_id) -- is structurally impossible via any real app code
+    path today, since these two columns are introduced by THIS migration and
+    no prior release ever wrote a non-NULL value into them. It is kept
+    anyway so CREATE UNIQUE INDEX cannot crash init_db() on a hand-edited or
+    otherwise corrupted DB.
+
+    Deliberately does NOT reuse _migrate_questionnaire_response_uniqueness's
+    "keep MAX(id)" rule: that rule is correct there because a later
+    questionnaire_responses row is a legitimate Back->revise correction and
+    should win. Here the duplicated column is before_score -- the whole
+    point of this migration is that the FIRST accepted baseline must never
+    be silently replaced by a second write for the same card (see
+    start_intervention's ON CONFLICT ... DO NOTHING below, and
+    cb_before's "duplicate tap" contract). So this keeps MIN(id) -- the
+    earliest-inserted, first-accepted row -- and discards later duplicates,
+    matching that same semantics during a one-time migration cleanup. Only
+    non-NULL-identity groups are touched; historical NULL-identity rows are
+    never considered for dedupe."""
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE source_chat_id IS NOT NULL "
+        "AND source_message_id IS NOT NULL AND id NOT IN ("
+        "  SELECT MIN(id) FROM intervention_results "
+        "  WHERE source_chat_id IS NOT NULL AND source_message_id IS NOT NULL "
+        "  GROUP BY user_id, source_chat_id, source_message_id)")
+    stale = (await cur.fetchone())[0]
+    if stale:
+        await db.execute(
+            "DELETE FROM intervention_results WHERE source_chat_id IS NOT NULL "
+            "AND source_message_id IS NOT NULL AND id NOT IN ("
+            "  SELECT MIN(id) FROM intervention_results "
+            "  WHERE source_chat_id IS NOT NULL AND source_message_id IS NOT NULL "
+            "  GROUP BY user_id, source_chat_id, source_message_id)")
+        logging.info(
+            "intervention_results dedupe: removed %d duplicate-card row(s) "
+            "(should be structurally unreachable via app code -- defensive only)",
+            stale)
     await db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_intervention_one_baseline_per_card "
         "ON intervention_results(user_id, source_chat_id, source_message_id) "
@@ -906,14 +946,28 @@ async def start_intervention(uid: int, objective: str, scenario: str,
     claim on the same card -- i.e. this call LOST a genuine concurrent race
     against another callback for the same (user, chat, message). Callers that
     omit both (None, None) never hit the constraint and always get a row, as
-    before -- this is additive, not a behavior change for existing callers."""
+    before -- this is additive, not a behavior change for existing callers.
+
+    Uses a NARROW ON CONFLICT(...) target naming the exact partial index,
+    not a blanket INSERT OR IGNORE: SQLite's conflict-resolution algorithm
+    for OR IGNORE would silently absorb ANY constraint violation on this
+    table (e.g. the before_score CHECK(BETWEEN 1 AND 10) -- reachable if a
+    forged callback ever supplied an out-of-range score), which would
+    misclassify a real data-integrity bug as an ordinary "lost the race"
+    outcome. Naming the conflict target means only a violation of THIS
+    index is swallowed (rowcount 0 => lost the claim); any other integrity
+    violation still raises a genuine IntegrityError, matching the existing
+    "fails loud, not fake-success" contract used elsewhere in this module."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            """INSERT OR IGNORE INTO intervention_results
+            """INSERT INTO intervention_results
                (user_id,session_objective,scenario,practice_id,practice_version,
                 router_version,ab_variant,selection_reason_json,stage,readiness,
                 capacity,before_score,source_chat_id,source_message_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(user_id,source_chat_id,source_message_id)
+               WHERE source_chat_id IS NOT NULL AND source_message_id IS NOT NULL
+               DO NOTHING""",
             (uid, objective, scenario, practice_id, practice_version,
              router_version, ab_variant, json.dumps(selection_reason),
              stage, readiness, capacity, before_score,

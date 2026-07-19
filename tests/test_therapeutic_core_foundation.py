@@ -671,3 +671,227 @@ def test_intervention_results_privacy_lifecycle_cross_user_isolated(tmp_db, monk
     assert summary["intervention_results"] == 1
     assert _row_count(a) == 0
     assert _row_count(b) == 0  # untouched (b never had a row, confirms no cross-effect)
+
+
+# ── Baseline migration safety battery (permanent regression coverage) ──────
+# Same technique as tests/test_onboarding_schema_migration.py: a hand-built
+# OLD schema shape (not a fresh database.init_db() call), driven through the
+# real database.init_db()/_migrate_intervention_baseline_uniqueness path --
+# a fresh-database test alone would never exercise the upgrade path at all.
+_PRE_FIX_INTERVENTION_SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+    language TEXT DEFAULT 'ru', message_count INTEGER DEFAULT 0,
+    last_seen TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE intervention_results (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id                 INTEGER NOT NULL,
+    session_objective       TEXT NOT NULL,
+    scenario                TEXT NOT NULL,
+    practice_id             TEXT NOT NULL,
+    practice_version        TEXT NOT NULL DEFAULT 'v1',
+    router_version          TEXT NOT NULL DEFAULT '2.0',
+    ab_variant              TEXT DEFAULT 'control',
+    selection_reason_json   TEXT,
+    stage                   TEXT DEFAULT 'OPEN',
+    readiness               TEXT DEFAULT 'MEDIUM',
+    capacity                REAL DEFAULT 1.0,
+    before_score            INTEGER CHECK(before_score BETWEEN 1 AND 10),
+    after_score             INTEGER,
+    follow_up_24h_score     INTEGER,
+    confidence_score        REAL DEFAULT 1.0,
+    engagement_metrics_json TEXT,
+    feedback_rating         INTEGER,
+    self_reported_behavior  INTEGER DEFAULT 0,
+    created_at              TEXT DEFAULT (datetime('now'))
+);
+"""
+
+
+@pytest.fixture
+def old_shape_db(tmp_path, monkeypatch):
+    """A real sqlite file with the pre-atomic-fix intervention_results shape
+    -- no source_chat_id/source_message_id columns at all -- NOT a fresh
+    database.init_db() call. This is what the migration battery below
+    upgrades, proving the upgrade path itself, not just a fresh-DB path."""
+    import sqlite3
+    path = str(tmp_path / "old_shape.db")
+    con = sqlite3.connect(path)
+    con.executescript(_PRE_FIX_INTERVENTION_SCHEMA_DDL)
+    con.commit()
+    con.close()
+    monkeypatch.setattr(database, "DB", path)
+    return path
+
+
+def _baseline_index_sql(path):
+    import sqlite3
+    con = sqlite3.connect(path)
+    row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_intervention_one_baseline_per_card'").fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def test_migration_A_fresh_db_creates_index_and_is_idempotent(tmp_db):
+    assert _baseline_index_sql(database.DB) is not None
+    run(database.init_db())  # second call on a fresh DB must not raise
+    assert _baseline_index_sql(database.DB) is not None
+
+
+def test_migration_B_upgrades_pre_fix_schema_preserving_rows(old_shape_db):
+    import sqlite3
+    con = sqlite3.connect(old_shape_db)
+    con.execute("INSERT INTO users (id,username,first_name) VALUES (1,'u','U')")
+    con.execute(
+        "INSERT INTO intervention_results (user_id,session_objective,scenario,"
+        "practice_id,before_score) VALUES (1,'s','grounding','breathing_box_v1',5)")
+    con.commit()
+    con.close()
+
+    run(database.init_db())        # upgrade migration
+    run(database.init_db())        # idempotency: second run must not raise
+
+    con = sqlite3.connect(old_shape_db)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(intervention_results)").fetchall()]
+    row = con.execute("SELECT before_score, source_chat_id, source_message_id "
+                       "FROM intervention_results WHERE user_id=1").fetchone()
+    con.close()
+    assert "source_chat_id" in cols and "source_message_id" in cols
+    assert row == (5, None, None)  # row preserved untouched; new columns NULL
+    assert _baseline_index_sql(old_shape_db) is not None
+
+
+def test_migration_C_null_identity_rows_never_collide(old_shape_db):
+    import sqlite3
+    con = sqlite3.connect(old_shape_db)
+    con.execute("INSERT INTO users (id,username,first_name) VALUES (1,'u','U')")
+    for score in (5, 6, 7):
+        con.execute(
+            "INSERT INTO intervention_results (user_id,session_objective,scenario,"
+            "practice_id,before_score) VALUES (1,'s','grounding','breathing_box_v1',?)",
+            (score,))
+    con.commit()
+    con.close()
+
+    run(database.init_db())
+
+    con = sqlite3.connect(old_shape_db)
+    cnt = con.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE user_id=1").fetchone()[0]
+    con.close()
+    assert cnt == 3  # all NULL-identity historical rows survive uncollided
+
+
+def test_migration_D_duplicate_non_null_identity_keeps_earliest_score(tmp_path, monkeypatch):
+    # This duplicate shape is structurally unreachable via real app code --
+    # source_chat_id/source_message_id are introduced by THIS migration, so
+    # no prior release ever wrote a non-NULL value into them -- but the
+    # defensive dedupe must still behave correctly if a hand-edited or
+    # otherwise corrupted DB ever hits it. Deliberately proves MIN(id) (the
+    # earliest-inserted, FIRST accepted baseline) survives, not MAX(id):
+    # unlike questionnaire_responses (where a later row is a legitimate
+    # revision), a later duplicate here must never replace the first
+    # accepted before_score.
+    path = str(tmp_path / "dup.db")
+    monkeypatch.setattr(database, "DB", path)
+    real_migrate = database._migrate_intervention_baseline_uniqueness
+
+    async def _noop(db):
+        return None
+    monkeypatch.setattr(database, "_migrate_intervention_baseline_uniqueness", _noop)
+    run(database.init_db())  # table/columns exist; index deliberately skipped
+    monkeypatch.setattr(database, "_migrate_intervention_baseline_uniqueness", real_migrate)
+
+    run(database.upsert_user(3001, "u", "U"))
+    import sqlite3
+    con = sqlite3.connect(path)
+    con.execute(
+        "INSERT INTO intervention_results (user_id,session_objective,scenario,practice_id,"
+        "practice_version,router_version,ab_variant,before_score,source_chat_id,source_message_id) "
+        "VALUES (3001,'s','grounding','breathing_box_v1','v1','2.0','control',5,111,222)")
+    con.execute(
+        "INSERT INTO intervention_results (user_id,session_objective,scenario,practice_id,"
+        "practice_version,router_version,ab_variant,before_score,source_chat_id,source_message_id) "
+        "VALUES (3001,'s','grounding','breathing_box_v1','v1','2.0','control',9,111,222)")
+    con.commit()
+    con.close()
+
+    async def _apply_real_migration():
+        import aiosqlite
+        async with aiosqlite.connect(path) as db:
+            await real_migrate(db)
+            await db.commit()
+    run(_apply_real_migration())  # must not raise IntegrityError
+
+    con = sqlite3.connect(path)
+    rows = con.execute(
+        "SELECT before_score FROM intervention_results WHERE user_id=3001").fetchall()
+    con.close()
+    assert rows == [(5,)]  # exactly one row; the EARLIEST accepted score survives, not 9
+    assert _baseline_index_sql(path) is not None
+
+
+def test_migration_E_cross_user_same_card_coordinates_no_conflict(tmp_db):
+    import sqlite3
+    run(database.upsert_user(4001, "u", "U"))
+    run(database.upsert_user(4002, "u", "U"))
+    r1 = run(database.start_intervention(4001, "s", "grounding", "breathing_box_v1", "v1", {}, 5,
+                                          source_chat_id=555, source_message_id=666))
+    r2 = run(database.start_intervention(4002, "s", "grounding", "breathing_box_v1", "v1", {}, 7,
+                                          source_chat_id=555, source_message_id=666))
+    assert r1 is not None and r2 is not None  # different users never conflict
+    con = sqlite3.connect(database.DB)
+    cnt = con.execute("SELECT COUNT(*) FROM intervention_results").fetchone()[0]
+    con.close()
+    assert cnt == 2
+
+
+def test_migration_F_same_user_different_cards_create_distinct_rows(tmp_db):
+    import sqlite3
+    run(database.upsert_user(5001, "u", "U"))
+    r1 = run(database.start_intervention(5001, "s", "grounding", "breathing_box_v1", "v1", {}, 5,
+                                          source_chat_id=777, source_message_id=888))
+    r2 = run(database.start_intervention(5001, "s", "grounding", "breathing_box_v1", "v1", {}, 7,
+                                          source_chat_id=777, source_message_id=889))
+    assert r1 is not None and r2 is not None  # distinct cards never conflict
+    con = sqlite3.connect(database.DB)
+    cnt = con.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE user_id=5001").fetchone()[0]
+    con.close()
+    assert cnt == 2
+
+
+def test_migration_G_genuine_check_violation_is_not_swallowed(tmp_db):
+    # An out-of-range score (e.g. a forged callback) must raise a real error,
+    # never be misclassified as an ordinary "lost the atomic claim" outcome --
+    # proves the narrow ON CONFLICT(...) target, not a blanket INSERT OR IGNORE.
+    import sqlite3
+    run(database.upsert_user(6001, "u", "U"))
+    with pytest.raises(Exception):
+        run(database.start_intervention(6001, "s", "grounding", "breathing_box_v1", "v1", {}, 99,
+                                         source_chat_id=333, source_message_id=444))
+    con = sqlite3.connect(database.DB)
+    cnt = con.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE user_id=6001").fetchone()[0]
+    con.close()
+    assert cnt == 0
+
+
+def test_migration_H_duplicate_claim_winner_and_loser_distinguished(tmp_db):
+    import sqlite3
+    run(database.upsert_user(7001, "u", "U"))
+    r1 = run(database.start_intervention(7001, "s", "grounding", "breathing_box_v1", "v1", {}, 5,
+                                          source_chat_id=999, source_message_id=1000))
+    r2 = run(database.start_intervention(7001, "s", "grounding", "breathing_box_v1", "v1", {}, 9,
+                                          source_chat_id=999, source_message_id=1000))
+    assert r1 is not None  # winner: a real row id
+    assert r2 is None      # loser: lost the atomic claim, distinguishable from the winner
+    con = sqlite3.connect(database.DB)
+    row = con.execute(
+        "SELECT COUNT(*), before_score FROM intervention_results "
+        "WHERE user_id=7001").fetchone()
+    con.close()
+    assert row == (1, 5)  # exactly one row; the winner's (first) score stands
