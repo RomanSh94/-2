@@ -78,6 +78,14 @@ CREATE TABLE IF NOT EXISTS intervention_results (
     engagement_metrics_json TEXT,
     feedback_rating         INTEGER,
     self_reported_behavior  INTEGER DEFAULT 0,
+    -- Therapeutic Core Foundation: the Telegram card identity (chat + message
+    -- id of the before-score offer), used ONLY as the atomic idempotency key
+    -- below -- see idx_intervention_one_baseline_per_card, created after
+    -- _apply_migrations (mirrors _migrate_questionnaire_response_uniqueness's
+    -- own after-migrations placement, since an upgraded DB only gains these
+    -- two columns via _MIGRATIONS, not via this CREATE TABLE).
+    source_chat_id          INTEGER,
+    source_message_id       INTEGER,
     created_at              TEXT DEFAULT (datetime('now'))
 );
 
@@ -544,6 +552,11 @@ _MIGRATIONS = [
     # user_onboarding_state a given database has (fresh CREATE TABLE already
     # includes it; the pre-versioning-schema migration backfills it as NULL).
     ("user_onboarding_state", "privacy_notice_version", "TEXT"),
+    # Therapeutic Core Foundation: atomic baseline-claim key (see
+    # _migrate_intervention_baseline_uniqueness below for the actual
+    # constraint -- these columns must exist first on an upgraded DB).
+    ("intervention_results", "source_chat_id", "INTEGER"),
+    ("intervention_results", "source_message_id", "INTEGER"),
 ]
 
 
@@ -586,6 +599,28 @@ async def _migrate_questionnaire_response_uniqueness(db) -> None:
     await db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_qresponses_session_item "
         "ON questionnaire_responses(session_id, item_id)")
+
+
+async def _migrate_intervention_baseline_uniqueness(db) -> None:
+    """Therapeutic Core Foundation P1 fix -- cb_before's prior guard (an
+    in-memory FSMContext check-then-act) is NOT atomic: two genuinely
+    concurrent callback_query deliveries for the SAME offer (the Telegram
+    card identified by chat_id+message_id) can both read the FSM state
+    before either writes it, both pass, and both call start_intervention,
+    creating two baseline rows. This partial UNIQUE index is the real,
+    engine-enforced invariant -- one baseline per (user, card), same
+    "safe on every boot, run after _apply_migrations" convention as
+    _migrate_questionnaire_response_uniqueness above (these two columns
+    only exist on an upgraded DB once _apply_migrations has run). NULL
+    values (rows predating this migration) are excluded from the
+    constraint -- SQLite treats NULL as distinct in a UNIQUE index, so
+    historical rows never collide with each other or with new rows.
+    start_intervention's INSERT OR IGNORE relies on this index; a rowcount
+    of 0 there means "lost the atomic claim", not an error."""
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_intervention_one_baseline_per_card "
+        "ON intervention_results(user_id, source_chat_id, source_message_id) "
+        "WHERE source_chat_id IS NOT NULL AND source_message_id IS NOT NULL")
 
 
 # ── Onboarding real-versioning migration (spec item E) ──────────────────────
@@ -698,6 +733,7 @@ async def init_db():
         await _finish_onboarding_state_migration(db)
         await _apply_migrations(db)
         await _migrate_questionnaire_response_uniqueness(db)
+        await _migrate_intervention_baseline_uniqueness(db)
         await _backfill_notice_acknowledgements(db)
         await db.commit()
 
@@ -861,18 +897,29 @@ async def start_intervention(uid: int, objective: str, scenario: str,
                               selection_reason: dict, before_score: int,
                               stage: str = "OPEN", readiness: str = "MEDIUM",
                               capacity: float = 1.0, ab_variant: str = "control",
-                              router_version: str = "2.0") -> int:
+                              router_version: str = "2.0",
+                              source_chat_id: int | None = None,
+                              source_message_id: int | None = None) -> int | None:
+    """Returns the new row's id, or None if source_chat_id/source_message_id
+    were given and idx_intervention_one_baseline_per_card (see
+    _migrate_intervention_baseline_uniqueness) rejected this as a duplicate
+    claim on the same card -- i.e. this call LOST a genuine concurrent race
+    against another callback for the same (user, chat, message). Callers that
+    omit both (None, None) never hit the constraint and always get a row, as
+    before -- this is additive, not a behavior change for existing callers."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            """INSERT INTO intervention_results
+            """INSERT OR IGNORE INTO intervention_results
                (user_id,session_objective,scenario,practice_id,practice_version,
                 router_version,ab_variant,selection_reason_json,stage,readiness,
-                capacity,before_score)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                capacity,before_score,source_chat_id,source_message_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (uid, objective, scenario, practice_id, practice_version,
              router_version, ab_variant, json.dumps(selection_reason),
-             stage, readiness, capacity, before_score))
-        await db.commit(); return cur.lastrowid
+             stage, readiness, capacity, before_score,
+             source_chat_id, source_message_id))
+        await db.commit()
+        return cur.lastrowid if cur.rowcount else None
 
 async def finish_intervention(record_id: int, after_score: int,
                                feedback_rating: int, confidence_score: float,

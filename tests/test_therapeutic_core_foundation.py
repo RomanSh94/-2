@@ -56,10 +56,11 @@ class FakeUser:
 
 
 class FakeMessage:
-    def __init__(self, user, text=""):
+    def __init__(self, user, text="", message_id=1):
         self.from_user = user
         self.text = text
         self.chat = types.SimpleNamespace(id=user.id)
+        self.message_id = message_id
         self.answers = []
 
     async def answer(self, text, **kw):
@@ -494,6 +495,72 @@ def test_duplicate_tap_creates_exactly_one_baseline_and_cannot_overwrite(tmp_db,
         "SELECT before_score FROM intervention_results WHERE user_id=?", (uid,)).fetchone()[0]
     con.close()
     assert before == 5  # first tap's score stands, never overwritten
+
+
+def test_intervention_baseline_unique_index_exists(tmp_db):
+    # Direct schema evidence for the atomic idempotency contract (not just
+    # behavioral inference): idx_intervention_one_baseline_per_card is a real,
+    # engine-level partial UNIQUE index, created by
+    # database._migrate_intervention_baseline_uniqueness.
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_intervention_one_baseline_per_card'").fetchone()
+    con.close()
+    assert row is not None
+    sql = row[0]
+    assert "UNIQUE" in sql
+    assert "user_id" in sql and "source_chat_id" in sql and "source_message_id" in sql
+
+
+def test_concurrent_double_tap_is_atomic_exactly_one_row_survives(tmp_db, monkeypatch):
+    # The test above proves SEQUENTIAL duplicate-tap protection only -- it
+    # does not prove the check-then-act in cb_before is safe under real
+    # concurrency. cb_before reads fsm_state.get_data() and only writes the
+    # claim much later (after an intervening `await load_state(...)` and the
+    # DB insert itself) -- two genuinely concurrent callback_query deliveries
+    # for the SAME card can both pass that in-memory check before either
+    # commits. This test forces real interleaving via asyncio.gather plus an
+    # asyncio.Event rendezvous barrier (not two sequential `run()` calls), so
+    # both coroutines are actually in flight at the same time before either
+    # reaches start_intervention -- then asserts the database-level
+    # idx_intervention_one_baseline_per_card constraint (not the FSM check)
+    # is what actually prevents a second row.
+    uid = 713
+    run(database.upsert_user(uid, "u", "U"))
+
+    barrier = asyncio.Event()
+    reached = {"n": 0}
+
+    async def racy_load_state(*a, **kw):
+        reached["n"] += 1
+        if reached["n"] >= 2:
+            barrier.set()
+        await barrier.wait()
+        return {}
+    monkeypatch.setattr(bot, "load_state", racy_load_state)
+
+    fsm = FakeFSM()
+    same_message = FakeMessage(FakeUser(uid), message_id=42)
+    cb1 = FakeCallback(FakeUser(uid), same_message, "before:breathing_box_v1:grounding:ru:5")
+    cb2 = FakeCallback(FakeUser(uid), same_message, "before:breathing_box_v1:grounding:ru:9")
+
+    async def _run_both():
+        await asyncio.gather(bot.cb_before(cb1, fsm), bot.cb_before(cb2, fsm))
+    run(_run_both())
+
+    assert _row_count(uid) == 1  # at most one row, even under real concurrency
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    before = con.execute(
+        "SELECT before_score FROM intervention_results WHERE user_id=?", (uid,)).fetchone()[0]
+    con.close()
+    assert before in (5, 9)  # whichever genuinely won the race -- never both, never corrupted
+    # Exactly one callback answered (both call callback.answer() unconditionally
+    # in cb_before, so this doesn't distinguish winner/loser) -- the real proof
+    # is the row count above plus that practice content was sent exactly once.
+    assert len(same_message.answers) == 2  # winner's practice text + after-score prompt, once
 
 
 def test_cross_user_callbacks_never_cross_contaminate(tmp_db, monkeypatch):

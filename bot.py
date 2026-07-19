@@ -940,7 +940,17 @@ async def cb_before(callback: CallbackQuery, fsm_state: FSMContext):
         fdata.get("readiness", "MEDIUM"),
         fdata.get("capacity", get_capacity(state)),
         get_variant(uid), ROUTER_VERSION,
+        source_chat_id=callback.message.chat.id,
+        source_message_id=callback.message.message_id,
     )
+    if intervention_id is None:
+        # Lost the atomic claim: a genuinely concurrent (or duplicate) tap on
+        # this EXACT card already won -- idx_intervention_one_baseline_per_card
+        # rejected this insert. The in-memory fdata check above is only a
+        # cheap fast path for the common sequential case; this is the real,
+        # engine-enforced guarantee. No second row, no overwrite, no content.
+        await callback.answer()
+        return
     await fsm_state.update_data(
         intervention_id=intervention_id,
         practice_id=practice_id,
