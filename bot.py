@@ -61,8 +61,7 @@ from state_engine import (
 from psychology_profile import maybe_update_profile, format_profile_for_user
 from readiness_engine import assess_readiness
 from cognitive_capacity import get_capacity
-from relationship_monitor import monitor_relationship
-from practice_registry import select_practice, get_practice_by_id
+from practice_registry import select_practice, get_production_practice_by_id
 from safety_validator import (
     validate_response,
     validate_response_with_context, select_fallback,
@@ -179,6 +178,21 @@ def score_kb(prefix: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=str(i), callback_data=f"{prefix}:{i}") for i in range(1, 6)],
         [InlineKeyboardButton(text=str(i), callback_data=f"{prefix}:{i}") for i in range(6, 11)],
     ])
+
+
+def before_score_kb(practice_id: str, scenario: str, lang: str) -> InlineKeyboardMarkup:
+    """Same 1-10 buttons as score_kb, plus an explicit "skip rating" action
+    when Therapeutic Core Foundation is enabled -- lets the user proceed
+    straight to the practice content without fabricating a baseline (see
+    cb_before_skip). Flag OFF reproduces score_kb's exact prior keyboard,
+    byte-for-byte -- no user-visible change."""
+    base = score_kb(f"before:{practice_id}:{scenario}:{lang}")
+    if not config.THERAPEUTIC_CORE_FOUNDATION_ENABLED:
+        return base
+    rows = list(base.inline_keyboard) + [[InlineKeyboardButton(
+        text=("Пропустить оценку" if lang == "ru" else "Skip rating"),
+        callback_data=f"before_skip:{practice_id}:{scenario}:{lang}")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def quality_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -597,13 +611,20 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             await log_disambiguation(uid, user_text, phrase, signal)
             return
 
-    # 3.5 Dependency monitor
-    # record_message MUST come first so the current message is counted
-    # before the threshold check — otherwise the 100th message never triggers.
+    # 3.5 Dependency monitor -- the ONE deterministic authority (Therapeutic
+    # Core Foundation): consolidates the behavioural-pattern signals (this
+    # module) and the explicit-phrase signal (relationship_monitor) behind a
+    # single shared cooldown gate. record_message MUST come first so the
+    # current message is counted before the threshold check -- otherwise the
+    # 100th message never triggers. A non-None result is a soft, narrow
+    # redirect that REPLACES the ordinary reply for this turn (never both),
+    # matching CLINICAL_BOUNDARY.md §2.3 -- it is never crisis protocol, and
+    # this check always runs strictly after the crisis/RED checks above.
     await dependency_monitor.record_message(uid)
-    dep_msg = await dependency_monitor.check_dependency(uid, lang)
+    dep_msg = await dependency_monitor.assess(uid, user_text, lang)
     if dep_msg:
         await message.answer(dep_msg)
+        return
 
     # 5. Update state
     state = await load_state(uid) or dict(DEFAULT_STATE)
@@ -623,12 +644,6 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     variant = get_variant(uid)
     scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
                                variant, trajectory=trajectory)
-    
-    # 10. Check dependency
-    dep_resp = monitor_relationship(user_text, lang)
-    if dep_resp:
-        await message.answer(dep_resp)
-        return
     
     # 11. Select practice
     severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
@@ -756,7 +771,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             await fsm_state.update_data(stage=stage, readiness=readiness, capacity=capacity)
         await message.answer(f"Как ты себя чувствуешь прямо сейчас? (1=плохо, 10=хорошо)" if lang == "ru"
                              else "How do you feel right now? (1=bad, 10=good)",
-                             reply_markup=score_kb(f"before:{practice['id']}:{scenario}:{lang}"))
+                             reply_markup=before_score_kb(practice['id'], scenario, lang))
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -890,11 +905,34 @@ async def cb_crisis(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("before:"))
 async def cb_before(callback: CallbackQuery, fsm_state: FSMContext):
     uid = callback.from_user.id
-    parts = callback.data.split(":")
-    practice_id, scenario, lang, score = parts[1], parts[2], parts[3], int(parts[4])
+    try:
+        parts = callback.data.split(":")
+        practice_id, scenario, lang, score = parts[1], parts[2], parts[3], int(parts[4])
+    except (IndexError, ValueError):
+        # Malformed callback data (forged/truncated) -- fail closed, no DB write.
+        await callback.answer()
+        return
+
+    # Fail closed BEFORE any DB write: a forged, stale-version, or
+    # catalog-only practice_id must never create an intervention_results row,
+    # let alone display content. This is the ONLY lookup used with
+    # callback-supplied (untrusted) data -- get_practice_by_id itself has no
+    # such guard.
+    practice = get_production_practice_by_id(practice_id, lang)
+    if not practice:
+        await callback.answer()
+        return
+
+    # Idempotency: a duplicate tap of the SAME offer (double-tap, or the
+    # button remaining clickable after the first tap) must create exactly
+    # one baseline row, never a second one, and never let a later tap
+    # overwrite the first score.
+    fdata = await fsm_state.get_data()
+    if fdata.get("practice_id") == practice_id and fdata.get("intervention_id") is not None:
+        await callback.answer()
+        return
 
     state = await load_state(uid) or dict(DEFAULT_STATE)
-    fdata = await fsm_state.get_data()
     intervention_id = await start_intervention(
         uid, scenario, scenario, practice_id, PRACTICE_VERSION,
         {"state": state}, score,
@@ -912,14 +950,40 @@ async def cb_before(callback: CallbackQuery, fsm_state: FSMContext):
     )
     await fsm_state.set_state(InterventionStates.awaiting_after)
 
-    practice = get_practice_by_id(practice_id, lang)
-    if practice:
-        steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
-        await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}", parse_mode="HTML")
-        await asyncio.sleep(1)
-        await callback.message.answer(
-            ("Как теперь?" if lang == "ru" else "How now?"),
-            reply_markup=score_kb("after"))
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
+    await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}", parse_mode="HTML")
+    await asyncio.sleep(1)
+    await callback.message.answer(
+        ("Как теперь?" if lang == "ru" else "How now?"),
+        reply_markup=score_kb("after"))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("before_skip:"))
+async def cb_before_skip(callback: CallbackQuery, fsm_state: FSMContext):
+    """Explicit baseline-skip (Therapeutic Core Foundation, flag-gated): the
+    user proceeds straight to the practice content WITHOUT providing a
+    before-score. Deliberately does NOT call start_intervention (no baseline
+    is fabricated, no row is created -- non-evaluable by absence, the same
+    convention the existing schema already uses for any offer the user never
+    engages with) and does NOT enter the after/quality rating loop (nothing
+    exists to compare a later value against, so no improvement claim is
+    ever possible for this episode)."""
+    if not config.THERAPEUTIC_CORE_FOUNDATION_ENABLED:
+        await callback.answer()
+        return
+    try:
+        parts = callback.data.split(":")
+        practice_id, scenario, lang = parts[1], parts[2], parts[3]
+    except IndexError:
+        await callback.answer()
+        return
+    practice = get_production_practice_by_id(practice_id, lang)
+    if not practice:
+        await callback.answer()
+        return
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
+    await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}", parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("after:"))

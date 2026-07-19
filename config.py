@@ -148,3 +148,16 @@ def _validate_rollout_policy(raw: str) -> str:
 
 ONBOARDING_ROLLOUT_POLICY = _validate_rollout_policy(
     os.getenv("ONBOARDING_ROLLOUT_POLICY", "NEW_USERS_ONLY"))
+
+# Therapeutic Core Foundation — default OFF. Gates ONLY the new explicit
+# baseline-skip control on the existing before-score prompt (cb_before_skip /
+# before_score_kb); flag false reproduces the prior score_kb keyboard
+# byte-for-byte. Does NOT gate the dependency-monitor consolidation (an
+# always-on safety correction, never a product feature) or the canonical
+# production-practice allowlist (a safety/reachability enforcement, not new
+# user-visible behavior — the 7 production ids were already the only ones
+# ever actually selected).
+THERAPEUTIC_CORE_FOUNDATION_ENABLED = (
+    os.getenv("THERAPEUTIC_CORE_FOUNDATION_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)

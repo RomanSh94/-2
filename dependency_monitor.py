@@ -19,6 +19,9 @@ import time
 from collections import defaultdict, deque
 from typing import Optional
 
+from relationship_monitor import (
+    monitor_relationship, REDIRECT_RESPONSE_RU, REDIRECT_RESPONSE_EN)
+
 # ── Thresholds ────────────────────────────────────────────────────────────────
 _DAY_SEC   = 86_400
 _3_HOURS   = 3 * 3600
@@ -90,12 +93,29 @@ class DependencyMonitor:
             self._night_msgs[user_id] = 0
             self._night_date[user_id] = today
 
-    async def check_dependency(self, user_id: int, lang: str = "ru") -> Optional[str]:
-        """
-        Returns a redirect message string if a dependency pattern is detected, else None.
-        Each distinct trigger fires exactly once; the gate resets only when the
-        condition drops below threshold (not just because we already notified).
-        """
+    async def assess(self, user_id: int, text: str, lang: str = "ru") -> Optional[str]:
+        """The ONE deterministic authority for "is a dependency-boundary
+        redirect warranted right now" — consolidates the explicit-phrase
+        signal (relationship_monitor.monitor_relationship) and this class's
+        own behavioural-pattern signals (night/frequency/marathon-session)
+        behind a SINGLE shared cooldown gate (`_last_redirect`), so the two
+        previously-independent mechanisms can no longer disagree or double-
+        fire in the same turn. The LLM never makes this decision.
+
+        Priority when multiple conditions are active simultaneously:
+        night > frequency > marathon > explicit phrase (behavioural patterns
+        first, since they represent sustained usage; the phrase check is the
+        lowest-priority, most-immediate signal). Each distinct trigger fires
+        at most once per cooldown window — the gate only resets once BOTH the
+        behavioural conditions have dropped below threshold AND the current
+        message contains no dependency phrase, matching CLINICAL_BOUNDARY.md
+        §2.3 ("не острый safety-флаг... ответ мягкий и узкий").
+
+        Caller contract: this must be called AFTER crisis handling has
+        already been ruled out for this message — it never checks crisis
+        state itself, and a non-None return here is expected to make the
+        caller skip ordinary scenario/practice routing for this turn (a
+        soft, narrow redirect instead of the ordinary reply — never both)."""
         ts  = self._timestamps[user_id]
         now = time.time()
 
@@ -104,6 +124,7 @@ class DependencyMonitor:
         freq_active     = len(ts) > _MAX_DAY_MSGS
         session_start   = self._session_start.get(user_id)
         marathon_active = bool(session_start and (now - session_start) > _3_HOURS)
+        phrase_active   = monitor_relationship(text, lang) is not None
 
         last = self._last_redirect.get(user_id)
 
@@ -123,6 +144,12 @@ class DependencyMonitor:
             if last != "marathon":
                 self._last_redirect[user_id] = "marathon"
                 return _MARATHON_EN if lang == "en" else _MARATHON_RU
+            return None
+
+        if phrase_active:
+            if last != "phrase":
+                self._last_redirect[user_id] = "phrase"
+                return REDIRECT_RESPONSE_EN if lang == "en" else REDIRECT_RESPONSE_RU
             return None
 
         # No conditions active — reset gate so next threshold crossing fires again

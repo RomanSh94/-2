@@ -215,10 +215,9 @@ def test_owner_non_red_ordinary_persistence_still_works(pipeline_spies, monkeypa
     monkeypatch.setattr(bot, "get_emotional_trajectory", _async(types.SimpleNamespace(
         trend="stable", hopelessness_streak=0, yellow_plus_streak=0, messages_analyzed=0)))
     monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(None))
     monkeypatch.setattr(bot, "load_state", _async(None))
     monkeypatch.setattr(bot, "save_state", _async(None))
-    monkeypatch.setattr(bot, "monitor_relationship", lambda *a, **kw: None)
     monkeypatch.setattr(bot, "log_router_decision", _async(None))
     monkeypatch.setattr(bot, "maybe_summarize", _async(None))
     monkeypatch.setattr(bot, "build_context", _async(("", [])))
@@ -251,10 +250,13 @@ def test_tester_aggression_non_red_no_owner_alert(pipeline_spies, monkeypatch):
     monkeypatch.setattr(bot, "get_emotional_trajectory", _async(types.SimpleNamespace(
         trend="stable", hopelessness_streak=0, yellow_plus_streak=0, messages_analyzed=0)))
     monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(None))
+    # Short-circuits the pipeline right after the aggression-alert decision
+    # (already made above this point) so the test doesn't need to stub the
+    # router/LLM machinery further downstream -- assess() is the single
+    # consolidated entry point now (was: a separate monitor_relationship stub).
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async("stop"))
     monkeypatch.setattr(bot, "load_state", _async(None))
     monkeypatch.setattr(bot, "save_state", _async(None))
-    monkeypatch.setattr(bot, "monitor_relationship", lambda *a, **kw: "stop")
     user = FakeUser(10)
     msg = FakeMessage(user, "ненависть переполняет, они поплатятся")
     asyncio.run(bot.pipeline(msg, msg.text, None, tg_user=user))
@@ -265,10 +267,9 @@ def test_owner_aggression_non_red_owner_alert_preserved(pipeline_spies, monkeypa
     monkeypatch.setattr(bot, "get_emotional_trajectory", _async(types.SimpleNamespace(
         trend="stable", hopelessness_streak=0, yellow_plus_streak=0, messages_analyzed=0)))
     monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async("stop"))
     monkeypatch.setattr(bot, "load_state", _async(None))
     monkeypatch.setattr(bot, "save_state", _async(None))
-    monkeypatch.setattr(bot, "monitor_relationship", lambda *a, **kw: "stop")
     user = FakeUser(1)
     msg = FakeMessage(user, "ненависть переполняет, они поплатятся")
     asyncio.run(bot.pipeline(msg, msg.text, None, tg_user=user))

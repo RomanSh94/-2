@@ -8,6 +8,7 @@ import types
 import pytest
 
 import bot
+import database
 import journals
 import emotion_map
 import access_control as ac
@@ -115,7 +116,15 @@ def test_cbt_journal_emotion_step_includes_map_button(monkeypatch):
     assert any(btn.callback_data == "emotion:map" for row in kb.inline_keyboard for btn in row)
 
 
-def test_onboarding_includes_map_button(monkeypatch):
+def test_onboarding_includes_map_button(monkeypatch, tmp_path):
+    # cmd_start's real (unstubbed) DB calls -- get_stored_user_language,
+    # get_onboarding_eligibility -- need a real, schema-initialized DB; a
+    # bare monkeypatch of upsert_user/get_memory_overview alone left this
+    # test dependent on whatever "x20.db" happened to already exist at the
+    # default relative path (pre-existing test-isolation gap, unrelated to
+    # this pass's other changes -- fixed here to match repo convention).
+    monkeypatch.setattr(database, "DB", str(tmp_path / "t.db"))
+    asyncio.run(database.init_db())
     monkeypatch.setattr(bot, "get_memory_overview", _async({"message_count": 0}))
     monkeypatch.setattr(bot, "upsert_user", _async(None))
     user = FakeUser(1)
