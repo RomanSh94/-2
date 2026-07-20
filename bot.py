@@ -853,59 +853,81 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             await fsm_state.update_data(one_shot_voice_pending=False,
                                         one_shot_voice_pending_at=None)
 
-    fmt_cmd = parse_format_command(user_text, lang) if voice_ux_active else None
+    # Detection itself is flag-gated ONLY (cheap, stateless, no I/O) -- but
+    # every ACTION (persistence, replay, override arming, voice delivery)
+    # below remains private-chat-only. This matters specifically for a PURE
+    # command outside a private chat: it must be recognized and short-
+    # circuited with a neutral notice, never silently sent to the
+    # therapeutic LLM just because chat.type != "private" made detection
+    # itself unavailable (the earlier, narrower gate did exactly that).
+    fmt_cmd = parse_format_command(user_text, lang) if config.VOICE_REPLIES_ENABLED else None
     if fmt_cmd:
-        if fmt_cmd.kind == "voice_persistent":
-            await set_response_preference(uid, response_format="voice")
-        elif fmt_cmd.kind == "text_persistent":
-            await set_response_preference(uid, response_format="text")
-        elif fmt_cmd.kind == "concise_persistent":
-            await set_response_preference(uid, response_length="concise")
-        elif fmt_cmd.kind == "voice_oneshot":
-            one_shot_voice = True
-        elif fmt_cmd.kind == "concise_oneshot":
-            one_shot_concise = True
-
         pure = is_pure_format_command(user_text, lang)
-        if pure and fmt_cmd.persistent:
-            await message.answer(_format_ack_text(fmt_cmd, lang))
-            return
-        if pure and fmt_cmd.kind == "voice_oneshot":
-            # §8: "много текста"/"лень читать" etc. -- voice-ify the LAST
-            # SUCCESSFULLY DELIVERED ordinary response instead of generating
-            # a new therapeutic interpretation, when one is still available.
-            # Sourced from FSM state (last_delivered_response), NOT the
-            # database -- FSM is scoped per (chat, user) by aiogram itself,
-            # so a private-chat reply can never be replayed from a
-            # different chat the same Telegram user happens to also be in.
-            fdata = await fsm_state.get_data() if fsm_state is not None else {}
-            last = fdata.get("last_delivered_response")
-            last_at = fdata.get("last_delivered_response_at") or 0
-            if last and (time.time() - last_at <= config.VOICE_LAST_RESPONSE_TTL_SECONDS):
-                spoken = _safe_concise_version(last, lang)
-                ok = await _synthesize_and_send_voice(message, uid, spoken, lang)
-                if not ok:
-                    await message.answer(last)
-                return
-            # No usable previous response (none stored, or past its TTL):
-            # this message itself must NEVER be treated as therapeutic
-            # content. Clear any stale value, arm the override for the NEXT
-            # ordinary reply (consumed above, on that future update), and
-            # stop here.
-            if fsm_state is not None:
-                await fsm_state.update_data(
-                    last_delivered_response=None, last_delivered_response_at=None,
-                    one_shot_voice_pending=True, one_shot_voice_pending_at=time.time())
+        if pure and not is_private_chat:
+            # §5: a pure meta-command outside a private chat must never
+            # replay, never arm an override, never touch a preference, and
+            # never enter therapeutic routing -- a short neutral notice,
+            # then stop.
             await message.answer(
-                "Хорошо, следующий ответ озвучу." if lang == "ru"
-                else "Okay, I'll voice the next reply.")
+                "Настройки формата и озвучивание доступны в личном чате с ботом." if lang == "ru"
+                else "Format settings and voice replies are only available in a private chat with me.")
             return
-        elif pure and fmt_cmd.kind in ("concise_oneshot", "detailed_oneshot"):
-            await message.answer(_format_ack_text(fmt_cmd, lang))
-            return
-        # else: MIXED message, or a one-shot voice override with nothing yet
-        # to voice -- fall through to ordinary routing with the one-shot
-        # flags armed for deliver_response below.
+
+        if is_private_chat:
+            if fmt_cmd.kind == "voice_persistent":
+                await set_response_preference(uid, response_format="voice")
+            elif fmt_cmd.kind == "text_persistent":
+                await set_response_preference(uid, response_format="text")
+            elif fmt_cmd.kind == "concise_persistent":
+                await set_response_preference(uid, response_length="concise")
+            elif fmt_cmd.kind == "voice_oneshot":
+                one_shot_voice = True
+            elif fmt_cmd.kind == "concise_oneshot":
+                one_shot_concise = True
+
+            if pure and fmt_cmd.persistent:
+                await message.answer(_format_ack_text(fmt_cmd, lang))
+                return
+            if pure and fmt_cmd.kind == "voice_oneshot":
+                # §8: "много текста"/"лень читать" etc. -- voice-ify the LAST
+                # SUCCESSFULLY DELIVERED ordinary response instead of
+                # generating a new therapeutic interpretation, when one is
+                # still available. Sourced from FSM state
+                # (last_delivered_response), NOT the database -- FSM is
+                # scoped per (chat, user) by aiogram itself, so a
+                # private-chat reply can never be replayed from a different
+                # chat the same Telegram user happens to also be in.
+                fdata = await fsm_state.get_data() if fsm_state is not None else {}
+                last = fdata.get("last_delivered_response")
+                last_at = fdata.get("last_delivered_response_at") or 0
+                if last and (time.time() - last_at <= config.VOICE_LAST_RESPONSE_TTL_SECONDS):
+                    spoken = _safe_concise_version(last, lang)
+                    ok = await _synthesize_and_send_voice(message, uid, spoken, lang)
+                    if not ok:
+                        await message.answer(last)
+                    return
+                # No usable previous response (none stored, or past its
+                # TTL): this message itself must NEVER be treated as
+                # therapeutic content. Clear any stale value, arm the
+                # override for the NEXT ordinary reply (consumed above, on
+                # that future update), and stop here.
+                if fsm_state is not None:
+                    await fsm_state.update_data(
+                        last_delivered_response=None, last_delivered_response_at=None,
+                        one_shot_voice_pending=True, one_shot_voice_pending_at=time.time())
+                await message.answer(
+                    "Хорошо, следующий ответ озвучу." if lang == "ru"
+                    else "Okay, I'll voice the next reply.")
+                return
+            elif pure and fmt_cmd.kind in ("concise_oneshot", "detailed_oneshot"):
+                await message.answer(_format_ack_text(fmt_cmd, lang))
+                return
+        # else: a MIXED message. In a private chat, falls through with the
+        # one-shot flags armed above. In a non-private chat, is_private_chat
+        # was False so the `if is_private_chat:` block never ran -- the
+        # format fragment is silently ignored (no preference write, no
+        # override armed) and ordinary routing proceeds UNCHANGED for the
+        # emotional content, exactly as it did before this feature existed.
 
     # 5. Update state
     state = await load_state(uid) or dict(DEFAULT_STATE)
