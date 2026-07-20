@@ -161,3 +161,53 @@ THERAPEUTIC_CORE_FOUNDATION_ENABLED = (
     os.getenv("THERAPEUTIC_CORE_FOUNDATION_ENABLED", "false").strip().lower()
     in ("1", "true", "yes", "on")
 )
+
+# ── Voice and Adaptive Response UX — both default OFF ───────────────────────
+# VOICE_REPLIES_ENABLED gates: the /format selector, the "🔊 Прослушать"
+# listen button, natural-language format/voice meta-commands, and the
+# response-preferences-driven delivery (deliver_response in bot.py). Flag
+# false => deliver_response always sends plain text, byte-for-byte the prior
+# `await message.answer(answer)` behavior, and /format replies as if it were
+# an unknown command (no selector shown, nothing saved).
+VOICE_REPLIES_ENABLED = (
+    os.getenv("VOICE_REPLIES_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+# EMOTIONAL_REACTIONS_ENABLED gates ONLY the best-effort Telegram message
+# reaction (reaction_selector.py + bot.py's _maybe_react). Independent of
+# VOICE_REPLIES_ENABLED -- a deployment can enable one without the other.
+EMOTIONAL_REACTIONS_ENABLED = (
+    os.getenv("EMOTIONAL_REACTIONS_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+# TTS configuration (not rollout flags -- inert while VOICE_REPLIES_ENABLED
+# is false). tts-1 is OpenAI's low-latency TTS model; opus is the format
+# Telegram voice messages actually want (see tts.py).
+TTS_MODEL              = os.getenv("TTS_MODEL", "tts-1")
+TTS_VOICE_RU           = os.getenv("TTS_VOICE_RU", "alloy")
+TTS_VOICE_EN           = os.getenv("TTS_VOICE_EN", "alloy")
+TTS_RESPONSE_FORMAT    = os.getenv("TTS_RESPONSE_FORMAT", "opus")
+TTS_TIMEOUT_SECONDS    = int(os.getenv("TTS_TIMEOUT_SECONDS", "20"))
+TTS_MAX_INPUT_CHARS    = int(os.getenv("TTS_MAX_INPUT_CHARS", "600"))
+TTS_MAX_AUDIO_SECONDS  = int(os.getenv("TTS_MAX_AUDIO_SECONDS", "90"))
+
+# Reaction configuration (not rollout flags -- inert while
+# EMOTIONAL_REACTIONS_ENABLED is false).
+EMOTIONAL_REACTION_COOLDOWN_SECONDS = int(
+    os.getenv("EMOTIONAL_REACTION_COOLDOWN_SECONDS", "120"))
+EMOTIONAL_REACTION_MIN_CONFIDENCE = float(
+    os.getenv("EMOTIONAL_REACTION_MIN_CONFIDENCE", "0.6"))
+
+# Bounded TTLs for the two pieces of ephemeral FSM-scoped state used by
+# format-command replay (not rollout flags -- inert while
+# VOICE_REPLIES_ENABLED is false). Both are plain configuration values, not
+# feature flags: no default or migration path ever changes their meaning.
+# ONE_SHOT_OVERRIDE: how long a "voice the next reply" armed-but-unconsumed
+# override (from "лень читать" with nothing yet to voice-ify) remains valid.
+# LAST_RESPONSE: how long a successfully delivered final ordinary answer
+# stays eligible to be replayed by a later "лень читать"/"много текста".
+VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS = int(
+    os.getenv("VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS", "300"))
+VOICE_LAST_RESPONSE_TTL_SECONDS = int(
+    os.getenv("VOICE_LAST_RESPONSE_TTL_SECONDS", "21600"))
