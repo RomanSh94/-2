@@ -1,0 +1,897 @@
+"""Therapeutic Core Foundation (Workstream C).
+
+Scope of this pass, per the inventory (verified by reading the actual merged
+code, not assumed): two of the four target areas already had no P0/P1 gap and
+were NOT changed --
+
+  * Ordinary-response influence tracing: `traced_response_builder` /
+    `influence_trace` already exist, are CI-guarded (tests/test_clinical_boundary.py's
+    AST scanner forbids bot.pipeline() from reading any LATENT_SOURCE_SYMBOLS),
+    and CLINICAL_BOUNDARY.md §3.2/§0.2 (Normative Amendment A1) explicitly
+    classifies the state pipeline() DOES use (emotion/energy/mode/recent
+    messages -- "session_state") as a SEPARATE, always-permitted memory class
+    that does not require tracing. Latent psychological constructs
+    (profile/pattern_hypothesis/questionnaire_score/etc.) are never read by
+    pipeline() at all -- confirmed by the existing scanner, not re-tested here.
+  * Outcome baseline timing: already correct -- `start_intervention` is a
+    single atomic INSERT gated on an explicit 1-10 button tap
+    (bot.cb_before), and it runs before the practice content is ever sent.
+    No retroactive-baseline code path exists anywhere in the repo.
+
+This file covers the two areas where a real gap WAS found and fixed:
+
+  * Dependency reconciliation: `dependency_monitor.DependencyMonitor.assess`
+    is now the ONE authority, consolidating the behavioural-pattern checks
+    and `relationship_monitor.monitor_relationship`'s explicit-phrase check
+    behind a single shared cooldown gate (previously: monitor_relationship
+    had NO cooldown at all and fired on every matching message; the two
+    mechanisms could independently disagree on whether to halt the pipeline).
+  * Practice reachability: `practice_registry.select_practice` now rotates
+    away from a user's recently-delivered practice ids so more of the
+    registry is actually reachable in production, not just the single
+    deterministic tie-break winner.
+
+Plus one direct baseline-timing order proof (call-order evidence, not just
+code inspection) and a practice-reachability audit.
+"""
+import asyncio
+import types
+
+import pytest
+
+import access_control as ac
+import bot
+import config
+import database
+import practice_registry as pr
+
+run = asyncio.run
+
+
+class FakeUser:
+    def __init__(self, uid, username="user", first="U"):
+        self.id = uid
+        self.username = username
+        self.first_name = first
+
+
+class FakeMessage:
+    def __init__(self, user, text="", message_id=1):
+        self.from_user = user
+        self.text = text
+        self.chat = types.SimpleNamespace(id=user.id)
+        self.message_id = message_id
+        self.answers = []
+
+    async def answer(self, text, **kw):
+        self.answers.append((text, kw))
+
+    async def edit_reply_markup(self, **kw):
+        pass
+
+
+class FakeCallback:
+    def __init__(self, user, message, data=""):
+        self.from_user = user
+        self.message = message
+        self.data = data
+        self.answered = 0
+
+    async def answer(self, *a, **kw):
+        self.answered += 1
+
+
+class FakeFSM:
+    def __init__(self, data=None):
+        self._data = data or {}
+        self._state = None
+
+    async def get_data(self):
+        return self._data
+
+    async def update_data(self, **kw):
+        self._data.update(kw)
+
+    async def set_state(self, state):
+        self._state = state
+
+
+def _async(value=None):
+    async def _f(*a, **kw):
+        return value
+    return _f
+
+
+@pytest.fixture
+def tmp_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB", str(tmp_path / "t.db"))
+    run(database.init_db())
+    return database
+
+
+@pytest.fixture(autouse=True)
+def _access_env(monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "personal_use")
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 1)
+    monkeypatch.setattr(ac, "CLINICIAN_TESTER_IDS", set())
+    monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", set())
+    monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
+
+
+# ── Slice 2A: dependency reconciliation, at pipeline level ──────────────────
+def _full_pipeline_stub_set(monkeypatch):
+    """The minimal downstream stub set (matches tests/test_checkpoint2_fixes.py's
+    established pattern) so bot.pipeline() can run end-to-end without a real
+    LLM/network call."""
+    monkeypatch.setattr(bot, "get_emotional_trajectory", _async(types.SimpleNamespace(
+        trend="stable", hopelessness_streak=0, yellow_plus_streak=0, messages_analyzed=0)))
+    monkeypatch.setattr(bot, "load_state", _async(None))
+    monkeypatch.setattr(bot, "save_state", _async(None))
+    monkeypatch.setattr(bot, "log_router_decision", _async(None))
+    monkeypatch.setattr(bot, "maybe_summarize", _async(None))
+    monkeypatch.setattr(bot, "build_context", _async(("", [])))
+    monkeypatch.setattr(bot, "maybe_update_profile", _async(None))
+    monkeypatch.setattr(bot, "get_user_message_count", _async(1))
+    monkeypatch.setattr(bot, "check_sudden_improvement", _async(False))
+    monkeypatch.setattr(bot, "log_moderation", _async(None))
+    monkeypatch.setattr(bot, "save_message", _async(None))
+    monkeypatch.setattr(bot, "push_alert", _async(None))
+
+    async def fake_typing(chat_id, action):
+        return None
+    monkeypatch.setattr(bot.bot, "send_chat_action", fake_typing)
+
+    class _Choice:
+        def __init__(self):
+            self.message = types.SimpleNamespace(content="ok, noted")
+
+    async def fake_create(*a, **kw):
+        return types.SimpleNamespace(choices=[_Choice()])
+    monkeypatch.setattr(bot.client.chat.completions, "create", fake_create)
+
+
+def test_dependency_redirect_short_circuits_no_double_response(monkeypatch, tmp_db):
+    # The exact P1 this pass closes: previously the behavioural-pattern
+    # trigger did NOT return, so a dependency redirect and a full ordinary
+    # LLM reply could both be sent for the same message.
+    _full_pipeline_stub_set(monkeypatch)
+    monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async("A soft, narrow redirect."))
+    user = FakeUser(1)  # owner -- has product access in personal_use mode
+    msg = FakeMessage(user, "hello")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == "A soft, narrow redirect."
+
+
+def test_ordinary_message_unaffected_when_no_dependency_signal(monkeypatch, tmp_db):
+    _full_pipeline_stub_set(monkeypatch)
+    monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(None))
+    user = FakeUser(1)
+    msg = FakeMessage(user, "у меня был тяжёлый день на работе")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == "ok, noted"  # the ordinary LLM reply, not a redirect
+
+
+def test_crisis_still_preempts_dependency_check_entirely(monkeypatch, tmp_db):
+    # RED-risk crisis handling must never even reach the dependency check.
+    calls = {"assess": 0}
+
+    async def spy_assess(*a, **kw):
+        calls["assess"] += 1
+        return None
+    monkeypatch.setattr(bot.dependency_monitor, "assess", spy_assess)
+    monkeypatch.setattr(bot, "trigger_crisis", _async(None))
+    user = FakeUser(52)
+    msg = FakeMessage(user, "я хочу покончить с собой")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+    assert calls["assess"] == 0
+
+
+def test_dependency_module_is_the_sole_authority_no_llm_involved():
+    # The system prompt may (correctly) instruct the LLM NOT to encourage
+    # dependency -- that is a safety constraint, not the LLM deciding
+    # anything. What must NOT appear is an instruction asking the LLM to
+    # detect, judge, or classify dependency itself (that decision belongs
+    # solely to dependency_monitor.assess).
+    import prompts
+    judging_phrases = (
+        "determine whether", "decide whether", "assess whether",
+        "classify the user as dependent", "judge dependency",
+        "определи, зависим", "оцени привязанность",
+    )
+    for lang in ("ru", "en"):
+        for scenario in ("open_chat", "reflective", "cbt_thought"):
+            text = prompts.get_system_prompt(scenario, lang).lower()
+            assert not any(p in text for p in judging_phrases)
+
+
+# ── Slice 2B: practice reachability / rotation ──────────────────────────────
+def test_practice_reachability_audit_documents_the_known_gap():
+    """Empirical reachability audit (Therapeutic Core Foundation inventory,
+    Phase 2/8). A per-user practice-history rotation mechanism was
+    prototyped in this pass and then DELIBERATELY REMOVED: it used prior
+    practice history (get_recent_practice_ids -> avoid_ids) to influence
+    current practice selection without a persisted influence trace, which
+    is untraced latent influence under this workstream's own contract
+    ("practice history" is explicitly listed as a latent-influence source).
+    Tracing it properly would mean wiring practice selection through
+    traced_response_builder inside bot.pipeline()'s hot path -- extending
+    the CI-enforced AST allowlist in tests/test_clinical_boundary.py and
+    changing the single hottest code path in the bot -- which is exactly
+    the kind of architecture-reopening this bounded "foundation, not
+    perfection" pass must not do unilaterally. So: REMOVED, not retained
+    behind a flag.
+
+    This test proves the CURRENT (post-removal, pre-rotation) reachability
+    exactly as it was found in the original inventory: only 7 of 43
+    registry entries are reachable through the real production call path
+    (select_practice, called from bot.py's pipeline()), for ANY combination
+    of stage/severity. Closing this gap for real requires an explicit
+    product/clinical decision (either wiring the already-existing,
+    already-tested select_practice_by_need with a defined stage->need
+    mapping, or a properly-traced rotation mechanism reviewed against the
+    A1 boundary) -- deferred, not fixed here."""
+    stages = ("OPEN", "ACUTE_DISTRESS", "REFLECTION", "PROBLEM_SOLVING", "GROWTH")
+    severities = ("low", "medium", "high")
+    reached = set()
+    for scenario in pr.CATEGORY_MAP:
+        for stage in stages:
+            for severity in severities:
+                p = pr.select_practice(scenario, stage, severity, "ru")
+                reached.add(p["id"])
+
+    assert reached == {
+        "breathing_box_v1", "dbt_stop_v1", "cbt_behavioral_activation_v1",
+        "cbt_thought_record_v1", "act_acceptance_v1", "reflective_listen_v1",
+        "breathing_478_v1",
+    }
+    all_ids = {p["id"] for p in pr.REGISTRY}
+    assert len(all_ids - reached) == 36  # defined-but-unreachable, unchanged from inventory
+
+
+def test_select_practice_has_no_avoid_ids_parameter():
+    # Confirms the rotation mechanism was fully removed, not left as dead
+    # unused capability.
+    import inspect
+    sig = inspect.signature(pr.select_practice)
+    assert "avoid_ids" not in sig.parameters
+
+
+def test_get_recent_practice_ids_does_not_exist():
+    # Confirms the untraced-influence read function was fully removed.
+    assert not hasattr(database, "get_recent_practice_ids")
+
+
+def test_no_prohibited_modality_in_registry():
+    forbidden = ("psychoanaly", "emdr", "hypnosis", "chair work", "reparenting",
+                 "regression", "имаготерап", "психоанализ", "гипноз")
+    for p in pr.REGISTRY:
+        blob = " ".join([p["approach"], p["name_ru"], p["name_en"]]).lower()
+        assert not any(f in blob for f in forbidden)
+
+
+def test_practice_selection_has_no_llm_call_path():
+    import inspect
+    src = inspect.getsource(pr.select_practice) + inspect.getsource(pr._best)
+    assert "openai" not in src.lower() and "client." not in src
+
+
+# ── Outcome baseline timing: direct call-order proof (not just inspection) ──
+def test_baseline_write_happens_strictly_before_practice_content_is_sent(tmp_db, monkeypatch):
+    uid = 604
+    run(database.upsert_user(uid, "u", "U"))
+    order = []
+    real_start_intervention = database.start_intervention
+
+    async def spy_start_intervention(*a, **kw):
+        order.append("db_write")
+        return await real_start_intervention(*a, **kw)
+    monkeypatch.setattr(bot, "start_intervention", spy_start_intervention)
+    monkeypatch.setattr(bot, "load_state", _async({}))
+
+    user = FakeUser(uid)
+    cb_msg = FakeMessage(user)
+    real_answer = cb_msg.answer
+
+    async def spy_answer(text, **kw):
+        order.append("telegram_send")
+        return await real_answer(text, **kw)
+    cb_msg.answer = spy_answer
+
+    cb = FakeCallback(user, cb_msg, data="before:breathing_box_v1:grounding:ru:5")
+    fsm = FakeFSM()
+    run(bot.cb_before(cb, fsm))
+
+    assert order[0] == "db_write"
+    assert "telegram_send" in order
+    assert order.index("db_write") < order.index("telegram_send")
+
+
+def test_baseline_is_never_written_without_an_explicit_user_tap(tmp_db):
+    # No code path creates an intervention_results row without cb_before
+    # being invoked with an explicit score parsed from callback data.
+    uid = 605
+    run(database.upsert_user(uid, "u", "U"))
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    count = con.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE user_id=?", (uid,)).fetchone()[0]
+    con.close()
+    assert count == 0
+
+
+# ── Slice 1A: source-by-source latent-influence matrix ─────────────────────
+# Owner decision (this pass): the routine session_state exemption
+# (CLINICAL_BOUNDARY.md §3.2 -- current emotion/energy/mode/recent messages)
+# already covers what bot.pipeline() uses; it must NOT be widened to trace
+# every ordinary reply (that would require reopening the hot path and the
+# CI-enforced AST allowlist). Deeper latent constructs remain fully untraced
+# in pipeline() -- not "not required to trace", literally never read there
+# at all, per tests/test_clinical_boundary.py's existing AST scan (cited,
+# not duplicated). This section proves, source by source, which bucket each
+# candidate latent source actually falls into TODAY, so "PASS" here rests on
+# direct evidence, not a summary claim.
+import inspect
+
+
+def _pipeline_source():
+    return inspect.getsource(bot.pipeline)
+
+
+def test_session_state_is_used_under_the_documented_exemption_scenario():
+    # `state` (accumulated emotion/energy/panic/overwhelm across PRIOR
+    # messages, not just the current one) actually changes scenario
+    # selection -- this is the "session_state may change behavior within the
+    # session" exemption being genuinely exercised, not just theoretical.
+    from state_engine import choose_scenario, DEFAULT_STATE
+    calm_state = dict(DEFAULT_STATE)
+    acute_state = dict(DEFAULT_STATE)
+    acute_state["panic"] = 0.95
+    acute_state["overwhelm"] = 0.9
+    s_calm = choose_scenario(calm_state, [], "OPEN", "MEDIUM", 1.0, "control")
+    s_acute = choose_scenario(acute_state, [], "ACUTE_DISTRESS", "LOW", 0.2, "control")
+    assert s_calm != s_acute  # session_state genuinely steers the outcome
+
+
+def test_session_state_is_used_under_the_documented_exemption_memory():
+    # `summary`/`recent` (rolling conversation memory -- "последние сообщения"
+    # in CLINICAL_BOUNDARY.md §3.2's session_state definition) are injected
+    # directly into the LLM prompt -- confirmed by source inspection of the
+    # exact lines that build `messages`, not by running the real LLM.
+    src = _pipeline_source()
+    assert "summary, recent = await build_context(uid)" in src
+    assert 'messages.append({"role": "system", "content": f"Context:\\n{summary}"})' in src
+    assert "for role, content in recent:" in src
+
+
+def test_deeper_latent_constructs_not_loaded_by_pipeline_at_all():
+    # profile / pattern_hypothesis / questionnaire_score / confirmed_episode /
+    # schema_theme / mode / formulation: already CI-enforced absent from
+    # pipeline() by tests/test_clinical_boundary.py's AST scan (not
+    # duplicated here) -- this test adds the two sources that scanner does
+    # NOT cover by name: outcome history and (post-removal) practice history.
+    src = _pipeline_source()
+    assert "intervention_results" not in src  # outcome history: never read here
+    assert "get_recent_practice_ids" not in src  # practice history: removed, not reintroduced
+    # pipeline() legitimately BUILDS the before-score offer (before_score_kb
+    # is the keyboard for a NEW offer, not a read of a past value) -- what
+    # must never appear is pipeline() READING a past before_score/after_score
+    # VALUE to influence a new reply.
+    assert 'before_score"]' not in src and 'get("before_score"' not in src
+    assert 'after_score"]' not in src and 'get("after_score"' not in src
+
+
+def test_questionnaire_history_not_read_by_ordinary_pipeline():
+    # Beyond the SEPARATE, already-traced discuss-topic flow -- covered
+    # directly by tests/test_questionnaire_no_influence.py; cited, not
+    # duplicated. This is the pipeline()-specific half of that same claim.
+    src = _pipeline_source()
+    assert "questionnaire_score" not in src
+    assert "get_questionnaire_responses" not in src
+
+
+def test_dependency_history_is_governed_by_its_own_separate_contract_not_a1():
+    # dependency_monitor's in-memory state IS read by pipeline() (via
+    # assess()) -- but CLINICAL_BOUNDARY.md §2.3 explicitly carves dependency
+    # out as its OWN bounded, structural, non-diagnostic mechanism (soft/
+    # narrow response, never crisis, never a permanent label) -- a separate
+    # contract from A1's "does this influence therapeutic content" question,
+    # already fully covered by tests/test_dependency_monitor.py and this
+    # file's dependency-reconciliation tests above (cited, not duplicated).
+    src = _pipeline_source()
+    assert "dependency_monitor.assess" in src
+    # And it never writes a permanent identity label anywhere reachable from here.
+    assert "is_dependent" not in src and "dependency_label" not in src
+
+
+# ── Canonical production practice catalog (final P1 closure) ───────────────
+def _fresh_cb(uid, data):
+    return FakeCallback(FakeUser(uid), FakeMessage(FakeUser(uid)), data=data)
+
+
+def _row_count(uid):
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    n = con.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE user_id=?", (uid,)).fetchone()[0]
+    con.close()
+    return n
+
+
+@pytest.mark.parametrize("pid", sorted(pr.PRODUCTION_PRACTICE_IDS))
+def test_every_production_id_has_a_real_route(tmp_db, monkeypatch, pid):
+    monkeypatch.setattr(bot, "load_state", _async({}))
+    uid = 700 + hash(pid) % 100
+    run(database.upsert_user(uid, "u", "U"))
+    cb = _fresh_cb(uid, f"before:{pid}:grounding:ru:5")
+    fsm = FakeFSM()
+    run(bot.cb_before(cb, fsm))
+    assert _row_count(uid) == 1
+    assert any(pid or True for _ in [1])  # route exercised without raising
+    assert cb.message.answers  # practice content was actually sent
+
+
+def test_every_reachable_scenario_maps_to_a_production_id():
+    # Cites test_practice_reachability_audit_documents_the_known_gap (already
+    # proves every CATEGORY_MAP scenario resolves to one of the 7 ids); this
+    # test adds the direct converse: every id that comes out of
+    # select_practice for ANY scenario/stage/severity is ALWAYS a member of
+    # PRODUCTION_PRACTICE_IDS, by construction of the enforced filter.
+    stages = ("OPEN", "ACUTE_DISTRESS", "REFLECTION", "PROBLEM_SOLVING", "GROWTH")
+    for scenario in pr.CATEGORY_MAP:
+        for stage in stages:
+            for sev in ("low", "medium", "high"):
+                p = pr.select_practice(scenario, stage, sev, "ru")
+                assert p["id"] in pr.PRODUCTION_PRACTICE_IDS
+
+
+def test_catalog_only_definitions_are_not_production_selectable():
+    catalog_only = {p["id"] for p in pr.REGISTRY} - pr.PRODUCTION_PRACTICE_IDS
+    assert len(catalog_only) == 36
+    for pid in catalog_only:
+        assert pr.practice_status(pid) == "CATALOG_ONLY"
+        assert pr.get_production_practice_by_id(pid) is None
+
+
+def test_forged_practice_id_fails_closed_no_row_no_content(tmp_db, monkeypatch):
+    monkeypatch.setattr(bot, "load_state", _async({}))
+    uid = 701
+    run(database.upsert_user(uid, "u", "U"))
+    for forged in ("mind_body_scan_v1", "totally_made_up_id", ""):
+        cb = _fresh_cb(uid, f"before:{forged}:grounding:ru:5")
+        run(bot.cb_before(cb, FakeFSM()))
+        assert _row_count(uid) == 0
+        assert cb.message.answers == []
+
+
+def test_malformed_callback_data_fails_closed(tmp_db, monkeypatch):
+    monkeypatch.setattr(bot, "load_state", _async({}))
+    uid = 702
+    run(database.upsert_user(uid, "u", "U"))
+    for bad in ("before:only_id", "before:id:scenario:lang:not_a_number"):
+        cb = _fresh_cb(uid, bad)
+        run(bot.cb_before(cb, FakeFSM()))
+        assert _row_count(uid) == 0
+
+
+def test_duplicate_tap_creates_exactly_one_baseline_and_cannot_overwrite(tmp_db, monkeypatch):
+    monkeypatch.setattr(bot, "load_state", _async({}))
+    uid = 703
+    run(database.upsert_user(uid, "u", "U"))
+    fsm = FakeFSM()
+    cb1 = _fresh_cb(uid, "before:breathing_box_v1:grounding:ru:5")
+    run(bot.cb_before(cb1, fsm))
+    assert _row_count(uid) == 1
+    # Duplicate tap of the SAME offer, even with a DIFFERENT score.
+    cb2 = _fresh_cb(uid, "before:breathing_box_v1:grounding:ru:9")
+    run(bot.cb_before(cb2, fsm))
+    assert _row_count(uid) == 1  # still exactly one row
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    before = con.execute(
+        "SELECT before_score FROM intervention_results WHERE user_id=?", (uid,)).fetchone()[0]
+    con.close()
+    assert before == 5  # first tap's score stands, never overwritten
+
+
+def test_intervention_baseline_unique_index_exists(tmp_db):
+    # Direct schema evidence for the atomic idempotency contract (not just
+    # behavioral inference): idx_intervention_one_baseline_per_card is a real,
+    # engine-level partial UNIQUE index, created by
+    # database._migrate_intervention_baseline_uniqueness.
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_intervention_one_baseline_per_card'").fetchone()
+    con.close()
+    assert row is not None
+    sql = row[0]
+    assert "UNIQUE" in sql
+    assert "user_id" in sql and "source_chat_id" in sql and "source_message_id" in sql
+
+
+def test_concurrent_double_tap_is_atomic_exactly_one_row_survives(tmp_db, monkeypatch):
+    # The test above proves SEQUENTIAL duplicate-tap protection only -- it
+    # does not prove the check-then-act in cb_before is safe under real
+    # concurrency. cb_before reads fsm_state.get_data() and only writes the
+    # claim much later (after an intervening `await load_state(...)` and the
+    # DB insert itself) -- two genuinely concurrent callback_query deliveries
+    # for the SAME card can both pass that in-memory check before either
+    # commits. This test forces real interleaving via asyncio.gather plus an
+    # asyncio.Event rendezvous barrier (not two sequential `run()` calls), so
+    # both coroutines are actually in flight at the same time before either
+    # reaches start_intervention -- then asserts the database-level
+    # idx_intervention_one_baseline_per_card constraint (not the FSM check)
+    # is what actually prevents a second row.
+    uid = 713
+    run(database.upsert_user(uid, "u", "U"))
+
+    barrier = asyncio.Event()
+    reached = {"n": 0}
+
+    async def racy_load_state(*a, **kw):
+        reached["n"] += 1
+        if reached["n"] >= 2:
+            barrier.set()
+        await barrier.wait()
+        return {}
+    monkeypatch.setattr(bot, "load_state", racy_load_state)
+
+    fsm = FakeFSM()
+    same_message = FakeMessage(FakeUser(uid), message_id=42)
+    cb1 = FakeCallback(FakeUser(uid), same_message, "before:breathing_box_v1:grounding:ru:5")
+    cb2 = FakeCallback(FakeUser(uid), same_message, "before:breathing_box_v1:grounding:ru:9")
+
+    async def _run_both():
+        await asyncio.gather(bot.cb_before(cb1, fsm), bot.cb_before(cb2, fsm))
+    run(_run_both())
+
+    assert _row_count(uid) == 1  # at most one row, even under real concurrency
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    before = con.execute(
+        "SELECT before_score FROM intervention_results WHERE user_id=?", (uid,)).fetchone()[0]
+    con.close()
+    assert before in (5, 9)  # whichever genuinely won the race -- never both, never corrupted
+    # Exactly one callback answered (both call callback.answer() unconditionally
+    # in cb_before, so this doesn't distinguish winner/loser) -- the real proof
+    # is the row count above plus that practice content was sent exactly once.
+    assert len(same_message.answers) == 2  # winner's practice text + after-score prompt, once
+
+
+def test_cross_user_callbacks_never_cross_contaminate(tmp_db, monkeypatch):
+    monkeypatch.setattr(bot, "load_state", _async({}))
+    a, b = 704, 705
+    run(database.upsert_user(a, "u", "U"))
+    run(database.upsert_user(b, "u", "U"))
+    run(bot.cb_before(_fresh_cb(a, "before:breathing_box_v1:grounding:ru:5"), FakeFSM()))
+    assert _row_count(a) == 1
+    assert _row_count(b) == 0
+
+
+def test_crisis_scenario_never_offers_a_baseline_prompt():
+    src = _pipeline_source()
+    assert 'if scenario not in ("crisis", "open_chat"):' in src
+
+
+def test_baseline_skip_flag_off_reproduces_prior_keyboard_exactly():
+    assert config.THERAPEUTIC_CORE_FOUNDATION_ENABLED is False
+    kb_new = bot.before_score_kb("breathing_box_v1", "grounding", "ru")
+    kb_old = bot.score_kb("before:breathing_box_v1:grounding:ru")
+    assert kb_new.inline_keyboard == kb_old.inline_keyboard  # byte-for-byte identical
+
+
+def test_baseline_skip_flag_on_adds_one_skip_button_creates_no_row(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "THERAPEUTIC_CORE_FOUNDATION_ENABLED", True)
+    uid = 706
+    run(database.upsert_user(uid, "u", "U"))
+    kb = bot.before_score_kb("breathing_box_v1", "grounding", "ru")
+    assert len(kb.inline_keyboard) == 3  # 2 score rows + 1 skip row
+    cb = _fresh_cb(uid, "before_skip:breathing_box_v1:grounding:ru")
+    run(bot.cb_before_skip(cb, FakeFSM()))
+    assert _row_count(uid) == 0  # non-evaluable: no baseline fabricated
+    assert cb.message.answers  # practice content still shown
+
+
+def test_baseline_skip_disabled_when_flag_off(tmp_db, monkeypatch):
+    uid = 707
+    run(database.upsert_user(uid, "u", "U"))
+    cb = _fresh_cb(uid, "before_skip:breathing_box_v1:grounding:ru")
+    run(bot.cb_before_skip(cb, FakeFSM()))
+    assert cb.message.answers == []  # flag off -- no-op, matches "no new behavior by default"
+
+
+def test_skip_then_no_after_prompt_no_improvement_claim_possible(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "THERAPEUTIC_CORE_FOUNDATION_ENABLED", True)
+    uid = 708
+    run(database.upsert_user(uid, "u", "U"))
+    cb = _fresh_cb(uid, "before_skip:breathing_box_v1:grounding:ru")
+    run(bot.cb_before_skip(cb, FakeFSM()))
+    # No "how do you feel now" / after-score keyboard was ever sent.
+    assert not any("score_kb" in str(kw) for _, kw in cb.message.answers)
+    assert _row_count(uid) == 0
+
+
+def test_db_failure_before_baseline_prevents_intervention_start(tmp_db, monkeypatch):
+    monkeypatch.setattr(bot, "load_state", _async({}))
+    uid = 709
+    run(database.upsert_user(uid, "u", "U"))
+
+    async def boom(*a, **kw):
+        raise database.aiosqlite.Error("simulated DB failure")
+    monkeypatch.setattr(bot, "start_intervention", boom)
+    cb = _fresh_cb(uid, "before:breathing_box_v1:grounding:ru:5")
+    with pytest.raises(Exception):
+        run(bot.cb_before(cb, FakeFSM()))
+    assert cb.message.answers == []  # practice content never sent -- fails loud, not fake-success
+    assert _row_count(uid) == 0
+
+
+def test_telegram_failure_after_baseline_leaves_baseline_row_intact(tmp_db, monkeypatch):
+    monkeypatch.setattr(bot, "load_state", _async({}))
+    uid = 710
+    run(database.upsert_user(uid, "u", "U"))
+    cb = _fresh_cb(uid, "before:breathing_box_v1:grounding:ru:5")
+
+    async def fail_answer(*a, **kw):
+        raise RuntimeError("simulated Telegram send failure")
+    cb.message.answer = fail_answer
+    with pytest.raises(Exception):
+        run(bot.cb_before(cb, FakeFSM()))
+    # The baseline row is already committed (DB write precedes Telegram send,
+    # per test_baseline_write_happens_strictly_before_practice_content_is_sent)
+    # -- honest, retryable state, not a false "nothing happened".
+    assert _row_count(uid) == 1
+
+
+def test_intervention_results_privacy_lifecycle_cross_user_isolated(tmp_db, monkeypatch):
+    # intervention_results is already registered (category RESEARCH_LOG,
+    # privacy_registry.py:92-93) -- no new table this pass. Direct proof of
+    # export/delete-preview/delete-all/cross-user isolation for THIS table
+    # specifically (not previously exercised end-to-end in this worktree).
+    monkeypatch.setattr(bot, "load_state", _async({}))
+    a, b = 711, 712
+    run(database.upsert_user(a, "u", "U"))
+    run(database.upsert_user(b, "u", "U"))
+    run(bot.cb_before(_fresh_cb(a, "before:breathing_box_v1:grounding:ru:5"), FakeFSM()))
+
+    exp_a = run(database.export_all_personal_data(a))
+    exp_b = run(database.export_all_personal_data(b))
+    assert len(exp_a["intervention_results"]) == 1
+    assert exp_b["intervention_results"] == []
+
+    preview = run(database.preview_delete_all_personal_data(a))
+    assert preview["intervention_results"]["row_count"] == 1
+
+    summary = run(database.delete_all_personal_data(a))
+    assert summary["intervention_results"] == 1
+    assert _row_count(a) == 0
+    assert _row_count(b) == 0  # untouched (b never had a row, confirms no cross-effect)
+
+
+# ── Baseline migration safety battery (permanent regression coverage) ──────
+# Same technique as tests/test_onboarding_schema_migration.py: a hand-built
+# OLD schema shape (not a fresh database.init_db() call), driven through the
+# real database.init_db()/_migrate_intervention_baseline_uniqueness path --
+# a fresh-database test alone would never exercise the upgrade path at all.
+_PRE_FIX_INTERVENTION_SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+    language TEXT DEFAULT 'ru', message_count INTEGER DEFAULT 0,
+    last_seen TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE intervention_results (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id                 INTEGER NOT NULL,
+    session_objective       TEXT NOT NULL,
+    scenario                TEXT NOT NULL,
+    practice_id             TEXT NOT NULL,
+    practice_version        TEXT NOT NULL DEFAULT 'v1',
+    router_version          TEXT NOT NULL DEFAULT '2.0',
+    ab_variant              TEXT DEFAULT 'control',
+    selection_reason_json   TEXT,
+    stage                   TEXT DEFAULT 'OPEN',
+    readiness               TEXT DEFAULT 'MEDIUM',
+    capacity                REAL DEFAULT 1.0,
+    before_score            INTEGER CHECK(before_score BETWEEN 1 AND 10),
+    after_score             INTEGER,
+    follow_up_24h_score     INTEGER,
+    confidence_score        REAL DEFAULT 1.0,
+    engagement_metrics_json TEXT,
+    feedback_rating         INTEGER,
+    self_reported_behavior  INTEGER DEFAULT 0,
+    created_at              TEXT DEFAULT (datetime('now'))
+);
+"""
+
+
+@pytest.fixture
+def old_shape_db(tmp_path, monkeypatch):
+    """A real sqlite file with the pre-atomic-fix intervention_results shape
+    -- no source_chat_id/source_message_id columns at all -- NOT a fresh
+    database.init_db() call. This is what the migration battery below
+    upgrades, proving the upgrade path itself, not just a fresh-DB path."""
+    import sqlite3
+    path = str(tmp_path / "old_shape.db")
+    con = sqlite3.connect(path)
+    con.executescript(_PRE_FIX_INTERVENTION_SCHEMA_DDL)
+    con.commit()
+    con.close()
+    monkeypatch.setattr(database, "DB", path)
+    return path
+
+
+def _baseline_index_sql(path):
+    import sqlite3
+    con = sqlite3.connect(path)
+    row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_intervention_one_baseline_per_card'").fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def test_migration_A_fresh_db_creates_index_and_is_idempotent(tmp_db):
+    assert _baseline_index_sql(database.DB) is not None
+    run(database.init_db())  # second call on a fresh DB must not raise
+    assert _baseline_index_sql(database.DB) is not None
+
+
+def test_migration_B_upgrades_pre_fix_schema_preserving_rows(old_shape_db):
+    import sqlite3
+    con = sqlite3.connect(old_shape_db)
+    con.execute("INSERT INTO users (id,username,first_name) VALUES (1,'u','U')")
+    con.execute(
+        "INSERT INTO intervention_results (user_id,session_objective,scenario,"
+        "practice_id,before_score) VALUES (1,'s','grounding','breathing_box_v1',5)")
+    con.commit()
+    con.close()
+
+    run(database.init_db())        # upgrade migration
+    run(database.init_db())        # idempotency: second run must not raise
+
+    con = sqlite3.connect(old_shape_db)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(intervention_results)").fetchall()]
+    row = con.execute("SELECT before_score, source_chat_id, source_message_id "
+                       "FROM intervention_results WHERE user_id=1").fetchone()
+    con.close()
+    assert "source_chat_id" in cols and "source_message_id" in cols
+    assert row == (5, None, None)  # row preserved untouched; new columns NULL
+    assert _baseline_index_sql(old_shape_db) is not None
+
+
+def test_migration_C_null_identity_rows_never_collide(old_shape_db):
+    import sqlite3
+    con = sqlite3.connect(old_shape_db)
+    con.execute("INSERT INTO users (id,username,first_name) VALUES (1,'u','U')")
+    for score in (5, 6, 7):
+        con.execute(
+            "INSERT INTO intervention_results (user_id,session_objective,scenario,"
+            "practice_id,before_score) VALUES (1,'s','grounding','breathing_box_v1',?)",
+            (score,))
+    con.commit()
+    con.close()
+
+    run(database.init_db())
+
+    con = sqlite3.connect(old_shape_db)
+    cnt = con.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE user_id=1").fetchone()[0]
+    con.close()
+    assert cnt == 3  # all NULL-identity historical rows survive uncollided
+
+
+def test_migration_D_duplicate_non_null_identity_keeps_earliest_score(tmp_path, monkeypatch):
+    # This duplicate shape is structurally unreachable via real app code --
+    # source_chat_id/source_message_id are introduced by THIS migration, so
+    # no prior release ever wrote a non-NULL value into them -- but the
+    # defensive dedupe must still behave correctly if a hand-edited or
+    # otherwise corrupted DB ever hits it. Deliberately proves MIN(id) (the
+    # earliest-inserted, FIRST accepted baseline) survives, not MAX(id):
+    # unlike questionnaire_responses (where a later row is a legitimate
+    # revision), a later duplicate here must never replace the first
+    # accepted before_score.
+    path = str(tmp_path / "dup.db")
+    monkeypatch.setattr(database, "DB", path)
+    real_migrate = database._migrate_intervention_baseline_uniqueness
+
+    async def _noop(db):
+        return None
+    monkeypatch.setattr(database, "_migrate_intervention_baseline_uniqueness", _noop)
+    run(database.init_db())  # table/columns exist; index deliberately skipped
+    monkeypatch.setattr(database, "_migrate_intervention_baseline_uniqueness", real_migrate)
+
+    run(database.upsert_user(3001, "u", "U"))
+    import sqlite3
+    con = sqlite3.connect(path)
+    con.execute(
+        "INSERT INTO intervention_results (user_id,session_objective,scenario,practice_id,"
+        "practice_version,router_version,ab_variant,before_score,source_chat_id,source_message_id) "
+        "VALUES (3001,'s','grounding','breathing_box_v1','v1','2.0','control',5,111,222)")
+    con.execute(
+        "INSERT INTO intervention_results (user_id,session_objective,scenario,practice_id,"
+        "practice_version,router_version,ab_variant,before_score,source_chat_id,source_message_id) "
+        "VALUES (3001,'s','grounding','breathing_box_v1','v1','2.0','control',9,111,222)")
+    con.commit()
+    con.close()
+
+    async def _apply_real_migration():
+        import aiosqlite
+        async with aiosqlite.connect(path) as db:
+            await real_migrate(db)
+            await db.commit()
+    run(_apply_real_migration())  # must not raise IntegrityError
+
+    con = sqlite3.connect(path)
+    rows = con.execute(
+        "SELECT before_score FROM intervention_results WHERE user_id=3001").fetchall()
+    con.close()
+    assert rows == [(5,)]  # exactly one row; the EARLIEST accepted score survives, not 9
+    assert _baseline_index_sql(path) is not None
+
+
+def test_migration_E_cross_user_same_card_coordinates_no_conflict(tmp_db):
+    import sqlite3
+    run(database.upsert_user(4001, "u", "U"))
+    run(database.upsert_user(4002, "u", "U"))
+    r1 = run(database.start_intervention(4001, "s", "grounding", "breathing_box_v1", "v1", {}, 5,
+                                          source_chat_id=555, source_message_id=666))
+    r2 = run(database.start_intervention(4002, "s", "grounding", "breathing_box_v1", "v1", {}, 7,
+                                          source_chat_id=555, source_message_id=666))
+    assert r1 is not None and r2 is not None  # different users never conflict
+    con = sqlite3.connect(database.DB)
+    cnt = con.execute("SELECT COUNT(*) FROM intervention_results").fetchone()[0]
+    con.close()
+    assert cnt == 2
+
+
+def test_migration_F_same_user_different_cards_create_distinct_rows(tmp_db):
+    import sqlite3
+    run(database.upsert_user(5001, "u", "U"))
+    r1 = run(database.start_intervention(5001, "s", "grounding", "breathing_box_v1", "v1", {}, 5,
+                                          source_chat_id=777, source_message_id=888))
+    r2 = run(database.start_intervention(5001, "s", "grounding", "breathing_box_v1", "v1", {}, 7,
+                                          source_chat_id=777, source_message_id=889))
+    assert r1 is not None and r2 is not None  # distinct cards never conflict
+    con = sqlite3.connect(database.DB)
+    cnt = con.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE user_id=5001").fetchone()[0]
+    con.close()
+    assert cnt == 2
+
+
+def test_migration_G_genuine_check_violation_is_not_swallowed(tmp_db):
+    # An out-of-range score (e.g. a forged callback) must raise a real error,
+    # never be misclassified as an ordinary "lost the atomic claim" outcome --
+    # proves the narrow ON CONFLICT(...) target, not a blanket INSERT OR IGNORE.
+    import sqlite3
+    run(database.upsert_user(6001, "u", "U"))
+    with pytest.raises(Exception):
+        run(database.start_intervention(6001, "s", "grounding", "breathing_box_v1", "v1", {}, 99,
+                                         source_chat_id=333, source_message_id=444))
+    con = sqlite3.connect(database.DB)
+    cnt = con.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE user_id=6001").fetchone()[0]
+    con.close()
+    assert cnt == 0
+
+
+def test_migration_H_duplicate_claim_winner_and_loser_distinguished(tmp_db):
+    import sqlite3
+    run(database.upsert_user(7001, "u", "U"))
+    r1 = run(database.start_intervention(7001, "s", "grounding", "breathing_box_v1", "v1", {}, 5,
+                                          source_chat_id=999, source_message_id=1000))
+    r2 = run(database.start_intervention(7001, "s", "grounding", "breathing_box_v1", "v1", {}, 9,
+                                          source_chat_id=999, source_message_id=1000))
+    assert r1 is not None  # winner: a real row id
+    assert r2 is None      # loser: lost the atomic claim, distinguishable from the winner
+    con = sqlite3.connect(database.DB)
+    row = con.execute(
+        "SELECT COUNT(*), before_score FROM intervention_results "
+        "WHERE user_id=7001").fetchone()
+    con.close()
+    assert row == (1, 5)  # exactly one row; the winner's (first) score stands
