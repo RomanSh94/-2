@@ -863,30 +863,6 @@ async def get_recent_messages(uid: int, limit: int = 8) -> list:
             " ORDER BY id DESC LIMIT ?", (uid, limit))
         rows = await cur.fetchall(); rows.reverse(); return rows
 
-async def get_last_assistant_message(uid: int, max_age_hours: int = 6) -> str | None:
-    """The most recent assistant reply, scoped to the CURRENT active
-    conversation -- reusing two EXISTING mechanisms, not a new table or a
-    new session-identity concept:
-      * summarized=0 -- memory.py's own existing definition of "still in
-        the rolling context window"; once maybe_summarize compresses a
-        message, no other part of this codebase treats it as current
-        conversation either.
-      * a bounded recency window -- a long-idle user's very next message
-        must never replay a months-old reply as if it were just said.
-    role='assistant' alone already excludes crisis/admin/error text: those
-    paths never call save_message(uid, "assistant", ...) at all (confirmed
-    by direct inspection -- crisis only ever saves the user's own message;
-    only ordinary validated LLM replies and the deterministic disambiguation
-    clarifying question are ever persisted this way)."""
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            "SELECT content FROM messages WHERE user_id=? AND role='assistant'"
-            " AND summarized=0 AND content != ''"
-            f" AND created_at > datetime('now', '-{int(max_age_hours)} hours')"
-            " ORDER BY id DESC LIMIT 1", (uid,))
-        row = await cur.fetchone()
-    return row[0] if row else None
-
 async def get_unsummarized_messages(uid: int) -> list:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(

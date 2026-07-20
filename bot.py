@@ -120,7 +120,7 @@ from database import (
     complete_onboarding, set_onboarding_card_ref, get_onboarding_eligibility,
     get_stored_user_language, has_privacy_notice_ack,
     record_notice_acknowledgement,
-    get_response_preferences, set_response_preference, get_last_assistant_message,
+    get_response_preferences, set_response_preference,
 )
 import onboarding
 import onboarding_content
@@ -328,8 +328,13 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
     ordinary response is delivered — text / voice / voice_and_concise_text,
     from the user's stored preference or a one-shot meta-command override.
     Flag OFF => always plain text, byte-for-byte the prior
-    `await message.answer(answer)` behavior."""
-    if not config.VOICE_REPLIES_ENABLED:
+    `await message.answer(answer)` behavior. Also private-chat-only (§4):
+    even if a preference were somehow set, delivery from a non-private chat
+    always falls back to plain text with no listen button -- defense in
+    depth alongside the pipeline()-level guard that never lets a group
+    message reach the format-command/override code at all."""
+    is_private = getattr(message.chat, "type", "private") == "private"
+    if not config.VOICE_REPLIES_ENABLED or not is_private:
         await message.answer(answer)
         return
 
@@ -673,6 +678,11 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     поэтому реальный пользователь передаётся явно (callback.from_user)."""
     u = tg_user or message.from_user
     uid, username, first_name = u.id, u.username or "", u.first_name or ""
+    # Voice and Adaptive Response UX is private-chat-only in V1 (§4): this
+    # bot has no ChatType filtering anywhere else either, so this is a new,
+    # narrow, explicit boundary for just this feature, not a bot-wide policy
+    # change. `chat.type` is a standard field on every real aiogram Message.
+    is_private_chat = getattr(message.chat, "type", "private") == "private"
 
     # 1. Detect language (pure, no I/O — safe to run before any access check)
     lang = detect_language(user_text)
@@ -808,31 +818,42 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
 
     # 4.3 Format meta-command detection (Voice and Adaptive Response UX) --
     # AFTER crisis/dependency handling, BEFORE ordinary therapeutic routing.
+    # Private-chat-only in V1 (§4): a group/supergroup message never even
+    # enters this block, so nothing here can be armed, consumed, or replayed
+    # from a non-private chat -- ordinary text handling for a group message
+    # is completely unaffected (not a bot-wide policy change).
     # A MIXED message ("Мне тревожно, и ответь голосом") falls through to
     # the ordinary pipeline below unchanged -- only delivery of the eventual
     # answer is affected. A PURE command never enters therapeutic routing.
     one_shot_voice = False
     one_shot_concise = False
+    voice_ux_active = config.VOICE_REPLIES_ENABLED and is_private_chat
 
     # Consume a one-shot voice override armed by a PRIOR Telegram update (see
     # the "no previous response yet" branch below) -- a plain local variable
     # cannot survive past the end of THIS function call, so the override is
-    # persisted in FSM state, which aiogram scopes per (user, chat) and which
-    # already threads through this function as `fsm_state`. Cleared the
-    # instant it is read: it can apply to at most ONE subsequent ordinary
+    # persisted in FSM state. aiogram's default FSMStrategy is USER_IN_CHAT
+    # (confirmed: bot.py's Dispatcher(storage=MemoryStorage()) never
+    # overrides fsm_strategy), so `fsm_state` is ALREADY scoped per (chat,
+    # user) -- the same user in a different chat gets a completely separate
+    # FSM entry. Cleared the instant it is read (whether still within TTL or
+    # already expired): it can apply to at most ONE subsequent ordinary
     # reply, is never written to the DB, and is never a permanent
     # preference. Crisis and dependency both return earlier in pipeline()
     # than this point, so an intervening crisis/dependency message leaves an
     # armed override untouched -- PRESERVED for the next ordinary message,
     # the chosen deterministic rule (not silently dropped, not consumed by
     # a non-ordinary reply).
-    if config.VOICE_REPLIES_ENABLED and fsm_state is not None:
+    if voice_ux_active and fsm_state is not None:
         pending = await fsm_state.get_data()
         if pending.get("one_shot_voice_pending"):
-            one_shot_voice = True
-            await fsm_state.update_data(one_shot_voice_pending=False)
+            armed_at = pending.get("one_shot_voice_pending_at") or 0
+            if time.time() - armed_at <= config.VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS:
+                one_shot_voice = True
+            await fsm_state.update_data(one_shot_voice_pending=False,
+                                        one_shot_voice_pending_at=None)
 
-    fmt_cmd = parse_format_command(user_text, lang) if config.VOICE_REPLIES_ENABLED else None
+    fmt_cmd = parse_format_command(user_text, lang) if voice_ux_active else None
     if fmt_cmd:
         if fmt_cmd.kind == "voice_persistent":
             await set_response_preference(uid, response_format="voice")
@@ -850,22 +871,31 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             await message.answer(_format_ack_text(fmt_cmd, lang))
             return
         if pure and fmt_cmd.kind == "voice_oneshot":
-            # §8: "много текста"/"лень читать" etc. -- voice-ify the last
-            # bot response (existing bounded conversation memory) instead of
-            # generating a new therapeutic interpretation, when one exists.
-            last = await get_last_assistant_message(uid)
-            if last:
+            # §8: "много текста"/"лень читать" etc. -- voice-ify the LAST
+            # SUCCESSFULLY DELIVERED ordinary response instead of generating
+            # a new therapeutic interpretation, when one is still available.
+            # Sourced from FSM state (last_delivered_response), NOT the
+            # database -- FSM is scoped per (chat, user) by aiogram itself,
+            # so a private-chat reply can never be replayed from a
+            # different chat the same Telegram user happens to also be in.
+            fdata = await fsm_state.get_data() if fsm_state is not None else {}
+            last = fdata.get("last_delivered_response")
+            last_at = fdata.get("last_delivered_response_at") or 0
+            if last and (time.time() - last_at <= config.VOICE_LAST_RESPONSE_TTL_SECONDS):
                 spoken = _safe_concise_version(last, lang)
                 ok = await _synthesize_and_send_voice(message, uid, spoken, lang)
                 if not ok:
                     await message.answer(last)
                 return
-            # No previous response to voice-ify: this message itself must
-            # NEVER be treated as therapeutic content (it is a meta-command,
-            # not a disclosure). Arm the override for the NEXT ordinary
-            # reply (consumed above, on that future update) and stop here.
+            # No usable previous response (none stored, or past its TTL):
+            # this message itself must NEVER be treated as therapeutic
+            # content. Clear any stale value, arm the override for the NEXT
+            # ordinary reply (consumed above, on that future update), and
+            # stop here.
             if fsm_state is not None:
-                await fsm_state.update_data(one_shot_voice_pending=True)
+                await fsm_state.update_data(
+                    last_delivered_response=None, last_delivered_response_at=None,
+                    one_shot_voice_pending=True, one_shot_voice_pending_at=time.time())
             await message.answer(
                 "Хорошо, следующий ответ озвучу." if lang == "ru"
                 else "Okay, I'll voice the next reply.")
@@ -998,6 +1028,15 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     await asyncio.sleep(typing_delay(answer))
     await deliver_response(message, uid, answer, lang,
                            one_shot_voice=one_shot_voice, one_shot_concise=one_shot_concise)
+    # Only reached if deliver_response did not raise -- an exception during
+    # actual Telegram delivery leaves NO last_delivered_response write, so a
+    # failed send is never later replayed as if it had succeeded. Stored in
+    # FSM state (chat+user scoped, never the DB) -- never crisis/dependency
+    # text, since both of those paths already returned earlier in pipeline()
+    # and never reach this line at all.
+    if voice_ux_active and fsm_state is not None:
+        await fsm_state.update_data(last_delivered_response=answer,
+                                    last_delivered_response_at=time.time())
 
     # 17.5 Profile refresh (§5) — deterministic, every 5th user message.
     await maybe_update_profile(uid, await get_user_message_count(uid))
@@ -1305,6 +1344,13 @@ async def cmd_format(message: Message):
         # Flag off: behave as if this command does not exist -- no selector,
         # nothing saved, previous behavior preserved exactly.
         return
+    if getattr(message.chat, "type", "private") != "private":
+        # §4: private-chat-only in V1 -- a short neutral notice, never the
+        # selector itself (never repeats/exposes anything private).
+        await message.answer(
+            "Эта настройка доступна только в личном чате со мной." if lang == "ru"
+            else "This setting is only available in a private chat with me.")
+        return
     await message.answer(
         "Как тебе удобнее получать ответы?" if lang == "ru"
         else "How would you like to receive replies?",
@@ -1317,6 +1363,10 @@ async def cb_format_select(callback: CallbackQuery):
     if not config.VOICE_REPLIES_ENABLED:
         # Flag off: fail closed -- a stale button from before rollback must
         # not silently save anything.
+        await callback.answer()
+        return
+    if getattr(callback.message.chat, "type", "private") != "private":
+        # §4: a group callback must never modify a persistent preference.
         await callback.answer()
         return
     try:
@@ -1347,6 +1397,12 @@ async def cb_listen(callback: CallbackQuery):
     flow) -- a forged/cross-user/malformed callback all fail closed."""
     uid = callback.from_user.id
     if not config.VOICE_REPLIES_ENABLED:
+        await callback.answer()
+        return
+    if getattr(callback.message.chat, "type", "private") != "private":
+        # §4: the listen button is never attached outside a private chat
+        # (deliver_response only attaches it when is_private) -- this is a
+        # defense-in-depth fail-closed for a forged/replayed callback_data.
         await callback.answer()
         return
     try:

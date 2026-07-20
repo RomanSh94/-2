@@ -10,6 +10,7 @@ always mocked.
 import asyncio
 import inspect
 import os
+import time
 import types
 
 import pytest
@@ -33,10 +34,10 @@ class FakeUser:
 
 
 class FakeMessage:
-    def __init__(self, user, text="", message_id=1):
+    def __init__(self, user, text="", message_id=1, chat_type="private"):
         self.from_user = user
         self.text = text
-        self.chat = types.SimpleNamespace(id=user.id)
+        self.chat = types.SimpleNamespace(id=user.id, type=chat_type)
         self.message_id = message_id
         self.answers = []
         self.voices = []
@@ -1201,17 +1202,19 @@ def test_dependency_redirect_on_second_update_returns_before_voice_delivery(tmp_
     assert (run(fsm.get_data())).get("one_shot_voice_pending") is True  # preserved for the next ordinary turn
 
 
-# ── Previous-response replay authorization scope (get_last_assistant_message) ─
-# "same chat" is not a separate dimension in this bot's schema: it is a
-# private 1:1 Telegram bot where chat_id == user_id for every user (the
-# whole codebase scopes exclusively by user_id -- messages/state/profile
-# all key ONLY on user_id, never chat_id), so there is no cross-chat case
-# to construct for a single user; user_id IS the chat identity here.
+# ── Previous-response replay authorization scope (FSM-scoped, chat+user) ────
+# Replay now sources last_delivered_response/last_delivered_response_at from
+# FSM state (aiogram's default FSMStrategy.USER_IN_CHAT, confirmed directly
+# against Dispatcher.__init__ -- bot.py never overrides it), NOT from
+# database.get_last_assistant_message (removed this pass -- it was
+# introduced only by this PR, had no other caller, and was user_id-only
+# with no chat dimension at all -- a genuine cross-chat replay risk for the
+# SAME Telegram user_id appearing in two different chats). No test here may
+# claim cross-chat safety from a user_id-only SQL query.
 
 def test_replay_same_conversation_no_llm_call_one_validated_voice(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
-    run(database.save_message(1, "assistant", "This is the real prior final answer."))
     llm_calls = {"n": 0}
     async def spy_create(*a, **kw):
         llm_calls["n"] += 1
@@ -1230,7 +1233,8 @@ def test_replay_same_conversation_no_llm_call_one_validated_voice(tmp_db, monkey
     monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
     monkeypatch.setattr(os, "remove", lambda p: None)
 
-    fsm = FakeFSM()
+    fsm = FakeFSM({"last_delivered_response": "This is the real prior final answer.",
+                   "last_delivered_response_at": time.time()})
     msg = FakeMessage(FakeUser(1), "лень читать")
     run(bot.pipeline(msg, "лень читать", fsm))
 
@@ -1244,7 +1248,6 @@ def test_replay_shortens_and_revalidates_a_long_previous_response(tmp_db, monkey
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
     long_prior = ("Одно предложение с важной мыслью. " * 20).strip()
-    run(database.save_message(1, "assistant", long_prior))
     validated = []
     synthesized = []
     def spy_validate(text, lang="ru"):
@@ -1257,7 +1260,8 @@ def test_replay_shortens_and_revalidates_a_long_previous_response(tmp_db, monkey
     monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
     monkeypatch.setattr(os, "remove", lambda p: None)
 
-    fsm = FakeFSM()
+    fsm = FakeFSM({"last_delivered_response": long_prior,
+                   "last_delivered_response_at": time.time()})
     run(bot.pipeline(FakeMessage(FakeUser(1), "много текста"), "много текста", fsm))
 
     assert len(validated) == 1
@@ -1266,51 +1270,70 @@ def test_replay_shortens_and_revalidates_a_long_previous_response(tmp_db, monkey
     assert synthesized == [concise]  # exactly the re-validated concise text, never the raw long text
 
 
-def test_replay_stale_old_response_outside_recency_window_is_not_replayed(tmp_db, monkeypatch):
+def test_replay_expired_response_outside_ttl_is_not_replayed_and_is_cleared(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
-    import sqlite3
-    con = sqlite3.connect(database.DB)
-    con.execute(
-        "INSERT INTO messages (user_id, role, content, summarized, created_at) "
-        "VALUES (1, 'assistant', 'a very old reply', 0, datetime('now', '-2 days'))")
-    con.commit()
-    con.close()
-    result = run(database.get_last_assistant_message(1))
-    assert result is None  # outside the bounded recency window -- never replayed
+    _full_pipeline_stub_set(monkeypatch, llm_text="unused")
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    too_old = time.time() - config.VOICE_LAST_RESPONSE_TTL_SECONDS - 100
+
+    fsm = FakeFSM({"last_delivered_response": "a very old reply",
+                   "last_delivered_response_at": too_old})
+    run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm))
+
+    assert tts_calls["n"] == 0  # outside the bounded TTL -- never replayed
+    data = run(fsm.get_data())
+    assert data.get("last_delivered_response") is None       # stale value cleared
+    assert data.get("one_shot_voice_pending") is True         # armed for the next ordinary reply instead
 
 
-def test_replay_summarized_response_is_not_replayed(tmp_db, monkeypatch):
-    # summarized=1 means memory.py already compressed it away -- no other
-    # part of this codebase treats it as "the current conversation" either.
+def test_replay_cross_chat_isolation_same_user_different_fsm(tmp_db, monkeypatch):
+    # Same Telegram user_id, two DIFFERENT FSM entries -- exactly what
+    # aiogram's default FSMStrategy.USER_IN_CHAT produces for the SAME user
+    # in two DIFFERENT chats. This is the actual defect scenario: a
+    # user_id-only lookup would have returned chat A's response from chat B;
+    # the FSM-scoped source structurally cannot.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
-    import sqlite3
-    con = sqlite3.connect(database.DB)
-    con.execute(
-        "INSERT INTO messages (user_id, role, content, summarized) "
-        "VALUES (1, 'assistant', 'already compressed into a summary', 1)")
-    con.commit()
-    con.close()
-    result = run(database.get_last_assistant_message(1))
-    assert result is None
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    _full_pipeline_stub_set(monkeypatch, llm_text="unused")
+
+    fsm_chat_a = FakeFSM({"last_delivered_response": "chat A's private final answer.",
+                          "last_delivered_response_at": time.time()})
+    fsm_chat_b = FakeFSM()  # a different chat's FSM entry -- never touched by chat A
+
+    run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm_chat_b))
+    assert tts_calls["n"] == 0  # chat B never sees chat A's stored response
+    assert (run(fsm_chat_b.get_data())).get("one_shot_voice_pending") is True
+    assert (run(fsm_chat_a.get_data())).get("last_delivered_response") == "chat A's private final answer."
 
 
 def test_replay_cross_user_isolation(tmp_db, monkeypatch):
     run(database.upsert_user(1, "u", "U"))
     run(database.upsert_user(2, "u", "U"))
-    run(database.save_message(1, "assistant", "A's private final answer"))
-    result_b = run(database.get_last_assistant_message(2))
-    assert result_b is None  # user B never sees user A's response
+    fsm_a = FakeFSM({"last_delivered_response": "A's private final answer",
+                     "last_delivered_response_at": time.time()})
+    fsm_b = FakeFSM()  # user B's own, separate FSM -- never shares user A's data
+    assert (run(fsm_b.get_data())).get("last_delivered_response") is None
 
 
-def test_replay_never_selects_user_role_or_other_scenario_rows(tmp_db, monkeypatch):
-    # role='assistant' filtering already structurally excludes crisis/admin/
-    # error text (confirmed by direct inspection: those paths never call
-    # save_message(uid, "assistant", ...) at all) -- this proves the filter
-    # itself is enforced at the query level, not merely by convention.
-    run(database.upsert_user(1, "u", "U"))
-    run(database.save_message(1, "user", "the user's own message, not a bot reply"))
-    result = run(database.get_last_assistant_message(1))
-    assert result is None
+def test_last_delivered_response_has_exactly_one_write_site_after_successful_delivery():
+    # Structural guarantee that only the ordinary successful-delivery path
+    # can ever populate last_delivered_response -- crisis/dependency/error
+    # paths all return earlier in pipeline() and never reach this line.
+    src = _pipeline_source()
+    assert src.count("last_delivered_response=answer") == 1
+    write_idx = src.index("last_delivered_response=answer")
+    deliver_idx = src.index("await deliver_response(")
+    assert deliver_idx < write_idx  # written only AFTER delivery succeeds, never before
 
 
 def test_replay_no_usable_response_stores_override_and_returns_safely(tmp_db, monkeypatch):
@@ -1507,3 +1530,77 @@ def test_format_select_only_ever_affects_the_tapping_users_own_preference(tmp_db
     prefs2 = run(database.get_response_preferences(2))
     assert prefs1["response_format"] == "text"   # message "owner" (user 1) unaffected
     assert prefs2["response_format"] == "voice"  # only the TAPPING user (user 2) changed
+
+
+# ── Explicit private-chat-only enforcement (§4 this pass) ───────────────────
+
+def test_format_command_does_not_expose_selector_in_group_chat(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    msg = FakeMessage(FakeUser(1), "/format", chat_type="group")
+    run(bot.cmd_format(msg))
+    assert len(msg.answers) == 1  # a short neutral notice only
+    assert "🎙" not in msg.answers[0][0]  # never the selector itself
+
+
+def test_fmt_callback_fails_closed_in_group_chat(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    group_msg = FakeMessage(FakeUser(1), "", chat_type="group")
+    cb = FakeCallback(FakeUser(1), group_msg, f"{bot._FMT_KB_VERSION}:format:voice")
+    run(bot.cb_format_select(cb))
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_format"] == "text"  # never modified from a group callback
+
+
+def test_listen_button_not_attached_in_group_chat(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, response_format="text"))
+    msg = FakeMessage(FakeUser(1), "", chat_type="group")
+    run(bot.deliver_response(msg, 1, "an ordinary answer", "ru"))
+    assert msg.answers == [("an ordinary answer", {})]  # no reply_markup at all
+
+
+def test_listen_callback_fails_closed_in_group_chat(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        calls["n"] += 1
+        return True
+    monkeypatch.setattr(bot, "_synthesize_and_send_voice", spy_synth)
+    group_msg = FakeMessage(FakeUser(1), "visible text", chat_type="group")
+    cb = FakeCallback(FakeUser(1), group_msg, f"{bot._LISTEN_KB_VERSION}:1")
+    run(bot.cb_listen(cb))
+    assert calls["n"] == 0
+
+
+def test_replay_and_override_never_execute_in_group_chat(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    _full_pipeline_stub_set(monkeypatch, llm_text="an ordinary group reply")
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+
+    fsm = FakeFSM({"last_delivered_response": "a private reply that must never leak into the group",
+                   "last_delivered_response_at": time.time()})
+    group_msg = FakeMessage(FakeUser(1), "лень читать", chat_type="group")
+    run(bot.pipeline(group_msg, "лень читать", fsm))
+
+    assert tts_calls["n"] == 0                    # no replay, no synthesis at all
+    assert len(group_msg.answers) == 1             # ordinary LLM reply delivered as plain text
+    assert group_msg.answers[0][0] == "an ordinary group reply"
+    data = run(fsm.get_data())
+    assert data.get("one_shot_voice_pending") is not True  # no override ever armed from a group turn
+
+
+def test_private_callback_still_works_after_group_boundary_added(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    cb = FakeCallback(FakeUser(1), FakeMessage(FakeUser(1)), f"{bot._FMT_KB_VERSION}:format:voice")
+    run(bot.cb_format_select(cb))
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_format"] == "voice"  # private chat (default chat_type) unaffected by the new guard

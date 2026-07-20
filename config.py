@@ -198,3 +198,16 @@ EMOTIONAL_REACTION_COOLDOWN_SECONDS = int(
     os.getenv("EMOTIONAL_REACTION_COOLDOWN_SECONDS", "120"))
 EMOTIONAL_REACTION_MIN_CONFIDENCE = float(
     os.getenv("EMOTIONAL_REACTION_MIN_CONFIDENCE", "0.6"))
+
+# Bounded TTLs for the two pieces of ephemeral FSM-scoped state used by
+# format-command replay (not rollout flags -- inert while
+# VOICE_REPLIES_ENABLED is false). Both are plain configuration values, not
+# feature flags: no default or migration path ever changes their meaning.
+# ONE_SHOT_OVERRIDE: how long a "voice the next reply" armed-but-unconsumed
+# override (from "лень читать" with nothing yet to voice-ify) remains valid.
+# LAST_RESPONSE: how long a successfully delivered final ordinary answer
+# stays eligible to be replayed by a later "лень читать"/"много текста".
+VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS = int(
+    os.getenv("VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS", "300"))
+VOICE_LAST_RESPONSE_TTL_SECONDS = int(
+    os.getenv("VOICE_LAST_RESPONSE_TTL_SECONDS", "21600"))
