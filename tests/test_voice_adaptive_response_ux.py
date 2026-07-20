@@ -807,3 +807,151 @@ def test_dependency_redirect_path_untouched_by_voice_wiring(monkeypatch):
     dep_idx = src.index("dependency_monitor.assess")
     fmt_idx = src.index("parse_format_command(user_text")
     assert dep_idx < fmt_idx
+
+
+# ── Incoming voice — RU/EN/AUTO transcription language (real gap, closed) ───
+# handle_voice's stt_lang computation was wired but never directly tested.
+# voice.py itself is untouched by this workstream (its `lang` parameter
+# already worked correctly) -- these tests exercise the actual CALLER logic
+# in bot.py that decides which language hint reaches it.
+
+def _voice_msg(user, text=""):
+    m = FakeMessage(user, text)
+    m.voice = object()
+    return m
+
+
+@pytest.fixture(autouse=True)
+def _no_real_typing_indicator(monkeypatch):
+    """handle_voice calls bot.bot.send_chat_action (a real aiogram Bot
+    method) unconditionally -- mock it repo-wide in this file so no test
+    attempts a real network call, matching tests/test_onboarding_gate.py's
+    fake_bot convention (this file targets bot.bot method-by-method instead
+    of swapping the whole object, since other tests here already patch
+    individual bot.bot methods like get_chat/set_message_reaction)."""
+    async def noop(*a, **kw):
+        return None
+    monkeypatch.setattr(bot.bot, "send_chat_action", noop)
+
+
+def test_voice_language_ru_passes_ru_hint(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, voice_language="ru"))
+    seen = {}
+    async def fake_transcribe(voice, bot_, client_, lang):
+        seen["lang"] = lang
+        return "привет мир"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    monkeypatch.setattr(bot, "pipeline", _async(None))
+    run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
+    assert seen["lang"] == "ru"
+
+
+def test_voice_language_en_passes_en_hint(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, voice_language="en"))
+    seen = {}
+    async def fake_transcribe(voice, bot_, client_, lang):
+        seen["lang"] = lang
+        return "hello world"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    monkeypatch.setattr(bot, "pipeline", _async(None))
+    run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
+    assert seen["lang"] == "en"
+
+
+def test_voice_language_auto_uses_existing_stored_language_not_hardcoded_ru(tmp_db, monkeypatch):
+    # "auto" (the untouched default) falls back to the EXISTING behavior --
+    # get_user_language -- one of the two explicitly-permitted options, NOT
+    # literal Whisper auto-detect. Must not hardcode "ru" for an EN user.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U", "en"))
+    seen = {}
+    async def fake_transcribe(voice, bot_, client_, lang):
+        seen["lang"] = lang
+        return "hello world"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    monkeypatch.setattr(bot, "pipeline", _async(None))
+    run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
+    assert seen["lang"] == "en"
+
+
+def test_voice_flag_off_never_consults_preferences_at_all(tmp_db, monkeypatch):
+    run(database.upsert_user(1, "u", "U", "en"))
+    calls = {"n": 0}
+    async def spy_get_prefs(uid):
+        calls["n"] += 1
+        return {"response_format": "text", "response_length": "normal", "voice_language": "ru"}
+    monkeypatch.setattr(bot, "get_response_preferences", spy_get_prefs)
+    seen = {}
+    async def fake_transcribe(voice, bot_, client_, lang):
+        seen["lang"] = lang
+        return "hello"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    monkeypatch.setattr(bot, "pipeline", _async(None))
+    run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
+    assert calls["n"] == 0  # preference lookup never attempted -- byte-identical to prior behavior
+    assert seen["lang"] == "en"  # falls back to stored UI language exactly as before this workstream
+
+
+def test_transcription_uses_transcriptions_endpoint_never_translates():
+    # audio.transcriptions returns text in the ORIGINAL spoken language;
+    # audio.translations would silently translate to English, misrepresenting
+    # what the user said to the downstream risk/safety pipeline.
+    import voice as voice_module
+    src = inspect.getsource(voice_module.transcribe_voice)
+    assert "audio.transcriptions.create" in src
+    assert "audio.translations" not in src
+
+
+def test_transcribed_text_enters_the_normal_pipeline_unaltered(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", False)
+    run(database.upsert_user(1, "u", "U"))
+    async def fake_transcribe(voice, bot_, client_, lang):
+        return "мне очень плохо"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    seen = {}
+    async def spy_pipeline(message, text, state, **kw):
+        seen["text"] = text
+    monkeypatch.setattr(bot, "pipeline", spy_pipeline)
+    run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
+    assert seen["text"] == "мне очень плохо"  # exact transcript, unaltered, reaches risk detection
+
+
+def test_transcription_failure_sends_existing_safe_error_response(tmp_db, monkeypatch):
+    async def boom(*a, **kw):
+        raise RuntimeError("stt provider down")
+    monkeypatch.setattr(bot, "transcribe_voice", boom)
+    run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
+    # unchanged, pre-existing fallback text -- proves this workstream did not
+    # alter the failure path.
+
+
+def test_no_outgoing_voice_preference_leaks_into_incoming_stt_language(tmp_db, monkeypatch):
+    # response_format=voice is an OUTGOING delivery preference; it must have
+    # zero effect on the INCOMING transcription language hint.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U", "en"))
+    run(database.set_response_preference(1, response_format="voice"))
+    seen = {}
+    async def fake_transcribe(voice, bot_, client_, lang):
+        seen["lang"] = lang
+        return "hello"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    monkeypatch.setattr(bot, "pipeline", _async(None))
+    run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
+    assert seen["lang"] == "en"  # voice_language still default "auto" -- unaffected by response_format
+
+
+def test_crisis_text_transcribed_from_voice_triggers_the_same_crisis_path(tmp_db, monkeypatch):
+    async def fake_transcribe(voice, bot_, client_, lang):
+        return "я хочу покончить с собой"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    calls = {"n": 0}
+    async def spy_crisis(*a, **kw):
+        calls["n"] += 1
+    monkeypatch.setattr(bot, "trigger_crisis", spy_crisis)
+    run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
+    assert calls["n"] == 1  # the identical deterministic crisis path fires regardless of input source
