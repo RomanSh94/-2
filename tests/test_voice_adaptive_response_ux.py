@@ -1997,6 +1997,44 @@ def test_pure_persistent_concise_in_group_does_not_change_response_length(tmp_db
     assert prefs["response_length"] == "normal"  # untouched
 
 
+def test_private_persistent_concise_command_saves_preference_without_llm(tmp_db, monkeypatch):
+    # The PRIVATE-chat counterpart to the group test above -- proves the
+    # "всегда пиши короче" parser fix (format_commands.py) actually reaches
+    # its intended positive outcome (persistence, ack, no LLM/TTS), not just
+    # its negative outcome (correctly refused in a group).
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, response_format="text", response_length="normal"))
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="should never be reached"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+
+    fsm = FakeFSM()
+    text = "всегда пиши короче"
+    msg = FakeMessage(FakeUser(1), text)  # default chat_type="private"
+    run(bot.pipeline(msg, text, fsm))
+
+    assert llm_calls["n"] == 0
+    assert tts_calls["n"] == 0
+    assert len(msg.answers) == 1  # exactly one acknowledgement
+    assert "личном чате" not in msg.answers[0][0]  # the private ack, not the group notice
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_length"] == "concise"  # actually changed this time
+    assert prefs["response_format"] == "text"      # untouched -- only length was targeted
+    data = run(fsm.get_data())
+    assert data.get("one_shot_voice_pending") is not True  # no override armed
+    # No raw command text anywhere in the preference table's columns.
+    assert "всегда пиши короче" not in prefs.values()
+
+
 def test_mixed_persistent_command_in_group_delivers_ordinary_text_ignores_preference(tmp_db, monkeypatch):
     # "Мне тревожно, всегда отвечай голосом" -- a MIXED message carrying a
     # PERSISTENT phrasing. Ordinary emotional content still reaches the
