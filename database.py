@@ -524,6 +524,25 @@ CREATE TABLE IF NOT EXISTS user_notice_acknowledgements (
     acknowledged_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (user_id, notice_id, notice_version)
 );
+
+-- Voice and Adaptive Response UX — neutral response-delivery UI preference,
+-- nothing more. Stores ONLY the three closed-set choices below, never a raw
+-- format-command message, never an inferred psychological trait ("lazy",
+-- "dislikes reading", depression status, etc.). One row per user
+-- (PRIMARY KEY user_id) since this is a single current preference, not a
+-- history. CHECK constraints keep the value space closed at the engine
+-- level, matching this repo's convention for every other closed-vocabulary
+-- column (e.g. user_onboarding_state.status above).
+CREATE TABLE IF NOT EXISTS user_response_preferences (
+    user_id         INTEGER PRIMARY KEY REFERENCES users(id),
+    response_format TEXT NOT NULL DEFAULT 'text',
+    response_length TEXT NOT NULL DEFAULT 'normal',
+    voice_language  TEXT NOT NULL DEFAULT 'auto',
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK(response_format IN ('text', 'voice', 'voice_and_concise_text')),
+    CHECK(response_length IN ('concise', 'normal')),
+    CHECK(voice_language IN ('ru', 'en', 'auto'))
+);
 """
 
 # Additive column migrations (no migration system in this repo; ADD COLUMN is
@@ -844,6 +863,19 @@ async def get_recent_messages(uid: int, limit: int = 8) -> list:
             " ORDER BY id DESC LIMIT ?", (uid, limit))
         rows = await cur.fetchall(); rows.reverse(); return rows
 
+async def get_last_assistant_message(uid: int) -> str | None:
+    """The most recent assistant reply, from the EXISTING bounded
+    conversation memory (messages table, already written by save_message on
+    every ordinary reply) -- Voice and Adaptive Response UX reuses this for
+    "voice-ify the last answer" (much-text/lazy-to-read/listen button)
+    instead of persisting the answer a second time anywhere."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT content FROM messages WHERE user_id=? AND role='assistant'"
+            " ORDER BY id DESC LIMIT 1", (uid,))
+        row = await cur.fetchone()
+    return row[0] if row else None
+
 async def get_unsummarized_messages(uid: int) -> list:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
@@ -856,6 +888,50 @@ async def mark_summarized(ids: list):
     async with aiosqlite.connect(DB) as db:
         ph = ",".join("?" * len(ids))
         await db.execute(f"UPDATE messages SET summarized=1 WHERE id IN ({ph})", ids)
+        await db.commit()
+
+# ── Response Preferences (Voice and Adaptive Response UX) ────────────────────
+_DEFAULT_RESPONSE_PREFERENCES = {
+    "response_format": "text", "response_length": "normal", "voice_language": "auto",
+}
+
+async def get_response_preferences(uid: int) -> dict:
+    """Always returns a full dict with the three closed-set fields, even for
+    a user with no row yet (the schema defaults, not a DB round-trip write)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT response_format, response_length, voice_language"
+            " FROM user_response_preferences WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+    if not row:
+        return dict(_DEFAULT_RESPONSE_PREFERENCES)
+    return {"response_format": row[0], "response_length": row[1], "voice_language": row[2]}
+
+async def set_response_preference(uid: int, **fields) -> None:
+    """Upserts ONLY the neutral UI fields named in `fields` (a subset of
+    response_format/response_length/voice_language) -- never a raw message,
+    never an inferred trait. The CHECK constraints in the schema reject an
+    out-of-vocabulary value at the engine level regardless of caller intent."""
+    allowed = {"response_format", "response_length", "voice_language"}
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"unknown response preference field(s): {unknown}")
+    if not fields:
+        return
+    current = await get_response_preferences(uid)
+    current.update(fields)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            """INSERT INTO user_response_preferences
+               (user_id, response_format, response_length, voice_language, updated_at)
+               VALUES (?,?,?,?,datetime('now'))
+               ON CONFLICT(user_id) DO UPDATE SET
+                   response_format=excluded.response_format,
+                   response_length=excluded.response_length,
+                   voice_language=excluded.voice_language,
+                   updated_at=excluded.updated_at""",
+            (uid, current["response_format"], current["response_length"],
+             current["voice_language"]))
         await db.commit()
 
 # ── Summaries ─────────────────────────────────────────────────────────────────

@@ -185,6 +185,14 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
         retention_policy="Until user-requested delete-all.",
         log_policy="No raw field in logs/alerts."),
 
+    "user_response_preferences": _e(
+        table="user_response_preferences", user_id_column="user_id", category="ENGAGEMENT",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="No raw field in logs/alerts. Only the three closed-set "
+                    "values (response_format/response_length/voice_language) -- "
+                    "never a raw format-command message or an inferred trait."),
+
     # ── Crisis safety/audit records — retained, NOT silently deleted ────────────
     "crisis_events": _e(
         table="crisis_events", user_id_column="user_id", category="CRISIS_SAFETY",

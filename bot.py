@@ -9,9 +9,12 @@ X20 Bot — Основной файл
 import asyncio
 import hmac
 import logging
+import os
 import pathlib
+import re
 import secrets
 import sys
+import time
 
 # Windows consoles default to a legacy codepage (e.g. cp1251) that cannot encode
 # the emoji used in our log/print statements, which crashes startup with
@@ -24,7 +27,10 @@ for _stream in (sys.stdout, sys.stderr):
 
 from html import escape as _he
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, FSInputFile, ReactionTypeEmoji,
+)
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.filters import Command
 from aiogram.exceptions import (
@@ -77,6 +83,9 @@ from scheduler import setup_scheduler
 from dashboard import start_dashboard
 from ab_testing import get_variant
 from dependency_monitor import DependencyMonitor
+from format_commands import parse_format_command, is_pure_format_command
+from reaction_selector import ReactionCategory, select_reaction_category, pick_supported_emoji
+from tts import synthesize_speech, TTSError
 from database import (
     init_db, upsert_user, save_message, load_state, save_state,
     log_moderation, log_validator_block, log_router_decision,
@@ -111,6 +120,7 @@ from database import (
     complete_onboarding, set_onboarding_card_ref, get_onboarding_eligibility,
     get_stored_user_language, has_privacy_notice_ack,
     record_notice_acknowledgement,
+    get_response_preferences, set_response_preference, get_last_assistant_message,
 )
 import onboarding
 import onboarding_content
@@ -200,6 +210,176 @@ def quality_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="➖ Частично", callback_data="quality:0"),
         InlineKeyboardButton(text="👎 Не помогло", callback_data="quality:-1"),
     ]])
+
+# ── Voice and Adaptive Response UX ──────────────────────────────────────────
+# Everything below is inert while VOICE_REPLIES_ENABLED / EMOTIONAL_REACTIONS_
+# ENABLED are false (the default). deliver_response is the ONE shared point
+# where a final, Safety-Validator-approved ordinary response is actually
+# delivered -- text, voice, or voice+concise-text -- reused by the listen
+# button and the "much text/lazy to read" meta-command path below.
+
+_FMT_KB_VERSION = "fmt1"
+_LISTEN_KB_VERSION = "listen1"
+_LISTEN_TAP_COOLDOWN_SECONDS = 5
+_reaction_last_sent: dict[int, float] = {}
+_listen_last_tap: dict[int, float] = {}
+
+
+def format_selector_kb(lang: str) -> InlineKeyboardMarkup:
+    ru = [
+        [InlineKeyboardButton(text="📝 Текстом", callback_data=f"{_FMT_KB_VERSION}:format:text")],
+        [InlineKeyboardButton(text="🎙 Голосом", callback_data=f"{_FMT_KB_VERSION}:format:voice")],
+        [InlineKeyboardButton(text="🎙 Голосом + короткий текст",
+                              callback_data=f"{_FMT_KB_VERSION}:format:voice_and_concise_text")],
+        [InlineKeyboardButton(text="Кратко", callback_data=f"{_FMT_KB_VERSION}:length:concise")],
+        [InlineKeyboardButton(text="Обычно", callback_data=f"{_FMT_KB_VERSION}:length:normal")],
+    ]
+    en = [
+        [InlineKeyboardButton(text="📝 Text", callback_data=f"{_FMT_KB_VERSION}:format:text")],
+        [InlineKeyboardButton(text="🎙 Voice", callback_data=f"{_FMT_KB_VERSION}:format:voice")],
+        [InlineKeyboardButton(text="🎙 Voice + short text",
+                              callback_data=f"{_FMT_KB_VERSION}:format:voice_and_concise_text")],
+        [InlineKeyboardButton(text="Brief", callback_data=f"{_FMT_KB_VERSION}:length:concise")],
+        [InlineKeyboardButton(text="Normal", callback_data=f"{_FMT_KB_VERSION}:length:normal")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=(ru if lang == "ru" else en))
+
+
+def _listen_kb(uid: int, lang: str) -> InlineKeyboardMarkup:
+    label = "🔊 Прослушать" if lang == "ru" else "🔊 Listen"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=label, callback_data=f"{_LISTEN_KB_VERSION}:{uid}")]])
+
+
+def _format_ack_text(cmd, lang: str) -> str:
+    ru = {
+        "voice_persistent": "Хорошо, буду отвечать голосом.",
+        "text_persistent": "Хорошо, буду отвечать текстом.",
+        "concise_persistent": "Хорошо, буду отвечать короче.",
+        "concise_oneshot": "Постараюсь короче в следующий раз.",
+        "detailed_oneshot": "Хорошо, в следующий раз отвечу подробнее.",
+    }
+    en = {
+        "voice_persistent": "Got it — I'll reply with voice from now on.",
+        "text_persistent": "Got it — I'll reply with text from now on.",
+        "concise_persistent": "Got it — I'll keep replies shorter.",
+        "concise_oneshot": "I'll keep the next reply shorter.",
+        "detailed_oneshot": "Got it — I'll go into more detail next time.",
+    }
+    table = ru if lang == "ru" else en
+    return table.get(cmd.kind, "Хорошо." if lang == "ru" else "Got it.")
+
+
+def _concise_version(text: str, max_chars: int = 220) -> str:
+    """Deterministic, bounded shortening -- NOT a second LLM interpretation.
+    Takes leading sentences up to a char budget; never fabricates content."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    out = ""
+    for s in sentences:
+        if out and len(out) + len(s) + 1 > max_chars:
+            break
+        out = (out + " " + s).strip()
+    return out or (text[:max_chars].rstrip() + "…")
+
+
+def _safe_concise_version(text: str, lang: str) -> str:
+    """The concise text is re-validated through Safety Validator (§9):
+    truncation cannot introduce a new claim, but it COULD cut off a
+    qualifying safety caveat, so the shortened text is checked again before
+    ever reaching TTS. Falls back to the full (already-approved) text if
+    the shortened version fails validation."""
+    candidate = _concise_version(text)
+    if candidate == text.strip():
+        return text
+    is_safe, _ = validate_response(candidate, lang)
+    return candidate if is_safe else text
+
+
+async def _synthesize_and_send_voice(target, uid: int, text: str, lang: str) -> bool:
+    """Synthesizes `text` (already Safety-Validator-approved) and sends ONE
+    voice message via `target` (a Message, exposing .answer_voice). Returns
+    True on success, False on ANY failure (TTS or Telegram send) -- never
+    raises, and the temporary audio file is always removed."""
+    if not config.VOICE_REPLIES_ENABLED:
+        return False
+    path = None
+    try:
+        path = await synthesize_speech(client, text, lang)
+        await target.answer_voice(FSInputFile(path))
+        return True
+    except Exception as e:
+        print(f"[tts] uid={uid}: {type(e).__name__}")
+        return False
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+async def deliver_response(message: Message, uid: int, answer: str, lang: str,
+                            *, one_shot_voice: bool = False,
+                            one_shot_concise: bool = False) -> None:
+    """The SINGLE shared point where a final, Safety-Validator-approved
+    ordinary response is delivered — text / voice / voice_and_concise_text,
+    from the user's stored preference or a one-shot meta-command override.
+    Flag OFF => always plain text, byte-for-byte the prior
+    `await message.answer(answer)` behavior."""
+    if not config.VOICE_REPLIES_ENABLED:
+        await message.answer(answer)
+        return
+
+    prefs = await get_response_preferences(uid)
+    fmt = "voice" if one_shot_voice else prefs["response_format"]
+    concise = one_shot_concise or prefs["response_length"] == "concise"
+
+    if fmt == "text":
+        await message.answer(answer, reply_markup=_listen_kb(uid, lang))
+        return
+
+    if fmt == "voice_and_concise_text":
+        visible = _safe_concise_version(answer, lang)
+        voice_text = visible if concise else answer
+        await message.answer(visible)
+        await _synthesize_and_send_voice(message, uid, voice_text, lang)
+        return
+
+    # fmt == "voice"
+    voice_text = _safe_concise_version(answer, lang) if concise else answer
+    ok = await _synthesize_and_send_voice(message, uid, voice_text, lang)
+    if not ok:
+        await message.answer(answer)  # TTS failed -- never silent; full text stands in
+
+
+async def _maybe_react(message: Message, uid: int, category: ReactionCategory,
+                        confidence: float) -> None:
+    """Best-effort Telegram message reaction -- never blocks or delays the
+    actual response, never raises, never persists `category` anywhere."""
+    if not config.EMOTIONAL_REACTIONS_ENABLED:
+        return
+    if category == ReactionCategory.NONE or confidence < config.EMOTIONAL_REACTION_MIN_CONFIDENCE:
+        return
+    now = time.time()
+    if now - _reaction_last_sent.get(uid, 0) < config.EMOTIONAL_REACTION_COOLDOWN_SECONDS:
+        return
+    try:
+        chat = await bot.get_chat(message.chat.id)
+        available = None
+        if chat.available_reactions is not None:
+            available = [r.emoji for r in chat.available_reactions if hasattr(r, "emoji")]
+        emoji = pick_supported_emoji(category, available)
+        if not emoji:
+            return
+        await bot.set_message_reaction(
+            chat_id=message.chat.id, message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)])
+        _reaction_last_sent[uid] = now
+    except Exception as e:
+        print(f"[reaction] uid={uid}: {type(e).__name__}")
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -626,25 +806,76 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         await message.answer(dep_msg)
         return
 
+    # 4.3 Format meta-command detection (Voice and Adaptive Response UX) --
+    # AFTER crisis/dependency handling, BEFORE ordinary therapeutic routing.
+    # A MIXED message ("Мне тревожно, и ответь голосом") falls through to
+    # the ordinary pipeline below unchanged -- only delivery of the eventual
+    # answer is affected. A PURE command never enters therapeutic routing.
+    one_shot_voice = False
+    one_shot_concise = False
+    fmt_cmd = parse_format_command(user_text, lang) if config.VOICE_REPLIES_ENABLED else None
+    if fmt_cmd:
+        if fmt_cmd.kind == "voice_persistent":
+            await set_response_preference(uid, response_format="voice")
+        elif fmt_cmd.kind == "text_persistent":
+            await set_response_preference(uid, response_format="text")
+        elif fmt_cmd.kind == "concise_persistent":
+            await set_response_preference(uid, response_length="concise")
+        elif fmt_cmd.kind == "voice_oneshot":
+            one_shot_voice = True
+        elif fmt_cmd.kind == "concise_oneshot":
+            one_shot_concise = True
+
+        pure = is_pure_format_command(user_text, lang)
+        if pure and fmt_cmd.persistent:
+            await message.answer(_format_ack_text(fmt_cmd, lang))
+            return
+        if pure and fmt_cmd.kind == "voice_oneshot":
+            # §8: "много текста"/"лень читать" etc. -- voice-ify the last
+            # bot response (existing bounded conversation memory) instead of
+            # generating a new therapeutic interpretation, when one exists.
+            last = await get_last_assistant_message(uid)
+            if last:
+                spoken = _safe_concise_version(last, lang)
+                ok = await _synthesize_and_send_voice(message, uid, spoken, lang)
+                if not ok:
+                    await message.answer(last)
+                return
+            # else: no previous response -- fall through with one_shot_voice
+            # already armed, applied to the NEXT ordinary reply below.
+        elif pure and fmt_cmd.kind in ("concise_oneshot", "detailed_oneshot"):
+            await message.answer(_format_ack_text(fmt_cmd, lang))
+            return
+        # else: MIXED message, or a one-shot voice override with nothing yet
+        # to voice -- fall through to ordinary routing with the one-shot
+        # flags armed for deliver_response below.
+
     # 5. Update state
     state = await load_state(uid) or dict(DEFAULT_STATE)
     state = update_state(state, user_text)
     await save_state(uid, state)
-    
+
     # 6. Detect stage
     stage = detect_stage(user_text, lang)
-    
+
     # 7. Assess readiness
     readiness = assess_readiness(user_text, lang)
-    
+
     # 8. Cognitive capacity
     capacity = get_capacity(state)
-    
+
     # 9. Select scenario
     variant = get_variant(uid)
     scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
                                variant, trajectory=trajectory)
-    
+
+    # 9.5 Emotional reaction (Voice and Adaptive Response UX) -- best-effort,
+    # deterministic, fires only for genuine (non-format-only) messages: a
+    # PURE format command already returned above and never reaches here.
+    cat, conf = select_reaction_category(user_text, risk["categories"], stage, lang,
+                                         is_meta_command=False, is_dependency_redirect=False)
+    await _maybe_react(message, uid, cat, conf)
+
     # 11. Select practice
     severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
     practice = select_practice(scenario, stage, severity, lang)
@@ -738,7 +969,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                        risk["score"], risk["categories"])
     await save_message(uid, "assistant", answer, scenario, lang)
     await asyncio.sleep(typing_delay(answer))
-    await message.answer(answer)
+    await deliver_response(message, uid, answer, lang,
+                           one_shot_voice=one_shot_voice, one_shot_concise=one_shot_concise)
 
     # 17.5 Profile refresh (§5) — deterministic, every 5th user message.
     await maybe_update_profile(uid, await get_user_message_count(uid))
@@ -1033,7 +1265,93 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
         msg = ("Рад помочь 🙂" if data.get("lang") == "ru" else "Glad to help 🙂") if rating >= 0 else \
               ("Спасибо за честность" if data.get("lang") == "ru" else "Thanks for honesty")
         await callback.message.answer(msg, reply_markup=ReplyKeyboardRemove())
+        await _maybe_react(callback.message, uid, ReactionCategory.PRACTICE_COMPLETED, 1.0)
     await callback.answer()
+
+# ── /format — response-delivery preference selector ─────────────────────────
+
+@dp.message(Command("format"))
+async def cmd_format(message: Message):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    if not config.VOICE_REPLIES_ENABLED:
+        # Flag off: behave as if this command does not exist -- no selector,
+        # nothing saved, previous behavior preserved exactly.
+        return
+    await message.answer(
+        "Как тебе удобнее получать ответы?" if lang == "ru"
+        else "How would you like to receive replies?",
+        reply_markup=format_selector_kb(lang))
+
+
+@dp.callback_query(F.data.startswith(f"{_FMT_KB_VERSION}:"))
+async def cb_format_select(callback: CallbackQuery):
+    uid = callback.from_user.id
+    if not config.VOICE_REPLIES_ENABLED:
+        # Flag off: fail closed -- a stale button from before rollback must
+        # not silently save anything.
+        await callback.answer()
+        return
+    try:
+        _, kind, value = callback.data.split(":")
+    except ValueError:
+        await callback.answer()
+        return
+    if kind == "format" and value in ("text", "voice", "voice_and_concise_text"):
+        await set_response_preference(uid, response_format=value)
+    elif kind == "length" and value in ("concise", "normal"):
+        await set_response_preference(uid, response_length=value)
+    else:
+        # Malformed/forged value outside the closed vocabulary -- fail closed.
+        await callback.answer()
+        return
+    lang = await get_user_language(uid)
+    await callback.message.answer(
+        "Сохранено ✅" if lang == "ru" else "Saved ✅")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{_LISTEN_KB_VERSION}:"))
+async def cb_listen(callback: CallbackQuery):
+    """"🔊 Прослушать" — synthesizes the EXACT visible text of the message
+    the button is attached to. No new LLM call, no deeper memory lookup, no
+    DB row created. Ownership is checked because the owning uid is encoded
+    in callback_data (a stateless action, unlike cb_before's FSM-scoped
+    flow) -- a forged/cross-user/malformed callback all fail closed."""
+    uid = callback.from_user.id
+    if not config.VOICE_REPLIES_ENABLED:
+        await callback.answer()
+        return
+    try:
+        owner_uid = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+    if owner_uid != uid:
+        await callback.answer()
+        return
+    text = callback.message.text
+    if not text:
+        await callback.answer()
+        return
+    now = time.time()
+    if now - _listen_last_tap.get(uid, 0) < _LISTEN_TAP_COOLDOWN_SECONDS:
+        await callback.answer()
+        return
+    _listen_last_tap[uid] = now
+    lang = await get_user_language(uid)
+    # Re-validate before TTS even though this text was already sent once --
+    # defense in depth, same "only Safety-Validator-approved text may enter
+    # TTS" contract as deliver_response, applied consistently at every TTS
+    # call site rather than assumed safe because it was validated once.
+    is_safe, _ = validate_response(text, lang)
+    if not is_safe:
+        await callback.answer(
+            "Не получилось озвучить" if lang == "ru" else "Couldn't create voice")
+        return
+    ok = await _synthesize_and_send_voice(callback.message, uid, text, lang)
+    await callback.answer(
+        None if ok else ("Не получилось озвучить" if lang == "ru" else "Couldn't create voice"))
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -4244,10 +4562,20 @@ async def cb_emotion_map(callback: CallbackQuery):
 
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):
-    lang = await get_user_language(message.from_user.id)   # needed for Whisper lang hint
+    uid = message.from_user.id
+    lang = await get_user_language(uid)   # needed for Whisper lang hint
+    # Voice and Adaptive Response UX: an explicitly SAVED voice_language
+    # preference (only ever set via /format, so unreachable while
+    # VOICE_REPLIES_ENABLED is false) overrides the stored UI language hint;
+    # "auto" (the untouched default) preserves the exact prior behavior.
+    stt_lang = lang
+    if config.VOICE_REPLIES_ENABLED:
+        prefs = await get_response_preferences(uid)
+        if prefs["voice_language"] in ("ru", "en"):
+            stt_lang = prefs["voice_language"]
     await bot.send_chat_action(message.chat.id, "typing")
     try:
-        text = await transcribe_voice(message.voice, bot, client, lang)
+        text = await transcribe_voice(message.voice, bot, client, stt_lang)
         await message.answer(f"🎤 <i>{_he(text)}</i>", parse_mode="HTML")
         await pipeline(message, text, state)
     except Exception as e:
