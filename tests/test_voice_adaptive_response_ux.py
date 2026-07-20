@@ -1575,16 +1575,25 @@ def test_complete_delivery_failure_never_writes_or_overwrites_replay_state(tmp_d
         raise tts_module.TTSError("simulated TTS failure")
     monkeypatch.setattr(bot, "synthesize_speech", failing_synth)
 
+    # Distinct messages per method so the match string below PROVES which
+    # call actually raised -- if the exception instead came from
+    # answer_voice (or anywhere else), the differing text would fail the
+    # match and this test would fail loudly rather than pass ambiguously.
     class BoomMessage(FakeMessage):
         async def answer(self, *a, **kw):
-            raise RuntimeError("simulated total Telegram outage")
+            raise RuntimeError("simulated total Telegram outage on text fallback")
         async def answer_voice(self, *a, **kw):
-            raise RuntimeError("simulated total Telegram outage")
+            raise RuntimeError("simulated total Telegram outage on voice send")
 
     fsm = FakeFSM({"last_delivered_response": "an older, genuinely delivered answer",
                    "last_delivered_response_at": time.time()})
     msg = BoomMessage(FakeUser(1), "Мне тревожно")
-    with pytest.raises(Exception):
+    # synthesize_speech fails first (TTSError, caught inside
+    # _synthesize_and_send_voice), so deliver_response's "voice" branch
+    # falls back to message.answer(answer) -- THAT is the call expected to
+    # raise here, confirmed by the distinct match string, not answer_voice
+    # (never reached) or an unrelated AttributeError/mock misconfiguration.
+    with pytest.raises(RuntimeError, match="text fallback"):
         run(bot.pipeline(msg, "Мне тревожно", fsm))
 
     data = run(fsm.get_data())
@@ -1906,6 +1915,138 @@ def test_mixed_message_in_group_preserves_ordinary_behavior_ignores_format_fragm
     assert msg.answers == [("an ordinary group reply", {})]  # ordinary reply, plain text
     prefs = run(database.get_response_preferences(1))
     assert prefs["response_format"] == "text"        # untouched
+
+
+# ── Persistent commands specifically in a group (§3 this pass) ─────────────
+# A one-shot group test alone is not evidence for persistent preference
+# safety -- these prove the PERSISTENT phrasing, end to end through a real
+# bot.pipeline() call, never modifies a stored preference from a group.
+
+def test_pure_persistent_voice_in_group_gives_neutral_notice_no_llm_no_pref_write(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="should never be reached"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+
+    fsm = FakeFSM()
+    text = "всегда отвечай голосом"
+    msg = FakeMessage(FakeUser(1), text, chat_type="group")
+    run(bot.pipeline(msg, text, fsm))
+
+    assert llm_calls["n"] == 0
+    assert tts_calls["n"] == 0
+    assert len(msg.answers) == 1
+    assert "личном чате" in msg.answers[0][0]  # exactly one neutral notice
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_format"] == "text"  # untouched by the persistent phrasing
+    data = run(fsm.get_data())
+    assert data.get("one_shot_voice_pending") is not True  # no override armed either
+
+
+def test_pure_persistent_text_in_group_does_not_change_existing_voice_preference(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, response_format="voice"))
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="unused"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+
+    fsm = FakeFSM()
+    text = "всегда отвечай текстом"
+    msg = FakeMessage(FakeUser(1), text, chat_type="group")
+    run(bot.pipeline(msg, text, fsm))
+
+    assert llm_calls["n"] == 0
+    assert len(msg.answers) == 1
+    assert "личном чате" in msg.answers[0][0]
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_format"] == "voice"  # the EXISTING preference survives untouched
+
+
+def test_pure_persistent_concise_in_group_does_not_change_response_length(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="unused"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+
+    fsm = FakeFSM()
+    text = "всегда пиши короче"
+    msg = FakeMessage(FakeUser(1), text, chat_type="group")
+    run(bot.pipeline(msg, text, fsm))
+
+    assert llm_calls["n"] == 0
+    assert len(msg.answers) == 1
+    assert "личном чате" in msg.answers[0][0]
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_length"] == "normal"  # untouched
+
+
+def test_mixed_persistent_command_in_group_delivers_ordinary_text_ignores_preference(tmp_db, monkeypatch):
+    # "Мне тревожно, всегда отвечай голосом" -- a MIXED message carrying a
+    # PERSISTENT phrasing. Ordinary emotional content still reaches the
+    # existing LLM route (pre-existing bot behavior preserved), delivered as
+    # plain text; the persistent format fragment has zero effect.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    _full_pipeline_stub_set(monkeypatch, llm_text="an ordinary group reply")
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+
+    fsm = FakeFSM()
+    text = "Мне тревожно, всегда отвечай голосом"
+    msg = FakeMessage(FakeUser(1), text, chat_type="group")
+    run(bot.pipeline(msg, text, fsm))
+
+    assert tts_calls["n"] == 0
+    assert msg.answers == [("an ordinary group reply", {})]  # plain text, ordinary reply
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_format"] == "text"  # never modified by the persistent fragment
+    data = run(fsm.get_data())
+    assert data.get("one_shot_voice_pending") is not True
+
+
+def test_pure_persistent_voice_english_in_group_gives_neutral_notice(tmp_db, monkeypatch):
+    # EN format-command parsing is supported (format_commands._PERSISTENT_MARKERS
+    # includes "always reply"/"always respond") -- confirm the EN phrasing
+    # gets the same group boundary, not just RU.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U", "en"))
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="unused"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+
+    fsm = FakeFSM()
+    text = "always reply with voice"
+    msg = FakeMessage(FakeUser(1), text, chat_type="group")
+    run(bot.pipeline(msg, text, fsm))
+
+    assert llm_calls["n"] == 0
+    assert len(msg.answers) == 1
+    assert "private chat" in msg.answers[0][0]
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_format"] == "text"
 
 
 def test_private_callback_still_works_after_group_boundary_added(tmp_db, monkeypatch):

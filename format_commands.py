@@ -71,7 +71,14 @@ _CONCISE_PATTERNS = {
     # "много текста" in _AMBIGUOUS_VOICE_PATTERNS, which already covers this
     # concept under the standalone-only rule (see the book-comment false
     # positive test). Keeping it here too would let it bypass that guard.
-    "ru": ("короче", "можно кратко",
+    #
+    # The longer "пиши короче"/"отвечай короче" phrases are listed BEFORE the
+    # bare "короче" so _first_match (iterates in order) picks the fuller
+    # phrase when present -- otherwise "всегда ПИШИ короче" leaves "пиши" as
+    # an unaccounted leftover word in is_pure_format_command's purity check,
+    # misclassifying a genuinely pure persistent command as MIXED (the same
+    # class of gap as the earlier missing "отвечай голосом" pattern).
+    "ru": ("пиши короче", "отвечай короче", "короче", "можно кратко",
            "без длинного объяснения", "сократи ответ", "покороче"),
     "en": ("keep it short", "make it brief", "too long", "shorter please",
            "keep it brief"),
