@@ -14,6 +14,7 @@ import types
 
 import pytest
 
+import access_control as ac
 import bot
 import config
 import database
@@ -56,6 +57,26 @@ class FakeCallback:
 
     async def answer(self, *a, **kw):
         self.answered.append((a, kw))
+
+
+class FakeFSM:
+    """Backed by a plain dict shared across calls -- a real per-(user,chat)
+    aiogram FSMContext also persists data across separate updates via its
+    storage; sharing ONE FakeFSM instance across two separate `pipeline()`
+    calls is the correct way to simulate two separate Telegram updates for
+    the SAME user/chat, and using two DIFFERENT FakeFSM instances correctly
+    simulates two DIFFERENT users/chats never sharing state."""
+    def __init__(self, data=None):
+        self._data = data or {}
+
+    async def get_data(self):
+        return dict(self._data)
+
+    async def update_data(self, **kw):
+        self._data.update(kw)
+
+    async def set_state(self, state):
+        pass
 
 
 def _async(value=None):
@@ -834,6 +855,45 @@ def _no_real_typing_indicator(monkeypatch):
     monkeypatch.setattr(bot.bot, "send_chat_action", noop)
 
 
+@pytest.fixture(autouse=True)
+def _access_env(monkeypatch):
+    """personal_use mode + owner uid 1 -- same convention as
+    tests/test_therapeutic_core_foundation.py -- lets a REAL pipeline() call
+    pass the access-control/onboarding/active-crisis gates naturally for a
+    fresh tmp_db and uid=1, with no need to stub each gate individually."""
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "personal_use")
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 1)
+    monkeypatch.setattr(ac, "CLINICIAN_TESTER_IDS", set())
+    monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", set())
+    monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
+
+
+def _full_pipeline_stub_set(monkeypatch, llm_text="ok, noted"):
+    """Minimal stubs to run a REAL bot.pipeline() end to end without a real
+    LLM/network call -- same technique as
+    tests/test_therapeutic_core_foundation.py's own helper of this name."""
+    monkeypatch.setattr(bot, "get_emotional_trajectory", _async(types.SimpleNamespace(
+        trend="stable", hopelessness_streak=0, yellow_plus_streak=0, messages_analyzed=0)))
+    monkeypatch.setattr(bot, "maybe_summarize", _async(None))
+    monkeypatch.setattr(bot, "build_context", _async(("", [])))
+    monkeypatch.setattr(bot, "maybe_update_profile", _async(None))
+    monkeypatch.setattr(bot, "get_user_message_count", _async(1))
+    monkeypatch.setattr(bot, "check_sudden_improvement", _async(False))
+    # dependency_monitor is a module-level singleton with in-memory state --
+    # neutralize it so cross-test state (from OTHER tests reusing uid=1)
+    # can never accidentally trip a redirect in THESE tests.
+    monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(None))
+
+    class _Choice:
+        def __init__(self, content):
+            self.message = types.SimpleNamespace(content=content)
+
+    async def fake_create(*a, **kw):
+        return types.SimpleNamespace(choices=[_Choice(llm_text)])
+    monkeypatch.setattr(bot.client.chat.completions, "create", fake_create)
+
+
 def test_voice_language_ru_passes_ru_hint(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
@@ -955,3 +1015,495 @@ def test_crisis_text_transcribed_from_voice_triggers_the_same_crisis_path(tmp_db
     monkeypatch.setattr(bot, "trigger_crisis", spy_crisis)
     run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
     assert calls["n"] == 1  # the identical deterministic crisis path fires regardless of input source
+
+
+# ── One-shot voice override lifetime — real sequential updates (P1 fix) ────
+# The override must survive across SEPARATE bot.pipeline() invocations
+# sharing the same FakeFSM object (simulating separate Telegram updates for
+# the same user/chat) -- a bare local variable inside one function call
+# cannot do this. These tests exercise the ACTUAL fix (FSM-backed
+# one_shot_voice_pending), not a single-call shortcut.
+
+def test_update1_no_previous_response_arms_override_no_llm_no_tts(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    _full_pipeline_stub_set(monkeypatch)
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="should never be reached"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+
+    run(database.upsert_user(1, "u", "U"))
+    fsm = FakeFSM()
+    run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm))
+
+    assert llm_calls["n"] == 0                # no therapeutic interpretation of the meta-command
+    assert tts_calls["n"] == 0                # no empty/irrelevant audio synthesized
+    data = run(fsm.get_data())
+    assert data.get("one_shot_voice_pending") is True
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_format"] == "text"  # permanent preference untouched
+
+
+def test_update2_consumes_override_and_voices_the_real_answer_exactly_once(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    _full_pipeline_stub_set(monkeypatch, llm_text="a real validated answer")
+    voiced = []
+    async def spy_synth(client_, text, lang):
+        voiced.append(text)
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    monkeypatch.setattr(os, "remove", lambda p: None)
+
+    run(database.upsert_user(1, "u", "U"))
+    fsm = FakeFSM()
+    run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm))  # update 1
+    assert (run(fsm.get_data())).get("one_shot_voice_pending") is True
+
+    msg2 = FakeMessage(FakeUser(1), "Мне тревожно")
+    run(bot.pipeline(msg2, "Мне тревожно", fsm))  # update 2 -- a SEPARATE pipeline() call
+
+    assert voiced == ["a real validated answer"]   # exactly one voice, the real validated answer
+    assert msg2.answers == []                       # voice mode: no text alongside a successful voice
+    assert (run(fsm.get_data())).get("one_shot_voice_pending") is False  # consumed and cleared
+    prefs = run(database.get_response_preferences(1))
+    assert prefs["response_format"] == "text"       # STILL never became a permanent preference
+
+
+def test_update3_override_no_longer_applies(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    _full_pipeline_stub_set(monkeypatch, llm_text="an answer")
+    voiced = []
+    async def spy_synth(client_, text, lang):
+        voiced.append(text)
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    monkeypatch.setattr(os, "remove", lambda p: None)
+
+    run(database.upsert_user(1, "u", "U"))
+    fsm = FakeFSM()
+    run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm))       # update 1
+    run(bot.pipeline(FakeMessage(FakeUser(1), "Мне тревожно"), "Мне тревожно", fsm))      # update 2
+    voiced.clear()
+
+    msg3 = FakeMessage(FakeUser(1), "Мне всё ещё тревожно")
+    run(bot.pipeline(msg3, "Мне всё ещё тревожно", fsm))                                 # update 3
+    assert voiced == []             # override already consumed on update 2 -- not still active
+    assert len(msg3.answers) == 1   # default response_format=text applies
+
+
+def test_override_is_isolated_per_user_fsm(tmp_db, monkeypatch):
+    # Two DIFFERENT FakeFSM instances = two different users' separate
+    # aiogram FSM storage entries. User A's armed override must never leak
+    # into User B's delivery.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    _full_pipeline_stub_set(monkeypatch, llm_text="reply for someone")
+    voiced = []
+    async def spy_synth(client_, text, lang):
+        voiced.append(text)
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    monkeypatch.setattr(os, "remove", lambda p: None)
+
+    run(database.upsert_user(1, "u", "U"))
+    run(database.upsert_user(2, "u", "U"))
+    fsm_a, fsm_b = FakeFSM(), FakeFSM()
+    run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm_a))  # only A arms it
+    assert (run(fsm_a.get_data())).get("one_shot_voice_pending") is True
+    assert (run(fsm_b.get_data())).get("one_shot_voice_pending") is not True
+
+    msg_b = FakeMessage(FakeUser(2), "Мне грустно")
+    run(bot.pipeline(msg_b, "Мне грустно", fsm_b))  # user B, unrelated FSM
+    assert voiced == []              # B never had an override armed -- default text, no voice
+    assert len(msg_b.answers) == 1
+
+
+def test_expired_or_already_cleared_override_does_not_reactivate(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    _full_pipeline_stub_set(monkeypatch, llm_text="an answer")
+    voiced = []
+    async def spy_synth(client_, text, lang):
+        voiced.append(text)
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    monkeypatch.setattr(os, "remove", lambda p: None)
+
+    run(database.upsert_user(1, "u", "U"))
+    fsm = FakeFSM({"one_shot_voice_pending": False})  # explicitly already-cleared state
+    run(bot.pipeline(FakeMessage(FakeUser(1), "Мне тревожно"), "Мне тревожно", fsm))
+    assert voiced == []  # a cleared/false flag never reactivates a voice delivery
+
+
+def test_crisis_on_second_update_sends_crisis_text_not_voice_and_preserves_override(tmp_db, monkeypatch):
+    # Chosen deterministic rule: crisis returns BEFORE the override-consumption
+    # code runs at all (it sits earlier in pipeline()) -- so an armed override
+    # survives untouched, to be applied to the next ORDINARY message instead.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    _full_pipeline_stub_set(monkeypatch)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    crisis_calls = {"n": 0}
+    async def spy_crisis(*a, **kw):
+        crisis_calls["n"] += 1
+    monkeypatch.setattr(bot, "trigger_crisis", spy_crisis)
+
+    run(database.upsert_user(1, "u", "U"))
+    fsm = FakeFSM()
+    run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm))  # arms override
+    assert (run(fsm.get_data())).get("one_shot_voice_pending") is True
+
+    msg2 = FakeMessage(FakeUser(1), "я хочу покончить с собой")
+    run(bot.pipeline(msg2, "я хочу покончить с собой", fsm))
+    assert crisis_calls["n"] == 1
+    assert tts_calls["n"] == 0        # crisis never becomes voice, ever
+    assert (run(fsm.get_data())).get("one_shot_voice_pending") is True  # preserved, not silently dropped
+
+
+def test_dependency_redirect_on_second_update_returns_before_voice_delivery(tmp_db, monkeypatch):
+    # Same chosen rule as crisis: dependency_monitor.assess also runs (and
+    # can return) BEFORE the override-consumption code, so the pending
+    # override survives a dependency-redirect turn untouched.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    _full_pipeline_stub_set(monkeypatch)
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="unused"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+
+    run(database.upsert_user(1, "u", "U"))
+    fsm = FakeFSM()
+    run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm))  # arms override
+    assert (run(fsm.get_data())).get("one_shot_voice_pending") is True
+
+    # Now make THIS SPECIFIC call's dependency check fire a redirect.
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async("A soft, narrow redirect."))
+    msg2 = FakeMessage(FakeUser(1), "ты единственный кто меня понимает")
+    run(bot.pipeline(msg2, "ты единственный кто меня понимает", fsm))
+    assert msg2.answers == [("A soft, narrow redirect.", {})]
+    assert llm_calls["n"] == 0
+    assert tts_calls["n"] == 0
+    assert (run(fsm.get_data())).get("one_shot_voice_pending") is True  # preserved for the next ordinary turn
+
+
+# ── Previous-response replay authorization scope (get_last_assistant_message) ─
+# "same chat" is not a separate dimension in this bot's schema: it is a
+# private 1:1 Telegram bot where chat_id == user_id for every user (the
+# whole codebase scopes exclusively by user_id -- messages/state/profile
+# all key ONLY on user_id, never chat_id), so there is no cross-chat case
+# to construct for a single user; user_id IS the chat identity here.
+
+def test_replay_same_conversation_no_llm_call_one_validated_voice(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.save_message(1, "assistant", "This is the real prior final answer."))
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="should never be reached"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    validated = []
+    synthesized = []
+    def spy_validate(text, lang="ru"):
+        validated.append(text)
+        return True, None
+    async def spy_synth(client_, text, lang):
+        synthesized.append(text)
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "validate_response", spy_validate)
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    monkeypatch.setattr(os, "remove", lambda p: None)
+
+    fsm = FakeFSM()
+    msg = FakeMessage(FakeUser(1), "лень читать")
+    run(bot.pipeline(msg, "лень читать", fsm))
+
+    assert llm_calls["n"] == 0
+    assert synthesized == ["This is the real prior final answer."]  # short enough: no shortening needed
+    assert validated == []  # _safe_concise_version only validates when it actually shortens
+    assert len(msg.answers) == 0  # no long text resent
+
+
+def test_replay_shortens_and_revalidates_a_long_previous_response(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    long_prior = ("Одно предложение с важной мыслью. " * 20).strip()
+    run(database.save_message(1, "assistant", long_prior))
+    validated = []
+    synthesized = []
+    def spy_validate(text, lang="ru"):
+        validated.append(text)
+        return True, None
+    async def spy_synth(client_, text, lang):
+        synthesized.append(text)
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "validate_response", spy_validate)
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    monkeypatch.setattr(os, "remove", lambda p: None)
+
+    fsm = FakeFSM()
+    run(bot.pipeline(FakeMessage(FakeUser(1), "много текста"), "много текста", fsm))
+
+    assert len(validated) == 1
+    concise = validated[0]
+    assert concise != long_prior and len(concise) < len(long_prior)
+    assert synthesized == [concise]  # exactly the re-validated concise text, never the raw long text
+
+
+def test_replay_stale_old_response_outside_recency_window_is_not_replayed(tmp_db, monkeypatch):
+    run(database.upsert_user(1, "u", "U"))
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    con.execute(
+        "INSERT INTO messages (user_id, role, content, summarized, created_at) "
+        "VALUES (1, 'assistant', 'a very old reply', 0, datetime('now', '-2 days'))")
+    con.commit()
+    con.close()
+    result = run(database.get_last_assistant_message(1))
+    assert result is None  # outside the bounded recency window -- never replayed
+
+
+def test_replay_summarized_response_is_not_replayed(tmp_db, monkeypatch):
+    # summarized=1 means memory.py already compressed it away -- no other
+    # part of this codebase treats it as "the current conversation" either.
+    run(database.upsert_user(1, "u", "U"))
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    con.execute(
+        "INSERT INTO messages (user_id, role, content, summarized) "
+        "VALUES (1, 'assistant', 'already compressed into a summary', 1)")
+    con.commit()
+    con.close()
+    result = run(database.get_last_assistant_message(1))
+    assert result is None
+
+
+def test_replay_cross_user_isolation(tmp_db, monkeypatch):
+    run(database.upsert_user(1, "u", "U"))
+    run(database.upsert_user(2, "u", "U"))
+    run(database.save_message(1, "assistant", "A's private final answer"))
+    result_b = run(database.get_last_assistant_message(2))
+    assert result_b is None  # user B never sees user A's response
+
+
+def test_replay_never_selects_user_role_or_other_scenario_rows(tmp_db, monkeypatch):
+    # role='assistant' filtering already structurally excludes crisis/admin/
+    # error text (confirmed by direct inspection: those paths never call
+    # save_message(uid, "assistant", ...) at all) -- this proves the filter
+    # itself is enforced at the query level, not merely by convention.
+    run(database.upsert_user(1, "u", "U"))
+    run(database.save_message(1, "user", "the user's own message, not a bot reply"))
+    result = run(database.get_last_assistant_message(1))
+    assert result is None
+
+
+def test_replay_no_usable_response_stores_override_and_returns_safely(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    _full_pipeline_stub_set(monkeypatch)
+
+    fsm = FakeFSM()
+    msg = FakeMessage(FakeUser(1), "лень читать")
+    run(bot.pipeline(msg, "лень читать", fsm))
+    assert tts_calls["n"] == 0  # no empty/irrelevant voice ever synthesized
+    assert (run(fsm.get_data())).get("one_shot_voice_pending") is True
+
+
+# ── Runtime Safety Validator ordering — recorder mocks, not source-order ────
+
+def test_ordinary_voice_unsafe_draft_never_reaches_tts_fallback_does(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, response_format="voice"))
+    _full_pipeline_stub_set(monkeypatch, llm_text="an unsafe draft answer")
+
+    def spy_validate_ctx(response_text, user_text, risk, lang):
+        return False, "simulated rejection reason"
+    monkeypatch.setattr(bot, "validate_response_with_context", spy_validate_ctx)
+    synthesized = []
+    async def spy_synth(client_, text, lang):
+        synthesized.append(text)
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    monkeypatch.setattr(os, "remove", lambda p: None)
+
+    fsm = FakeFSM()
+    msg = FakeMessage(FakeUser(1), "Мне тревожно")
+    run(bot.pipeline(msg, "Мне тревожно", fsm))
+
+    assert len(synthesized) == 1
+    assert synthesized[0] != "an unsafe draft answer"  # the rejected draft never reaches TTS
+    assert "an unsafe draft answer" not in synthesized  # explicit, exact-value check
+
+
+def test_one_shot_voice_override_also_never_synthesizes_the_unsafe_draft(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    # response_format stays "text" (default) -- the ONE-SHOT override is what
+    # forces voice delivery here, exercising the other code path than the
+    # persistent-preference test above.
+    _full_pipeline_stub_set(monkeypatch, llm_text="an unsafe one-shot draft")
+
+    def spy_validate_ctx(response_text, user_text, risk, lang):
+        return False, "simulated rejection reason"
+    monkeypatch.setattr(bot, "validate_response_with_context", spy_validate_ctx)
+    synthesized = []
+    async def spy_synth(client_, text, lang):
+        synthesized.append(text)
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    monkeypatch.setattr(os, "remove", lambda p: None)
+
+    fsm = FakeFSM()
+    run(bot.pipeline(FakeMessage(FakeUser(1), "ответь голосом, мне тревожно"),
+                      "ответь голосом, мне тревожно", fsm))
+
+    assert len(synthesized) == 1
+    assert "an unsafe one-shot draft" not in synthesized
+
+
+def test_voice_and_concise_text_transformed_spoken_text_is_revalidated(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, response_format="voice_and_concise_text",
+                                          response_length="concise"))
+    long_answer = ("Одно предложение с важной мыслью. " * 20).strip()
+    _full_pipeline_stub_set(monkeypatch, llm_text=long_answer)
+    validated = []
+    def spy_validate(text, lang="ru"):
+        validated.append(text)
+        return True, None
+    synthesized = []
+    async def spy_synth(client_, text, lang):
+        synthesized.append(text)
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "validate_response", spy_validate)
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    monkeypatch.setattr(os, "remove", lambda p: None)
+
+    fsm = FakeFSM()
+    msg = FakeMessage(FakeUser(1), "Мне тревожно")
+    run(bot.pipeline(msg, "Мне тревожно", fsm))
+
+    assert len(validated) >= 1
+    assert synthesized == [validated[-1]]  # the LAST (revalidated) transform is what reaches TTS
+    assert long_answer not in synthesized
+
+
+# ── Direct crisis and dependency delivery proofs (voice+reactions enabled) ──
+
+def test_crisis_sends_visible_text_never_calls_tts_or_reaction_or_llm(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, response_format="voice"))
+
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="unused"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    reaction_calls = {"n": 0}
+    async def spy_react(**kw):
+        reaction_calls["n"] += 1
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
+    crisis_text_calls = []
+    async def spy_send_crisis(answer_fn, text, kb, lang, uid, eid, kind):
+        crisis_text_calls.append(text)
+        await answer_fn(text)
+    monkeypatch.setattr(bot, "send_crisis", spy_send_crisis)
+
+    fsm = FakeFSM()
+    msg = FakeMessage(FakeUser(1), "я хочу покончить с собой")
+    run(bot.pipeline(msg, "я хочу покончить с собой", fsm))
+
+    assert len(crisis_text_calls) == 1 and crisis_text_calls[0]  # visible crisis text sent, non-empty
+    assert msg.answers and msg.answers[0][0] == crisis_text_calls[0]
+    assert llm_calls["n"] == 0     # ordinary LLM never called
+    assert tts_calls["n"] == 0     # crisis is NEVER voice, in this or any future version
+    assert reaction_calls["n"] == 0  # no decorative reaction on a crisis message
+
+
+def test_dependency_redirect_never_calls_tts_reaction_or_second_ordinary_answer(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, response_format="voice"))
+    monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async("A soft, narrow redirect."))
+
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="unused"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    reaction_calls = {"n": 0}
+    async def spy_react(**kw):
+        reaction_calls["n"] += 1
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
+
+    fsm = FakeFSM()
+    msg = FakeMessage(FakeUser(1), "ты единственный кто меня понимает")
+    run(bot.pipeline(msg, "ты единственный кто меня понимает", fsm))
+
+    assert msg.answers == [("A soft, narrow redirect.", {})]  # exactly one plain-text redirect
+    assert llm_calls["n"] == 0
+    assert tts_calls["n"] == 0
+    assert reaction_calls["n"] == 0
+
+
+# ── /format chat-scope decision ─────────────────────────────────────────────
+# Chosen product contract: this entire bot has no ChatType filtering
+# anywhere (crisis/DASS/onboarding included -- confirmed by direct
+# inspection, not introduced by this PR) because it is architecturally a
+# personal, private 1:1 support bot (access_control's whole role model
+# assumes exactly one private chat per authorized user). /format and the
+# listen button inherit this same, pre-existing, whole-bot assumption
+# rather than adding a NEW, inconsistent chat-type restriction found nowhere
+# else in the codebase. Both are safe regardless of chat type by
+# construction: /format only ever writes callback.from_user.id's own
+# preference (no named target uid in its callback_data at all), and the
+# listen button's encoded owner-uid check fails closed on any mismatch.
+def test_format_select_only_ever_affects_the_tapping_users_own_preference(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.upsert_user(2, "u", "U"))
+    cb = FakeCallback(FakeUser(2), FakeMessage(FakeUser(1)), f"{bot._FMT_KB_VERSION}:format:voice")
+    run(bot.cb_format_select(cb))
+    prefs1 = run(database.get_response_preferences(1))
+    prefs2 = run(database.get_response_preferences(2))
+    assert prefs1["response_format"] == "text"   # message "owner" (user 1) unaffected
+    assert prefs2["response_format"] == "voice"  # only the TAPPING user (user 2) changed

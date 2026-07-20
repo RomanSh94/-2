@@ -863,15 +863,26 @@ async def get_recent_messages(uid: int, limit: int = 8) -> list:
             " ORDER BY id DESC LIMIT ?", (uid, limit))
         rows = await cur.fetchall(); rows.reverse(); return rows
 
-async def get_last_assistant_message(uid: int) -> str | None:
-    """The most recent assistant reply, from the EXISTING bounded
-    conversation memory (messages table, already written by save_message on
-    every ordinary reply) -- Voice and Adaptive Response UX reuses this for
-    "voice-ify the last answer" (much-text/lazy-to-read/listen button)
-    instead of persisting the answer a second time anywhere."""
+async def get_last_assistant_message(uid: int, max_age_hours: int = 6) -> str | None:
+    """The most recent assistant reply, scoped to the CURRENT active
+    conversation -- reusing two EXISTING mechanisms, not a new table or a
+    new session-identity concept:
+      * summarized=0 -- memory.py's own existing definition of "still in
+        the rolling context window"; once maybe_summarize compresses a
+        message, no other part of this codebase treats it as current
+        conversation either.
+      * a bounded recency window -- a long-idle user's very next message
+        must never replay a months-old reply as if it were just said.
+    role='assistant' alone already excludes crisis/admin/error text: those
+    paths never call save_message(uid, "assistant", ...) at all (confirmed
+    by direct inspection -- crisis only ever saves the user's own message;
+    only ordinary validated LLM replies and the deterministic disambiguation
+    clarifying question are ever persisted this way)."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             "SELECT content FROM messages WHERE user_id=? AND role='assistant'"
+            " AND summarized=0 AND content != ''"
+            f" AND created_at > datetime('now', '-{int(max_age_hours)} hours')"
             " ORDER BY id DESC LIMIT 1", (uid,))
         row = await cur.fetchone()
     return row[0] if row else None

@@ -813,6 +813,25 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # answer is affected. A PURE command never enters therapeutic routing.
     one_shot_voice = False
     one_shot_concise = False
+
+    # Consume a one-shot voice override armed by a PRIOR Telegram update (see
+    # the "no previous response yet" branch below) -- a plain local variable
+    # cannot survive past the end of THIS function call, so the override is
+    # persisted in FSM state, which aiogram scopes per (user, chat) and which
+    # already threads through this function as `fsm_state`. Cleared the
+    # instant it is read: it can apply to at most ONE subsequent ordinary
+    # reply, is never written to the DB, and is never a permanent
+    # preference. Crisis and dependency both return earlier in pipeline()
+    # than this point, so an intervening crisis/dependency message leaves an
+    # armed override untouched -- PRESERVED for the next ordinary message,
+    # the chosen deterministic rule (not silently dropped, not consumed by
+    # a non-ordinary reply).
+    if config.VOICE_REPLIES_ENABLED and fsm_state is not None:
+        pending = await fsm_state.get_data()
+        if pending.get("one_shot_voice_pending"):
+            one_shot_voice = True
+            await fsm_state.update_data(one_shot_voice_pending=False)
+
     fmt_cmd = parse_format_command(user_text, lang) if config.VOICE_REPLIES_ENABLED else None
     if fmt_cmd:
         if fmt_cmd.kind == "voice_persistent":
@@ -841,8 +860,16 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 if not ok:
                     await message.answer(last)
                 return
-            # else: no previous response -- fall through with one_shot_voice
-            # already armed, applied to the NEXT ordinary reply below.
+            # No previous response to voice-ify: this message itself must
+            # NEVER be treated as therapeutic content (it is a meta-command,
+            # not a disclosure). Arm the override for the NEXT ordinary
+            # reply (consumed above, on that future update) and stop here.
+            if fsm_state is not None:
+                await fsm_state.update_data(one_shot_voice_pending=True)
+            await message.answer(
+                "Хорошо, следующий ответ озвучу." if lang == "ru"
+                else "Okay, I'll voice the next reply.")
+            return
         elif pure and fmt_cmd.kind in ("concise_oneshot", "detailed_oneshot"):
             await message.answer(_format_ack_text(fmt_cmd, lang))
             return
