@@ -235,6 +235,41 @@ _reaction_last_sent: dict[int, float] = {}
 _listen_last_tap: dict[int, float] = {}
 
 
+# Legacy reply-keyboard eviction (UX defect found during the owner canary).
+#
+# Before commit 214ba15 the mood entry was a ReplyKeyboardMarkup(6 rows,
+# one_time_keyboard=True); it is now an InlineKeyboardMarkup. But a Telegram
+# reply keyboard lives CLIENT-SIDE and survives indefinitely -- switching the
+# bot to inline does not retract it, and one_time_keyboard only collapses it
+# (the user can re-open it from the input field, and several clients re-expand
+# it on their own). So every account that used the bot before that commit
+# still carries the old 6-row keyboard, which covers a large part of the
+# screen and makes ordinary typing awkward. Only two rarely-reached call
+# sites (/help, the post-practice rating) ever sent ReplyKeyboardRemove, so
+# an ordinary "/start -> talk" session never cleared it.
+#
+# Fix: piggy-back a ReplyKeyboardRemove on the FIRST ordinary reply we send
+# each user, then never again. deliver_response is the single shared delivery
+# point, so one insertion covers all three required triggers -- choosing an
+# emotion (cb_mood -> pipeline), typing free text, and sending a voice
+# message (handle_voice -> pipeline). No extra message is sent, no visible
+# change for users who never had the legacy keyboard, and no DB schema.
+#
+# In-memory set (same convention as _reaction_last_sent/_listen_last_tap): a
+# restart simply re-sends one harmless no-op removal per user. Nothing in the
+# current codebase constructs a ReplyKeyboardMarkup at all, so this can never
+# retract a keyboard some other live flow still needs.
+_legacy_kb_cleared: set[int] = set()
+
+
+def _legacy_kb_removal(uid: int):
+    """ReplyKeyboardRemove exactly once per user per process, else None."""
+    if uid in _legacy_kb_cleared:
+        return None
+    _legacy_kb_cleared.add(uid)
+    return ReplyKeyboardRemove()
+
+
 def _voice_ux_enabled_for(uid: int) -> bool:
     return (
         config.VOICE_REPLIES_ENABLED
@@ -361,7 +396,7 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
     message reach the format-command/override code at all."""
     is_private = getattr(message.chat, "type", "private") == "private"
     if not _voice_ux_enabled_for(uid) or not is_private:
-        await message.answer(answer)
+        await message.answer(answer, reply_markup=_legacy_kb_removal(uid))
         return
 
     prefs = await get_response_preferences(uid)
@@ -389,13 +424,38 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
 async def _maybe_react(message: Message, uid: int, category: ReactionCategory,
                         confidence: float) -> None:
     """Best-effort Telegram message reaction -- never blocks or delays the
-    actual response, never raises, never persists `category` anywhere."""
+    actual response, never raises, never persists `category` anywhere.
+
+    Emits a privacy-safe decision line so a canary is diagnosable without
+    reading anyone's chat: category, confidence and a fixed skip-reason
+    token only. Never the message text, the response, the transcript, the
+    username or the Telegram user id -- during the owner canary the silent
+    outcome was indistinguishable from a broken flag, which is exactly what
+    this makes visible. _log is deliberately exception-proof: observability
+    must never be able to affect text delivery."""
+    def _log(decision: str, reason: str = "-") -> None:
+        try:
+            print(f"[reaction] decision={decision} reason={reason} "
+                  f"category={category.value} confidence={confidence:.2f}")
+        except Exception:
+            pass
+
     if not _reactions_enabled_for(uid):
+        _log("skipped", "not_authorized")
         return
-    if category == ReactionCategory.NONE or confidence < config.EMOTIONAL_REACTION_MIN_CONFIDENCE:
+    if category == ReactionCategory.NONE:
+        _log("skipped", "no_match")
         return
+    if confidence < config.EMOTIONAL_REACTION_MIN_CONFIDENCE:
+        _log("skipped", "low_confidence")
+        return
+    # NOTE: deliberately no chat-type gate here. Reactions have never been
+    # private-chat-only (unlike Voice UX), and narrowing that now would be an
+    # unrequested behavior change -- see
+    # test_owner_gate_reactions_owner_in_group_unaffected.
     now = time.time()
     if now - _reaction_last_sent.get(uid, 0) < config.EMOTIONAL_REACTION_COOLDOWN_SECONDS:
+        _log("skipped", "cooldown")
         return
     try:
         chat = await bot.get_chat(message.chat.id)
@@ -404,13 +464,15 @@ async def _maybe_react(message: Message, uid: int, category: ReactionCategory,
             available = [r.emoji for r in chat.available_reactions if hasattr(r, "emoji")]
         emoji = pick_supported_emoji(category, available)
         if not emoji:
+            _log("skipped", "unsupported_in_chat")
             return
         await bot.set_message_reaction(
             chat_id=message.chat.id, message_id=message.message_id,
             reaction=[ReactionTypeEmoji(emoji=emoji)])
         _reaction_last_sent[uid] = now
+        _log("selected", "sent")
     except Exception as e:
-        print(f"[reaction] uid={uid}: {type(e).__name__}")
+        _log("failed", type(e).__name__)
 
 # ────────────────────────────────────────────────────────────────────────────
 

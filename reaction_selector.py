@@ -76,8 +76,29 @@ _KEYWORDS: dict[str, dict[ReactionCategory, tuple[str, ...]]] = {
         ReactionCategory.GRATITUDE_OR_WARMTH: (
             "спасибо", "благодарю", "признательн",
         ),
+        # Owner-canary finding: the ordinary phrases actually sent live
+        # ("сегодня мне немного тревожно...", "я очень устал...") matched
+        # nothing here AND produced no risk category, so the selector
+        # correctly returned NONE and no reaction ever appeared. The
+        # risk-category fallbacks below only fire on panic/burnout-level
+        # signals; everyday, sub-clinical wording never reaches them. These
+        # stems close that gap without widening the emotional claim -- a
+        # reaction stays a transient acknowledgement, never an assessment.
+        #
+        # Stems, not whole words, so ordinary inflections cost one entry
+        # each: "тревож" covers тревожно/тревожусь/тревога/тревожный,
+        # "устал" covers устал/устала, "расстроен" covers расстроен(а).
+        # Both stems are needed: the "тревож-" forms (тревожно/тревожусь/
+        # тревожный) and the "тревог-" forms (тревога/тревогу/тревоге) do not
+        # share a common prefix beyond "трево".
+        ReactionCategory.ANXIETY_OR_WORRY: (
+            "тревож", "тревог", "переживаю", "беспокоюсь", "волнуюсь",
+        ),
+        ReactionCategory.EXHAUSTION_OR_OVERWHELM: (
+            "устал", "вымотан", "измотан", "нет сил",
+        ),
         ReactionCategory.SADNESS_OR_DISAPPOINTMENT: (
-            "мне грустно", "обидно", "разочаров", "как жаль",
+            "мне грустно", "обидно", "разочаров", "как жаль", "расстроен",
         ),
         ReactionCategory.CONFUSION_OR_UNCERTAINTY: (
             "не знаю что делать", "запуталась", "запутался", "совсем не понимаю",
@@ -97,8 +118,14 @@ _KEYWORDS: dict[str, dict[ReactionCategory, tuple[str, ...]]] = {
         ReactionCategory.GRATITUDE_OR_WARMTH: (
             "thank you", "thanks so much", "so grateful", "i appreciate",
         ),
+        ReactionCategory.ANXIETY_OR_WORRY: (
+            "anxious", "worried", "nervous about", "stressed about",
+        ),
+        ReactionCategory.EXHAUSTION_OR_OVERWHELM: (
+            "exhausted", "so tired", "worn out", "no energy left",
+        ),
         ReactionCategory.SADNESS_OR_DISAPPOINTMENT: (
-            "so sad", "really disappointed", "bums me out",
+            "so sad", "really disappointed", "bums me out", "upset",
         ),
         ReactionCategory.CONFUSION_OR_UNCERTAINTY: (
             "don't know what to do", "so confused", "i don't understand any of this",
