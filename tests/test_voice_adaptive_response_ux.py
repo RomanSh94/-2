@@ -86,6 +86,16 @@ def _async(value=None):
     return _f
 
 
+def _no_voice_ux_markup(kw) -> bool:
+    """No Voice-UX keyboard (listen button / format selector) was attached.
+
+    A plain ordinary reply may still legitimately carry a ReplyKeyboardRemove
+    -- the one-shot eviction of the pre-214ba15 legacy reply keyboard (see
+    bot._legacy_kb_removal), which adds no visible UI. Only an
+    InlineKeyboardMarkup would mean a Voice-UX control leaked in."""
+    return not isinstance(kw.get("reply_markup"), bot.InlineKeyboardMarkup)
+
+
 @pytest.fixture
 def tmp_db(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB", str(tmp_path / "t.db"))
@@ -113,6 +123,10 @@ def _voice_flags_off(monkeypatch):
     dm._night_msgs.clear()
     dm._night_date.clear()
     dm._last_redirect.clear()
+    # Legacy reply-keyboard eviction is also module-level, once-per-user state
+    # (see bot._legacy_kb_removal). Reset it so each test starts from a fresh
+    # user and no test observes another test's eviction.
+    bot._legacy_kb_cleared.clear()
 
 
 # Note: access_control.OWNER_USER_ID already defaults to 1 for every test in
@@ -131,10 +145,16 @@ def test_both_flags_default_false_from_env():
     # are exercised directly via the autouse fixture's explicit False too.
 
 
-def test_deliver_response_flag_off_is_byte_identical_to_prior_behavior(tmp_db, monkeypatch):
+def test_deliver_response_flag_off_sends_plain_text_with_no_voice_ux_markup(tmp_db, monkeypatch):
+    # Formerly asserted a byte-identical empty kwargs dict. The ordinary
+    # reply now also carries a one-shot ReplyKeyboardRemove that evicts the
+    # pre-214ba15 legacy reply keyboard (an owner-requested UX fix; no
+    # visible UI). What this test exists to prove is unchanged and still
+    # asserted: flag off => plain text, no voice, no Voice-UX keyboard.
     msg = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(msg, 1, "the answer", "ru"))
-    assert msg.answers == [("the answer", {})]
+    assert [a[0] for a in msg.answers] == ["the answer"]
+    assert _no_voice_ux_markup(msg.answers[0][1])
     assert msg.voices == []
 
 
@@ -1944,7 +1964,8 @@ def test_listen_button_not_attached_in_group_chat(tmp_db, monkeypatch):
     run(database.set_response_preference(1, response_format="text"))
     msg = FakeMessage(FakeUser(1), "", chat_type="group")
     run(bot.deliver_response(msg, 1, "an ordinary answer", "ru"))
-    assert msg.answers == [("an ordinary answer", {})]  # no reply_markup at all
+    assert [a[0] for a in msg.answers] == ["an ordinary answer"]
+    assert _no_voice_ux_markup(msg.answers[0][1])  # no listen button in a group
 
 
 def test_listen_callback_fails_closed_in_group_chat(tmp_db, monkeypatch):
@@ -2031,7 +2052,8 @@ def test_mixed_message_in_group_preserves_ordinary_behavior_ignores_format_fragm
     run(bot.pipeline(msg, text, fsm))
 
     assert tts_calls["n"] == 0                      # format fragment ignored -- no voice
-    assert msg.answers == [("an ordinary group reply", {})]  # ordinary reply, plain text
+    assert [a[0] for a in msg.answers] == ["an ordinary group reply"]
+    assert _no_voice_ux_markup(msg.answers[0][1])  # ordinary reply, plain text
     prefs = run(database.get_response_preferences(1))
     assert prefs["response_format"] == "text"        # untouched
 
@@ -2174,7 +2196,8 @@ def test_mixed_persistent_command_in_group_delivers_ordinary_text_ignores_prefer
     run(bot.pipeline(msg, text, fsm))
 
     assert tts_calls["n"] == 0
-    assert msg.answers == [("an ordinary group reply", {})]  # plain text, ordinary reply
+    assert [a[0] for a in msg.answers] == ["an ordinary group reply"]
+    assert _no_voice_ux_markup(msg.answers[0][1])  # plain text, ordinary reply
     prefs = run(database.get_response_preferences(1))
     assert prefs["response_format"] == "text"  # never modified by the persistent fragment
     data = run(fsm.get_data())
@@ -2235,7 +2258,8 @@ def test_owner_gate_voice_non_owner_stays_text_only_even_with_saved_voice_pref(t
     monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
     msg = FakeMessage(FakeUser(2), "hi")
     run(bot.deliver_response(msg, 2, "an ordinary answer", "ru"))
-    assert msg.answers == [("an ordinary answer", {})]  # no listen button either
+    assert [a[0] for a in msg.answers] == ["an ordinary answer"]
+    assert _no_voice_ux_markup(msg.answers[0][1])  # no listen button either
     assert msg.voices == []
     assert tts_calls["n"] == 0
 
@@ -2254,7 +2278,8 @@ def test_owner_gate_voice_missing_owner_id_disables_for_everyone(tmp_db, monkeyp
     monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
     msg = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(msg, 1, "an ordinary answer", "ru"))
-    assert msg.answers == [("an ordinary answer", {})]
+    assert [a[0] for a in msg.answers] == ["an ordinary answer"]
+    assert _no_voice_ux_markup(msg.answers[0][1])
     assert tts_calls["n"] == 0
 
 
@@ -2372,3 +2397,202 @@ def test_owner_gate_reactions_owner_in_group_unaffected(tmp_db, monkeypatch):
     msg = FakeMessage(FakeUser(1), "x", chat_type="group")
     run(bot._maybe_react(msg, 1, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))
     assert len(calls) == 1
+
+
+# ── Owner-canary defect fixes: legacy reply keyboard + reaction coverage ────
+# Two live defects found during the Phase B owner canary on 29d2fe8:
+#   1. a pre-214ba15 ReplyKeyboardMarkup survived CLIENT-SIDE and obscured
+#      the chat, because nothing in an ordinary session ever retracted it;
+#   2. every ordinary phrase the owner sent selected NONE, so no reaction
+#      could ever appear (the flag and the owner gate were both correct).
+
+def test_first_ordinary_reply_carries_reply_keyboard_removal(tmp_db, monkeypatch):
+    # Covers the three required triggers at once: deliver_response is the
+    # single shared delivery point for a chosen emotion (cb_mood -> pipeline),
+    # ordinary free text, and an incoming voice message (handle_voice ->
+    # pipeline), so one removal here retracts the legacy keyboard for all.
+    bot._legacy_kb_cleared.clear()
+    run(database.upsert_user(1, "u", "U"))
+    msg = FakeMessage(FakeUser(1), "hi")
+    run(bot.deliver_response(msg, 1, "an ordinary answer", "ru"))
+    assert msg.answers[0][0] == "an ordinary answer"
+    assert isinstance(msg.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
+
+
+def test_reply_keyboard_removal_is_sent_only_once_per_user(tmp_db, monkeypatch):
+    # It must not ride on every answer -- once the client-side keyboard is
+    # gone, repeating the removal is pure noise.
+    bot._legacy_kb_cleared.clear()
+    run(database.upsert_user(1, "u", "U"))
+    first = FakeMessage(FakeUser(1), "hi")
+    run(bot.deliver_response(first, 1, "first", "ru"))
+    second = FakeMessage(FakeUser(1), "hi again")
+    run(bot.deliver_response(second, 1, "second", "ru"))
+    assert isinstance(first.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
+    assert second.answers[0][1].get("reply_markup") is None
+
+
+def test_reply_keyboard_removal_is_per_user_not_global(tmp_db, monkeypatch):
+    bot._legacy_kb_cleared.clear()
+    run(database.upsert_user(1, "u", "U"))
+    run(database.upsert_user(2, "u", "U"))
+    a = FakeMessage(FakeUser(1), "hi")
+    run(bot.deliver_response(a, 1, "for a", "ru"))
+    b = FakeMessage(FakeUser(2), "hi")
+    run(bot.deliver_response(b, 2, "for b", "ru"))
+    assert isinstance(a.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
+    assert isinstance(b.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
+
+
+def test_mood_entry_is_inline_and_reply_keyboard_never_reintroduced():
+    # The emotion choices must stay attached to their own message (inline) so
+    # they can never occupy the user's text-input keyboard area again.
+    kb = bot._mood_entry_keyboard("ru", ["a", "b"])
+    assert isinstance(kb, bot.InlineKeyboardMarkup)
+    # bot.py must not even import ReplyKeyboardMarkup -- it cannot construct
+    # one it never bound. (Asserting on getsource would match this file's own
+    # explanatory comments about the legacy keyboard.)
+    assert not hasattr(bot, "ReplyKeyboardMarkup")
+
+
+def test_emotion_selection_removes_menu_and_does_not_duplicate_it(tmp_db, monkeypatch):
+    # Choosing an emotion retracts its own inline menu exactly once and does
+    # not re-render a second mood card.
+    run(database.upsert_user(1, "u", "U"))
+    edits = []
+    class _Msg(FakeMessage):
+        async def edit_reply_markup(self, reply_markup=None):
+            edits.append(reply_markup)
+    monkeypatch.setattr(bot, "pipeline", _async(None))
+    msg = _Msg(FakeUser(1), "greeting")
+    run(bot.cb_mood(FakeCallback(FakeUser(1), msg, "mood:0"), FakeFSM()))
+    assert edits == [None]      # menu retracted exactly once
+    assert msg.answers == []    # no duplicate mood card re-sent
+
+
+# ── Reaction selector: the exact phrases sent during the live canary ───────
+
+@pytest.mark.parametrize("phrase,expected", [
+    ("Сегодня я сильно тревожусь из-за важной рабочей задачи.",
+     rs.ReactionCategory.ANXIETY_OR_WORRY),
+    ("Сегодня мне немного тревожно из-за обычной рабочей задачи.",
+     rs.ReactionCategory.ANXIETY_OR_WORRY),
+    ("Я немного расстроен после тяжёлого дня.",
+     rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT),
+    ("Я очень устал после сложного дня.",
+     rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM),
+])
+def test_live_canary_phrases_now_select_an_eligible_reaction(phrase, expected):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert cat == expected
+    assert conf >= config.EMOTIONAL_REACTION_MIN_CONFIDENCE
+    assert rs.pick_supported_emoji(cat, None) is not None
+
+
+@pytest.mark.parametrize("phrase", [
+    "Расскажи коротко, как работает этот бот.",
+    "Во сколько ты обычно присылаешь напоминания?",
+])
+def test_neutral_phrases_still_select_no_reaction(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert cat == rs.ReactionCategory.NONE
+    assert conf == 0.0
+
+
+def test_new_stems_cover_ordinary_inflections():
+    for phrase in ("мне тревожно", "я тревожусь", "чувствую тревогу"):
+        assert rs.select_reaction_category(phrase, [], "OPEN", "ru")[0] == \
+            rs.ReactionCategory.ANXIETY_OR_WORRY
+    for phrase in ("я устал", "я устала"):
+        assert rs.select_reaction_category(phrase, [], "OPEN", "ru")[0] == \
+            rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM
+    for phrase in ("я расстроен", "я расстроена"):
+        assert rs.select_reaction_category(phrase, [], "OPEN", "ru")[0] == \
+            rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT
+
+
+def test_new_keywords_never_override_crisis_or_dependency():
+    # An anxiety/exhaustion stem riding along with a crisis signal must still
+    # yield NONE -- safety precedence is unchanged by the widened vocabulary.
+    assert rs.select_reaction_category(
+        "мне очень тревожно и я не хочу жить", ["suicide"],
+        "ACUTE_DISTRESS", "ru") == (rs.ReactionCategory.NONE, 0.0)
+    assert rs.select_reaction_category(
+        "я устал", [], "OPEN", "ru",
+        is_dependency_redirect=True) == (rs.ReactionCategory.NONE, 0.0)
+    assert rs.select_reaction_category(
+        "я устал", [], "OPEN", "ru",
+        is_meta_command=True) == (rs.ReactionCategory.NONE, 0.0)
+
+
+def test_english_variants_select_expected_categories():
+    for phrase, expected in (
+        ("i feel anxious about tomorrow", rs.ReactionCategory.ANXIETY_OR_WORRY),
+        ("i am exhausted after today", rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM),
+    ):
+        cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "en")
+        assert cat == expected
+        assert conf >= config.EMOTIONAL_REACTION_MIN_CONFIDENCE
+
+
+# ── Privacy-safe reaction observability ───────────────────────────────────
+
+def _capture_reaction_logs(monkeypatch):
+    lines = []
+    def fake_print(*a, **kw):
+        text = " ".join(str(x) for x in a)
+        if text.startswith("[reaction]"):
+            lines.append(text)
+    monkeypatch.setattr("builtins.print", fake_print)
+    return lines
+
+
+def test_reaction_log_records_skip_reason_without_user_data(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    lines = _capture_reaction_logs(monkeypatch)
+    msg = FakeMessage(FakeUser(1), "секретный текст пользователя")
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.NONE, 0.0))
+    assert any("decision=skipped" in l and "reason=no_match" in l for l in lines)
+    joined = " ".join(lines)
+    assert "секретный текст пользователя" not in joined   # no message text
+    assert "uid=" not in joined and "username" not in joined  # no identity
+
+
+def test_reaction_log_records_low_confidence_then_selected_then_cooldown(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    async def fake_get_chat(chat_id):
+        return types.SimpleNamespace(available_reactions=None)
+    monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
+    monkeypatch.setattr(bot.bot, "set_message_reaction", _async(None))
+    lines = _capture_reaction_logs(monkeypatch)
+    msg = FakeMessage(FakeUser(1), "x")
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.ANXIETY_OR_WORRY, 0.1))
+    assert any("reason=low_confidence" in l for l in lines)
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.ANXIETY_OR_WORRY, 0.9))
+    assert any("decision=selected" in l for l in lines)
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.ANXIETY_OR_WORRY, 0.9))
+    assert any("reason=cooldown" in l for l in lines)
+
+
+def test_reaction_failure_never_blocks_and_records_error_class(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    async def fake_get_chat(chat_id):
+        return types.SimpleNamespace(available_reactions=None)
+    async def boom(**kw):
+        raise RuntimeError("telegram down")
+    monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
+    monkeypatch.setattr(bot.bot, "set_message_reaction", boom)
+    lines = _capture_reaction_logs(monkeypatch)
+    msg = FakeMessage(FakeUser(1), "x")
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.ANXIETY_OR_WORRY, 0.9))  # must not raise
+    assert any("decision=failed" in l and "RuntimeError" in l for l in lines)
+
+
+def test_reaction_logging_failure_does_not_affect_delivery(tmp_db, monkeypatch):
+    # Observability must never be able to break the response path.
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    def exploding_print(*a, **kw):
+        raise OSError("stdout gone")
+    monkeypatch.setattr("builtins.print", exploding_print)
+    msg = FakeMessage(FakeUser(1), "x")
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.NONE, 0.0))  # must not raise
