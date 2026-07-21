@@ -1044,6 +1044,92 @@ def test_crisis_text_transcribed_from_voice_triggers_the_same_crisis_path(tmp_db
     assert calls["n"] == 1  # the identical deterministic crisis path fires regardless of input source
 
 
+# ── Product correction: incoming voice/STT is for ALL users with normal ────
+# product access -- the owner-only gate applies ONLY to OUTGOING Voice UX
+# (TTS, /format, listen button, reactions), never to receiving/transcribing
+# an incoming voice message. handle_voice itself (registered via
+# @dp.message(F.voice), see above) was already, and remains, completely
+# unconditional -- the owner gate only narrows the voice_language STT-hint
+# lookup (defense in depth), never whether transcription/pipeline entry
+# happens at all. These two tests lock that in end to end for a non-owner.
+
+@pytest.mark.parametrize("voice_flag", [True, False])
+def test_non_owner_incoming_voice_still_transcribes_and_replies_text_only(tmp_db, monkeypatch, voice_flag):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", voice_flag)
+    run(database.upsert_user(2, "u", "U"))
+    run(database.grant_user_access(2))  # "normal product access", non-owner
+    run(database.set_response_preference(2, response_format="voice"))  # must have zero effect
+
+    transcribe_calls = {"n": 0}
+    async def fake_transcribe(voice, bot_, client_, lang):
+        transcribe_calls["n"] += 1
+        return "мне грустно сегодня"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    async def fake_create(*a, **kw):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="ordinary text reply"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", fake_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+
+    fsm = FakeFSM()
+    msg = _voice_msg(FakeUser(2))
+    run(bot.handle_voice(msg, fsm))
+
+    assert transcribe_calls["n"] == 1
+    assert msg.answers[0][0] == "🎤 <i>мне грустно сегодня</i>"  # exact transcript, unaltered
+    assert msg.answers[-1][0] == "ordinary text reply"  # ordinary pipeline ran through to a text reply
+    assert tts_calls["n"] == 0
+    assert msg.voices == []
+    data = run(fsm.get_data())
+    assert not data.get("last_delivered_response")  # no owner-only replay state written/exposed
+
+
+def test_non_owner_incoming_voice_crisis_reaches_visible_crisis_text(tmp_db, monkeypatch):
+    # Crisis detection/delivery is never gated by role or access (see
+    # access_control.py's own module docstring) -- confirms that holds when
+    # the crisis signal arrives via a non-owner's TRANSCRIBED voice too.
+    run(database.upsert_user(2, "u", "U"))
+    run(database.grant_user_access(2))
+
+    async def fake_transcribe(voice, bot_, client_, lang):
+        return "я хочу покончить с собой"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="unused"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    reaction_calls = {"n": 0}
+    async def spy_react(**kw):
+        reaction_calls["n"] += 1
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
+    crisis_text_calls = []
+    async def spy_send_crisis(answer_fn, text, kb, lang, uid, eid, kind):
+        crisis_text_calls.append(text)
+        await answer_fn(text)
+    monkeypatch.setattr(bot, "send_crisis", spy_send_crisis)
+
+    fsm = FakeFSM()
+    msg = _voice_msg(FakeUser(2))
+    run(bot.handle_voice(msg, fsm))
+
+    assert len(crisis_text_calls) == 1 and crisis_text_calls[0]
+    assert msg.answers[-1][0] == crisis_text_calls[0]  # visible crisis text sent
+    assert llm_calls["n"] == 0
+    assert tts_calls["n"] == 0
+    assert reaction_calls["n"] == 0
+
+
 # ── One-shot voice override lifetime — real sequential updates (P1 fix) ────
 # The override must survive across SEPARATE bot.pipeline() invocations
 # sharing the same FakeFSM object (simulating separate Telegram updates for
