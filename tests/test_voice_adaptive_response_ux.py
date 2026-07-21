@@ -100,6 +100,25 @@ def _voice_flags_off(monkeypatch):
     monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", False)
     bot._reaction_last_sent.clear()
     bot._listen_last_tap.clear()
+    # dependency_monitor (bot.py) is a module-level singleton that persists
+    # in-memory message counts/timestamps for the whole pytest process. Now
+    # that the owner-only gate concentrates every owner-requiring test onto
+    # the same uid=1 (see _default_owner below), enough real pipeline() runs
+    # in sequence can cross the >100-messages/24h threshold and silently
+    # replace an unrelated test's expected output with a high-frequency
+    # redirect. Reset per test so no test observes another test's traffic.
+    dm = bot.dependency_monitor
+    dm._timestamps.clear()
+    dm._session_start.clear()
+    dm._night_msgs.clear()
+    dm._night_date.clear()
+    dm._last_redirect.clear()
+
+
+# Note: access_control.OWNER_USER_ID already defaults to 1 for every test in
+# this file via the pre-existing _access_env autouse fixture (below, in the
+# "incoming voice" section) -- that fixture, not a new one, is why uid=1 is
+# this file's default owner for the new owner-only gate too.
 
 
 # ── §19 Feature flags ────────────────────────────────────────────────────────
@@ -526,6 +545,7 @@ def test_deliver_response_never_imported_by_crisis_modules():
 
 def test_listen_button_synthesizes_exact_displayed_text(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 42)
     seen = {}
     async def fake_synth(target, uid, text, lang):
         seen["text"] = text
@@ -546,6 +566,9 @@ def test_listen_button_no_new_llm_call():
 
 def test_listen_button_cross_user_fails_closed(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 99)  # attacker must ALSO pass the owner gate here,
+    # so this proves the cross-user encoded-uid check itself fails closed --
+    # not merely "the attacker is a non-owner" (a different, already-covered case)
     calls = {"n": 0}
     async def fake_synth(*a, **kw):
         calls["n"] += 1
@@ -575,6 +598,7 @@ def test_listen_button_malformed_callback_fails_closed(tmp_db, monkeypatch):
 
 def test_listen_button_repeated_tap_is_rate_limited(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 7)
     calls = {"n": 0}
     async def fake_synth(*a, **kw):
         calls["n"] += 1
@@ -677,6 +701,7 @@ def test_cooldown_per_user_and_cross_user_isolation(tmp_db, monkeypatch):
     msg_a = FakeMessage(FakeUser(1), "x")
     run(bot._maybe_react(msg_a, 1, rs.ReactionCategory.RELIEF_OR_CALM, 0.9))
     run(bot._maybe_react(msg_a, 1, rs.ReactionCategory.RELIEF_OR_CALM, 0.9))  # cooldown blocks
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 2)  # only one owner uid at a time -- re-patch for user 2
     msg_b = FakeMessage(FakeUser(2), "x")
     run(bot._maybe_react(msg_b, 2, rs.ReactionCategory.RELIEF_OR_CALM, 0.9))  # different user, unaffected
     assert len(calls) == 2  # user 1 once, user 2 once -- never blocked by user 1's cooldown
@@ -684,6 +709,7 @@ def test_cooldown_per_user_and_cross_user_isolation(tmp_db, monkeypatch):
 
 def test_at_most_one_reaction_per_call(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 5)
     calls = []
     async def fake_get_chat(chat_id):
         return types.SimpleNamespace(available_reactions=None)
@@ -1018,6 +1044,92 @@ def test_crisis_text_transcribed_from_voice_triggers_the_same_crisis_path(tmp_db
     assert calls["n"] == 1  # the identical deterministic crisis path fires regardless of input source
 
 
+# ── Product correction: incoming voice/STT is for ALL users with normal ────
+# product access -- the owner-only gate applies ONLY to OUTGOING Voice UX
+# (TTS, /format, listen button, reactions), never to receiving/transcribing
+# an incoming voice message. handle_voice itself (registered via
+# @dp.message(F.voice), see above) was already, and remains, completely
+# unconditional -- the owner gate only narrows the voice_language STT-hint
+# lookup (defense in depth), never whether transcription/pipeline entry
+# happens at all. These two tests lock that in end to end for a non-owner.
+
+@pytest.mark.parametrize("voice_flag", [True, False])
+def test_non_owner_incoming_voice_still_transcribes_and_replies_text_only(tmp_db, monkeypatch, voice_flag):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", voice_flag)
+    run(database.upsert_user(2, "u", "U"))
+    run(database.grant_user_access(2))  # "normal product access", non-owner
+    run(database.set_response_preference(2, response_format="voice"))  # must have zero effect
+
+    transcribe_calls = {"n": 0}
+    async def fake_transcribe(voice, bot_, client_, lang):
+        transcribe_calls["n"] += 1
+        return "мне грустно сегодня"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    async def fake_create(*a, **kw):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="ordinary text reply"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", fake_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+
+    fsm = FakeFSM()
+    msg = _voice_msg(FakeUser(2))
+    run(bot.handle_voice(msg, fsm))
+
+    assert transcribe_calls["n"] == 1
+    assert msg.answers[0][0] == "🎤 <i>мне грустно сегодня</i>"  # exact transcript, unaltered
+    assert msg.answers[-1][0] == "ordinary text reply"  # ordinary pipeline ran through to a text reply
+    assert tts_calls["n"] == 0
+    assert msg.voices == []
+    data = run(fsm.get_data())
+    assert not data.get("last_delivered_response")  # no owner-only replay state written/exposed
+
+
+def test_non_owner_incoming_voice_crisis_reaches_visible_crisis_text(tmp_db, monkeypatch):
+    # Crisis detection/delivery is never gated by role or access (see
+    # access_control.py's own module docstring) -- confirms that holds when
+    # the crisis signal arrives via a non-owner's TRANSCRIBED voice too.
+    run(database.upsert_user(2, "u", "U"))
+    run(database.grant_user_access(2))
+
+    async def fake_transcribe(voice, bot_, client_, lang):
+        return "я хочу покончить с собой"
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="unused"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    reaction_calls = {"n": 0}
+    async def spy_react(**kw):
+        reaction_calls["n"] += 1
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
+    crisis_text_calls = []
+    async def spy_send_crisis(answer_fn, text, kb, lang, uid, eid, kind):
+        crisis_text_calls.append(text)
+        await answer_fn(text)
+    monkeypatch.setattr(bot, "send_crisis", spy_send_crisis)
+
+    fsm = FakeFSM()
+    msg = _voice_msg(FakeUser(2))
+    run(bot.handle_voice(msg, fsm))
+
+    assert len(crisis_text_calls) == 1 and crisis_text_calls[0]
+    assert msg.answers[-1][0] == crisis_text_calls[0]  # visible crisis text sent
+    assert llm_calls["n"] == 0
+    assert tts_calls["n"] == 0
+    assert reaction_calls["n"] == 0
+
+
 # ── One-shot voice override lifetime — real sequential updates (P1 fix) ────
 # The override must survive across SEPARATE bot.pipeline() invocations
 # sharing the same FakeFSM object (simulating separate Telegram updates for
@@ -1119,6 +1231,8 @@ def test_override_is_isolated_per_user_fsm(tmp_db, monkeypatch):
     assert (run(fsm_a.get_data())).get("one_shot_voice_pending") is True
     assert (run(fsm_b.get_data())).get("one_shot_voice_pending") is not True
 
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 2)  # B must also pass the owner gate, so this
+    # proves genuine FSM isolation, not merely "B is a non-owner"
     msg_b = FakeMessage(FakeUser(2), "Мне грустно")
     run(bot.pipeline(msg_b, "Мне грустно", fsm_b))  # user B, unrelated FSM
     assert voiced == []              # B never had an override armed -- default text, no voice
@@ -1510,6 +1624,8 @@ def test_one_shot_override_ttl_isolated_per_user_same_chat_key(tmp_db, monkeypat
     fsm_user_a = FakeFSM()
     fsm_user_b = FakeFSM()
     run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm_user_a))
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 2)  # B must also pass the owner gate, so this
+    # proves genuine FSM isolation, not merely "B is a non-owner"
     run(bot.pipeline(FakeMessage(FakeUser(2), "Мне тревожно"), "Мне тревожно", fsm_user_b))
     assert voiced == []  # user B's own FSM never sees user A's armed override
 
@@ -1790,12 +1906,15 @@ def test_format_select_only_ever_affects_the_tapping_users_own_preference(tmp_db
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
     run(database.upsert_user(2, "u", "U"))
-    cb = FakeCallback(FakeUser(2), FakeMessage(FakeUser(1)), f"{bot._FMT_KB_VERSION}:format:voice")
+    # Tapper must be the owner (uid=1, this file's default) for the feature
+    # to be available at all; the message shown belongs to a different,
+    # non-owner user (uid=2) -- proving the tap affects only the TAPPER.
+    cb = FakeCallback(FakeUser(1), FakeMessage(FakeUser(2)), f"{bot._FMT_KB_VERSION}:format:voice")
     run(bot.cb_format_select(cb))
     prefs1 = run(database.get_response_preferences(1))
     prefs2 = run(database.get_response_preferences(2))
-    assert prefs1["response_format"] == "text"   # message "owner" (user 1) unaffected
-    assert prefs2["response_format"] == "voice"  # only the TAPPING user (user 2) changed
+    assert prefs1["response_format"] == "voice"  # only the TAPPING user (user 1) changed
+    assert prefs2["response_format"] == "text"   # message "owner" (user 2) unaffected
 
 
 # ── Explicit private-chat-only enforcement (§4 this pass) ───────────────────
@@ -2094,3 +2213,162 @@ def test_private_callback_still_works_after_group_boundary_added(tmp_db, monkeyp
     run(bot.cb_format_select(cb))
     prefs = run(database.get_response_preferences(1))
     assert prefs["response_format"] == "voice"  # private chat (default chat_type) unaffected by the new guard
+
+
+# ── Owner-only canary gate for Voice and Reactions (this pass) ──────────────
+# uid=1 is this file's default owner (see _access_env above). The behavior
+# matrix's owner-in-private and owner-in-group cells, and the crisis/
+# dependency safety proofs, are already fully exercised by pre-existing
+# tests throughout this file (all built on uid=1) -- only the genuinely
+# NEW cells (non-owner, and missing/invalid OWNER_USER_ID) are added below.
+
+def test_owner_gate_voice_non_owner_stays_text_only_even_with_saved_voice_pref(tmp_db, monkeypatch):
+    # Voice #3 + #9 combined: flag=true + non-owner -> text-only, TTS=0,
+    # regardless of a previously-saved response_format="voice" preference.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(2, "u", "U"))
+    run(database.set_response_preference(2, response_format="voice"))
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    msg = FakeMessage(FakeUser(2), "hi")
+    run(bot.deliver_response(msg, 2, "an ordinary answer", "ru"))
+    assert msg.answers == [("an ordinary answer", {})]  # no listen button either
+    assert msg.voices == []
+    assert tts_calls["n"] == 0
+
+
+def test_owner_gate_voice_missing_owner_id_disables_for_everyone(tmp_db, monkeypatch):
+    # Voice #4: flag=true but OWNER_USER_ID unset/invalid -> disabled for
+    # EVERYONE, including the uid that would otherwise be owner.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(ac, "OWNER_USER_ID", None)
+    run(database.upsert_user(1, "u", "U"))
+    run(database.set_response_preference(1, response_format="voice"))
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+    msg = FakeMessage(FakeUser(1), "hi")
+    run(bot.deliver_response(msg, 1, "an ordinary answer", "ru"))
+    assert msg.answers == [("an ordinary answer", {})]
+    assert tts_calls["n"] == 0
+
+
+def test_owner_gate_non_owner_pure_voice_command_in_private_chat_gives_neutral_notice(tmp_db, monkeypatch):
+    # Voice #5: non-owner sends a PURE voice command in their OWN private
+    # chat. In personal_use mode (this file's _access_env default) a
+    # non-owner, non-invited uid is already rejected by the PRE-EXISTING
+    # access-control gate before format-command parsing is ever reached --
+    # an even stronger proof of "no side effects": no preference write, no
+    # override armed, no TTS, and the message never reaches the therapeutic
+    # LLM at all (existing legacy behavior, per the contract's own wording).
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(2, "u", "U"))
+    llm_calls = {"n": 0}
+    async def spy_create(*a, **kw):
+        llm_calls["n"] += 1
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="should never be reached"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", spy_create)
+    tts_calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        tts_calls["n"] += 1
+        return "/tmp/x.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", spy_synth)
+
+    fsm = FakeFSM()
+    text = "ответь голосом"
+    msg = FakeMessage(FakeUser(2), text)  # uid=2 is a non-owner; private chat
+    run(bot.pipeline(msg, text, fsm))
+
+    assert llm_calls["n"] == 0
+    assert tts_calls["n"] == 0
+    assert len(msg.answers) == 1  # rejected early by the pre-existing access gate
+    prefs = run(database.get_response_preferences(2))
+    assert prefs["response_format"] == "text"
+    data = run(fsm.get_data())
+    assert data.get("one_shot_voice_pending") is not True
+
+
+def test_owner_gate_non_owner_format_command_selector_unavailable(tmp_db, monkeypatch):
+    # Voice #6: non-owner /format -> silent no-op (same as flag-off), pref unchanged.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(2, "u", "U"))
+    msg = FakeMessage(FakeUser(2), "/format")
+    run(bot.cmd_format(msg))
+    assert msg.answers == []
+    prefs = run(database.get_response_preferences(2))
+    assert prefs["response_format"] == "text"
+
+
+def test_owner_gate_non_owner_format_callback_fails_closed(tmp_db, monkeypatch):
+    # Voice #7: non-owner taps the format-selector callback -> fails closed.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    run(database.upsert_user(2, "u", "U"))
+    cb = FakeCallback(FakeUser(2), FakeMessage(FakeUser(2)), f"{bot._FMT_KB_VERSION}:format:voice")
+    run(bot.cb_format_select(cb))
+    prefs = run(database.get_response_preferences(2))
+    assert prefs["response_format"] == "text"
+
+
+def test_owner_gate_non_owner_listen_callback_fails_closed(tmp_db, monkeypatch):
+    # Voice #8: a non-owner taps a validly self-encoded listen callback
+    # (matching their own uid) -- must still fail closed, no TTS.
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    calls = {"n": 0}
+    async def spy_synth(*a, **kw):
+        calls["n"] += 1
+        return True
+    monkeypatch.setattr(bot, "_synthesize_and_send_voice", spy_synth)
+    user = FakeUser(2)
+    msg = FakeMessage(user, "someone else's visible answer")
+    cb = FakeCallback(user, msg, f"{bot._LISTEN_KB_VERSION}:2")
+    run(bot.cb_listen(cb))
+    assert calls["n"] == 0
+
+
+def test_owner_gate_reactions_non_owner_zero_calls(tmp_db, monkeypatch):
+    # Reactions #13: flag=true + non-owner -> zero Telegram reaction calls.
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    calls = {"n": 0}
+    async def spy_react(**kw):
+        calls["n"] += 1
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
+    msg = FakeMessage(FakeUser(2), "x")
+    run(bot._maybe_react(msg, 2, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))
+    assert calls["n"] == 0
+
+
+def test_owner_gate_reactions_missing_owner_id_disables_for_everyone(tmp_db, monkeypatch):
+    # Reactions #14: flag=true but OWNER_USER_ID unset/invalid -> zero calls,
+    # even for the uid that would otherwise be owner.
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    monkeypatch.setattr(ac, "OWNER_USER_ID", None)
+    calls = {"n": 0}
+    async def spy_react(**kw):
+        calls["n"] += 1
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
+    msg = FakeMessage(FakeUser(1), "x")
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))
+    assert calls["n"] == 0
+
+
+def test_owner_gate_reactions_owner_in_group_unaffected(tmp_db, monkeypatch):
+    # Reactions #15: reactions were never chat-type restricted before this
+    # gate -- owner-in-group must still get a reaction (only the owner
+    # check is new; the existing private-chat policy is not weakened).
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    async def fake_get_chat(chat_id):
+        return types.SimpleNamespace(available_reactions=None)
+    calls = []
+    async def spy_react(**kw):
+        calls.append(kw)
+    monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
+    msg = FakeMessage(FakeUser(1), "x", chat_type="group")
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))
+    assert len(calls) == 1

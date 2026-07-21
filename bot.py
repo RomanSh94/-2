@@ -217,12 +217,38 @@ def quality_kb() -> InlineKeyboardMarkup:
 # where a final, Safety-Validator-approved ordinary response is actually
 # delivered -- text, voice, or voice+concise-text -- reused by the listen
 # button and the "much text/lazy to read" meta-command path below.
+#
+# Owner-only canary gate: both flags remain global rollout switches (default
+# false), but even once true, the two helpers below additionally require an
+# exact match against the EXISTING access_control.OWNER_USER_ID (a single
+# immutable Telegram numeric id, already fail-closed to None on a missing/
+# invalid environment value -- see access_control.py). No new allowlist, no
+# new role system, no new DB table: reuses the same mechanism this codebase
+# already trusts elsewhere (e.g. dass21_access.authorize_dass21_user). If
+# OWNER_USER_ID is unset/invalid, these always return False for everyone,
+# including whoever happens to hold that uid in a misconfigured deployment.
 
 _FMT_KB_VERSION = "fmt1"
 _LISTEN_KB_VERSION = "listen1"
 _LISTEN_TAP_COOLDOWN_SECONDS = 5
 _reaction_last_sent: dict[int, float] = {}
 _listen_last_tap: dict[int, float] = {}
+
+
+def _voice_ux_enabled_for(uid: int) -> bool:
+    return (
+        config.VOICE_REPLIES_ENABLED
+        and access_control.OWNER_USER_ID is not None
+        and uid == access_control.OWNER_USER_ID
+    )
+
+
+def _reactions_enabled_for(uid: int) -> bool:
+    return (
+        config.EMOTIONAL_REACTIONS_ENABLED
+        and access_control.OWNER_USER_ID is not None
+        and uid == access_control.OWNER_USER_ID
+    )
 
 
 def format_selector_kb(lang: str) -> InlineKeyboardMarkup:
@@ -303,7 +329,7 @@ async def _synthesize_and_send_voice(target, uid: int, text: str, lang: str) -> 
     voice message via `target` (a Message, exposing .answer_voice). Returns
     True on success, False on ANY failure (TTS or Telegram send) -- never
     raises, and the temporary audio file is always removed."""
-    if not config.VOICE_REPLIES_ENABLED:
+    if not _voice_ux_enabled_for(uid):
         return False
     path = None
     try:
@@ -334,7 +360,7 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
     depth alongside the pipeline()-level guard that never lets a group
     message reach the format-command/override code at all."""
     is_private = getattr(message.chat, "type", "private") == "private"
-    if not config.VOICE_REPLIES_ENABLED or not is_private:
+    if not _voice_ux_enabled_for(uid) or not is_private:
         await message.answer(answer)
         return
 
@@ -364,7 +390,7 @@ async def _maybe_react(message: Message, uid: int, category: ReactionCategory,
                         confidence: float) -> None:
     """Best-effort Telegram message reaction -- never blocks or delays the
     actual response, never raises, never persists `category` anywhere."""
-    if not config.EMOTIONAL_REACTIONS_ENABLED:
+    if not _reactions_enabled_for(uid):
         return
     if category == ReactionCategory.NONE or confidence < config.EMOTIONAL_REACTION_MIN_CONFIDENCE:
         return
@@ -827,7 +853,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # answer is affected. A PURE command never enters therapeutic routing.
     one_shot_voice = False
     one_shot_concise = False
-    voice_ux_active = config.VOICE_REPLIES_ENABLED and is_private_chat
+    voice_ux_active = _voice_ux_enabled_for(uid) and is_private_chat
 
     # Consume a one-shot voice override armed by a PRIOR Telegram update (see
     # the "no previous response yet" branch below) -- a plain local variable
@@ -863,17 +889,19 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     fmt_cmd = parse_format_command(user_text, lang) if config.VOICE_REPLIES_ENABLED else None
     if fmt_cmd:
         pure = is_pure_format_command(user_text, lang)
-        if pure and not is_private_chat:
-            # §5: a pure meta-command outside a private chat must never
-            # replay, never arm an override, never touch a preference, and
-            # never enter therapeutic routing -- a short neutral notice,
-            # then stop.
+        if pure and not voice_ux_active:
+            # §5 (private-chat boundary) + owner-only canary gate: a pure
+            # meta-command from a non-private chat OR a non-owner user (even
+            # in their own private chat) must never replay, never arm an
+            # override, never touch a preference, and never enter
+            # therapeutic routing -- a short neutral notice, then stop.
+            # voice_ux_active already folds in flag + owner + private-chat.
             await message.answer(
                 "Настройки формата и озвучивание доступны в личном чате с ботом." if lang == "ru"
                 else "Format settings and voice replies are only available in a private chat with me.")
             return
 
-        if is_private_chat:
+        if voice_ux_active:
             if fmt_cmd.kind == "voice_persistent":
                 await set_response_preference(uid, response_format="voice")
             elif fmt_cmd.kind == "text_persistent":
@@ -922,12 +950,13 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             elif pure and fmt_cmd.kind in ("concise_oneshot", "detailed_oneshot"):
                 await message.answer(_format_ack_text(fmt_cmd, lang))
                 return
-        # else: a MIXED message. In a private chat, falls through with the
-        # one-shot flags armed above. In a non-private chat, is_private_chat
-        # was False so the `if is_private_chat:` block never ran -- the
-        # format fragment is silently ignored (no preference write, no
-        # override armed) and ordinary routing proceeds UNCHANGED for the
-        # emotional content, exactly as it did before this feature existed.
+        # else: a MIXED message. When voice_ux_active (owner, private chat,
+        # flag on), falls through with the one-shot flags armed above.
+        # Otherwise -- non-private chat OR non-owner -- voice_ux_active was
+        # False so the `if voice_ux_active:` block never ran -- the format
+        # fragment is silently ignored (no preference write, no override
+        # armed) and ordinary routing proceeds UNCHANGED for the emotional
+        # content, exactly as it did before this feature existed.
 
     # 5. Update state
     state = await load_state(uid) or dict(DEFAULT_STATE)
@@ -1362,9 +1391,10 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
 async def cmd_format(message: Message):
     uid = message.from_user.id
     lang = await get_user_language(uid)
-    if not config.VOICE_REPLIES_ENABLED:
-        # Flag off: behave as if this command does not exist -- no selector,
-        # nothing saved, previous behavior preserved exactly.
+    if not _voice_ux_enabled_for(uid):
+        # Flag off, OR flag on but not the owner: behave as if this command
+        # does not exist -- no selector, nothing saved, previous behavior
+        # preserved exactly for everyone but the owner during canary.
         return
     if getattr(message.chat, "type", "private") != "private":
         # §4: private-chat-only in V1 -- a short neutral notice, never the
@@ -1382,9 +1412,10 @@ async def cmd_format(message: Message):
 @dp.callback_query(F.data.startswith(f"{_FMT_KB_VERSION}:"))
 async def cb_format_select(callback: CallbackQuery):
     uid = callback.from_user.id
-    if not config.VOICE_REPLIES_ENABLED:
-        # Flag off: fail closed -- a stale button from before rollback must
-        # not silently save anything.
+    if not _voice_ux_enabled_for(uid):
+        # Flag off, OR flag on but not the owner: fail closed -- a stale
+        # button from before rollback, or a non-owner during canary, must
+        # never silently save anything.
         await callback.answer()
         return
     if getattr(callback.message.chat, "type", "private") != "private":
@@ -1418,7 +1449,11 @@ async def cb_listen(callback: CallbackQuery):
     in callback_data (a stateless action, unlike cb_before's FSM-scoped
     flow) -- a forged/cross-user/malformed callback all fail closed."""
     uid = callback.from_user.id
-    if not config.VOICE_REPLIES_ENABLED:
+    if not _voice_ux_enabled_for(uid):
+        # Flag off, OR flag on but not the owner -- defense in depth: the
+        # listen button is only ever attached by deliver_response for an
+        # eligible owner turn, but a forged/replayed callback_data must
+        # still fail closed here regardless.
         await callback.answer()
         return
     if getattr(callback.message.chat, "type", "private") != "private":
@@ -4670,11 +4705,13 @@ async def handle_voice(message: Message, state: FSMContext):
     uid = message.from_user.id
     lang = await get_user_language(uid)   # needed for Whisper lang hint
     # Voice and Adaptive Response UX: an explicitly SAVED voice_language
-    # preference (only ever set via /format, so unreachable while
-    # VOICE_REPLIES_ENABLED is false) overrides the stored UI language hint;
+    # preference (only ever settable via the now owner-gated /format, so
+    # unreachable for anyone else) overrides the stored UI language hint;
     # "auto" (the untouched default) preserves the exact prior behavior.
+    # Gated the same way as every other Voice UX action -- defense in depth
+    # in case a preference row ever existed for a non-owner uid.
     stt_lang = lang
-    if config.VOICE_REPLIES_ENABLED:
+    if _voice_ux_enabled_for(uid):
         prefs = await get_response_preferences(uid)
         if prefs["voice_language"] in ("ru", "en"):
             stt_lang = prefs["voice_language"]
