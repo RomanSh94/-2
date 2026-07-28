@@ -84,6 +84,7 @@ def _env(monkeypatch):
     monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", set())
     monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
     bot._user_generation.clear()
+    bot._ingest_registry.clear()
     # Neutralize network + slow bits, keep pipeline logic real.
     monkeypatch.setattr(bot.bot, "send_chat_action", _async(None))
     monkeypatch.setattr(bot, "typing_delay", lambda a: 0)
@@ -172,6 +173,49 @@ def test_persistence_order_slow_A_then_fast_B_keeps_arrival_order(tmp_db, monkey
     # The LAST user row is B's, not stale A's -- next memory load sees B as
     # the newest user turn.
     assert mB.answers == ["answer1"] and mA.answers == []
+
+
+def test_T1_pause_in_first_pre_save_await_B_cannot_persist_first(tmp_db, monkeypatch):
+    # T1: A enters first, acquires the ingestion lock, and pauses during the
+    # FIRST pre-save await (get_active_crisis). B enters for the same user but
+    # blocks on the lock -- so B cannot persist its user row before A. Required
+    # user-row order by id: user_A, user_B.
+    run(database.upsert_user(1, "u", "U"))
+    gac_gate = asyncio.Event()
+    calls = {"n": 0}
+
+    async def gated_get_active_crisis(uid):
+        i = calls["n"]
+        calls["n"] += 1
+        if i == 0:                 # A blocks here, holding the ingestion lock
+            await gac_gate.wait()
+        return None
+    monkeypatch.setattr(bot, "get_active_crisis", gated_get_active_crisis)
+
+    async def create(*a, **kw):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="ok"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", create)
+
+    mA = FakeMessage(FakeUser(1), "A first")
+    mB = FakeMessage(FakeUser(1), "B second")
+
+    async def scenario():
+        tA = asyncio.create_task(bot.pipeline(mA, "A first", FakeFSM()))
+        await asyncio.sleep(0.03)          # A acquires lock, blocks in get_active_crisis
+        tB = asyncio.create_task(bot.pipeline(mB, "B second", FakeFSM()))
+        await asyncio.sleep(0.03)          # B blocks on the ingestion lock
+        assert mB.answers == []            # B has persisted/delivered nothing yet
+        gac_gate.set()                     # release A
+        await tA
+        await tB
+        return await _message_roles(1)
+    roles = run(scenario())
+
+    # user_A landed before user_B despite A pausing first; A superseded (gen),
+    # so only assistant_B. Order proves B could not persist before A.
+    assert roles == ["user", "user", "assistant"]
+    assert mB.answers == ["ok"] and mA.answers == []
 
 
 def test_early_order_A_paused_in_summarize_keeps_arrival_order(tmp_db, monkeypatch):
@@ -360,3 +404,75 @@ def test_dispatch_logs_are_privacy_safe_by_construction():
     a, b = bot._new_correlation_id(), bot._new_correlation_id()
     assert a != b
     assert len(a) == 8 and all(c in "0123456789abcdef" for c in a)
+
+
+# ── Ingestion-lock registry (T6) and error path (T7) ───────────────────────
+
+def test_T6_registry_evicts_only_unheld_and_stays_bounded(monkeypatch):
+    bot._ingest_registry.clear()
+
+    async def scenario():
+        # A held holder is present while held, and evicted on release (refs==0).
+        h = await bot._ingest_enter(1)
+        assert 1 in bot._ingest_registry and bot._ingest_registry[1].refs == 1
+        bot._ingest_leave(1, h)
+        assert 1 not in bot._ingest_registry            # dropped when unheld
+
+        # A currently-HELD holder is never evicted, even under bound pressure.
+        monkeypatch.setattr(bot, "_INGEST_MAX", 4)
+        held = await bot._ingest_enter(999)             # hold uid 999
+        for uid in range(20):                            # churn many others
+            hh = await bot._ingest_enter(uid)
+            bot._ingest_leave(uid, hh)
+        assert 999 in bot._ingest_registry              # held holder survived
+        assert bot._ingest_registry[999].refs == 1
+        assert len(bot._ingest_registry) <= 4           # bounded
+        bot._ingest_leave(999, held)
+        assert 999 not in bot._ingest_registry
+    run(scenario())
+
+
+def test_T6_waiting_holder_is_not_evicted():
+    # A holder with a WAITER (refs>0) must never be evicted while the waiter
+    # is queued, or the waiter would be orphaned.
+    bot._ingest_registry.clear()
+
+    async def scenario():
+        h1 = await bot._ingest_enter(5)                 # A holds uid 5
+        waiter = asyncio.create_task(bot._ingest_enter(5))  # B waits on uid 5
+        await asyncio.sleep(0.02)
+        assert bot._ingest_registry[5].refs == 2        # holder + waiter
+        bot._ingest_leave(5, h1)                        # A releases -> B acquires
+        h2 = await waiter
+        assert bot._ingest_registry.get(5) is not None  # still present (B holds)
+        bot._ingest_leave(5, h2)
+        assert 5 not in bot._ingest_registry
+    run(scenario())
+
+
+def test_T7_error_before_save_releases_lock_and_user_not_blocked(tmp_db, monkeypatch):
+    run(database.upsert_user(1, "u", "U"))
+    calls = {"n": 0}
+
+    async def sometimes_raises(uid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("db blip before save")
+        return None
+    monkeypatch.setattr(bot, "get_active_crisis", sometimes_raises)
+
+    async def create(*a, **kw):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="ok"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", create)
+
+    m1 = FakeMessage(FakeUser(1), "one")
+    with pytest.raises(RuntimeError, match="db blip before save"):
+        run(bot.pipeline(m1, "one", FakeFSM()))
+    # finally released the lock and dropped the unheld holder.
+    assert 1 not in bot._ingest_registry
+    # The user is NOT permanently blocked -- a later message goes through.
+    m2 = FakeMessage(FakeUser(1), "two")
+    run(bot.pipeline(m2, "two", FakeFSM()))
+    assert m2.answers == ["ok"]
+    assert 1 not in bot._ingest_registry                # released again
