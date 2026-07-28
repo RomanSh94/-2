@@ -78,6 +78,37 @@ def test_seen_store_is_bounded_fifo(monkeypatch):
     assert 0 not in bot._seen_update_ids
 
 
+def test_update_id_zero_is_tracked_not_treated_as_missing():
+    # update_id==0 is a valid id; `is not None` must include it so a repeated
+    # 0 is still deduplicated rather than waved through as "no id".
+    calls = []
+    async def handler(event, data):
+        calls.append(event.update_id)
+    g = _guard()
+    run(g(handler, _update(0), {}))
+    run(g(handler, _update(0), {}))   # duplicate 0
+    assert calls == [0]                # handled once
+    assert 0 in bot._seen_update_ids
+
+
+def test_concurrent_same_update_id_handled_once():
+    # Two tasks feeding the SAME update_id concurrently: the check-and-add is a
+    # read-modify-write with no await between, so under asyncio's single thread
+    # exactly one passes.
+    ran = []
+    async def handler(event, data):
+        await asyncio.sleep(0)         # yield, to interleave the two tasks
+        ran.append(event.update_id)
+    g = _guard()
+    async def scenario():
+        await asyncio.gather(
+            g(handler, _update(77), {}),
+            g(handler, _update(77), {}),
+        )
+    run(scenario())
+    assert ran == [77]                 # handler body ran exactly once
+
+
 def test_update_without_update_id_is_passed_through():
     # A malformed/duck event lacking update_id must not be dropped or crash.
     calls = []
@@ -117,7 +148,15 @@ def test_guard_registered_as_update_outer_middleware():
     assert "dp.update.outer_middleware(DuplicateUpdateGuard())" in src
 
 
-def test_polling_drops_pending_updates_on_startup():
+def test_normal_startup_does_not_drop_pending_updates():
+    # In aiogram 3.7 drop_pending_updates is NOT a start_polling parameter --
+    # passing it would silently fall into **kwargs (a misleading no-op) and the
+    # only real drop path, bot.delete_webhook(drop_pending_updates=True),
+    # discards messages users sent during a restart. A normal restart must
+    # never drop a user's message, so neither appears.
     import inspect
     src = inspect.getsource(bot.main)
-    assert "drop_pending_updates=True" in src
+    # Assert on the actual call, not comment prose: start_polling is invoked
+    # with no extra arguments, so nothing requests a pending-update drop.
+    assert "start_polling(bot)" in src
+    assert "start_polling(bot," not in src

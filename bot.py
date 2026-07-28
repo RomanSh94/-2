@@ -791,6 +791,11 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     поэтому реальный пользователь передаётся явно (callback.from_user)."""
     u = tg_user or message.from_user
     uid, username, first_name = u.id, u.username or "", u.first_name or ""
+    # New user turn: bump the generation (also done for crisis, which returns
+    # earlier) so any older ordinary answer still in flight is superseded, and
+    # capture this turn's generation to check just before ordinary delivery.
+    _turn_gen = _bump_user_generation(uid)
+    _cid = _new_correlation_id()
     # Voice and Adaptive Response UX is private-chat-only in V1 (§4): this
     # bot has no ChatType filtering anywhere else either, so this is a new,
     # narrow, explicit boundary for just this feature, not a bot-wide policy
@@ -1092,7 +1097,19 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     for role, content in recent:
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_text})
-    
+
+    # 14.5 Persist the USER message BEFORE the LLM call. Memory loads recent
+    # messages by autoincrement id (get_recent_messages ORDER BY id DESC), so
+    # the row's arrival ORDER is its id order. Saving here -- when this turn is
+    # processed -- keeps a slow turn's user row correctly BEFORE a newer,
+    # faster turn's user row (P1: previously this save happened after the LLM,
+    # so a slow answer's user row landed last and looked like the newest active
+    # context). The assistant row is still saved later, and only if this turn
+    # was not superseded. A duplicate Telegram update never reaches here
+    # (DuplicateUpdateGuard drops it), so this never writes a duplicate row.
+    await save_message(uid, "user", user_text, scenario, lang,
+                       risk["score"], risk["categories"])
+
     # 15. LLM call
     await bot.send_chat_action(message.chat.id, "typing")
     try:
@@ -1158,12 +1175,23 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # NEVER re-prompt the LLM here.
         answer = select_fallback(risk, lang)
 
-    # 17. Save & send (with a human-feeling typing pause, §7.2). The user
-    # message carries its risk snapshot — the deterministic source for §4/§5.
-    await save_message(uid, "user", user_text, scenario, lang,
-                       risk["score"], risk["categories"])
-    await save_message(uid, "assistant", answer, scenario, lang)
+    # 17. Send (with a human-feeling typing pause, §7.2). The user message was
+    # already persisted before the LLM call (step 14.5) to preserve arrival
+    # order; only the assistant row + delivery remain, and both are gated on
+    # this turn not having been superseded.
     await asyncio.sleep(typing_delay(answer))
+    # Stale-response guard: if a NEWER turn for this user started while this
+    # ordinary answer was being generated (aiogram runs updates as concurrent
+    # tasks), this answer is stale -- skip persisting the assistant row AND
+    # delivering it, so an older reply can never arrive after a newer one, and
+    # a stale assistant answer never enters memory. Checked as late as possible
+    # (after the typing pause) to catch a turn that arrived during it.
+    # Deterministic safety replies (crisis/dependency/disambiguation) returned
+    # earlier and are never subject to this guard.
+    if _user_generation_superseded(uid, _turn_gen):
+        _dispatch_log(f"cid={_cid} stage=skipped_stale source=normal")
+        return
+    await save_message(uid, "assistant", answer, scenario, lang)
     await deliver_response(message, uid, answer, lang,
                            one_shot_voice=one_shot_voice, one_shot_concise=one_shot_concise)
     # Only reached if deliver_response did not raise -- an exception during
@@ -1802,35 +1830,94 @@ dp.callback_query.outer_middleware(
 #
 # Telegram update_ids are unique and monotonic under normal operation, so
 # this guard NEVER drops a legitimate update -- it fires only on an exact
-# duplicate id. Bounded FIFO; a restart simply starts with an empty window
-# (and drop_pending_updates in main() prevents the restart backlog itself).
-# The trace logs the update_id (a Telegram-internal sequence number) and the
-# decision only -- never message text, user id, username or any content.
+# duplicate id. Bounded FIFO; a restart simply starts with an empty window.
+# LIMITATION: this is IN-MEMORY -- it does NOT survive a process restart and
+# is not durable idempotency; it only defends a single continuous run against
+# a redelivered/replayed identical update. The trace logs the update_id (a
+# Telegram-internal sequence number) and the decision only -- never message
+# text, user id, username or any content.
 _SEEN_UPDATE_IDS_MAX = 4096
 _seen_update_ids: "OrderedDict[int, None]" = OrderedDict()
+
+
+def _dispatch_log(msg: str) -> None:
+    """Privacy-safe dispatch trace. Exception-proof by contract: observability
+    must never be able to break message delivery (§9)."""
+    try:
+        print(f"[dispatch] {msg}")
+    except Exception:
+        pass
 
 
 class DuplicateUpdateGuard(BaseMiddleware):
     async def __call__(self, handler, event, data):
         update_id = getattr(event, "update_id", None)
         if update_id is not None:
+            # check-and-add is a read-modify-write with no await between, so it
+            # is atomic under asyncio's single thread (concurrent duplicate ->
+            # exactly one passes).
             if update_id in _seen_update_ids:
-                print(f"[dispatch] update_id={update_id} decision=duplicate_dropped")
+                _dispatch_log(f"update_id={update_id} decision=duplicate_dropped")
                 return None
             _seen_update_ids[update_id] = None
             if len(_seen_update_ids) > _SEEN_UPDATE_IDS_MAX:
                 _seen_update_ids.popitem(last=False)
-            print(f"[dispatch] update_id={update_id} decision=accepted")
+            _dispatch_log(f"update_id={update_id} decision=accepted")
         return await handler(event, data)
 
 
 dp.update.outer_middleware(DuplicateUpdateGuard())
 
 
+# ── Stale-response guard: suppress an ordinary answer superseded mid-flight ─
+# Reproduced race (see tests): aiogram runs updates as concurrent tasks
+# (handle_as_tasks=True), so two turns from the SAME user can run pipeline()
+# at once. If an earlier turn's LLM call is slow and a later turn finishes
+# first, the earlier turn then delivers its now-stale answer AFTER the newer
+# one -- "two answers, the second referencing older context". This is the
+# actual mechanism behind the owner report; the DB timestamps are pipeline-
+# COMPLETION times, not arrival times, so they never proved two user sends.
+#
+# Fix: a per-user monotonic "generation". Every new user turn (ordinary
+# pipeline entry, crisis pipeline entry, and /start) bumps it. An ordinary
+# answer captures the generation at entry and, immediately before delivery,
+# skips if a newer turn has since bumped it. Deterministic safety responses
+# (crisis / dependency / disambiguation) return earlier and are never guarded
+# -- they are always delivered. The bump is a read-modify-write with no await
+# between, so it is atomic under asyncio's single thread; no lock needed.
+# Bounded FIFO; an evicted user fails OPEN (delivers), the pre-existing
+# behavior. In-memory only -- it does not, and need not, survive a restart.
+_USER_GEN_MAX = 4096
+_user_generation: "OrderedDict[int, int]" = OrderedDict()
+
+
+def _bump_user_generation(uid: int) -> int:
+    g = _user_generation.get(uid, 0) + 1
+    _user_generation[uid] = g
+    if len(_user_generation) > _USER_GEN_MAX:
+        _user_generation.popitem(last=False)
+    return g
+
+
+def _user_generation_superseded(uid: int, captured: int) -> bool:
+    """True iff a newer turn for uid started after `captured` was taken."""
+    return _user_generation.get(uid, captured) > captured
+
+
+def _new_correlation_id() -> str:
+    """Random per-turn id for privacy-safe log correlation. NOT derived from
+    any user identifier -- it exists only to stitch one turn's log lines
+    together, never to identify a person."""
+    return secrets.token_hex(4)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     from datetime import datetime, timezone
     uid = message.from_user.id
+    # /start is a new turn: bump the generation so any ordinary answer still
+    # being generated for this user is superseded and not delivered afterward.
+    _bump_user_generation(uid)
     # PR C3a.1 -- parse a /start deep-link payload BEFORE the access gate.
     # This is the critical ordering: a temp-invite-code holder has no prior
     # access, so if we ran ensure_full_access_or_closed_test first they'd be
@@ -4861,12 +4948,15 @@ async def main():
     scheduler = setup_scheduler(bot)
     scheduler.start()
     print("✅ X20 Bot started")
-    # drop_pending_updates: after any downtime, do NOT replay the backlog of
-    # updates accumulated while the bot was down -- answering a message many
-    # minutes late with stale context is worse than not answering it, and a
-    # replayed backlog is one route to the duplicate/stale-answer report the
-    # DuplicateUpdateGuard also defends against.
-    await dp.start_polling(bot, drop_pending_updates=True)
+    # NOTE: no drop_pending_updates here. In aiogram 3.7 it is NOT a
+    # start_polling parameter -- it would fall into **kwargs and be injected
+    # as workflow_data (a misleading no-op that drops nothing), and the only
+    # real way to drop the backlog is bot.delete_webhook(drop_pending_updates
+    # =True), which silently discards messages users sent during a restart.
+    # That message loss is deliberately NOT wanted: a normal restart must
+    # never drop a user's message. The stale-answer defence lives in the
+    # per-turn generation guard (see _bump_user_generation) instead.
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
