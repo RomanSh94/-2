@@ -32,6 +32,7 @@ from aiogram.types import (
     CallbackQuery, FSInputFile, ReactionTypeEmoji,
 )
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from collections import OrderedDict
 from aiogram.filters import Command
 from aiogram.exceptions import (
     TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter,
@@ -1786,6 +1787,44 @@ dp.message.outer_middleware(
     OnboardingGateMiddleware(_message_is_onboarding_exempt, kind="message"))
 dp.callback_query.outer_middleware(
     OnboardingGateMiddleware(_callback_is_onboarding_exempt, kind="callback"))
+
+
+# ── Duplicate-update guard + privacy-safe dispatch trace ───────────────────
+# Investigation of a "one message -> a second, stale-context answer ~1 min
+# later" report could not be closed because (a) the bot logged NOTHING per
+# update, so the two sends could not be correlated after the fact, and (b)
+# start_polling ran with neither drop_pending_updates NOR any update_id
+# deduplication -- so a redelivered/replayed update (restart backlog, a
+# reconnect) reprocesses as a fresh answer that leans on now-stale memory,
+# exactly the observed shape. The exact trigger of that specific event was
+# NOT proven; this closes the diagnosability gap and the one real latent
+# duplicate vector, without changing any normal behavior.
+#
+# Telegram update_ids are unique and monotonic under normal operation, so
+# this guard NEVER drops a legitimate update -- it fires only on an exact
+# duplicate id. Bounded FIFO; a restart simply starts with an empty window
+# (and drop_pending_updates in main() prevents the restart backlog itself).
+# The trace logs the update_id (a Telegram-internal sequence number) and the
+# decision only -- never message text, user id, username or any content.
+_SEEN_UPDATE_IDS_MAX = 4096
+_seen_update_ids: "OrderedDict[int, None]" = OrderedDict()
+
+
+class DuplicateUpdateGuard(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        update_id = getattr(event, "update_id", None)
+        if update_id is not None:
+            if update_id in _seen_update_ids:
+                print(f"[dispatch] update_id={update_id} decision=duplicate_dropped")
+                return None
+            _seen_update_ids[update_id] = None
+            if len(_seen_update_ids) > _SEEN_UPDATE_IDS_MAX:
+                _seen_update_ids.popitem(last=False)
+            print(f"[dispatch] update_id={update_id} decision=accepted")
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(DuplicateUpdateGuard())
 
 
 @dp.message(Command("start"))
@@ -4822,7 +4861,12 @@ async def main():
     scheduler = setup_scheduler(bot)
     scheduler.start()
     print("✅ X20 Bot started")
-    await dp.start_polling(bot)
+    # drop_pending_updates: after any downtime, do NOT replay the backlog of
+    # updates accumulated while the bot was down -- answering a message many
+    # minutes late with stale context is worse than not answering it, and a
+    # replayed backlog is one route to the duplicate/stale-answer report the
+    # DuplicateUpdateGuard also defends against.
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
