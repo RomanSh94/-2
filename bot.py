@@ -32,6 +32,7 @@ from aiogram.types import (
     CallbackQuery, FSInputFile, ReactionTypeEmoji,
 )
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from collections import OrderedDict
 from aiogram.filters import Command
 from aiogram.exceptions import (
     TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter,
@@ -790,6 +791,11 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     поэтому реальный пользователь передаётся явно (callback.from_user)."""
     u = tg_user or message.from_user
     uid, username, first_name = u.id, u.username or "", u.first_name or ""
+    # New user turn: bump the generation (also done for crisis, which returns
+    # earlier) so any older ordinary answer still in flight is superseded, and
+    # capture this turn's generation to check just before ordinary delivery.
+    _turn_gen = _bump_user_generation(uid)
+    _cid = _new_correlation_id()
     # Voice and Adaptive Response UX is private-chat-only in V1 (§4): this
     # bot has no ChatType filtering anywhere else either, so this is a new,
     # narrow, explicit boundary for just this feature, not a bot-wide policy
@@ -808,290 +814,314 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # recency window in get_active_crisis bounds this so nobody is stuck forever.
     # Crisis-adjacent like the RED branch below — runs regardless of role/access,
     # structurally BEFORE the product-access gate.
-    active = await get_active_crisis(uid)
-    if active and not (tg_user is not None):
-        event_id, stage, alang = active
-        lvl = classify(risk)
-        # Default to the crisis screen. Only EXPLICITLY reassuring text (and not
-        # RED/ORANGE) gets the gentle "I'm safe" offer — anything with distress
-        # ("мне плохо, я не в безопасности") or anything unclear keeps the crisis
-        # screen. Never assume safety.
-        if lvl not in (RED, ORANGE) and is_reassuring(user_text):
-            await message.answer(
-                "Я рядом. Если ты сейчас в большей безопасности — нажми ниже, "
-                "и мы спокойно продолжим." if lang == "ru" else
-                "I'm here. If you're safer now, tap below and we'll continue gently.",
-                reply_markup=safe_only_keyboard(event_id, lang))
-        else:
-            # PR 1B-1: same role-gated bookkeeping as trigger_crisis — an UNKNOWN
-            # (uninvited) uid does not get ordinary message/profile persistence.
-            if access_control.resolve_role_safe(uid) != access_control.UNKNOWN:
-                await save_message(uid, "user", user_text, "crisis", lang,
-                                   risk["score"], risk["categories"])
-            text, kb = crisis_screen(stage, lang, event_id)
-            await send_crisis(message.answer, text, kb, lang, uid, event_id, "screen")
-        return
-
-    # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here).
-    # RED bypasses the product-access gate below entirely, for ANY role — the
-    # crisis path must never be gated by access control.
-    if classify(risk) == RED:
-        await trigger_crisis(message, uid, username, user_text, risk, lang)
-        return
-
-    # 4.1 Product access gate — strictly AFTER both crisis paths above, and
-    # BEFORE any ordinary product persistence (upsert_user/log_moderation/state/
-    # profile/memory/LLM). UNKNOWN, CLINICIAN_REVIEWER, an unacknowledged
-    # CLINICIAN_TESTER, or an acknowledged tester with no reviewer mapping all
-    # get the closed-test/tester-acknowledgment screen instead, and NOTHING
-    # ordinary is written about them.
-    if not await ensure_full_access_or_closed_test(message, uid):
-        return
-
-    # 4.2 Mandatory onboarding gate (spec item A) — strictly AFTER both crisis
-    # paths AND the access gate, and BEFORE any ordinary product persistence.
-    # A user with an ACTIVE first-user onboarding must not reach ordinary text/
-    # voice conversation by typing through it — this re-shows their current
-    # onboarding card (editing it in place, never flooding the chat) instead of
-    # silently dropping the message or letting it fall into the pipeline.
-    # Unconditional (not skipped when called from cb_mood, which already runs
-    # this same check before ever calling pipeline()) -- a second read of the
-    # same DB state here is a harmless no-op when already blocked/cleared
-    # upstream, and this way pipeline() is safe to call from ANY entrypoint
-    # without relying on a caller-specific signal to know whether the gate was
-    # already checked.
-    if await _onboarding_blocks_ordinary_entry(uid):
-        await _resume_onboarding_card(message.chat.id, uid)
-        return
-
-    # 5. Ordinary persistence — only now that access is confirmed.
-    await upsert_user(uid, username, first_name, lang)
-    await reset_unanswered(uid)   # user re-engaged → clear ignored-push backoff
-
-    # 3. Log if medium+
-    if risk["level"] in ("medium", "high", "critical"):
-        await log_moderation(uid, username, first_name, risk["level"], risk["score"],
-                              risk["categories"], user_text, "pending", risk["implicit"])
-
-    # Aggression signal — checkpoint-2 item 2: routed through access_control
-    # instead of an unconditional push_alert. By construction we only reach here
-    # for a role that already has full product access (OWNER, or an
-    # acknowledged+mapped CLINICIAN_TESTER); should_alert_owner is False for a
-    # tester, so no owner alert and no raw-text leak happens for them. RED+
-    # aggression never reaches here (RED already returned above), so there is
-    # never a duplicate owner alert.
-    if "aggression" in risk["categories"] and access_control.should_alert_owner(uid):
-        await push_alert("Aggression Detected", uid, username, risk["level"],
-                         risk["score"], risk["categories"], user_text)
-
-    # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
-    # (current one not saved yet). Used to amplify ambiguity and bias routing.
-    trajectory = await get_emotional_trajectory(uid, window_hours=24)
-
-    # 4.5 Ambiguity check (v3 hotfix) — runs BEFORE any LLM call.
-    # A double-meaning phrase ("выйти в окно") must trigger a deterministic
-    # clarifying question, never an LLM guess. With recent risk history we also
-    # surface the hotline. This is the direct fix for the endorsement incident.
-    if risk.get("ambiguous_phrases"):
-        recent = await get_recent_messages(uid, limit=10)
-        signal = amplify_ambiguity_by_context(risk["ambiguous_phrases"], recent)
-        # §4: trajectory upgrades a soft "force_disambiguation" to "force_crisis"
-        # when aggregated dynamics show deterioration or a chronic risk streak —
-        # closing the gap where raw last-message scanning would miss it.
-        if signal and (trajectory.trend == "deteriorating"
-                       or trajectory.hopelessness_streak >= 3
-                       or trajectory.yellow_plus_streak >= 5):
-            signal = "force_crisis"
-        if signal:
-            phrase = risk["ambiguous_phrases"][0]
-            disambig = get_disambiguation_message(
-                phrase, lang, with_hotline=(signal == "force_crisis"))
-            await save_message(uid, "user", user_text, "disambiguation", lang,
-                               risk["score"], risk["categories"])
-            await save_message(uid, "assistant", disambig, "disambiguation", lang)
-            await message.answer(disambig)
-            await log_disambiguation(uid, user_text, phrase, signal)
-            return
-
-    # 3.5 Dependency monitor -- the ONE deterministic authority (Therapeutic
-    # Core Foundation): consolidates the behavioural-pattern signals (this
-    # module) and the explicit-phrase signal (relationship_monitor) behind a
-    # single shared cooldown gate. record_message MUST come first so the
-    # current message is counted before the threshold check -- otherwise the
-    # 100th message never triggers. A non-None result is a soft, narrow
-    # redirect that REPLACES the ordinary reply for this turn (never both),
-    # matching CLINICAL_BOUNDARY.md §2.3 -- it is never crisis protocol, and
-    # this check always runs strictly after the crisis/RED checks above.
-    await dependency_monitor.record_message(uid)
-    dep_msg = await dependency_monitor.assess(uid, user_text, lang)
-    if dep_msg:
-        await message.answer(dep_msg)
-        return
-
-    # 4.3 Format meta-command detection (Voice and Adaptive Response UX) --
-    # AFTER crisis/dependency handling, BEFORE ordinary therapeutic routing.
-    # Private-chat-only in V1 (§4): a group/supergroup message never even
-    # enters this block, so nothing here can be armed, consumed, or replayed
-    # from a non-private chat -- ordinary text handling for a group message
-    # is completely unaffected (not a bot-wide policy change).
-    # A MIXED message ("Мне тревожно, и ответь голосом") falls through to
-    # the ordinary pipeline below unchanged -- only delivery of the eventual
-    # answer is affected. A PURE command never enters therapeutic routing.
-    one_shot_voice = False
-    one_shot_concise = False
-    voice_ux_active = _voice_ux_enabled_for(uid) and is_private_chat
-
-    # Consume a one-shot voice override armed by a PRIOR Telegram update (see
-    # the "no previous response yet" branch below) -- a plain local variable
-    # cannot survive past the end of THIS function call, so the override is
-    # persisted in FSM state. aiogram's default FSMStrategy is USER_IN_CHAT
-    # (confirmed: bot.py's Dispatcher(storage=MemoryStorage()) never
-    # overrides fsm_strategy), so `fsm_state` is ALREADY scoped per (chat,
-    # user) -- the same user in a different chat gets a completely separate
-    # FSM entry. Cleared the instant it is read (whether still within TTL or
-    # already expired): it can apply to at most ONE subsequent ordinary
-    # reply, is never written to the DB, and is never a permanent
-    # preference. Crisis and dependency both return earlier in pipeline()
-    # than this point, so an intervening crisis/dependency message leaves an
-    # armed override untouched -- PRESERVED for the next ordinary message,
-    # the chosen deterministic rule (not silently dropped, not consumed by
-    # a non-ordinary reply).
-    if voice_ux_active and fsm_state is not None:
-        pending = await fsm_state.get_data()
-        if pending.get("one_shot_voice_pending"):
-            armed_at = pending.get("one_shot_voice_pending_at") or 0
-            if time.time() - armed_at <= config.VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS:
-                one_shot_voice = True
-            await fsm_state.update_data(one_shot_voice_pending=False,
-                                        one_shot_voice_pending_at=None)
-
-    # Detection itself is flag-gated ONLY (cheap, stateless, no I/O) -- but
-    # every ACTION (persistence, replay, override arming, voice delivery)
-    # below remains private-chat-only. This matters specifically for a PURE
-    # command outside a private chat: it must be recognized and short-
-    # circuited with a neutral notice, never silently sent to the
-    # therapeutic LLM just because chat.type != "private" made detection
-    # itself unavailable (the earlier, narrower gate did exactly that).
-    fmt_cmd = parse_format_command(user_text, lang) if config.VOICE_REPLIES_ENABLED else None
-    if fmt_cmd:
-        pure = is_pure_format_command(user_text, lang)
-        if pure and not voice_ux_active:
-            # §5 (private-chat boundary) + owner-only canary gate: a pure
-            # meta-command from a non-private chat OR a non-owner user (even
-            # in their own private chat) must never replay, never arm an
-            # override, never touch a preference, and never enter
-            # therapeutic routing -- a short neutral notice, then stop.
-            # voice_ux_active already folds in flag + owner + private-chat.
-            await message.answer(
-                "Настройки формата и озвучивание доступны в личном чате с ботом." if lang == "ru"
-                else "Format settings and voice replies are only available in a private chat with me.")
-            return
-
-        if voice_ux_active:
-            if fmt_cmd.kind == "voice_persistent":
-                await set_response_preference(uid, response_format="voice")
-            elif fmt_cmd.kind == "text_persistent":
-                await set_response_preference(uid, response_format="text")
-            elif fmt_cmd.kind == "concise_persistent":
-                await set_response_preference(uid, response_length="concise")
-            elif fmt_cmd.kind == "voice_oneshot":
-                one_shot_voice = True
-            elif fmt_cmd.kind == "concise_oneshot":
-                one_shot_concise = True
-
-            if pure and fmt_cmd.persistent:
-                await message.answer(_format_ack_text(fmt_cmd, lang))
-                return
-            if pure and fmt_cmd.kind == "voice_oneshot":
-                # §8: "много текста"/"лень читать" etc. -- voice-ify the LAST
-                # SUCCESSFULLY DELIVERED ordinary response instead of
-                # generating a new therapeutic interpretation, when one is
-                # still available. Sourced from FSM state
-                # (last_delivered_response), NOT the database -- FSM is
-                # scoped per (chat, user) by aiogram itself, so a
-                # private-chat reply can never be replayed from a different
-                # chat the same Telegram user happens to also be in.
-                fdata = await fsm_state.get_data() if fsm_state is not None else {}
-                last = fdata.get("last_delivered_response")
-                last_at = fdata.get("last_delivered_response_at") or 0
-                if last and (time.time() - last_at <= config.VOICE_LAST_RESPONSE_TTL_SECONDS):
-                    spoken = _safe_concise_version(last, lang)
-                    ok = await _synthesize_and_send_voice(message, uid, spoken, lang)
-                    if not ok:
-                        await message.answer(last)
-                    return
-                # No usable previous response (none stored, or past its
-                # TTL): this message itself must NEVER be treated as
-                # therapeutic content. Clear any stale value, arm the
-                # override for the NEXT ordinary reply (consumed above, on
-                # that future update), and stop here.
-                if fsm_state is not None:
-                    await fsm_state.update_data(
-                        last_delivered_response=None, last_delivered_response_at=None,
-                        one_shot_voice_pending=True, one_shot_voice_pending_at=time.time())
+    # Ingestion lock: acquired here (only pure language/risk detection
+    # runs before this point, so acquire order == entry order). Held
+    # through the user-row save only; released before summarization,
+    # the answer LLM, reaction sending, TTS and delivery.
+    _ingest = await _ingest_enter(uid)
+    try:
+        active = await get_active_crisis(uid)
+        if active and not (tg_user is not None):
+            event_id, stage, alang = active
+            lvl = classify(risk)
+            # Default to the crisis screen. Only EXPLICITLY reassuring text (and not
+            # RED/ORANGE) gets the gentle "I'm safe" offer — anything with distress
+            # ("мне плохо, я не в безопасности") or anything unclear keeps the crisis
+            # screen. Never assume safety.
+            if lvl not in (RED, ORANGE) and is_reassuring(user_text):
                 await message.answer(
-                    "Хорошо, следующий ответ озвучу." if lang == "ru"
-                    else "Okay, I'll voice the next reply.")
+                    "Я рядом. Если ты сейчас в большей безопасности — нажми ниже, "
+                    "и мы спокойно продолжим." if lang == "ru" else
+                    "I'm here. If you're safer now, tap below and we'll continue gently.",
+                    reply_markup=safe_only_keyboard(event_id, lang))
+            else:
+                # PR 1B-1: same role-gated bookkeeping as trigger_crisis — an UNKNOWN
+                # (uninvited) uid does not get ordinary message/profile persistence.
+                if access_control.resolve_role_safe(uid) != access_control.UNKNOWN:
+                    await save_message(uid, "user", user_text, "crisis", lang,
+                                       risk["score"], risk["categories"])
+                text, kb = crisis_screen(stage, lang, event_id)
+                await send_crisis(message.answer, text, kb, lang, uid, event_id, "screen")
+            return
+
+        # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here).
+        # RED bypasses the product-access gate below entirely, for ANY role — the
+        # crisis path must never be gated by access control.
+        if classify(risk) == RED:
+            await trigger_crisis(message, uid, username, user_text, risk, lang)
+            return
+
+        # 4.1 Product access gate — strictly AFTER both crisis paths above, and
+        # BEFORE any ordinary product persistence (upsert_user/log_moderation/state/
+        # profile/memory/LLM). UNKNOWN, CLINICIAN_REVIEWER, an unacknowledged
+        # CLINICIAN_TESTER, or an acknowledged tester with no reviewer mapping all
+        # get the closed-test/tester-acknowledgment screen instead, and NOTHING
+        # ordinary is written about them.
+        if not await ensure_full_access_or_closed_test(message, uid):
+            return
+
+        # 4.2 Mandatory onboarding gate (spec item A) — strictly AFTER both crisis
+        # paths AND the access gate, and BEFORE any ordinary product persistence.
+        # A user with an ACTIVE first-user onboarding must not reach ordinary text/
+        # voice conversation by typing through it — this re-shows their current
+        # onboarding card (editing it in place, never flooding the chat) instead of
+        # silently dropping the message or letting it fall into the pipeline.
+        # Unconditional (not skipped when called from cb_mood, which already runs
+        # this same check before ever calling pipeline()) -- a second read of the
+        # same DB state here is a harmless no-op when already blocked/cleared
+        # upstream, and this way pipeline() is safe to call from ANY entrypoint
+        # without relying on a caller-specific signal to know whether the gate was
+        # already checked.
+        if await _onboarding_blocks_ordinary_entry(uid):
+            await _resume_onboarding_card(message.chat.id, uid)
+            return
+
+        # 5. Ordinary persistence — only now that access is confirmed.
+        await upsert_user(uid, username, first_name, lang)
+        await reset_unanswered(uid)   # user re-engaged → clear ignored-push backoff
+
+        # 3. Log if medium+
+        if risk["level"] in ("medium", "high", "critical"):
+            await log_moderation(uid, username, first_name, risk["level"], risk["score"],
+                                  risk["categories"], user_text, "pending", risk["implicit"])
+
+        # Aggression signal — checkpoint-2 item 2: routed through access_control
+        # instead of an unconditional push_alert. By construction we only reach here
+        # for a role that already has full product access (OWNER, or an
+        # acknowledged+mapped CLINICIAN_TESTER); should_alert_owner is False for a
+        # tester, so no owner alert and no raw-text leak happens for them. RED+
+        # aggression never reaches here (RED already returned above), so there is
+        # never a duplicate owner alert.
+        if "aggression" in risk["categories"] and access_control.should_alert_owner(uid):
+            await push_alert("Aggression Detected", uid, username, risk["level"],
+                             risk["score"], risk["categories"], user_text)
+
+        # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
+        # (current one not saved yet). Used to amplify ambiguity and bias routing.
+        trajectory = await get_emotional_trajectory(uid, window_hours=24)
+
+        # 4.5 Ambiguity check (v3 hotfix) — runs BEFORE any LLM call.
+        # A double-meaning phrase ("выйти в окно") must trigger a deterministic
+        # clarifying question, never an LLM guess. With recent risk history we also
+        # surface the hotline. This is the direct fix for the endorsement incident.
+        if risk.get("ambiguous_phrases"):
+            recent = await get_recent_messages(uid, limit=10)
+            signal = amplify_ambiguity_by_context(risk["ambiguous_phrases"], recent)
+            # §4: trajectory upgrades a soft "force_disambiguation" to "force_crisis"
+            # when aggregated dynamics show deterioration or a chronic risk streak —
+            # closing the gap where raw last-message scanning would miss it.
+            if signal and (trajectory.trend == "deteriorating"
+                           or trajectory.hopelessness_streak >= 3
+                           or trajectory.yellow_plus_streak >= 5):
+                signal = "force_crisis"
+            if signal:
+                phrase = risk["ambiguous_phrases"][0]
+                disambig = get_disambiguation_message(
+                    phrase, lang, with_hotline=(signal == "force_crisis"))
+                await save_message(uid, "user", user_text, "disambiguation", lang,
+                                   risk["score"], risk["categories"])
+                await save_message(uid, "assistant", disambig, "disambiguation", lang)
+                await message.answer(disambig)
+                await log_disambiguation(uid, user_text, phrase, signal)
                 return
-            elif pure and fmt_cmd.kind in ("concise_oneshot", "detailed_oneshot"):
-                await message.answer(_format_ack_text(fmt_cmd, lang))
+
+        # 3.5 Dependency monitor -- the ONE deterministic authority (Therapeutic
+        # Core Foundation): consolidates the behavioural-pattern signals (this
+        # module) and the explicit-phrase signal (relationship_monitor) behind a
+        # single shared cooldown gate. record_message MUST come first so the
+        # current message is counted before the threshold check -- otherwise the
+        # 100th message never triggers. A non-None result is a soft, narrow
+        # redirect that REPLACES the ordinary reply for this turn (never both),
+        # matching CLINICAL_BOUNDARY.md §2.3 -- it is never crisis protocol, and
+        # this check always runs strictly after the crisis/RED checks above.
+        await dependency_monitor.record_message(uid)
+        dep_msg = await dependency_monitor.assess(uid, user_text, lang)
+        if dep_msg:
+            await message.answer(dep_msg)
+            return
+
+        # 4.3 Format meta-command detection (Voice and Adaptive Response UX) --
+        # AFTER crisis/dependency handling, BEFORE ordinary therapeutic routing.
+        # Private-chat-only in V1 (§4): a group/supergroup message never even
+        # enters this block, so nothing here can be armed, consumed, or replayed
+        # from a non-private chat -- ordinary text handling for a group message
+        # is completely unaffected (not a bot-wide policy change).
+        # A MIXED message ("Мне тревожно, и ответь голосом") falls through to
+        # the ordinary pipeline below unchanged -- only delivery of the eventual
+        # answer is affected. A PURE command never enters therapeutic routing.
+        one_shot_voice = False
+        one_shot_concise = False
+        voice_ux_active = _voice_ux_enabled_for(uid) and is_private_chat
+
+        # Consume a one-shot voice override armed by a PRIOR Telegram update (see
+        # the "no previous response yet" branch below) -- a plain local variable
+        # cannot survive past the end of THIS function call, so the override is
+        # persisted in FSM state. aiogram's default FSMStrategy is USER_IN_CHAT
+        # (confirmed: bot.py's Dispatcher(storage=MemoryStorage()) never
+        # overrides fsm_strategy), so `fsm_state` is ALREADY scoped per (chat,
+        # user) -- the same user in a different chat gets a completely separate
+        # FSM entry. Cleared the instant it is read (whether still within TTL or
+        # already expired): it can apply to at most ONE subsequent ordinary
+        # reply, is never written to the DB, and is never a permanent
+        # preference. Crisis and dependency both return earlier in pipeline()
+        # than this point, so an intervening crisis/dependency message leaves an
+        # armed override untouched -- PRESERVED for the next ordinary message,
+        # the chosen deterministic rule (not silently dropped, not consumed by
+        # a non-ordinary reply).
+        if voice_ux_active and fsm_state is not None:
+            pending = await fsm_state.get_data()
+            if pending.get("one_shot_voice_pending"):
+                armed_at = pending.get("one_shot_voice_pending_at") or 0
+                if time.time() - armed_at <= config.VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS:
+                    one_shot_voice = True
+                await fsm_state.update_data(one_shot_voice_pending=False,
+                                            one_shot_voice_pending_at=None)
+
+        # Detection itself is flag-gated ONLY (cheap, stateless, no I/O) -- but
+        # every ACTION (persistence, replay, override arming, voice delivery)
+        # below remains private-chat-only. This matters specifically for a PURE
+        # command outside a private chat: it must be recognized and short-
+        # circuited with a neutral notice, never silently sent to the
+        # therapeutic LLM just because chat.type != "private" made detection
+        # itself unavailable (the earlier, narrower gate did exactly that).
+        fmt_cmd = parse_format_command(user_text, lang) if config.VOICE_REPLIES_ENABLED else None
+        if fmt_cmd:
+            pure = is_pure_format_command(user_text, lang)
+            if pure and not voice_ux_active:
+                # §5 (private-chat boundary) + owner-only canary gate: a pure
+                # meta-command from a non-private chat OR a non-owner user (even
+                # in their own private chat) must never replay, never arm an
+                # override, never touch a preference, and never enter
+                # therapeutic routing -- a short neutral notice, then stop.
+                # voice_ux_active already folds in flag + owner + private-chat.
+                await message.answer(
+                    "Настройки формата и озвучивание доступны в личном чате с ботом." if lang == "ru"
+                    else "Format settings and voice replies are only available in a private chat with me.")
                 return
-        # else: a MIXED message. When voice_ux_active (owner, private chat,
-        # flag on), falls through with the one-shot flags armed above.
-        # Otherwise -- non-private chat OR non-owner -- voice_ux_active was
-        # False so the `if voice_ux_active:` block never ran -- the format
-        # fragment is silently ignored (no preference write, no override
-        # armed) and ordinary routing proceeds UNCHANGED for the emotional
-        # content, exactly as it did before this feature existed.
 
-    # 5. Update state
-    state = await load_state(uid) or dict(DEFAULT_STATE)
-    state = update_state(state, user_text)
-    await save_state(uid, state)
+            if voice_ux_active:
+                if fmt_cmd.kind == "voice_persistent":
+                    await set_response_preference(uid, response_format="voice")
+                elif fmt_cmd.kind == "text_persistent":
+                    await set_response_preference(uid, response_format="text")
+                elif fmt_cmd.kind == "concise_persistent":
+                    await set_response_preference(uid, response_length="concise")
+                elif fmt_cmd.kind == "voice_oneshot":
+                    one_shot_voice = True
+                elif fmt_cmd.kind == "concise_oneshot":
+                    one_shot_concise = True
 
-    # 6. Detect stage
-    stage = detect_stage(user_text, lang)
+                if pure and fmt_cmd.persistent:
+                    await message.answer(_format_ack_text(fmt_cmd, lang))
+                    return
+                if pure and fmt_cmd.kind == "voice_oneshot":
+                    # §8: "много текста"/"лень читать" etc. -- voice-ify the LAST
+                    # SUCCESSFULLY DELIVERED ordinary response instead of
+                    # generating a new therapeutic interpretation, when one is
+                    # still available. Sourced from FSM state
+                    # (last_delivered_response), NOT the database -- FSM is
+                    # scoped per (chat, user) by aiogram itself, so a
+                    # private-chat reply can never be replayed from a different
+                    # chat the same Telegram user happens to also be in.
+                    fdata = await fsm_state.get_data() if fsm_state is not None else {}
+                    last = fdata.get("last_delivered_response")
+                    last_at = fdata.get("last_delivered_response_at") or 0
+                    if last and (time.time() - last_at <= config.VOICE_LAST_RESPONSE_TTL_SECONDS):
+                        spoken = _safe_concise_version(last, lang)
+                        ok = await _synthesize_and_send_voice(message, uid, spoken, lang)
+                        if not ok:
+                            await message.answer(last)
+                        return
+                    # No usable previous response (none stored, or past its
+                    # TTL): this message itself must NEVER be treated as
+                    # therapeutic content. Clear any stale value, arm the
+                    # override for the NEXT ordinary reply (consumed above, on
+                    # that future update), and stop here.
+                    if fsm_state is not None:
+                        await fsm_state.update_data(
+                            last_delivered_response=None, last_delivered_response_at=None,
+                            one_shot_voice_pending=True, one_shot_voice_pending_at=time.time())
+                    await message.answer(
+                        "Хорошо, следующий ответ озвучу." if lang == "ru"
+                        else "Okay, I'll voice the next reply.")
+                    return
+                elif pure and fmt_cmd.kind in ("concise_oneshot", "detailed_oneshot"):
+                    await message.answer(_format_ack_text(fmt_cmd, lang))
+                    return
+            # else: a MIXED message. When voice_ux_active (owner, private chat,
+            # flag on), falls through with the one-shot flags armed above.
+            # Otherwise -- non-private chat OR non-owner -- voice_ux_active was
+            # False so the `if voice_ux_active:` block never ran -- the format
+            # fragment is silently ignored (no preference write, no override
+            # armed) and ordinary routing proceeds UNCHANGED for the emotional
+            # content, exactly as it did before this feature existed.
 
-    # 7. Assess readiness
-    readiness = assess_readiness(user_text, lang)
+        # 5. Update state
+        state = await load_state(uid) or dict(DEFAULT_STATE)
+        state = update_state(state, user_text)
+        await save_state(uid, state)
 
-    # 8. Cognitive capacity
-    capacity = get_capacity(state)
+        # 6. Detect stage
+        stage = detect_stage(user_text, lang)
 
-    # 9. Select scenario
-    variant = get_variant(uid)
-    scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
-                               variant, trajectory=trajectory)
+        # 7. Assess readiness
+        readiness = assess_readiness(user_text, lang)
 
-    # 9.5 Emotional reaction (Voice and Adaptive Response UX) -- best-effort,
-    # deterministic, fires only for genuine (non-format-only) messages: a
-    # PURE format command already returned above and never reaches here.
-    cat, conf = select_reaction_category(user_text, risk["categories"], stage, lang,
-                                         is_meta_command=False, is_dependency_redirect=False)
+        # 8. Cognitive capacity
+        capacity = get_capacity(state)
+
+        # 9. Select scenario
+        variant = get_variant(uid)
+        scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
+                                   variant, trajectory=trajectory)
+
+        # 9.5 Emotional reaction (Voice and Adaptive Response UX) -- best-effort,
+        # deterministic, fires only for genuine (non-format-only) messages: a
+        # PURE format command already returned above and never reaches here.
+        cat, conf = select_reaction_category(user_text, risk["categories"], stage, lang,
+                                             is_meta_command=False, is_dependency_redirect=False)
+
+        # 11. Select practice
+        severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
+        practice = select_practice(scenario, stage, severity, lang)
+
+        # 12. Log router decision
+        await log_router_decision(uid, state, risk["score"], risk["categories"],
+                                   stage, readiness, capacity, scenario,
+                                   practice["id"], variant, ROUTER_VERSION)
+
+        # 12.5 Persist the USER message HERE -- before BOTH long LLM awaits
+        # (maybe_summarize below AND the answer call). Memory loads recent messages
+        # by autoincrement id (get_recent_messages ORDER BY id DESC), so a row's
+        # arrival ORDER is its id order. Every await before this point is a fast
+        # local/DB op; the two multi-second awaits (summarization, answer) come
+        # after. So a slow turn can no longer pause on an LLM call while a newer,
+        # faster turn's user row lands first and makes the slow turn look like the
+        # newest active context (P1 EARLY PERSISTENCE ORDER RACE -- previously this
+        # save sat after both LLM awaits). The assistant row is still saved later,
+        # and only if this turn was not superseded. A duplicate Telegram update
+        # never reaches here (DuplicateUpdateGuard drops it), so no duplicate row.
+        await save_message(uid, "user", user_text, scenario, lang,
+                           risk["score"], risk["categories"])
+    finally:
+        _ingest_leave(uid, _ingest)
+    # 9.5 reaction: moved OUT of the ingestion lock (never hold the
+    # lock across reaction sending). cat/conf were computed above.
     await _maybe_react(message, uid, cat, conf)
 
-    # 11. Select practice
-    severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
-    practice = select_practice(scenario, stage, severity, lang)
-    
-    # 12. Log router decision
-    await log_router_decision(uid, state, risk["score"], risk["categories"],
-                               stage, readiness, capacity, scenario,
-                               practice["id"], variant, ROUTER_VERSION)
-    
-    # 13. Memory
+    # 13. Memory. build_context now returns the just-saved current user message
+    # as the newest item in `recent`, so it is NOT appended again below.
     await maybe_summarize(uid, client)
     summary, recent = await build_context(uid)
-    
-    # 14. Build messages
+
+    # 14. Build messages (recent already ends with the current user message)
     system_prompt = get_system_prompt(scenario, lang)
     messages = [{"role": "system", "content": system_prompt}]
     if summary:
         messages.append({"role": "system", "content": f"Context:\n{summary}"})
     for role, content in recent:
         messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": user_text})
-    
+
     # 15. LLM call
     await bot.send_chat_action(message.chat.id, "typing")
     try:
@@ -1157,12 +1187,23 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # NEVER re-prompt the LLM here.
         answer = select_fallback(risk, lang)
 
-    # 17. Save & send (with a human-feeling typing pause, §7.2). The user
-    # message carries its risk snapshot — the deterministic source for §4/§5.
-    await save_message(uid, "user", user_text, scenario, lang,
-                       risk["score"], risk["categories"])
-    await save_message(uid, "assistant", answer, scenario, lang)
+    # 17. Send (with a human-feeling typing pause, §7.2). The user message was
+    # already persisted before the LLM call (step 14.5) to preserve arrival
+    # order; only the assistant row + delivery remain, and both are gated on
+    # this turn not having been superseded.
     await asyncio.sleep(typing_delay(answer))
+    # Stale-response guard: if a NEWER turn for this user started while this
+    # ordinary answer was being generated (aiogram runs updates as concurrent
+    # tasks), this answer is stale -- skip persisting the assistant row AND
+    # delivering it, so an older reply can never arrive after a newer one, and
+    # a stale assistant answer never enters memory. Checked as late as possible
+    # (after the typing pause) to catch a turn that arrived during it.
+    # Deterministic safety replies (crisis/dependency/disambiguation) returned
+    # earlier and are never subject to this guard.
+    if _user_generation_superseded(uid, _turn_gen):
+        _dispatch_log(f"cid={_cid} stage=skipped_stale source=normal")
+        return
+    await save_message(uid, "assistant", answer, scenario, lang)
     await deliver_response(message, uid, answer, lang,
                            one_shot_voice=one_shot_voice, one_shot_concise=one_shot_concise)
     # Only reached if deliver_response did not raise -- an exception during
@@ -1788,10 +1829,179 @@ dp.callback_query.outer_middleware(
     OnboardingGateMiddleware(_callback_is_onboarding_exempt, kind="callback"))
 
 
+# ── Duplicate-update guard + privacy-safe dispatch trace ───────────────────
+# Investigation of a "one message -> a second, stale-context answer ~1 min
+# later" report could not be closed because (a) the bot logged NOTHING per
+# update, so the two sends could not be correlated after the fact, and (b)
+# start_polling ran with neither drop_pending_updates NOR any update_id
+# deduplication -- so a redelivered/replayed update (restart backlog, a
+# reconnect) reprocesses as a fresh answer that leans on now-stale memory,
+# exactly the observed shape. The exact trigger of that specific event was
+# NOT proven; this closes the diagnosability gap and the one real latent
+# duplicate vector, without changing any normal behavior.
+#
+# Telegram update_ids are unique and monotonic under normal operation, so
+# this guard NEVER drops a legitimate update -- it fires only on an exact
+# duplicate id. Bounded FIFO; a restart simply starts with an empty window.
+# LIMITATION: this is IN-MEMORY -- it does NOT survive a process restart and
+# is not durable idempotency; it only defends a single continuous run against
+# a redelivered/replayed identical update. The trace logs the update_id (a
+# Telegram-internal sequence number) and the decision only -- never message
+# text, user id, username or any content.
+_SEEN_UPDATE_IDS_MAX = 4096
+_seen_update_ids: "OrderedDict[int, None]" = OrderedDict()
+
+
+def _dispatch_log(msg: str) -> None:
+    """Privacy-safe dispatch trace. Exception-proof by contract: observability
+    must never be able to break message delivery (§9)."""
+    try:
+        print(f"[dispatch] {msg}")
+    except Exception:
+        pass
+
+
+class DuplicateUpdateGuard(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        update_id = getattr(event, "update_id", None)
+        if update_id is not None:
+            # check-and-add is a read-modify-write with no await between, so it
+            # is atomic under asyncio's single thread (concurrent duplicate ->
+            # exactly one passes).
+            if update_id in _seen_update_ids:
+                _dispatch_log(f"update_id={update_id} decision=duplicate_dropped")
+                return None
+            _seen_update_ids[update_id] = None
+            if len(_seen_update_ids) > _SEEN_UPDATE_IDS_MAX:
+                _seen_update_ids.popitem(last=False)
+            _dispatch_log(f"update_id={update_id} decision=accepted")
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(DuplicateUpdateGuard())
+
+
+# ── Stale-response guard: suppress an ordinary answer superseded mid-flight ─
+# Reproduced race (see tests): aiogram runs updates as concurrent tasks
+# (handle_as_tasks=True), so two turns from the SAME user can run pipeline()
+# at once. If an earlier turn's LLM call is slow and a later turn finishes
+# first, the earlier turn then delivers its now-stale answer AFTER the newer
+# one -- "two answers, the second referencing older context". This is the
+# actual mechanism behind the owner report; the DB timestamps are pipeline-
+# COMPLETION times, not arrival times, so they never proved two user sends.
+#
+# Fix: a per-user monotonic "generation". Every new user turn (ordinary
+# pipeline entry, crisis pipeline entry, and /start) bumps it. An ordinary
+# answer captures the generation at entry and, immediately before delivery,
+# skips if a newer turn has since bumped it. Deterministic safety responses
+# (crisis / dependency / disambiguation) return earlier and are never guarded
+# -- they are always delivered. The bump is a read-modify-write with no await
+# between, so it is atomic under asyncio's single thread; no lock needed.
+# Bounded FIFO; an evicted user fails OPEN (delivers), the pre-existing
+# behavior. In-memory only -- it does not, and need not, survive a restart.
+_USER_GEN_MAX = 4096
+_user_generation: "OrderedDict[int, int]" = OrderedDict()
+
+
+def _bump_user_generation(uid: int) -> int:
+    g = _user_generation.get(uid, 0) + 1
+    _user_generation[uid] = g
+    if len(_user_generation) > _USER_GEN_MAX:
+        _user_generation.popitem(last=False)
+    return g
+
+
+def _user_generation_superseded(uid: int, captured: int) -> bool:
+    """True iff a newer turn for uid started after `captured` was taken."""
+    return _user_generation.get(uid, captured) > captured
+
+
+def _new_correlation_id() -> str:
+    """Random per-turn id for privacy-safe log correlation. NOT derived from
+    any user identifier -- it exists only to stitch one turn's log lines
+    together, never to identify a person."""
+    return secrets.token_hex(4)
+
+
+# ── Per-user ingestion lock: preserve arrival order of user-row persistence ──
+# Generation suppression already stops a stale ANSWER from being delivered or
+# persisted. This closes the remaining pre-persistence race: two turns from the
+# same user run pipeline() as concurrent aiogram tasks, and the older one can
+# pause on a fast pre-save DB await while the newer one saves its user row
+# first -- and memory loads by autoincrement id (get_recent_messages ORDER BY
+# id DESC), so the older row would then look like the newest active context.
+#
+# Fix: each turn acquires this user's lock at entry (the only code before the
+# acquire is pure/sync -- language + risk detection -- so acquire order equals
+# entry order, and asyncio.Lock grants FIFO). It is held ONLY through the
+# pre-persistence work and the user-row save, then released BEFORE the two
+# multi-second awaits (summarization, answer) and before reaction sending /
+# TTS / delivery. So it orders persistence without serializing conversations.
+#
+# Registry: per-user, bounded LRU. A holder is evicted ONLY when refs == 0
+# (no acquirer and no waiter) -- never one that is held or awaited. In-memory;
+# a restart terminates all in-flight coroutines, so no cross-process claim is
+# needed. No user id is ever logged.
+class _IngestHolder:
+    __slots__ = ("lock", "refs", "seq")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refs = 0    # acquirers + current waiters referencing this holder
+        self.seq = 0     # last-used monotonic sequence (LRU tiebreak)
+
+
+_INGEST_MAX = 4096
+_ingest_registry: "OrderedDict[int, _IngestHolder]" = OrderedDict()
+_ingest_seq = 0
+
+
+def _ingest_get_or_create(uid: int) -> _IngestHolder:
+    """Sync (no await): bump refs and LRU, evicting only unheld/unwaited
+    holders. Atomic under asyncio's single thread."""
+    global _ingest_seq
+    holder = _ingest_registry.get(uid)
+    if holder is None:
+        holder = _IngestHolder()
+        _ingest_registry[uid] = holder
+    _ingest_seq += 1
+    holder.seq = _ingest_seq
+    holder.refs += 1
+    _ingest_registry.move_to_end(uid)
+    if len(_ingest_registry) > _INGEST_MAX:
+        for k in list(_ingest_registry):
+            if k != uid and _ingest_registry[k].refs == 0:
+                del _ingest_registry[k]
+                if len(_ingest_registry) <= _INGEST_MAX:
+                    break
+    return holder
+
+
+async def _ingest_enter(uid: int) -> _IngestHolder:
+    holder = _ingest_get_or_create(uid)
+    try:
+        await holder.lock.acquire()
+    except BaseException:
+        _ingest_leave(uid, holder, acquired=False)
+        raise
+    return holder
+
+
+def _ingest_leave(uid: int, holder: _IngestHolder, acquired: bool = True) -> None:
+    if acquired:
+        holder.lock.release()
+    holder.refs -= 1
+    if holder.refs <= 0 and _ingest_registry.get(uid) is holder:
+        del _ingest_registry[uid]
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     from datetime import datetime, timezone
     uid = message.from_user.id
+    # /start is a new turn: bump the generation so any ordinary answer still
+    # being generated for this user is superseded and not delivered afterward.
+    _bump_user_generation(uid)
     # PR C3a.1 -- parse a /start deep-link payload BEFORE the access gate.
     # This is the critical ordering: a temp-invite-code holder has no prior
     # access, so if we ran ensure_full_access_or_closed_test first they'd be
@@ -4822,6 +5032,14 @@ async def main():
     scheduler = setup_scheduler(bot)
     scheduler.start()
     print("✅ X20 Bot started")
+    # NOTE: no drop_pending_updates here. In aiogram 3.7 it is NOT a
+    # start_polling parameter -- it would fall into **kwargs and be injected
+    # as workflow_data (a misleading no-op that drops nothing), and the only
+    # real way to drop the backlog is bot.delete_webhook(drop_pending_updates
+    # =True), which silently discards messages users sent during a restart.
+    # That message loss is deliberately NOT wanted: a normal restart must
+    # never drop a user's message. The stale-answer defence lives in the
+    # per-turn generation guard (see _bump_user_generation) instead.
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
