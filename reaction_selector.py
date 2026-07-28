@@ -9,6 +9,7 @@ it is never persisted as a psychological profile, diagnosis, or trait.
 """
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Optional
 
@@ -142,6 +143,110 @@ _CONF_RISK_CATEGORY = 0.75
 _CONF_STAGE = 0.55
 
 
+# ── Keyword-hit guards (P1: false emotional reaction) ──────────────────────
+# A bare substring hit says only that a word appeared -- not that the USER is
+# reporting that feeling NOW. Reacting 😟 to "я больше не тревожусь", to a
+# colleague's feelings, to a quoted sentence, or to "что означает слово
+# «тревога»?" is a visible empathy failure: it tells the user the bot
+# misread them. These four bounded, deterministic guards reject exactly
+# those shapes. This is not sentiment analysis and must not grow into it --
+# when a guard is unsure it REJECTS, because a missing reaction is invisible
+# while a wrong one is not.
+_WORD_RE_CACHE: dict[str, "re.Pattern"] = {}
+
+
+def _word_re(pattern: str):
+    got = _WORD_RE_CACHE.get(pattern)
+    if got is None:
+        got = re.compile(pattern, re.UNICODE)
+        _WORD_RE_CACHE[pattern] = got
+    return got
+
+
+# Negation particles, matched as whole words within a short window BEFORE the
+# hit ("я больше НЕ тревожусь", "I am NOT upset"). The window is deliberately
+# small so a negation in an unrelated earlier clause does not mute a genuine
+# later disclosure.
+_NEGATION_WINDOW_CHARS = 24
+_NEGATION_RE = {
+    "ru": r"\b(не|нет|ни)\b",
+    "en": r"\b(not|no|never|dont|don't|doesn't|didn't)\b",
+}
+
+# First-person pronouns, whole-word. Possessives ("мой", "моя") are
+# deliberately EXCLUDED -- "мой коллега тревожится" is about the colleague.
+_FIRST_PERSON_RE = {
+    "ru": r"\b(я|мне|меня|мной|мною)\b",
+    # "my" is excluded for the same reason as RU "мой": "my colleague is
+    # exhausted" is about the colleague, not the speaker.
+    "en": r"\b(i|me|myself|i'm|im)\b",
+}
+
+# Explicit other-person subjects. Only mutes when NO first-person pronoun is
+# present, so "мой муж кричал, и мне тревожно" still reacts to the user.
+_THIRD_PERSON_RE = {
+    "ru": (r"\b(он|она|они|коллега|коллеги|муж|жена|сестра|брат|мама|папа|"
+           r"друг|подруга|начальник|сын|дочь|родители|партнёр|партнер)\b"),
+    "en": (r"\b(he|she|they|colleague|husband|wife|sister|brother|mom|mother|"
+           r"dad|father|friend|boss|son|daughter|parents|partner)\b"),
+}
+
+# Meta-language: the user is asking ABOUT a word or requesting an example,
+# not disclosing a feeling.
+_META_LANGUAGE = {
+    "ru": ("что означает", "что значит", "напиши пример", "приведи пример",
+           "пример фразы", "как пишется", "значение слова", "слово ", "фраз"),
+    "en": ("what does", "what means", "write an example", "give an example",
+           "example phrase", "the word ", "meaning of"),
+}
+
+# Quotation pairs. A hit inside quotes is reported speech or a cited phrase.
+_QUOTE_PAIRS = (("«", "»"), ("„", "“"), ('"', '"'), ("“", "”"))
+
+
+def _quoted_spans(text: str) -> list[tuple[int, int]]:
+    spans = []
+    for open_q, close_q in _QUOTE_PAIRS:
+        start = 0
+        while True:
+            i = text.find(open_q, start)
+            if i < 0:
+                break
+            j = text.find(close_q, i + len(open_q))
+            if j < 0:
+                break
+            spans.append((i, j))
+            start = j + len(close_q)
+    return spans
+
+
+def _keyword_hit_is_self_report(text_low: str, phrase: str, lang: str) -> bool:
+    """True only when a keyword hit plausibly IS the user reporting that
+    feeling about themselves, right now. Rejects negated, quoted,
+    third-person and meta-language hits."""
+    lang = lang if lang in _NEGATION_RE else "ru"
+    idx = text_low.find(phrase)
+    if idx < 0:
+        return False
+
+    for start, end in _quoted_spans(text_low):
+        if start < idx < end:
+            return False
+
+    if any(m in text_low for m in _META_LANGUAGE[lang]):
+        return False
+
+    window = text_low[max(0, idx - _NEGATION_WINDOW_CHARS):idx]
+    if _word_re(_NEGATION_RE[lang]).search(window):
+        return False
+
+    has_first = bool(_word_re(_FIRST_PERSON_RE[lang]).search(text_low))
+    if not has_first and _word_re(_THIRD_PERSON_RE[lang]).search(text_low):
+        return False
+
+    return True
+
+
 def select_reaction_category(
     user_text: str,
     risk_categories: list[str],
@@ -161,8 +266,13 @@ def select_reaction_category(
     text_low = (user_text or "").lower()
     kw = _KEYWORDS.get(lang, _KEYWORDS["ru"])
     for cat, phrases in kw.items():
-        if any(p in text_low for p in phrases):
-            return cat, _CONF_KEYWORD
+        for p in phrases:
+            # A guarded-out hit falls THROUGH to the risk-category rules
+            # below rather than short-circuiting to NONE: a genuine
+            # panic/burnout signal must still be able to earn a reaction on
+            # its own evidence, independently of this wording check.
+            if p in text_low and _keyword_hit_is_self_report(text_low, p, lang):
+                return cat, _CONF_KEYWORD
 
     if "hopelessness" in risk_categories:
         return ReactionCategory.TEARS_WELLING, _CONF_RISK_CATEGORY

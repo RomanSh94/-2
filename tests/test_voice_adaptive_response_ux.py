@@ -2444,6 +2444,42 @@ def test_reply_keyboard_removal_is_per_user_not_global(tmp_db, monkeypatch):
     assert isinstance(b.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
 
 
+def test_failed_eviction_still_delivers_text_and_stays_retryable(tmp_db, monkeypatch):
+    # Review finding: marking the uid BEFORE a confirmed send made a failed
+    # eviction permanent for that user. The answer must still arrive, and the
+    # next reply must try the eviction again.
+    bot._legacy_kb_cleared.clear()
+    run(database.upsert_user(1, "u", "U"))
+    sends = []
+    class _FlakyMessage(FakeMessage):
+        async def answer(self, text, **kw):
+            sends.append(kw.get("reply_markup"))
+            if isinstance(kw.get("reply_markup"), bot.ReplyKeyboardRemove):
+                raise RuntimeError("telegram rejected the removal")
+            self.answers.append((text, kw))
+
+    first = _FlakyMessage(FakeUser(1), "hi")
+    run(bot.deliver_response(first, 1, "the answer", "ru"))
+    assert [a[0] for a in first.answers] == ["the answer"]  # text still arrived
+    assert 1 not in bot._legacy_kb_cleared                  # left retryable
+
+    second = FakeMessage(FakeUser(1), "hi again")
+    run(bot.deliver_response(second, 1, "second answer", "ru"))
+    assert isinstance(second.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
+    assert 1 in bot._legacy_kb_cleared  # marked only after a successful send
+
+
+def test_eviction_tracking_is_bounded(tmp_db, monkeypatch):
+    # The set must not grow for the whole process lifetime.
+    bot._legacy_kb_cleared.clear()
+    monkeypatch.setattr(bot, "_LEGACY_KB_MAX_TRACKED", 5)
+    run(database.upsert_user(1, "u", "U"))
+    for uid in range(1, 12):
+        msg = FakeMessage(FakeUser(uid), "hi")
+        run(bot.deliver_response(msg, uid, "answer", "ru"))
+    assert len(bot._legacy_kb_cleared) <= 5
+
+
 def test_mood_entry_is_inline_and_reply_keyboard_never_reintroduced():
     # The emotion choices must stay attached to their own message (inline) so
     # they can never occupy the user's text-input keyboard area again.
@@ -2523,6 +2559,80 @@ def test_new_keywords_never_override_crisis_or_dependency():
     assert rs.select_reaction_category(
         "я устал", [], "OPEN", "ru",
         is_meta_command=True) == (rs.ReactionCategory.NONE, 0.0)
+
+
+# ── P1 guard: a keyword hit must be a SELF-REPORT, not any occurrence ─────
+# Reacting 😟 to "я больше не тревожусь", to a colleague's feelings, to a
+# quoted sentence or to "что означает слово «тревога»?" tells the user the
+# bot misread them. A missing reaction is invisible; a wrong one is not.
+
+@pytest.mark.parametrize("phrase", [
+    "Я больше не тревожусь.",
+    "Я не расстроен.",
+    "Я не устала, всё нормально.",
+])
+def test_negated_feeling_never_reacts(phrase):
+    assert rs.select_reaction_category(phrase, [], "OPEN", "ru")[0] == \
+        rs.ReactionCategory.NONE
+
+
+@pytest.mark.parametrize("phrase", [
+    "Мой коллега тревожится.",
+    "Мой брат очень устал.",
+])
+def test_third_person_feeling_never_reacts(phrase):
+    assert rs.select_reaction_category(phrase, [], "OPEN", "ru")[0] == \
+        rs.ReactionCategory.NONE
+
+
+@pytest.mark.parametrize("phrase", [
+    "Она сказала: «Я очень устала».",
+    'Он написал "мне тревожно" вчера.',
+])
+def test_quoted_feeling_never_reacts(phrase):
+    assert rs.select_reaction_category(phrase, [], "OPEN", "ru")[0] == \
+        rs.ReactionCategory.NONE
+
+
+@pytest.mark.parametrize("phrase", [
+    "Что означает слово «тревога»?",
+    "Напиши пример фразы «мне тревожно».",
+])
+def test_meta_language_never_reacts(phrase):
+    assert rs.select_reaction_category(phrase, [], "OPEN", "ru")[0] == \
+        rs.ReactionCategory.NONE
+
+
+def test_third_person_does_not_mute_the_users_own_feeling():
+    # A third-person subject is present, but so is a first-person pronoun,
+    # so the user's own disclosure still earns its reaction -- the guard
+    # must not over-reject.
+    cat, conf = rs.select_reaction_category(
+        "Мой муж кричал, и мне тревожно.", [], "OPEN", "ru")
+    assert cat == rs.ReactionCategory.ANXIETY_OR_WORRY
+    assert conf >= config.EMOTIONAL_REACTION_MIN_CONFIDENCE
+
+
+def test_bare_gratitude_without_pronoun_still_reacts():
+    # The guard must not require a first-person pronoun outright -- "Спасибо!"
+    # is a genuine self-report containing no pronoun at all.
+    assert rs.select_reaction_category("Спасибо!", [], "OPEN", "ru")[0] == \
+        rs.ReactionCategory.GRATITUDE_OR_WARMTH
+
+
+def test_guarded_keyword_still_falls_through_to_risk_category_rules():
+    # A guarded-out wording hit must not short-circuit the whole selector:
+    # an independent panic risk signal still earns its own reaction.
+    cat, conf = rs.select_reaction_category(
+        "Я не тревожусь", ["panic"], "ACUTE_DISTRESS", "ru")
+    assert cat == rs.ReactionCategory.ANXIETY_OR_WORRY
+    assert conf == 0.75
+
+
+def test_english_negation_and_third_person_guards():
+    for phrase in ("I am not anxious about it.", "My colleague is exhausted."):
+        assert rs.select_reaction_category(phrase, [], "OPEN", "en")[0] == \
+            rs.ReactionCategory.NONE
 
 
 def test_english_variants_select_expected_categories():

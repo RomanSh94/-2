@@ -257,17 +257,41 @@ _listen_last_tap: dict[int, float] = {}
 #
 # In-memory set (same convention as _reaction_last_sent/_listen_last_tap): a
 # restart simply re-sends one harmless no-op removal per user. Nothing in the
-# current codebase constructs a ReplyKeyboardMarkup at all, so this can never
-# retract a keyboard some other live flow still needs.
+# current codebase constructs a ReplyKeyboardMarkup at all (it is not even
+# imported), so this can never retract a keyboard some other live flow needs
+# -- and ReplyKeyboardRemove does not touch inline keyboards.
+#
+# BOUNDED, and deliberately so: one int per distinct user would otherwise grow
+# for the process lifetime. At the cap the whole set is dropped rather than
+# evicting an arbitrary member -- the only consequence of forgetting a user is
+# one extra no-op removal on their next reply, so a cheap full reset is
+# preferable to maintaining insertion order for a value this inconsequential.
+_LEGACY_KB_MAX_TRACKED = 10_000
 _legacy_kb_cleared: set[int] = set()
 
 
-def _legacy_kb_removal(uid: int):
-    """ReplyKeyboardRemove exactly once per user per process, else None."""
+async def _answer_evicting_legacy_kb(message: Message, uid: int, text: str) -> None:
+    """Send one ordinary reply, evicting the legacy reply keyboard the first
+    time we successfully reply to this user.
+
+    Eviction is strictly best-effort and must never cost the user their
+    answer: if the send carrying the removal fails, the answer is retried
+    plain and the uid stays UNMARKED so the next reply tries again. The uid
+    is marked only AFTER a confirmed successful send -- marking first would
+    make a failed eviction permanent for that user."""
     if uid in _legacy_kb_cleared:
-        return None
+        await message.answer(text)
+        return
+    try:
+        await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        # The removal never got through, so nothing was delivered either --
+        # retry the plain answer (not a duplicate) and leave uid unmarked.
+        await message.answer(text)
+        return
+    if len(_legacy_kb_cleared) >= _LEGACY_KB_MAX_TRACKED:
+        _legacy_kb_cleared.clear()
     _legacy_kb_cleared.add(uid)
-    return ReplyKeyboardRemove()
 
 
 def _voice_ux_enabled_for(uid: int) -> bool:
@@ -396,7 +420,7 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
     message reach the format-command/override code at all."""
     is_private = getattr(message.chat, "type", "private") == "private"
     if not _voice_ux_enabled_for(uid) or not is_private:
-        await message.answer(answer, reply_markup=_legacy_kb_removal(uid))
+        await _answer_evicting_legacy_kb(message, uid, answer)
         return
 
     prefs = await get_response_preferences(uid)
