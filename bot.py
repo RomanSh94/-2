@@ -1085,30 +1085,32 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                                stage, readiness, capacity, scenario,
                                practice["id"], variant, ROUTER_VERSION)
     
-    # 13. Memory
+    # 12.5 Persist the USER message HERE -- before BOTH long LLM awaits
+    # (maybe_summarize below AND the answer call). Memory loads recent messages
+    # by autoincrement id (get_recent_messages ORDER BY id DESC), so a row's
+    # arrival ORDER is its id order. Every await before this point is a fast
+    # local/DB op; the two multi-second awaits (summarization, answer) come
+    # after. So a slow turn can no longer pause on an LLM call while a newer,
+    # faster turn's user row lands first and makes the slow turn look like the
+    # newest active context (P1 EARLY PERSISTENCE ORDER RACE -- previously this
+    # save sat after both LLM awaits). The assistant row is still saved later,
+    # and only if this turn was not superseded. A duplicate Telegram update
+    # never reaches here (DuplicateUpdateGuard drops it), so no duplicate row.
+    await save_message(uid, "user", user_text, scenario, lang,
+                       risk["score"], risk["categories"])
+
+    # 13. Memory. build_context now returns the just-saved current user message
+    # as the newest item in `recent`, so it is NOT appended again below.
     await maybe_summarize(uid, client)
     summary, recent = await build_context(uid)
-    
-    # 14. Build messages
+
+    # 14. Build messages (recent already ends with the current user message)
     system_prompt = get_system_prompt(scenario, lang)
     messages = [{"role": "system", "content": system_prompt}]
     if summary:
         messages.append({"role": "system", "content": f"Context:\n{summary}"})
     for role, content in recent:
         messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": user_text})
-
-    # 14.5 Persist the USER message BEFORE the LLM call. Memory loads recent
-    # messages by autoincrement id (get_recent_messages ORDER BY id DESC), so
-    # the row's arrival ORDER is its id order. Saving here -- when this turn is
-    # processed -- keeps a slow turn's user row correctly BEFORE a newer,
-    # faster turn's user row (P1: previously this save happened after the LLM,
-    # so a slow answer's user row landed last and looked like the newest active
-    # context). The assistant row is still saved later, and only if this turn
-    # was not superseded. A duplicate Telegram update never reaches here
-    # (DuplicateUpdateGuard drops it), so this never writes a duplicate row.
-    await save_message(uid, "user", user_text, scenario, lang,
-                       risk["score"], risk["categories"])
 
     # 15. LLM call
     await bot.send_chat_action(message.chat.id, "typing")

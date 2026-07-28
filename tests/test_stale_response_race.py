@@ -174,6 +174,45 @@ def test_persistence_order_slow_A_then_fast_B_keeps_arrival_order(tmp_db, monkey
     assert mB.answers == ["answer1"] and mA.answers == []
 
 
+def test_early_order_A_paused_in_summarize_keeps_arrival_order(tmp_db, monkeypatch):
+    # Adversarial early-order race (§3): the proven long await BEFORE the user
+    # save was maybe_summarize (an LLM call). The user save now happens BEFORE
+    # it, so even when A pauses inside summarization, A's user row is already
+    # written and B cannot overtake it. Required order (by id): user_A, user_B,
+    # assistant_B; assistant_A absent.
+    run(database.upsert_user(1, "u", "U"))
+    summ_gate = asyncio.Event()
+    calls = {"n": 0}
+
+    async def gated_summarize(uid, client):
+        i = calls["n"]
+        calls["n"] += 1
+        if i == 0:                 # A blocks here, AFTER having saved user_A
+            await summ_gate.wait()
+        return None
+    monkeypatch.setattr(bot, "maybe_summarize", gated_summarize)
+
+    async def create(*a, **kw):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="ok"))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", create)
+
+    mA = FakeMessage(FakeUser(1), "A arrives first")
+    mB = FakeMessage(FakeUser(1), "B arrives second")
+
+    async def scenario():
+        tA = asyncio.create_task(bot.pipeline(mA, "A arrives first", FakeFSM()))
+        await asyncio.sleep(0.03)              # A saves user_A, then blocks in summarize
+        await bot.pipeline(mB, "B arrives second", FakeFSM())  # B saves user_B, completes
+        summ_gate.set()
+        await tA
+        return await _message_roles(1)
+    roles = run(scenario())
+
+    assert roles == ["user", "user", "assistant"]   # user_A before user_B; only assistant_B
+    assert mB.answers == ["ok"] and mA.answers == []
+
+
 def test_stale_turn_persists_no_assistant_row(tmp_db, monkeypatch):
     run(database.upsert_user(1, "u", "U"))
     gate = _gated_llm(monkeypatch)
