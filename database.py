@@ -543,6 +543,93 @@ CREATE TABLE IF NOT EXISTS user_response_preferences (
     CHECK(response_length IN ('concise', 'normal')),
     CHECK(voice_language IN ('ru', 'en', 'auto'))
 );
+
+-- Therapeutic Core domain foundation (Phase 1, master prompt SS15). Inert
+-- storage: nothing in bot.pipeline() reads or writes these tables yet -- see
+-- therapeutic_domain.py for the validated Python models each *_json column
+-- serializes. Top-level columns duplicate the filterable fields already
+-- inside the JSON (same pattern as router_decision_logs.state_snapshot) so
+-- callers can query/index without deserializing every row; the JSON blob
+-- remains the single source of truth for full reconstruction.
+CREATE TABLE IF NOT EXISTS core_sessions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id          INTEGER NOT NULL REFERENCES users(id),
+    intent           TEXT NOT NULL DEFAULT 'UNKNOWN',
+    phase            TEXT NOT NULL DEFAULT 'OPENING',
+    lifecycle_status TEXT NOT NULL DEFAULT 'OPEN',
+    state_json       TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_sessions_user ON core_sessions(user_id);
+-- At most one OPEN/PAUSED (resumable) session per user, enforced at the
+-- engine level -- same technique as idx_onboarding_one_active_per_user
+-- above. Concurrent create_core_session() calls for the same user race on
+-- this index: the second INSERT fails with IntegrityError instead of
+-- silently forking two active sessions.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_core_one_open_session_per_user
+    ON core_sessions(user_id) WHERE lifecycle_status IN ('OPEN','PAUSED');
+
+CREATE TABLE IF NOT EXISTS core_formulations (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       INTEGER NOT NULL REFERENCES core_sessions(id),
+    user_id          INTEGER NOT NULL REFERENCES users(id),
+    confirmation     TEXT NOT NULL DEFAULT 'UNCONFIRMED',
+    formulation_json TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_formulations_user ON core_formulations(user_id);
+CREATE INDEX IF NOT EXISTS idx_core_formulations_session ON core_formulations(session_id);
+
+-- capability_level/method_id/consent are columns (not just JSON) because the
+-- Phase 5 Method Registry and the Phase 6 Outcome Engine need to filter/join
+-- on them without deserializing intervention_json on every row.
+CREATE TABLE IF NOT EXISTS core_interventions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        INTEGER NOT NULL REFERENCES core_sessions(id),
+    user_id           INTEGER NOT NULL REFERENCES users(id),
+    method_id         TEXT NOT NULL,
+    capability_level  TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'PROPOSED',
+    consent           TEXT NOT NULL DEFAULT 'ABSENT',
+    intervention_json TEXT NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_interventions_user ON core_interventions(user_id);
+-- Engine-level proof of SS15.6 ("at most one active intervention per
+-- session"): a second ACCEPTED/STARTED row for the same session is an
+-- IntegrityError, not a hopeful application-level check. Same technique as
+-- idx_onboarding_one_active_per_user above.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_core_one_active_intervention_per_session
+    ON core_interventions(session_id) WHERE status IN ('ACCEPTED','STARTED');
+
+CREATE TABLE IF NOT EXISTS core_outcomes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    intervention_id INTEGER NOT NULL REFERENCES core_interventions(id),
+    user_id         INTEGER NOT NULL REFERENCES users(id),
+    metric_kind     TEXT NOT NULL,
+    outcome_json    TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_outcomes_user ON core_outcomes(user_id);
+
+-- Confirmable memory (SS14). lifecycle starts at CANDIDATE; only CONFIRMED/
+-- CORRECTED rows may influence a response (MemoryLifecycle.influences_responses
+-- in therapeutic_domain.py) -- REJECTED/EXPIRED rows stay in the table for audit/
+-- export but a future Core reader must filter them out, never delete-and-forget.
+CREATE TABLE IF NOT EXISTS core_memory_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    category    TEXT NOT NULL,
+    lifecycle   TEXT NOT NULL DEFAULT 'CANDIDATE',
+    memory_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_memory_items_user ON core_memory_items(user_id);
 """
 
 # Additive column migrations (no migration system in this repo; ADD COLUMN is
@@ -2615,3 +2702,221 @@ def sync_export_query_safe(table: str) -> tuple:
     rows = cur.fetchall()
     conn.close()
     return cols, rows
+
+
+# ── Therapeutic Core Foundation (Phase 1) ───────────────────────────────────
+# Restart-safe storage for therapeutic_domain.py's validated models. The DB row
+# is the canonical source of state -- never a process-local dict (SS15.3).
+# Every read/update filters by user_id (never trusts a bare row id as proof
+# of ownership -- SS21), so a stale/forged id from one user can never touch
+# another user's row: it simply matches zero rows.
+#
+# Nothing in bot.pipeline() calls into this section yet -- it ships inert,
+# behind THERAPEUTIC_CORE_FOUNDATION_ENABLED staying false, exactly like the
+# rest of the flag-off surface in this file.
+
+import therapeutic_domain as _core
+
+
+def _dump_session_json(state: _core.SessionState) -> str:
+    """The DB row id is the ONLY canonical session_id (§ "one source of
+    truth" -- see the Phase 1 PR description). state_json never embeds it, so
+    there is no second copy that could ever diverge from the row id, and no
+    caller can observe a placeholder/unassigned id even transiently: the row
+    doesn't exist in a queryable state until INSERT returns, at which point
+    the id is already final."""
+    d = state.to_dict()
+    d.pop("session_id", None)
+    return json.dumps(d)
+
+
+def _load_session(row_id, raw_json: str) -> _core.SessionState:
+    """Inverse of `_dump_session_json`: session_id is always hydrated from the
+    relational row id, never read out of the JSON blob."""
+    d = json.loads(raw_json)
+    d["session_id"] = str(row_id)
+    return _core.SessionState.from_dict(d)
+
+
+async def create_core_session(user_id: int, intent=_core.Intent.UNKNOWN) -> _core.SessionState:
+    """Single INSERT, single commit. Raises sqlite3.IntegrityError if `user_id`
+    already has an OPEN/PAUSED session (idx_core_one_open_session_per_user) --
+    concurrent creation for the same user fails deterministically rather than
+    silently forking two active sessions; a rolled-back INSERT leaves no row,
+    so there is nothing for a reader to observe mid-failure."""
+    state = _core.SessionState(session_id="unassigned", user_id=user_id, intent=intent)
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_sessions (user_id, intent, phase, lifecycle_status, state_json)
+               VALUES (?,?,?,?,?)""",
+            (user_id, state.intent.value, state.phase.value,
+             state.lifecycle_status.value, _dump_session_json(state)))
+        await db.commit()
+        state.session_id = str(cur.lastrowid)
+    return state
+
+
+async def get_core_session(session_id: str, user_id: int) -> _core.SessionState | None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id, state_json FROM core_sessions WHERE id=? AND user_id=?",
+            (session_id, user_id))
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return _load_session(row[0], row[1])
+
+
+async def list_core_sessions(user_id: int, active_only: bool = False) -> list[_core.SessionState]:
+    query = "SELECT id, state_json FROM core_sessions WHERE user_id=?"
+    if active_only:
+        query += " AND lifecycle_status IN ('OPEN','PAUSED')"
+    query += " ORDER BY id DESC"
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(query, (user_id,))).fetchall()
+    return [_load_session(r[0], r[1]) for r in rows]
+
+
+async def update_core_session(state: _core.SessionState) -> bool:
+    """Persists `state` back to its own row. Returns False (no-op) if
+    session_id/user_id no longer match any row -- callers must not assume the
+    write happened without checking this. Never trusts state.session_id as
+    proof of ownership by itself: the WHERE clause also requires user_id to
+    match, so a caller holding another user's session_id updates zero rows."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_sessions SET intent=?, phase=?, lifecycle_status=?,
+               state_json=?, updated_at=datetime('now') WHERE id=? AND user_id=?""",
+            (state.intent.value, state.phase.value, state.lifecycle_status.value,
+             _dump_session_json(state), state.session_id, state.user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def add_core_formulation(session_id: str, user_id: int,
+                                formulation: _core.Formulation) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_formulations (session_id, user_id, confirmation, formulation_json)
+               VALUES (?,?,?,?)""",
+            (session_id, user_id, formulation.confirmation.value,
+             json.dumps(formulation.to_dict())))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_core_formulations(session_id: str, user_id: int) -> list[_core.Formulation]:
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            """SELECT formulation_json FROM core_formulations
+               WHERE session_id=? AND user_id=? ORDER BY id""",
+            (session_id, user_id))).fetchall()
+    return [_core.Formulation.from_dict(json.loads(r[0])) for r in rows]
+
+
+async def add_core_intervention(session_id: str, user_id: int,
+                                 intervention: _core.Intervention) -> int:
+    """Raises sqlite3.IntegrityError if `intervention` starts ACCEPTED/STARTED
+    and the session already has another active intervention (SS15.6 -- enforced
+    by idx_core_one_active_intervention_per_session, not just by convention)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_interventions
+               (session_id, user_id, method_id, capability_level, status, consent, intervention_json)
+               VALUES (?,?,?,?,?,?,?)""",
+            (session_id, user_id, intervention.method_id,
+             intervention.capability_level.value, intervention.status.value,
+             intervention.consent.value, json.dumps(intervention.to_dict())))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_core_intervention(intervention_id: str, user_id: int) -> _core.Intervention | None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT intervention_json FROM core_interventions WHERE id=? AND user_id=?",
+            (intervention_id, user_id))
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return _core.Intervention.from_dict(json.loads(row[0]))
+
+
+async def get_active_core_intervention(session_id: str, user_id: int) -> _core.Intervention | None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """SELECT intervention_json FROM core_interventions
+               WHERE session_id=? AND user_id=? AND status IN ('ACCEPTED','STARTED')""",
+            (session_id, user_id))
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return _core.Intervention.from_dict(json.loads(row[0]))
+
+
+async def update_core_intervention(intervention_id: str, user_id: int,
+                                    intervention: _core.Intervention) -> bool:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_interventions SET status=?, consent=?, intervention_json=?,
+               updated_at=datetime('now') WHERE id=? AND user_id=?""",
+            (intervention.status.value, intervention.consent.value,
+             json.dumps(intervention.to_dict()), intervention_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def add_core_outcome(intervention_id: str, user_id: int,
+                            outcome: _core.OutcomeMeasurement) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_outcomes (intervention_id, user_id, metric_kind, outcome_json)
+               VALUES (?,?,?,?)""",
+            (intervention_id, user_id, outcome.metric_kind.value,
+             json.dumps(outcome.to_dict())))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_core_outcomes(intervention_id: str, user_id: int) -> list[_core.OutcomeMeasurement]:
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            """SELECT outcome_json FROM core_outcomes
+               WHERE intervention_id=? AND user_id=? ORDER BY id""",
+            (intervention_id, user_id))).fetchall()
+    return [_core.OutcomeMeasurement.from_dict(json.loads(r[0])) for r in rows]
+
+
+async def add_core_memory_item(user_id: int, item: _core.MemoryItem) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_memory_items (user_id, category, lifecycle, memory_json)
+               VALUES (?,?,?,?)""",
+            (user_id, item.category.value, item.lifecycle.value, json.dumps(item.to_dict())))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_core_memory_items(user_id: int, *, influencing_only: bool = False
+                                  ) -> list[_core.MemoryItem]:
+    """influencing_only=True returns only CONFIRMED/CORRECTED items (SS14.12 --
+    REJECTED/EXPIRED items must never influence a response)."""
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            "SELECT memory_json FROM core_memory_items WHERE user_id=? ORDER BY id",
+            (user_id,))).fetchall()
+    items = [_core.MemoryItem.from_dict(json.loads(r[0])) for r in rows]
+    if influencing_only:
+        items = [i for i in items if i.influences_responses]
+    return items
+
+
+async def update_core_memory_item_lifecycle(item_id: str, user_id: int,
+                                             lifecycle: _core.MemoryLifecycle) -> bool:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_memory_items SET lifecycle=?, updated_at=datetime('now')
+               WHERE id=? AND user_id=?""",
+            (lifecycle.value, item_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0

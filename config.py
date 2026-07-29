@@ -162,6 +162,41 @@ THERAPEUTIC_CORE_FOUNDATION_ENABLED = (
     in ("1", "true", "yes", "on")
 )
 
+# Master-prompt §24's off/owner/invited/all rollout contract for the NEW
+# governed Therapeutic Core (session/hypothesis/intervention/outcome/memory —
+# therapeutic_domain.py + database.py's core_* tables, Phase 1 onward). This is
+# the ONE canonical rollout switch for that surface, going forward.
+#
+# Legacy-flag relationship (no two competing sources of truth): the boolean
+# THERAPEUTIC_CORE_FOUNDATION_ENABLED above is scoped, permanently, to the
+# narrow pre-existing fixes documented in its own comment (baseline-skip
+# button, dependency-monitor consolidation, practice-registry reachability) —
+# it predates this rollout model and MUST NOT be read by any Phase-1-forward
+# Core code. Nothing in the new core_* storage or therapeutic_domain.py checks
+# it, and this flag will never be repurposed to mean something new; it is
+# simply a different, already-shipped feature that happens to share the
+# "Therapeutic Core" name from the original handoff document.
+# THERAPEUTIC_CORE_ROLLOUT_MODE is independent and starts at "off", so
+# introducing it changes no runtime behavior (flag-off compatibility is
+# preserved for both flags simultaneously). "invited" and "all" have no
+# effect yet because no Phase 3+ user-facing Core behavior exists to gate —
+# access_control.core_rollout_allowed() is the single check future phases
+# must call before running any Core turn.
+_THERAPEUTIC_CORE_ROLLOUT_MODES = ("off", "owner", "invited", "all")
+
+
+def _validate_core_rollout_mode(raw: str) -> str:
+    value = (raw or "off").strip().lower()
+    if value not in _THERAPEUTIC_CORE_ROLLOUT_MODES:
+        raise ValueError(
+            f"Unsupported THERAPEUTIC_CORE_ROLLOUT_MODE={value!r}; "
+            f"supported values: {_THERAPEUTIC_CORE_ROLLOUT_MODES}")
+    return value
+
+
+THERAPEUTIC_CORE_ROLLOUT_MODE = _validate_core_rollout_mode(
+    os.getenv("THERAPEUTIC_CORE_ROLLOUT_MODE", "off"))
+
 # ── Voice and Adaptive Response UX — both default OFF ───────────────────────
 # VOICE_REPLIES_ENABLED gates: the /format selector, the "🔊 Прослушать"
 # listen button, natural-language format/voice meta-commands, and the
