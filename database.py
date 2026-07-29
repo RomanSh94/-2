@@ -1459,16 +1459,133 @@ async def supersede_active_disclosure_flows_for_crisis(uid: int) -> int:
     shared crisis-entry function every route in this codebase funnels
     through -- BEFORE the crisis screen is delivered and BEFORE
     log_crisis_event is even attempted, so it holds regardless of whether
-    audit logging succeeds, fails, or is skipped. Returns the number of
-    flows superseded (0 or 1, since at most one can ever be active)."""
+    audit logging succeeds, fails, or is skipped.
+
+    Phase 3 correction: also invalidates a COMPLETED-but-unclaimed handoff
+    (status='completed' AND handoff_status='ready') the same way -- a crisis
+    beginning between "assessment completed" and "Conversation Controller
+    claims it" must not leave a stale pre-crisis handoff claimable once the
+    crisis is resolved. No schema change needed: the row's `status` moves to
+    'superseded_by_crisis' (already in the CHECK constraint), which is
+    exactly what get_unclaimed_handoff's own WHERE clause (status='completed')
+    already requires to no longer match.
+
+    Returns the number of rows superseded (0, 1, or -- only in the
+    vanishingly rare case both an active flow AND a completed-unclaimed one
+    exist for the same user -- 2)."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             """UPDATE depression_disclosure_flows
                SET status='superseded_by_crisis', superseded_reason='crisis_activated',
                    updated_at=datetime('now')
-               WHERE user_id=? AND status='active'""", (uid,))
+               WHERE user_id=? AND (status='active'
+                                    OR (status='completed' AND handoff_status='ready'))""",
+            (uid,))
         await db.commit()
         return cur.rowcount
+
+
+async def supersede_active_core_sessions_for_crisis(uid: int) -> int:
+    """Phase 3 correction §6: crisis must supersede ALL ordinary Core work,
+    not just the Depression Disclosure Gate. Called from the same canonical,
+    logging-independent crisis-entry point (top of trigger_crisis) as
+    supersede_active_disclosure_flows_for_crisis, in its own try/except.
+
+    Every OPEN core_session for this user is PAUSED (resumable later, same
+    semantics as /start -- a crisis interruption is not a permanent
+    cancellation of ordinary conversational work). Any PENDING or GRANTED
+    consent (e.g. an unanswered PRACTICE proposal) is WITHDRAWN, so a stale
+    consent callback becomes non-actionable the same way a stale disclosure-
+    gate callback does: the callback's own ownership+status check (§4) reads
+    this already-updated state, not a second explicit crisis check.
+
+    Goes through the existing list_core_sessions/update_core_session
+    accessors (not raw SQL) so state_json and its denormalized columns never
+    drift out of sync -- the same discipline as Phase 1's create_core_session."""
+    sessions = await list_core_sessions(uid, active_only=True)
+    count = 0
+    for s in sessions:
+        if s.lifecycle_status is not _core.LifecycleStatus.OPEN:
+            continue
+        s.lifecycle_status = _core.LifecycleStatus.PAUSED
+        if s.consent in (_core.ConsentState.PENDING, _core.ConsentState.GRANTED):
+            s.consent = _core.ConsentState.WITHDRAWN
+        if await update_core_session(s):
+            count += 1
+    return count
+
+
+async def claim_handoff_and_get_or_create_session(
+        uid: int) -> tuple[dict | None, "_core.SessionState | None"]:
+    """Phase 3 correction §5 -- ONE atomic transaction: claim the user's
+    single valid unclaimed Depression Disclosure Gate handoff (if any) and
+    link it to their existing OPEN/PAUSED session or a newly-created one, in
+    the SAME connection/commit as the claim itself.
+
+    Two concurrent calls for the same user can never both succeed: the
+    claim's own conditional UPDATE (handoff_status 'ready' -> 'claimed') is
+    the race guard, evaluated by SQLite's own transaction serialization on
+    this one connection/file -- the loser's rowcount is 0 and it returns
+    (None, None) immediately, touching no session row at all.
+
+    Correction round 2 (§2/§3): this function DOES NOT set or persist the
+    session's `intent`, deliberately. Claiming the handoff and linking it to
+    a session is INTERPRETATION-INDEPENDENT (the same regardless of what
+    this turn's text says) and safe to do unconditionally, before any
+    staleness check. Which Intent the session ends up with depends on THIS
+    turn's classification (repair signal > handoff purpose > plain text) and
+    on this turn still being authoritative when it finishes -- so the caller
+    (bot.py) sets `session.intent` itself and persists it ONLY via its own
+    already generation-guarded update_core_session() call, after its stale-
+    response check. A superseded turn therefore claims/links (harmless,
+    idempotent bookkeeping) but never gets to write an intent, a repair
+    constraint, or a consent change -- those all live in the one
+    update_core_session() call this function deliberately does not make.
+
+    Returns (None, None) when there is nothing to claim -- the caller falls
+    back to plain-text intent classification for this turn."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"""SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows
+               WHERE user_id=? AND status='completed' AND handoff_status='ready'
+               ORDER BY id DESC LIMIT 1""", (uid,))).fetchone()
+        if row is None:
+            return None, None
+        handoff = _dd_row_to_dict(row)
+
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows SET handoff_status='claimed',
+               updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND status='completed' AND handoff_status='ready'""",
+            (handoff["id"], uid))
+        if cur.rowcount == 0:
+            await db.commit()
+            return None, None  # lost the race to a concurrent claim
+
+        srow = await (await db.execute(
+            """SELECT id, state_json FROM core_sessions
+               WHERE user_id=? AND lifecycle_status IN ('OPEN','PAUSED')
+               ORDER BY id DESC LIMIT 1""", (uid,))).fetchone()
+        if srow is not None:
+            state = _load_session(srow[0], srow[1])
+            state.handoff_flow_id = str(handoff["id"])
+            await db.execute(
+                "UPDATE core_sessions SET state_json=?, updated_at=datetime('now') WHERE id=? AND user_id=?",
+                (_dump_session_json(state), state.session_id, uid))
+        else:
+            state = _core.SessionState(session_id="unassigned", user_id=uid)  # intent defaults UNKNOWN
+            cur2 = await db.execute(
+                """INSERT INTO core_sessions (user_id, intent, phase, lifecycle_status, state_json)
+                   VALUES (?,?,?,?,?)""",
+                (uid, state.intent.value, state.phase.value,
+                 state.lifecycle_status.value, _dump_session_json(state)))
+            state.session_id = str(cur2.lastrowid)
+            state.handoff_flow_id = str(handoff["id"])
+            await db.execute(
+                "UPDATE core_sessions SET state_json=? WHERE id=?",
+                (_dump_session_json(state), state.session_id))
+        await db.commit()
+    return handoff, state
 
 
 async def log_crisis_delivery(event_id, user_id: int, kind: str,
@@ -3143,12 +3260,14 @@ async def close_disclosure_flow(flow_id, user_id: int, *, from_step: str, status
 
 
 async def claim_disclosure_handoff(flow_id, user_id: int) -> dict | None:
-    """Phase 3 consumption point (not built in this PR -- this is the tested
-    accessor Phase 3 will call). Atomically transitions handoff_status
-    'ready' -> 'claimed'; a repeated claim finds handoff_status already
-    'claimed' and matches zero rows, so it fails deterministically (returns
-    None) rather than silently succeeding twice or raising. Ownership-checked
-    like every other accessor here -- a wrong user_id also matches zero rows."""
+    """The Conversation Controller's (Phase 3) consumption point. Atomically
+    transitions handoff_status 'ready' -> 'claimed'; a repeated claim finds
+    handoff_status already 'claimed' and matches zero rows, so it fails
+    deterministically (returns None) rather than silently succeeding twice or
+    raising -- this is what makes it safe to call from a turn that might be
+    reprocessed (e.g. after a restart) without ever creating two controller
+    sessions from the same handoff. Ownership-checked like every other
+    accessor here -- a wrong user_id also matches zero rows."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             """UPDATE depression_disclosure_flows SET handoff_status='claimed',
@@ -3162,3 +3281,21 @@ async def claim_disclosure_handoff(flow_id, user_id: int) -> dict | None:
             f"SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows WHERE id=?",
             (flow_id,))).fetchone()
     return _dd_row_to_dict(row)
+
+
+async def get_unclaimed_handoff(user_id: int) -> dict | None:
+    """The most recent completed, not-yet-claimed disclosure flow for this
+    user (status='completed' AND handoff_status='ready') -- used by the
+    Conversation Controller to find a handoff to claim without already
+    knowing its flow_id. At most one such row can realistically exist at a
+    time (only one flow is ever 'active' -> 'completed' per user before the
+    next one either supersedes it or is itself claimed), but ORDER BY id DESC
+    LIMIT 1 is still explicit about which one wins if history ever contains
+    more than one for any reason."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"""SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows
+               WHERE user_id=? AND status='completed' AND handoff_status='ready'
+               ORDER BY id DESC LIMIT 1""",
+            (user_id,))).fetchone()
+    return _dd_row_to_dict(row) if row else None

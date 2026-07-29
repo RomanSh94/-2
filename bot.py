@@ -135,6 +135,12 @@ from depression_disclosure import (
     PURPOSE_OPTIONS, DIAGNOSIS_SOURCE_OPTIONS, SAFETY_CHECK_OPTIONS,
     STEP_ALLOWED_VALUES, STEP_TAG_TO_DB_STEP, STEP_ANSWER_KEY,
 )
+from database import (
+    create_core_session, get_core_session, list_core_sessions, update_core_session,
+    claim_handoff_and_get_or_create_session, supersede_active_core_sessions_for_crisis,
+)
+import conversation_controller as controller
+from therapeutic_domain import Intent, RepairConstraint, LifecycleStatus, ConsentState
 import onboarding
 import onboarding_content
 from onboarding_content import ONBOARDING_VERSION, PRIVACY_NOTICE_VERSION, FIRST_STEP, LAST_STEP
@@ -789,6 +795,13 @@ async def trigger_crisis(message: Message, uid: int, username: str,
         await supersede_active_disclosure_flows_for_crisis(uid)
     except Exception as e:
         print(f"[crisis] disclosure-flow supersession FAILED uid={uid}: {type(e).__name__}: {e}")
+    # Phase 3 correction §6: crisis supersedes ALL ordinary Core work, not
+    # just the Depression Disclosure Gate -- same unconditional, logging-
+    # independent placement, its own try/except.
+    try:
+        await supersede_active_core_sessions_for_crisis(uid)
+    except Exception as e:
+        print(f"[crisis] core-session supersession FAILED uid={uid}: {type(e).__name__}: {e}")
 
     eid = None
     try:
@@ -920,6 +933,129 @@ async def journal_guard(message: Message, uid: int, lang: str,
     if level == "ORANGE":
         return "orange", risk
     return "ok", risk
+
+
+def _practice_consent_kb(session_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [("yes", "Да", "Yes"), ("no", "Нет", "No")]
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=(ru if lang != "en" else en),
+                             callback_data=f"cc:consent:{session_id}:{val}")
+        for val, ru, en in labels]])
+
+
+async def _run_conversation_controller(message: Message, uid: int, user_text: str,
+                                       lang: str, turn_gen: int) -> bool:
+    """Phase 3. Returns True iff this turn was fully handled (answered) by
+    the controller -- the caller must return immediately without falling
+    through to the ordinary scenario pipeline. False means no explicit
+    intent was recognized and there is no pending Phase 2 handoff to
+    consume; the caller continues ordinary processing unchanged.
+
+    Handoff consumption (§5): claim_handoff_and_get_or_create_session is ONE
+    atomic transaction (claim + session link), not a separate discover-then-
+    claim-then-create sequence -- two concurrent turns for the same user
+    cannot both claim the same handoff or create two sessions from it. A
+    repair signal on the CURRENT message always takes priority over both the
+    handoff-derived intent and plain text classification (§16).
+
+    `turn_gen` (§3): the SAME generation number pipeline() captured at turn
+    start, checked immediately before persistence/delivery -- a controller
+    response is subject to the identical stale-response suppression as the
+    ordinary LLM path (PR#67), never a second, uncovered code path.
+
+    Intent is deliberately NOT determined by claim_handoff_and_get_or_create_
+    session (§2/§3 of the second correction round): that call only claims
+    the handoff and links it to a session (interpretation-independent,
+    always safe to do eagerly). The purpose->intent mapping happens HERE,
+    in-memory, and is only ever written to the DB via the stale-guarded
+    update_core_session() call near the end of this function -- a superseded
+    turn claims/links (harmless) but never persists an intent."""
+    handoff, handoff_session = await claim_handoff_and_get_or_create_session(uid)
+    known_facts: list[str] = []
+    handoff_intent = None
+    if handoff is not None and handoff_session is not None:
+        answers = safe_load_answers(handoff["answers_json"])
+        purpose = answers.get("purpose")
+        handoff_intent = controller.HANDOFF_PURPOSE_TO_INTENT.get(purpose, Intent.UNKNOWN)
+        if handoff.get("diagnosis_source"):
+            known_facts.append(f"diagnosis_source={handoff['diagnosis_source']}")
+        for key in ("duration", "functioning", "basic_activities", "support"):
+            if answers.get(key):
+                known_facts.append(f"{key}={answers[key]}")
+
+    repair_now = controller.classify_repair_signals(user_text)
+    if repair_now:
+        intent = Intent.REPAIR
+    elif handoff_intent is not None and handoff_intent is not Intent.UNKNOWN:
+        intent = handoff_intent
+    else:
+        intent = controller.classify_intent(user_text, lang)
+
+    if intent is Intent.UNKNOWN:
+        return False
+
+    if handoff_session is not None:
+        session = handoff_session
+        session.intent = intent
+    else:
+        active_sessions = await list_core_sessions(uid, active_only=True)
+        session = active_sessions[0] if active_sessions else None
+        if session is None:
+            session = await create_core_session(uid, intent=intent)
+        elif session.lifecycle_status is LifecycleStatus.PAUSED:
+            # §17: a new explicit-intent message resumes a /start-paused
+            # session rather than forcing the user to explicitly "continue"
+            # -- engaging with a new explicit request IS the continuation signal.
+            session.lifecycle_status = LifecycleStatus.OPEN
+        session.intent = intent
+
+    plan = controller.build_response_plan(intent, repair_now)
+    system_prompt = controller.build_system_prompt(plan, lang, known_facts)
+
+    try:
+        completion = await client.chat.completions.create(
+            model="gpt-4o-mini", temperature=0.65, max_tokens=300,
+            messages=[{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": user_text}])
+        text = (completion.choices[0].message.content or "").strip()
+        if not text:
+            text = controller.fallback_text(lang, intent)
+    except Exception as e:
+        print(f"[controller] LLM call failed uid={uid}: {type(e).__name__}: {e}")
+        text = controller.fallback_text(lang, intent)
+
+    ok, _reason = controller.validate_controller_response(text, plan)
+    if ok:
+        ok, _reason = validate_response(text, lang)
+    if not ok:
+        text = controller.fallback_text(lang, intent)
+
+    # Stale-response guard (§3): the SAME suppression the ordinary LLM path
+    # uses (PR#67) -- a newer turn for this user superseded this one while
+    # the LLM call above was in flight. No persistence, no delivery.
+    if _user_generation_superseded(uid, turn_gen):
+        return True
+
+    # PRACTICE requires explicit consent (§12) -- deterministic Да/Нет
+    # buttons, never LLM-parsed free text. consent=PENDING is persisted
+    # BEFORE delivery so a fast-arriving callback always finds a live row.
+    reply_markup = None
+    if intent is Intent.PRACTICE:
+        session.consent = ConsentState.PENDING
+        reply_markup = _practice_consent_kb(session.session_id, lang)
+
+    await save_message(uid, "user", user_text, "controller", lang, 0, [])
+    await message.answer(text, reply_markup=reply_markup)
+    await save_message(uid, "assistant", text, "controller", lang)
+
+    # One-shot repair honoring (§16): only THIS turn's freshly-classified
+    # repair signals persist into the session; a signal from a PRIOR turn is
+    # cleared once a response has been generated attempting to honor it. If
+    # the user repeats the same complaint, classify_repair_signals() sets it
+    # again fresh on the next turn.
+    session.repair_constraints = repair_now
+    await update_core_session(session)
+    return True
 
 
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
@@ -1073,6 +1209,21 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 await close_disclosure_flow(active_flow["id"], uid,
                                             from_step=active_flow["step"],
                                             status="cancelled", superseded_reason="new_topic")
+
+        # 4.3b Conversation Controller (Phase 3, master prompt §10/§15). Runs
+        # strictly AFTER the RED crisis check and the Depression Disclosure
+        # Gate above -- both already returned for this turn if triggered, so
+        # a crisis or an eligible disclosure always wins. Gated by the SAME
+        # centralized Core rollout contract Phase 1 defined
+        # (access_control.core_rollout_allowed) -- no second, competing
+        # rollout switch. Returns True only when it fully handled (answered)
+        # this turn; False means "nothing for the controller to do here",
+        # and the existing ordinary scenario pipeline below runs completely
+        # unchanged (this IS the flag-off/no-explicit-intent byte-for-byte
+        # compatibility path).
+        if await access_control.core_rollout_allowed(uid):
+            if await _run_conversation_controller(message, uid, user_text, lang, _turn_gen):
+                return
 
         # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
         # (current one not saved yet). Used to amplify ambiguity and bias routing.
@@ -1816,6 +1967,64 @@ async def cb_dd_purpose(callback: CallbackQuery):
     await callback.message.answer(closing_text(lang))
 
 
+# ── Conversation Controller: PRACTICE consent (Phase 3 §12) ────────────────
+# callback_data "cc:consent:<session_id>:<yes|no>" -- deterministic Да/Нет,
+# never LLM-parsed free text. Same ownership/rollout/status discipline as
+# every other callback in this file: session_id alone is never proof of
+# ownership, and consent is only actionable while status=='PENDING'.
+
+_PRACTICE_ID = "grounding_5senses_v1"
+
+
+@dp.callback_query(F.data.startswith("cc:consent:"))
+async def cb_cc_consent(callback: CallbackQuery):
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, session_id, value = parts
+    if value not in ("yes", "no"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    session = await get_core_session(session_id, uid)
+    if session is None or session.consent is not ConsentState.PENDING \
+            or session.lifecycle_status is not LifecycleStatus.OPEN:
+        # Rejects: wrong owner, already-answered/duplicate tap, session
+        # PAUSED by /start or by crisis supersession (§6/§17), expired-ish
+        # states -- all identically, no state change, no delivery.
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+
+    if value == "no":
+        session.consent = ConsentState.DECLINED
+        if not await update_core_session(session):
+            await callback.answer()
+            return
+        await callback.answer()
+        await callback.message.answer(
+            "Хорошо, не будем. Если захочешь попробовать позже — просто скажи." if lang != "en"
+            else "Okay, we won't. Just say the word if you want to try later.")
+        return
+
+    session.consent = ConsentState.GRANTED
+    if not await update_core_session(session):
+        await callback.answer()
+        return
+    await callback.answer()
+    practice = get_production_practice_by_id(_PRACTICE_ID, lang)
+    if practice:
+        steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
+        await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}",
+                                      parse_mode="HTML")
+    else:  # pragma: no cover -- defensive, the id above is a real production practice
+        await callback.message.answer(controller.fallback_text(lang, Intent.PRACTICE))
+
+
 @dp.callback_query(F.data.startswith("after:"))
 async def cb_after(callback: CallbackQuery, fsm_state: FSMContext):
     score = int(callback.data.split(":")[1])
@@ -2357,6 +2566,18 @@ async def cmd_start(message: Message):
                                         status="cancelled", superseded_reason="start_command")
     except Exception as e:
         print(f"[depression-disclosure] /start supersession failed uid={uid}: {e}")
+    # Phase 3 §17: /start PAUSES (not cancels) any active Conversation
+    # Controller session -- unlike a Phase 2 safety flow, ordinary
+    # conversational work is resumable, so lifecycle_status becomes PAUSED,
+    # not a terminal status. Best-effort (never blocks /start itself).
+    try:
+        active_sessions = await list_core_sessions(uid, active_only=True)
+        for s in active_sessions:
+            if s.lifecycle_status is LifecycleStatus.OPEN:
+                s.lifecycle_status = LifecycleStatus.PAUSED
+                await update_core_session(s)
+    except Exception as e:
+        print(f"[controller] /start session pause failed uid={uid}: {e}")
     # PR C3a.1 -- parse a /start deep-link payload BEFORE the access gate.
     # This is the critical ordering: a temp-invite-code holder has no prior
     # access, so if we ran ensure_full_access_or_closed_test first they'd be
