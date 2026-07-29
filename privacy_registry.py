@@ -327,6 +327,49 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
                          "consent-acknowledgment state, not a safety-audit record.",
         log_policy="Notice id, version tag and timestamp only — no raw content of "
                   "any kind; never in logs/alerts."),
+
+    # Therapeutic Core Foundation (Phase 1, master prompt SS15) — same
+    # PSYCH_PROFILE treatment as user_psychology_profile/psychology_profile_history:
+    # structured therapeutic working state, not a safety-audit record, so it does
+    # NOT get CRISIS_SAFETY RETAIN treatment. Ships inert (flag off, nothing in
+    # bot.pipeline() reads/writes these tables yet) but is registered from its
+    # first commit, same discipline as influence_trace above.
+    "core_sessions": _e(
+        table="core_sessions", user_id_column="user_id", category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`state_json` is structured session state (phase/intent/goal), "
+                  "not raw message text — still never in logs/alerts."),
+
+    "core_formulations": _e(
+        table="core_formulations", user_id_column="user_id", category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`formulation_json` is a user-confirmable working hypothesis — "
+                  "never in logs/alerts."),
+
+    "core_interventions": _e(
+        table="core_interventions", user_id_column="user_id", category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`intervention_json` is method/consent/status metadata only — "
+                  "never in logs/alerts."),
+
+    "core_outcomes": _e(
+        table="core_outcomes", user_id_column="user_id", category="RESEARCH_LOG",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="Scores/metadata only — same treatment as intervention_results."),
+
+    "core_memory_items": _e(
+        table="core_memory_items", user_id_column="user_id", category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`memory_json` is confirmable psychological memory content — "
+                  "never in logs/alerts. REJECTED/EXPIRED rows are exported like "
+                  "any other row (export is not filtered by lifecycle) but must "
+                  "never be read back into a live response (see "
+                  "MemoryLifecycle.influences_responses in therapeutic_domain.py)."),
 }
 
 

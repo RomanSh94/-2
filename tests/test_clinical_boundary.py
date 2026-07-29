@@ -67,6 +67,23 @@ LATENT_ALLOWED_FILES = {
     "review_pack.py",       # the review-pack shell has an empty `pattern_hypotheses`
                             # placeholder KEY for a future PR; no pattern data source
                             # exists yet and none is read here.
+    "therapeutic_domain.py",  # Therapeutic Core Foundation (Phase 1) — reviewed: this
+                            # module DEFINES the `Formulation` dataclass (a working,
+                            # user-confirmable hypothesis per master-prompt SS15.4); it
+                            # has no I/O, no DB access, and is not on bot.pipeline()'s
+                            # call path (nothing imports it yet). Same "defines/writes
+                            # the source, does not read it as a control signal"
+                            # rationale as database.py above, one layer more
+                            # foundational (database.py stores formulation_json;
+                            # this module is the validated shape of that JSON).
+                            # Purity is a SEPARATE, symbol-independent guarantee, not
+                            # just this comment's word: tests/test_therapeutic_domain_
+                            # purity.py parses this file's AST and fails CI if it ever
+                            # imports anything beyond __future__/dataclasses/enum/
+                            # typing — so a future runtime module (session controller,
+                            # method selector, LLM/Telegram calls) CANNOT be folded
+                            # into this file without that test catching it; it must
+                            # live under a different name and get its own review.
 }
 _SKIP_DIRS = {"tests", "venv", ".venv", "__pycache__", ".git", ".github"}
 

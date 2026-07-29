@@ -89,6 +89,35 @@ def resolve_role_safe(uid: int) -> str:
         return UNKNOWN
 
 
+async def core_rollout_allowed(uid: int) -> bool:
+    """Single source of truth for config.THERAPEUTIC_CORE_ROLLOUT_MODE
+    (§24's off/owner/invited/all contract) — every future Core entry point
+    must call this rather than re-deriving eligibility inline. Fail-closed on
+    any unexpected mode, same discipline as the rest of this module.
+
+    "invited" reuses the existing PR-A invite primitive (database.user_access
+    via user_has_active_access) rather than inventing a second invite list —
+    an owner always counts as invited too."""
+    import config
+    mode = config.THERAPEUTIC_CORE_ROLLOUT_MODE
+    if mode == "off":
+        return False
+    if mode == "all":
+        return True
+    is_owner = resolve_role_safe(uid) == OWNER
+    if mode == "owner":
+        return is_owner
+    if mode == "invited":
+        if is_owner:
+            return True
+        import database
+        try:
+            return await database.user_has_active_access(uid)
+        except Exception:
+            return False
+    return False
+
+
 def resolved_reviewers_for(tester_uid: int) -> list[int]:
     """Reviewers explicitly mapped to this tester.
 
