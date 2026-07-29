@@ -2988,6 +2988,38 @@ async def update_core_session(state: _core.SessionState) -> bool:
         return cur.rowcount > 0
 
 
+async def transition_core_session_consent(session_id, user_id: int, *,
+                                          from_consent: str, to_consent: str) -> bool:
+    """Phase 3 hardening §4: atomic compare-and-set on `consent` (embedded in
+    state_json, not a top-level column). Reads the row, verifies consent==
+    from_consent AND lifecycle_status=='OPEN' in Python, then writes back
+    conditioned on state_json being EXACTLY the value just read (optimistic
+    concurrency) -- a second concurrent caller reading the same pre-write
+    state_json has its own conditional UPDATE match zero rows once the first
+    caller's write lands, because the JSON blob has changed underneath it.
+    This is what makes 'two concurrent yes taps deliver exactly once' a
+    database-enforced guarantee, not a lucky ordering of awaits. Returns
+    False uniformly for every failure reason (wrong owner, wrong consent
+    state, session not OPEN, or lost the race) -- callers treat all of these
+    identically: reject, no delivery, no state change."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            "SELECT id, state_json FROM core_sessions WHERE id=? AND user_id=?",
+            (session_id, user_id))).fetchone()
+        if row is None:
+            return False
+        state = _load_session(row[0], row[1])
+        if state.consent.value != from_consent or state.lifecycle_status is not _core.LifecycleStatus.OPEN:
+            return False
+        state.consent = _core.as_enum(_core.ConsentState, to_consent)
+        cur = await db.execute(
+            """UPDATE core_sessions SET state_json=?, updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND state_json=?""",
+            (_dump_session_json(state), session_id, user_id, row[1]))
+        await db.commit()
+        return cur.rowcount > 0
+
+
 async def add_core_formulation(session_id: str, user_id: int,
                                 formulation: _core.Formulation) -> int:
     async with aiosqlite.connect(DB) as db:

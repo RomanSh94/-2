@@ -283,6 +283,140 @@ def test_explicit_crisis_wins_over_controller(monkeypatch, tmp_db):
     assert run(database.list_core_sessions(1)) == []
 
 
+# ── A2. Hardening §4: the Controller must never bypass ambiguity or
+#        dependency boundary handling for an explicit-intent message ──────
+
+def test_explain_plus_ambiguous_selfharm_phrase_disambiguation_wins(monkeypatch, tmp_db):
+    """'Объясни, почему я хочу выйти в окно' -- EXPLAIN intent is present,
+    but 'выйти в окно' is a double-meaning phrase; the deterministic
+    disambiguation check must win, not the Controller's own LLM call."""
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    run(_seed_user(1))
+    user = FakeUser(1)
+    msg = FakeMessage(user, "Объясни, почему мне хочется выйти в окно.")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+    assert llm_calls["n"] == 0, "no Controller LLM call when ambiguity handling must win"
+    assert run(database.list_core_sessions(1)) == [], "no Core state advancement"
+    assert len(msg.answers) == 1  # the deterministic disambiguation question
+
+
+def test_vent_plus_ambiguous_selfharm_phrase_disambiguation_wins(monkeypatch, tmp_db):
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    run(_seed_user(1))
+    user = FakeUser(1)
+    msg = FakeMessage(user, "Мне нужно выговориться, хочется выйти в окно.")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+    assert llm_calls["n"] == 0
+    assert run(database.list_core_sessions(1)) == []
+
+
+def test_action_plus_dependency_signal_dependency_redirect_wins(monkeypatch, tmp_db):
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async("Мягкий отклик о зависимости."))
+    run(_seed_user(1))
+    user = FakeUser(1)
+    msg = FakeMessage(user, "Скажи сам, какой мне сделать шаг.")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+    assert llm_calls["n"] == 0, "no Controller LLM call when the dependency boundary must win"
+    assert run(database.list_core_sessions(1)) == []
+    assert msg.answers == [("Мягкий отклик о зависимости.", {})]
+
+
+def test_practice_consent_callback_non_actionable_during_active_crisis(tmp_db):
+    """Realistic path: an active crisis pauses the session via
+    supersede_active_core_sessions_for_crisis (the canonical, logging-
+    independent hook called from trigger_crisis) -- that PAUSED status,
+    not a separate get_active_crisis check inside the callback itself, is
+    what makes the stale consent tap non-actionable."""
+    run(_seed_user(1))
+    session = run(database.create_core_session(1, intent=Intent.PRACTICE))
+    session.consent = ConsentState.PENDING
+    run(database.update_core_session(session))
+    run(database.supersede_active_core_sessions_for_crisis(1))
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:consent:{session.session_id}:yes")
+    run(bot.cb_cc_consent(cb))
+    assert msg.answers == [], "active crisis must make the consent callback non-actionable"
+
+
+# ── A3. Hardening §7: the Controller is continuous across turns, not a
+#        one-turn phrase detector ────────────────────────────────────────────
+
+def test_controller_continues_across_ordinary_followup_turns(monkeypatch, tmp_db):
+    """Turn 1 has an explicit VENT phrase. Turns 2-3 do NOT match any
+    explicit phrase (plain follow-up sentences) but must remain governed by
+    the SAME VENT session -- continuation via the active OPEN session, not
+    a fresh classifier decision each turn."""
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    run(_seed_user(1))
+    user = FakeUser(1)
+
+    run(bot.pipeline(FakeMessage(user, "Мне нужно выговориться."),
+                     "Мне нужно выговориться.", None, tg_user=user))
+    run(bot.pipeline(FakeMessage(user, "Сегодня начальник снова на меня накричал."),
+                     "Сегодня начальник снова на меня накричал.", None, tg_user=user))
+    run(bot.pipeline(FakeMessage(user, "А потом я весь вечер прокручивал это в голове."),
+                     "А потом я весь вечер прокручивал это в голове.", None, tg_user=user))
+
+    assert llm_calls["n"] == 3, "the Controller (not the legacy pipeline) handled all 3 turns"
+    sessions = run(database.list_core_sessions(1))
+    assert len(sessions) == 1, "continuation reuses the same session, never forks a new one"
+    assert sessions[0].intent is Intent.VENT
+
+
+def test_new_explicit_intent_switches_active_session(monkeypatch, tmp_db):
+    """Turn 2 explicitly asks for an explanation -- an explicit signal always
+    overrides plain continuation of the previous intent."""
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    run(_seed_user(1))
+    user = FakeUser(1)
+    run(bot.pipeline(FakeMessage(user, "Мне нужно выговориться."),
+                     "Мне нужно выговориться.", None, tg_user=user))
+    run(bot.pipeline(FakeMessage(user, "Теперь объясни, почему я так реагирую."),
+                     "Теперь объясни, почему я так реагирую.", None, tg_user=user))
+    sessions = run(database.list_core_sessions(1))
+    assert len(sessions) == 1
+    assert sessions[0].intent is Intent.EXPLAIN
+
+
+def test_no_active_session_and_no_explicit_signal_falls_through(monkeypatch, tmp_db):
+    """Without any prior explicit-intent turn, an ordinary ambiguous message
+    has nothing to continue -- the Controller correctly declines and the
+    existing ordinary pipeline runs unchanged (not a bug, the documented
+    UNKNOWN/no-active-session boundary)."""
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    run(_seed_user(1))
+    user = FakeUser(1)
+    run(bot.pipeline(FakeMessage(user, "Сегодня был тяжёлый день."),
+                     "Сегодня был тяжёлый день.", None, tg_user=user))
+    assert llm_calls["n"] == 1
+    assert run(database.list_core_sessions(1)) == []
+
+
+def test_continuation_uses_bounded_known_facts_across_turns(monkeypatch, tmp_db):
+    """§8/§11: facts from a claimed Phase 2 handoff must reach the prompt on
+    EVERY subsequent turn (re-fetched via the linked session), not just the
+    turn that originally claimed it."""
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    run(_seed_user(1))
+    run(_complete_disclosure_flow_with_purpose(1, "vent"))
+    user = FakeUser(1)
+    run(bot.pipeline(FakeMessage(user, "мне тяжело"), "мне тяжело", None, tg_user=user))
+    run(bot.pipeline(FakeMessage(user, "и так весь день"), "и так весь день", None, tg_user=user))
+    second_turn_prompt = llm_calls["prompts"][1][0]["content"]
+    assert "duration=weeks" in second_turn_prompt, \
+        "known facts must still reach the prompt on a pure-continuation turn"
+
+
 # ── B. VENT / EXPLAIN / ACTION full-turn behavior ───────────────────────────
 
 def test_vent_turn_no_advice_creates_session(monkeypatch, tmp_db):
@@ -344,19 +478,28 @@ def test_repair_question_overload_produces_no_question(monkeypatch, tmp_db):
     assert RepairConstraint.QUESTION_OVERLOAD in sessions[0].repair_constraints
 
 
-def test_repair_constraint_clears_after_one_turn(monkeypatch, tmp_db):
+def test_repair_constraint_persists_bounded_then_expires(monkeypatch, tmp_db):
+    """§9 (hardening): a repair constraint is neither one-shot NOR permanent
+    -- it persists for a small bounded window of subsequent turns, then
+    expires deterministically."""
     _full_pipeline_stub_set(monkeypatch, llm_reply="Понял, больше не буду.")
     run(_seed_user(1))
     user = FakeUser(1)
     run(bot.pipeline(FakeMessage(user, "Хватит спрашивать."), "Хватит спрашивать.", None, tg_user=user))
-    mid = run(database.list_core_sessions(1))[0]
-    assert RepairConstraint.QUESTION_OVERLOAD in mid.repair_constraints
+    s = run(database.list_core_sessions(1))[0]
+    assert RepairConstraint.QUESTION_OVERLOAD in s.repair_constraints
+    assert s.repair_turns_remaining == 3
 
-    run(bot.pipeline(FakeMessage(user, "Объясни, почему так происходит."),
-                     "Объясни, почему так происходит.", None, tg_user=user))
-    after = run(database.list_core_sessions(1))[0]
-    assert RepairConstraint.QUESTION_OVERLOAD not in after.repair_constraints, \
-        "one-shot: a repair constraint must not persist forever without reason"
+    for expected_remaining in (2, 1, 0):
+        run(bot.pipeline(FakeMessage(user, "Объясни, почему так происходит."),
+                         "Объясни, почему так происходит.", None, tg_user=user))
+        s = run(database.list_core_sessions(1))[0]
+        assert s.repair_turns_remaining == expected_remaining
+        if expected_remaining > 0:
+            assert RepairConstraint.QUESTION_OVERLOAD in s.repair_constraints
+        else:
+            assert RepairConstraint.QUESTION_OVERLOAD not in s.repair_constraints, \
+                "must expire deterministically, not persist forever"
 
 
 def test_advice_rejected_constraint_reflected_in_next_prompt(monkeypatch, tmp_db):
@@ -816,23 +959,34 @@ def test_practice_consent_rollout_off_non_actionable(monkeypatch, tmp_db):
 # ── J. Stale-response suppression for controller turns (§3) ────────────────
 
 def test_stale_controller_response_suppressed_by_newer_turn(monkeypatch, tmp_db):
+    """Two-phase API (hardening §5): _controller_claim_turn is the FAST,
+    always-allowed-before-staleness half (inbound user-message persistence +
+    idempotent session claim -- explicitly allowed even for a turn that will
+    turn out stale); _controller_generate_and_deliver is the SLOW half where
+    the stale check actually happens, gating the assistant response only."""
     _full_pipeline_stub_set(monkeypatch, llm_reply="Слышу тебя.")
     run(_seed_user(1))
     user = FakeUser(1)
     msg = FakeMessage(user, "Мне нужно выговориться.")
+    claim = run(bot._controller_claim_turn(1, msg.text, "ru"))
+    assert claim is not None
     stale_gen = bot._bump_user_generation(1)
     bot._bump_user_generation(1)  # a newer turn has since started
-    run(bot._run_conversation_controller(msg, 1, msg.text, "ru", stale_gen))
-    # Delivery and the assistant/user message pair for THIS turn are
-    # suppressed (matching PR#67's existing ordinary-path contract exactly):
+    risk = {"score": 0, "level": "low", "categories": [], "implicit": False, "ambiguous_phrases": []}
+    run(bot._controller_generate_and_deliver(msg, 1, claim, stale_gen, risk))
+    # Delivery and the assistant response for THIS turn are suppressed
+    # (matching PR#67's existing ordinary-path contract exactly):
     assert msg.answers == [], "a superseded controller turn must not be delivered"
-    async def _no_controller_messages():
+
+    async def _messages():
         rows = await database.export_all_personal_data(1)
         return [m for m in rows["messages"] if m.get("scenario") == "controller"]
-    assert run(_no_controller_messages()) == [], "no message row for the suppressed turn"
-    # Session creation itself is legitimate pre-stale-check turn processing
-    # (same as ordinary-path user-row persistence, which also isn't undone
-    # by the stale-response guard) -- it is NOT "the stale response".
+    msgs = run(_messages())
+    # Inbound user-message persistence IS allowed before stale detection
+    # (explicitly, per the hardening correction) -- only the assistant side
+    # of a stale turn is suppressed.
+    assert [m["role"] for m in msgs] == ["user"], \
+        "the inbound user message persists even for a turn that turns out stale; no assistant row"
     sessions = run(database.list_core_sessions(1))
     assert len(sessions) == 1
 
@@ -900,13 +1054,19 @@ def test_stale_turn_cannot_add_repair_constraint(monkeypatch, tmp_db):
     user = FakeUser(1)
     _full_pipeline_stub_set(monkeypatch, llm_reply="Понял.")
     msg = FakeMessage(user, "Ты задаёшь одни вопросы.")
+    claim = run(bot._controller_claim_turn(1, msg.text, "ru"))
+    assert claim is not None
+    # The repair constraint IS present on the in-memory claim bundle (it was
+    # correctly recognized) -- the question is whether it reaches the DB.
+    assert RepairConstraint.QUESTION_OVERLOAD in claim["session"].repair_constraints
     stale_gen = bot._bump_user_generation(1)
     bot._bump_user_generation(1)
-    run(bot._run_conversation_controller(msg, 1, msg.text, "ru", stale_gen))
+    risk = {"score": 0, "level": "low", "categories": [], "implicit": False, "ambiguous_phrases": []}
+    run(bot._controller_generate_and_deliver(msg, 1, claim, stale_gen, risk))
     sessions = run(database.list_core_sessions(1))
     assert len(sessions) == 1
     assert sessions[0].repair_constraints == set(), \
-        "a stale turn must not add a repair constraint to the session"
+        "a stale turn must not persist a repair constraint to the session"
 
 
 # ── K. SessionState backward compatibility (§8) ─────────────────────────────
@@ -926,3 +1086,270 @@ def test_session_state_deserializes_pre_phase3_json_without_handoff_field():
     assert reserialized["handoff_flow_id"] is None
     roundtrip = SessionState.from_dict(_json.loads(_json.dumps(reserialized)))
     assert roundtrip.to_dict() == reserialized
+
+
+# ── L. Bounded recent context feeds repair turns (§7/§8 hardening) ─────────
+
+def test_repair_signals_catch_opyat_vodrosy_and_nichego_ne_obyasnyaesh():
+    """The exact hardening acceptance phrase must trigger BOTH the
+    question-overload and the missed-explanation repair constraints --
+    without this, the scenario below could never reach REPAIR at all."""
+    signals = controller.classify_repair_signals(
+        "Ты опять задаёшь вопросы и ничего не объясняешь.")
+    assert RepairConstraint.QUESTION_OVERLOAD in signals
+    assert RepairConstraint.MISSED_EXPLANATION in signals
+
+
+def test_bounded_recent_context_repair_scenario(monkeypatch, tmp_db):
+    """Hardening §7 exact acceptance scenario: 'Я почти не спал.' / 'На
+    работе всё валится из рук.' / 'Ты опять задаёшь вопросы и ничего не
+    объясняешь.' The final REPAIR turn's system prompt must carry the sleep
+    and work facts from the first two turns (bounded recent_context, fetched
+    before this turn's own message is saved) so the model can reuse them
+    without asking the user to repeat anything, and the delivered response
+    must contain no question (QUESTION_OVERLOAD)."""
+    llm_calls = {"n": 0}
+    replies = [
+        "Слышу тебя.",
+        "Понимаю, это тяжело.",
+        "Ты прав, я снова задавал вопросы вместо объяснений. Вижу: ты почти "
+        "не спал, и на работе всё валится из рук. Давай разберём это по "
+        "порядку.",
+    ]
+
+    class _Choice:
+        def __init__(self, content):
+            self.message = types.SimpleNamespace(content=content)
+
+    async def fake_create(*a, **kw):
+        i = llm_calls["n"]
+        llm_calls["n"] += 1
+        llm_calls.setdefault("prompts", []).append(kw.get("messages"))
+        return types.SimpleNamespace(choices=[_Choice(replies[min(i, len(replies) - 1)])])
+
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    monkeypatch.setattr(bot.client.chat.completions, "create", fake_create)
+
+    run(_seed_user(1))
+    user = FakeUser(1)
+
+    run(bot.pipeline(FakeMessage(user, "Мне нужно выговориться. Я почти не спал."),
+                     "Мне нужно выговориться. Я почти не спал.", None, tg_user=user))
+    run(bot.pipeline(FakeMessage(user, "На работе всё валится из рук."),
+                     "На работе всё валится из рук.", None, tg_user=user))
+    msg3 = FakeMessage(user, "Ты опять задаёшь вопросы и ничего не объясняешь.")
+    run(bot.pipeline(msg3, msg3.text, None, tg_user=user))
+
+    assert llm_calls["n"] == 3, "one primary LLM call per controller turn, no extra classifier calls"
+    system_prompt_3 = llm_calls["prompts"][2][0]["content"]
+    assert "не спал" in system_prompt_3, "recent_context must carry turn 1's fact into turn 3's prompt"
+    assert "работе" in system_prompt_3, "recent_context must carry turn 2's fact into turn 3's prompt"
+
+    sessions = run(database.list_core_sessions(1))
+    assert RepairConstraint.QUESTION_OVERLOAD in sessions[0].repair_constraints
+    assert RepairConstraint.MISSED_EXPLANATION in sessions[0].repair_constraints
+
+    final = msg3.answers[0][0]
+    assert "?" not in final, "QUESTION_OVERLOAD must be enforced on the delivered response"
+    assert "спал" in final and "работ" in final, \
+        "the delivered response must actually reuse the known recent facts"
+
+
+def test_recent_context_excludes_the_current_turns_own_message(tmp_db):
+    """recent_context is fetched (and this turn's own message saved) inside
+    _controller_claim_turn -- the current turn's own text must never appear
+    in its own prompt's recent-context section (only PRIOR turns)."""
+    run(_seed_user(1))
+    run(bot._controller_claim_turn(1, "Мне нужно выговориться.", "ru"))
+    claim2 = run(bot._controller_claim_turn(1, "Второе сообщение.", "ru"))
+    assert claim2["recent_context"] == ["Мне нужно выговориться."]
+
+
+# ── M. Atomic consent CAS concurrency (§4 hardening) ────────────────────────
+
+def test_concurrent_consent_taps_exactly_one_wins(tmp_db):
+    """Two concurrent 'yes' taps on the SAME pending consent race against
+    database.transition_core_session_consent directly -- the atomic
+    optimistic-concurrency CAS (WHERE state_json=?) must let exactly one
+    succeed, never both, regardless of interleaving."""
+    async def go():
+        await _seed_user(1)
+        session = await database.create_core_session(1, intent=Intent.PRACTICE)
+        session.consent = ConsentState.PENDING
+        await database.update_core_session(session)
+        results = await asyncio.gather(
+            database.transition_core_session_consent(
+                session.session_id, 1, from_consent="PENDING", to_consent="GRANTED"),
+            database.transition_core_session_consent(
+                session.session_id, 1, from_consent="PENDING", to_consent="GRANTED"),
+        )
+        return session, results
+    session, results = run(go())
+    assert sorted(results) == [False, True], "exactly one concurrent transition must win"
+    reloaded = run(database.get_core_session(session.session_id, 1))
+    assert reloaded.consent is ConsentState.GRANTED
+
+
+def test_consent_transition_rejects_wrong_from_state(tmp_db):
+    run(_seed_user(1))
+    session = run(database.create_core_session(1, intent=Intent.PRACTICE))
+    session.consent = ConsentState.GRANTED
+    run(database.update_core_session(session))
+    ok = run(database.transition_core_session_consent(
+        session.session_id, 1, from_consent="PENDING", to_consent="DECLINED"))
+    assert ok is False
+    reloaded = run(database.get_core_session(session.session_id, 1))
+    assert reloaded.consent is ConsentState.GRANTED, "no-op on a from_consent mismatch"
+
+
+def test_consent_transition_rejects_paused_session(tmp_db):
+    run(_seed_user(1))
+    session = run(database.create_core_session(1, intent=Intent.PRACTICE))
+    session.consent = ConsentState.PENDING
+    run(database.update_core_session(session))
+    run(database.supersede_active_core_sessions_for_crisis(1))
+    ok = run(database.transition_core_session_consent(
+        session.session_id, 1, from_consent="PENDING", to_consent="GRANTED"))
+    assert ok is False, "a paused (crisis-superseded) session must reject the transition"
+
+
+# ── N. Ingestion contract, exact validator args, adversarial output ────────
+
+def test_controller_llm_call_never_runs_while_ingestion_lock_held(monkeypatch, tmp_db):
+    """Explicit lock-state assertion (hardening §2), not just absence of
+    deadlock: the per-user ingestion lock must be fully released -- not
+    merely non-blocking -- before the Controller's LLM call fires."""
+    observed = {}
+
+    class _Choice:
+        def __init__(self, content):
+            self.message = types.SimpleNamespace(content=content)
+
+    async def fake_create(*a, **kw):
+        holder = bot._ingest_registry.get(1)
+        observed["locked"] = holder.lock.locked() if holder else False
+        return types.SimpleNamespace(choices=[_Choice("Понял.")])
+
+    _full_pipeline_stub_set(monkeypatch)
+    monkeypatch.setattr(bot.client.chat.completions, "create", fake_create)
+    run(_seed_user(1))
+    user = FakeUser(1)
+    run(bot.pipeline(FakeMessage(user, "Мне нужно выговориться."),
+                     "Мне нужно выговориться.", None, tg_user=user))
+    assert "locked" in observed, "the LLM call must actually have fired"
+    assert observed["locked"] is False, \
+        "the ingestion lock must be released before the Controller's LLM call"
+
+
+def test_controller_claimed_turn_skips_legacy_router_logging_but_keeps_state_save(monkeypatch, tmp_db):
+    """Zero-legacy-side-effect spy (hardening §1): once the Controller
+    claims a turn, the ordinary pipeline's scenario router-decision logging
+    must not run for it -- that log is a per-scenario research snapshot and
+    would misrepresent which system actually decided the turn (hardening
+    §6). The rolling emotional-state update is DELIBERATELY exempt:
+    state_engine is cross-cutting -- it feeds crisis/stage/capacity
+    detection on FUTURE turns regardless of which subsystem (Controller or
+    legacy pipeline) handles any given turn, so it must keep advancing even
+    while the Controller owns this one."""
+    calls = {"log_router_decision": 0, "save_state": 0}
+
+    async def spy_log(*a, **kw):
+        calls["log_router_decision"] += 1
+
+    async def spy_save_state(*a, **kw):
+        calls["save_state"] += 1
+
+    _full_pipeline_stub_set(monkeypatch)
+    monkeypatch.setattr(bot, "log_router_decision", spy_log)
+    monkeypatch.setattr(bot, "save_state", spy_save_state)
+    run(_seed_user(1))
+    user = FakeUser(1)
+    run(bot.pipeline(FakeMessage(user, "Мне нужно выговориться."),
+                     "Мне нужно выговориться.", None, tg_user=user))
+    assert calls["log_router_decision"] == 0, \
+        "a Controller-claimed turn must not log a legacy router decision"
+    assert calls["save_state"] == 1, \
+        "the rolling emotional-state update is cross-cutting and must still run"
+
+
+def test_ordinary_turn_still_runs_legacy_router_logging_and_state_save(monkeypatch, tmp_db):
+    """The inverse of the spy test above: an ORDINARY (non-explicit-intent)
+    message must still exercise the legacy side effects unchanged -- proving
+    the bypass is intent-gated, not a global regression."""
+    calls = {"log_router_decision": 0, "save_state": 0}
+
+    async def spy_log(*a, **kw):
+        calls["log_router_decision"] += 1
+
+    async def spy_save_state(*a, **kw):
+        calls["save_state"] += 1
+
+    _full_pipeline_stub_set(monkeypatch)
+    monkeypatch.setattr(bot, "log_router_decision", spy_log)
+    monkeypatch.setattr(bot, "save_state", spy_save_state)
+    run(_seed_user(1))
+    user = FakeUser(1)
+    run(bot.pipeline(FakeMessage(user, "Сегодня был обычный день."),
+                     "Сегодня был обычный день.", None, tg_user=user))
+    assert calls["log_router_decision"] >= 1
+    assert calls["save_state"] >= 1
+
+
+def test_controller_calls_validate_response_with_context_using_exact_args(monkeypatch, tmp_db):
+    """Hardening §3: prove the Controller uses the SAME stronger,
+    context-aware validator the ordinary pipeline uses, called with the
+    real candidate text, the real user text, the real risk dict, and the
+    real language -- not a weaker or stubbed-out check."""
+    captured = {}
+
+    def spy(candidate, user_text, risk, lang):
+        captured["args"] = (candidate, user_text, risk, lang)
+        return True, None
+
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Слышу тебя, я рядом.")
+    monkeypatch.setattr(bot, "validate_response_with_context", spy)
+    run(_seed_user(1))
+    user = FakeUser(1)
+    msg = FakeMessage(user, "Мне нужно выговориться.")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+
+    assert "args" in captured, "validate_response_with_context must actually be called"
+    candidate, user_text, risk, lang = captured["args"]
+    assert candidate == "Слышу тебя, я рядом."
+    assert user_text == "Мне нужно выговориться."
+    assert isinstance(risk, dict) and "score" in risk and "level" in risk
+    assert lang == "ru"
+
+
+def test_adversarial_llm_question_under_question_overload_falls_back(monkeypatch, tmp_db):
+    """Adversarial model output (hardening §12): the model asks a question
+    despite an active QUESTION_OVERLOAD constraint. The Controller Fidelity
+    Validator must catch it and substitute the intent-specific fallback --
+    the adversarial text must never reach the user."""
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Ты прав, но как тебе такое решение?")
+    run(_seed_user(1))
+    user = FakeUser(1)
+    msg = FakeMessage(user, "Хватит спрашивать.")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+    delivered = msg.answers[0][0]
+    assert "?" not in delivered, \
+        "an adversarial LLM question must never reach the user under QUESTION_OVERLOAD"
+    assert delivered == controller.fallback_text("ru", Intent.REPAIR)
+
+
+def test_decision_support_continuation_across_followup_turns(monkeypatch, tmp_db):
+    """Continuity must hold for intents beyond VENT/EXPLAIN too (hardening
+    §6): an explicit DECISION_SUPPORT phrase followed by a plain follow-up
+    with no new signal stays governed by the SAME DECISION_SUPPORT session."""
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    run(_seed_user(1))
+    user = FakeUser(1)
+    run(bot.pipeline(FakeMessage(user, "Не могу принять решение."),
+                     "Не могу принять решение.", None, tg_user=user))
+    run(bot.pipeline(FakeMessage(user, "С одной стороны одно, с другой стороны другое."),
+                     "С одной стороны одно, с другой стороны другое.", None, tg_user=user))
+    assert llm_calls["n"] == 2
+    sessions = run(database.list_core_sessions(1))
+    assert len(sessions) == 1
+    assert sessions[0].intent is Intent.DECISION_SUPPORT
