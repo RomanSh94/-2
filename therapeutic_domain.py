@@ -441,6 +441,12 @@ class SessionState:
     # session can be traced back to its originating handoff without
     # duplicating that data here. None for a session not seeded from a handoff.
     handoff_flow_id: str | None = None
+    # Phase 3 hardening: bounded multi-turn repair persistence. A repair
+    # signal sets this to a small fixed window (not "forever", not "one
+    # turn only" -- SS9 explicitly rejected both extremes); each subsequent
+    # controller turn without a fresh repair signal decrements it, and
+    # repair_constraints is cleared the turn this reaches 0.
+    repair_turns_remaining: int = 0
 
     def __post_init__(self):
         if not str(self.session_id).strip():
@@ -454,6 +460,8 @@ class SessionState:
         self.active_goal = _clip(self.active_goal, 300)
         self.repair_constraints = {
             as_enum(RepairConstraint, c) for c in self.repair_constraints}
+        if self.repair_turns_remaining < 0:
+            raise ValueError("SessionState.repair_turns_remaining must be >= 0")
 
     @property
     def is_active(self) -> bool:
@@ -472,6 +480,7 @@ class SessionState:
             "pending_outcome": self.pending_outcome,
             "repair_constraints": sorted(c.value for c in self.repair_constraints),
             "handoff_flow_id": self.handoff_flow_id,
+            "repair_turns_remaining": self.repair_turns_remaining,
         }
 
     @classmethod

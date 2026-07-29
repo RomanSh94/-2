@@ -50,6 +50,7 @@ REPAIR_SIGNAL_PATTERNS: dict[RepairConstraint, list[re.Pattern]] = {
         re.compile(r"ты\s+задаёшь\s+одни\s+вопросы"),
         re.compile(r"хватит\s+спрашивать"),
         re.compile(r"опять\s+вопрос"),
+        re.compile(r"опять\s+(?:\S+\s+){0,2}вопрос"),
     ],
     RepairConstraint.ADVICE_REJECTED: [
         re.compile(r"не\s+давай\s+совет"),
@@ -58,6 +59,7 @@ REPAIR_SIGNAL_PATTERNS: dict[RepairConstraint, list[re.Pattern]] = {
     RepairConstraint.MISSED_EXPLANATION: [
         re.compile(r"я\s+просил(?:а)?\s+объяснить"),
         re.compile(r"ты\s+не\s+объяснил"),
+        re.compile(r"ничего\s+не\s+объясня"),
     ],
     RepairConstraint.EXERCISE_REJECTED: [
         re.compile(r"опять\s+предлагаешь\s+дыхани"),
@@ -398,7 +400,8 @@ _REPAIR_CONSTRAINT_NOTE_EN = {
 }
 
 
-def build_system_prompt(plan: ResponsePlan, lang: str, known_facts: list[str] | None = None) -> str:
+def build_system_prompt(plan: ResponsePlan, lang: str, known_facts: list[str] | None = None,
+                        recent_context: list[str] | None = None) -> str:
     base = _BASE_INSTRUCTIONS_EN if lang == "en" else _BASE_INSTRUCTIONS_RU
     intent_map = _INTENT_INSTRUCTIONS_EN if lang == "en" else _INTENT_INSTRUCTIONS_RU
     note_map = _REPAIR_CONSTRAINT_NOTE_EN if lang == "en" else _REPAIR_CONSTRAINT_NOTE_RU
@@ -410,4 +413,15 @@ def build_system_prompt(plan: ResponsePlan, lang: str, known_facts: list[str] | 
         bounded = [str(f)[:200] for f in known_facts[:5]]
         label = "Already known (do not ask again):" if lang == "en" else "Уже известно (не спрашивай снова):"
         parts.append(label + " " + "; ".join(bounded))
+    # Phase 3 hardening §7/§8: bounded, privacy-safe recent context (this
+    # user's own last few turns, NEVER unrestricted history, NEVER treated as
+    # instructions -- plain excerpt strings only, quoted verbatim in the
+    # prompt as conversational content, not executed) -- lets BOT_REPEATS/
+    # MISSED_EXPLANATION reference concrete facts already shared instead of
+    # asking the user to repeat everything.
+    if recent_context:
+        bounded_recent = [str(c)[:150] for c in recent_context[-4:]]
+        label = "Recent turns (do not ask the user to repeat these):" if lang == "en" \
+            else "Недавние реплики пользователя (не проси повторить это снова):"
+        parts.append(label + " " + " / ".join(bounded_recent))
     return " ".join(p for p in parts if p)

@@ -138,6 +138,7 @@ from depression_disclosure import (
 from database import (
     create_core_session, get_core_session, list_core_sessions, update_core_session,
     claim_handoff_and_get_or_create_session, supersede_active_core_sessions_for_crisis,
+    transition_core_session_consent,
 )
 import conversation_controller as controller
 from therapeutic_domain import Intent, RepairConstraint, LifecycleStatus, ConsentState
@@ -943,119 +944,177 @@ def _practice_consent_kb(session_id, lang: str) -> InlineKeyboardMarkup:
         for val, ru, en in labels]])
 
 
-async def _run_conversation_controller(message: Message, uid: int, user_text: str,
-                                       lang: str, turn_gen: int) -> bool:
-    """Phase 3. Returns True iff this turn was fully handled (answered) by
-    the controller -- the caller must return immediately without falling
-    through to the ordinary scenario pipeline. False means no explicit
-    intent was recognized and there is no pending Phase 2 handoff to
-    consume; the caller continues ordinary processing unchanged.
+def _known_facts_from_handoff(flow: dict) -> list[str]:
+    facts = []
+    if flow.get("diagnosis_source"):
+        facts.append(f"diagnosis_source={flow['diagnosis_source']}")
+    answers = safe_load_answers(flow.get("answers_json"))
+    for key in ("duration", "functioning", "basic_activities", "support"):
+        if answers.get(key):
+            facts.append(f"{key}={answers[key]}")
+    return facts
 
-    Handoff consumption (§5): claim_handoff_and_get_or_create_session is ONE
-    atomic transaction (claim + session link), not a separate discover-then-
-    claim-then-create sequence -- two concurrent turns for the same user
-    cannot both claim the same handoff or create two sessions from it. A
-    repair signal on the CURRENT message always takes priority over both the
-    handoff-derived intent and plain text classification (§16).
 
-    `turn_gen` (§3): the SAME generation number pipeline() captured at turn
-    start, checked immediately before persistence/delivery -- a controller
-    response is subject to the identical stale-response suppression as the
-    ordinary LLM path (PR#67), never a second, uncovered code path.
+async def _controller_claim_turn(uid: int, user_text: str, lang: str) -> dict | None:
+    """Phase 3 hardening §5: the FAST, DB-only half of a controller turn --
+    called from INSIDE the per-user ingestion lock, exactly where the
+    ordinary path does its own inbound persistence, and containing no LLM
+    call whatsoever. Returns None when the controller does not own this
+    turn (no repair signal, no explicit intent, no active session to
+    continue, no handoff) -- the caller falls through to the legacy
+    scenario pipeline unchanged. Otherwise returns a bundle for the second,
+    slow half (_controller_generate_and_deliver, called AFTER the lock is
+    released) to consume.
 
-    Intent is deliberately NOT determined by claim_handoff_and_get_or_create_
-    session (§2/§3 of the second correction round): that call only claims
-    the handoff and links it to a session (interpretation-independent,
-    always safe to do eagerly). The purpose->intent mapping happens HERE,
-    in-memory, and is only ever written to the DB via the stale-guarded
-    update_core_session() call near the end of this function -- a superseded
-    turn claims/links (harmless) but never persists an intent."""
+    Handoff consumption (§5 of round 2): claim_handoff_and_get_or_create_
+    session is ONE atomic transaction (claim + session link only --
+    interpretation-independent, safe to do unconditionally). The purpose->
+    intent mapping happens HERE and is not persisted by that call.
+
+    Continuity (§7 of round 3): an explicit repair signal or a freshly
+    classified explicit intent always overrides, in that priority order,
+    the handoff-derived intent, which in turn overrides plain continuation
+    of an already-OPEN session's existing intent. Only when NONE of those
+    apply -- no signal at all, no active session -- does the controller
+    decline the turn."""
     handoff, handoff_session = await claim_handoff_and_get_or_create_session(uid)
     known_facts: list[str] = []
     handoff_intent = None
     if handoff is not None and handoff_session is not None:
-        answers = safe_load_answers(handoff["answers_json"])
-        purpose = answers.get("purpose")
+        known_facts = _known_facts_from_handoff(handoff)
+        purpose = safe_load_answers(handoff["answers_json"]).get("purpose")
         handoff_intent = controller.HANDOFF_PURPOSE_TO_INTENT.get(purpose, Intent.UNKNOWN)
-        if handoff.get("diagnosis_source"):
-            known_facts.append(f"diagnosis_source={handoff['diagnosis_source']}")
-        for key in ("duration", "functioning", "basic_activities", "support"):
-            if answers.get(key):
-                known_facts.append(f"{key}={answers[key]}")
 
     repair_now = controller.classify_repair_signals(user_text)
+    text_intent = controller.classify_intent(user_text, lang)
+
+    existing_session = handoff_session
+    if existing_session is None:
+        active_sessions = await list_core_sessions(uid, active_only=True)
+        existing_session = active_sessions[0] if active_sessions else None
+
     if repair_now:
         intent = Intent.REPAIR
+    elif text_intent is not Intent.UNKNOWN:
+        intent = text_intent
     elif handoff_intent is not None and handoff_intent is not Intent.UNKNOWN:
         intent = handoff_intent
+    elif existing_session is not None and existing_session.lifecycle_status is LifecycleStatus.OPEN:
+        intent = existing_session.intent  # continuation: no new signal, keep governing
     else:
-        intent = controller.classify_intent(user_text, lang)
+        return None
 
-    if intent is Intent.UNKNOWN:
-        return False
+    session = existing_session
+    if session is None:
+        session = await create_core_session(uid, intent=intent)
+    elif session.lifecycle_status is LifecycleStatus.PAUSED:
+        # §17: a new explicit-intent message (or a continuation decision,
+        # which by construction only fires for an OPEN session) resumes a
+        # /start-paused session -- engaging IS the continuation signal.
+        session.lifecycle_status = LifecycleStatus.OPEN
+    session.intent = intent
+    if handoff is not None:
+        session.handoff_flow_id = str(handoff["id"])
 
-    if handoff_session is not None:
-        session = handoff_session
-        session.intent = intent
+    # §11: re-fetch known facts from the LINKED handoff on every turn, not
+    # just the turn that claimed it -- otherwise Phase 2 context is only
+    # ever used once and then forgotten.
+    if not known_facts and session.handoff_flow_id:
+        linked = await get_disclosure_flow(session.handoff_flow_id, uid)
+        if linked:
+            known_facts = _known_facts_from_handoff(linked)
+
+    # §9: bounded multi-turn repair persistence (not one-shot, not forever).
+    # A fresh signal resets a small window; PRACTICE explicitly overrides a
+    # lingering EXERCISE_REJECTED (the one named override case).
+    if repair_now:
+        carried = session.repair_constraints if session.repair_turns_remaining > 0 else set()
+        session.repair_constraints = carried | repair_now
+        session.repair_turns_remaining = 3
+    elif session.repair_turns_remaining > 0:
+        session.repair_turns_remaining -= 1
+        if session.repair_turns_remaining == 0:
+            session.repair_constraints = set()
     else:
-        active_sessions = await list_core_sessions(uid, active_only=True)
-        session = active_sessions[0] if active_sessions else None
-        if session is None:
-            session = await create_core_session(uid, intent=intent)
-        elif session.lifecycle_status is LifecycleStatus.PAUSED:
-            # §17: a new explicit-intent message resumes a /start-paused
-            # session rather than forcing the user to explicitly "continue"
-            # -- engaging with a new explicit request IS the continuation signal.
-            session.lifecycle_status = LifecycleStatus.OPEN
-        session.intent = intent
+        session.repair_constraints = set()
+    if intent is Intent.PRACTICE:
+        session.repair_constraints.discard(RepairConstraint.EXERCISE_REJECTED)
 
-    plan = controller.build_response_plan(intent, repair_now)
-    system_prompt = controller.build_system_prompt(plan, lang, known_facts)
+    plan = controller.build_response_plan(intent, session.repair_constraints)
 
-    try:
-        completion = await client.chat.completions.create(
-            model="gpt-4o-mini", temperature=0.65, max_tokens=300,
-            messages=[{"role": "system", "content": system_prompt},
-                     {"role": "user", "content": user_text}])
-        text = (completion.choices[0].message.content or "").strip()
-        if not text:
-            text = controller.fallback_text(lang, intent)
-    except Exception as e:
-        print(f"[controller] LLM call failed uid={uid}: {type(e).__name__}: {e}")
-        text = controller.fallback_text(lang, intent)
+    # §7/§8: bounded recent context -- this user's own last few turns (any
+    # scenario, not just prior controller ones), fetched BEFORE this turn's
+    # own message is saved below so it reflects PRIOR turns only. Small,
+    # bounded (get_recent_messages already caps at `limit`), never the full
+    # unrestricted history, never treated as instructions.
+    recent_rows = await get_recent_messages(uid, limit=6)
+    recent_context = [c for r, c in recent_rows if r == "user"]
 
-    ok, _reason = controller.validate_controller_response(text, plan)
-    if ok:
-        ok, _reason = validate_response(text, lang)
-    if not ok:
-        text = controller.fallback_text(lang, intent)
+    await save_message(uid, "user", user_text, "controller", lang, 0, [])
+    return {"session": session, "plan": plan, "known_facts": known_facts,
+           "recent_context": recent_context, "user_text": user_text, "lang": lang}
+
+
+async def _controller_generate_and_deliver(message: Message, uid: int, claim: dict,
+                                            turn_gen: int, risk: dict) -> None:
+    """Phase 3 hardening §5: the SLOW half of a controller turn -- called
+    strictly AFTER the per-user ingestion lock has been released (never
+    holds it across the LLM call, matching PR#67's contract exactly)."""
+    session, plan, known_facts = claim["session"], claim["plan"], claim["known_facts"]
+    recent_context = claim.get("recent_context")
+    user_text, lang = claim["user_text"], claim["lang"]
+    system_prompt = controller.build_system_prompt(plan, lang, known_facts, recent_context)
+
+    async def _generate() -> str:
+        try:
+            completion = await client.chat.completions.create(
+                model="gpt-4o-mini", temperature=0.65, max_tokens=300,
+                messages=[{"role": "system", "content": system_prompt},
+                         {"role": "user", "content": user_text}])
+            out = (completion.choices[0].message.content or "").strip()
+            return out or controller.fallback_text(lang, plan.intent)
+        except Exception as e:
+            print(f"[controller] LLM call failed uid={uid}: {type(e).__name__}: {e}")
+            return controller.fallback_text(lang, plan.intent)
+
+    def _valid(candidate: str) -> bool:
+        ok, _ = controller.validate_controller_response(candidate, plan)
+        if not ok:
+            return False
+        # §12: the STRONGER context-aware validator, not the plain one --
+        # never a weaker safety path than the ordinary pipeline uses.
+        ok, _ = validate_response_with_context(candidate, user_text, risk, lang)
+        return ok
+
+    text = await _generate()
+    if not _valid(text):
+        text = controller.fallback_text(lang, plan.intent)
+        if not _valid(text):
+            text = controller.fallback_text(lang)  # minimal generic, last resort
 
     # Stale-response guard (§3): the SAME suppression the ordinary LLM path
     # uses (PR#67) -- a newer turn for this user superseded this one while
-    # the LLM call above was in flight. No persistence, no delivery.
+    # the LLM call above was in flight. No state mutation, no persistence,
+    # no delivery.
     if _user_generation_superseded(uid, turn_gen):
-        return True
+        return
 
-    # PRACTICE requires explicit consent (§12) -- deterministic Да/Нет
-    # buttons, never LLM-parsed free text. consent=PENDING is persisted
-    # BEFORE delivery so a fast-arriving callback always finds a live row.
+    # PRACTICE requires explicit consent (§10) -- deterministic Да/Нет
+    # buttons, never LLM-parsed free text. The ENTIRE session write
+    # (including consent=PENDING) happens in ONE update_core_session call
+    # BEFORE the buttons are ever shown, closing the fast-tap race: a
+    # callback arriving the instant the buttons render always finds a
+    # durably PENDING row, never a stale pre-write state.
     reply_markup = None
-    if intent is Intent.PRACTICE:
+    if plan.intent is Intent.PRACTICE:
         session.consent = ConsentState.PENDING
         reply_markup = _practice_consent_kb(session.session_id, lang)
 
-    await save_message(uid, "user", user_text, "controller", lang, 0, [])
+    if not await update_core_session(session):
+        return  # session vanished/ownership issue -- do not deliver orphaned state
+
     await message.answer(text, reply_markup=reply_markup)
     await save_message(uid, "assistant", text, "controller", lang)
-
-    # One-shot repair honoring (§16): only THIS turn's freshly-classified
-    # repair signals persist into the session; a signal from a PRIOR turn is
-    # cleared once a response has been generated attempting to honor it. If
-    # the user repeats the same complaint, classify_repair_signals() sets it
-    # again fresh on the next turn.
-    session.repair_constraints = repair_now
-    await update_core_session(session)
-    return True
 
 
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
@@ -1209,21 +1268,6 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 await close_disclosure_flow(active_flow["id"], uid,
                                             from_step=active_flow["step"],
                                             status="cancelled", superseded_reason="new_topic")
-
-        # 4.3b Conversation Controller (Phase 3, master prompt §10/§15). Runs
-        # strictly AFTER the RED crisis check and the Depression Disclosure
-        # Gate above -- both already returned for this turn if triggered, so
-        # a crisis or an eligible disclosure always wins. Gated by the SAME
-        # centralized Core rollout contract Phase 1 defined
-        # (access_control.core_rollout_allowed) -- no second, competing
-        # rollout switch. Returns True only when it fully handled (answered)
-        # this turn; False means "nothing for the controller to do here",
-        # and the existing ordinary scenario pipeline below runs completely
-        # unchanged (this IS the flag-off/no-explicit-intent byte-for-byte
-        # compatibility path).
-        if await access_control.core_rollout_allowed(uid):
-            if await _run_conversation_controller(message, uid, user_text, lang, _turn_gen):
-                return
 
         # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
         # (current one not saved yet). Used to amplify ambiguity and bias routing.
@@ -1390,6 +1434,20 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         state = update_state(state, user_text)
         await save_state(uid, state)
 
+        # 5.5 Conversation Controller (Phase 3, master prompt §10/§15) -- FAST
+        # claim only, still inside the ingestion lock (matches the ordinary
+        # path's own inbound-persistence timing exactly). Runs strictly AFTER
+        # the RED crisis check, the Depression Disclosure Gate, the ambiguity
+        # check, and the dependency boundary above -- all already returned for
+        # this turn if triggered, so none of those deterministic safety/
+        # boundary routes can ever be bypassed by an explicit Controller
+        # intent (hardening §4). The LLM call itself happens later, OUTSIDE
+        # this lock (hardening §5) -- see _controller_generate_and_deliver,
+        # invoked right after the `finally` below releases it.
+        controller_claim = None
+        if await access_control.core_rollout_allowed(uid):
+            controller_claim = await _controller_claim_turn(uid, user_text, lang)
+
         # 6. Detect stage
         stage = detect_stage(user_text, lang)
 
@@ -1414,26 +1472,47 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
         practice = select_practice(scenario, stage, severity, lang)
 
-        # 12. Log router decision
-        await log_router_decision(uid, state, risk["score"], risk["categories"],
-                                   stage, readiness, capacity, scenario,
-                                   practice["id"], variant, ROUTER_VERSION)
+        # 12. Log router decision -- and 12.5's inbound persistence -- SKIPPED
+        # for a Controller-owned turn: _controller_claim_turn already persisted
+        # the inbound user message itself (tagged "controller", not a legacy
+        # scenario), and logging a legacy routing decision for a turn the
+        # Controller actually owns would misrepresent research/analytics data
+        # (hardening §6 -- the legacy router must not act as if it decided
+        # this turn). stage/readiness/capacity/scenario/practice above still
+        # ran (pure computation, no side effects, nothing delivered) -- a
+        # deliberate, documented minor inefficiency traded for not reindenting
+        # this entire legacy block, rather than a correctness gap: nothing
+        # computed here is used, persisted, or delivered for a Controller turn.
+        if controller_claim is None:
+            await log_router_decision(uid, state, risk["score"], risk["categories"],
+                                       stage, readiness, capacity, scenario,
+                                       practice["id"], variant, ROUTER_VERSION)
 
-        # 12.5 Persist the USER message HERE -- before BOTH long LLM awaits
-        # (maybe_summarize below AND the answer call). Memory loads recent messages
-        # by autoincrement id (get_recent_messages ORDER BY id DESC), so a row's
-        # arrival ORDER is its id order. Every await before this point is a fast
-        # local/DB op; the two multi-second awaits (summarization, answer) come
-        # after. So a slow turn can no longer pause on an LLM call while a newer,
-        # faster turn's user row lands first and makes the slow turn look like the
-        # newest active context (P1 EARLY PERSISTENCE ORDER RACE -- previously this
-        # save sat after both LLM awaits). The assistant row is still saved later,
-        # and only if this turn was not superseded. A duplicate Telegram update
-        # never reaches here (DuplicateUpdateGuard drops it), so no duplicate row.
-        await save_message(uid, "user", user_text, scenario, lang,
-                           risk["score"], risk["categories"])
+            # 12.5 Persist the USER message HERE -- before BOTH long LLM awaits
+            # (maybe_summarize below AND the answer call). Memory loads recent messages
+            # by autoincrement id (get_recent_messages ORDER BY id DESC), so a row's
+            # arrival ORDER is its id order. Every await before this point is a fast
+            # local/DB op; the two multi-second awaits (summarization, answer) come
+            # after. So a slow turn can no longer pause on an LLM call while a newer,
+            # faster turn's user row lands first and makes the slow turn look like the
+            # newest active context (P1 EARLY PERSISTENCE ORDER RACE -- previously this
+            # save sat after both LLM awaits). The assistant row is still saved later,
+            # and only if this turn was not superseded. A duplicate Telegram update
+            # never reaches here (DuplicateUpdateGuard drops it), so no duplicate row.
+            await save_message(uid, "user", user_text, scenario, lang,
+                               risk["score"], risk["categories"])
     finally:
         _ingest_leave(uid, _ingest)
+
+    # Conversation Controller: the SLOW half (LLM call, validation, delivery)
+    # -- strictly AFTER the ingestion lock above is released (hardening §5),
+    # and authoritative for this turn: none of the ordinary reaction/memory/
+    # LLM/delivery code below ever runs for a Controller-owned turn
+    # (hardening §6 -- no second ordinary-response pipeline running alongside).
+    if controller_claim is not None:
+        await _controller_generate_and_deliver(message, uid, controller_claim, _turn_gen, risk)
+        return
+
     # 9.5 reaction: moved OUT of the ingestion lock (never hold the
     # lock across reaction sending). cat/conf were computed above.
     await _maybe_react(message, uid, cat, conf)
@@ -1990,32 +2069,36 @@ async def cb_cc_consent(callback: CallbackQuery):
     if not await access_control.core_rollout_allowed(uid):
         await callback.answer()
         return
-    session = await get_core_session(session_id, uid)
-    if session is None or session.consent is not ConsentState.PENDING \
-            or session.lifecycle_status is not LifecycleStatus.OPEN:
-        # Rejects: wrong owner, already-answered/duplicate tap, session
-        # PAUSED by /start or by crisis supersession (§6/§17), expired-ish
-        # states -- all identically, no state change, no delivery.
+    # Hardening §4: defense-in-depth. supersede_active_core_sessions_for_crisis
+    # (called from trigger_crisis) already PAUSES the session on crisis, which
+    # the atomic transition below independently rejects (requires lifecycle_
+    # status=='OPEN') -- this direct get_active_crisis check is a SECOND,
+    # independent guard so a crisis is caught even if that supersession step
+    # itself failed for any reason.
+    if await get_active_crisis(uid) is not None:
         await callback.answer()
         return
     lang = await get_user_language(uid) or "ru"
+    to_consent = ConsentState.DECLINED.value if value == "no" else ConsentState.GRANTED.value
+
+    # Atomic CAS (database.transition_core_session_consent): PENDING -> to_consent.
+    # Ownership (user_id in the WHERE), current consent state, and session
+    # lifecycle are all verified INSIDE the same atomic operation -- a
+    # duplicate tap, a stale tap after /start-pause or crisis-pause, or two
+    # concurrent taps racing each other all resolve to exactly one winner,
+    # never a lost-update or a double delivery.
+    if not await transition_core_session_consent(
+            session_id, uid, from_consent=ConsentState.PENDING.value, to_consent=to_consent):
+        await callback.answer()
+        return
+    await callback.answer()
 
     if value == "no":
-        session.consent = ConsentState.DECLINED
-        if not await update_core_session(session):
-            await callback.answer()
-            return
-        await callback.answer()
         await callback.message.answer(
             "Хорошо, не будем. Если захочешь попробовать позже — просто скажи." if lang != "en"
             else "Okay, we won't. Just say the word if you want to try later.")
         return
 
-    session.consent = ConsentState.GRANTED
-    if not await update_core_session(session):
-        await callback.answer()
-        return
-    await callback.answer()
     practice = get_production_practice_by_id(_PRACTICE_ID, lang)
     if practice:
         steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
