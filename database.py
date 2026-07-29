@@ -630,6 +630,40 @@ CREATE TABLE IF NOT EXISTS core_memory_items (
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_core_memory_items_user ON core_memory_items(user_id);
+
+-- Depression Disclosure Gate (Phase 2, master prompt SS13). Restart-safe,
+-- DB-backed multi-step flow -- NOT aiogram FSM/MemoryStorage, which does not
+-- survive a process restart. At most one ACTIVE flow per user; a callback's
+-- ownership/step/duplicate/staleness checks are all encoded in the single
+-- conditional UPDATE database.advance_disclosure_flow() issues (WHERE
+-- id=? AND user_id=? AND step=? AND status='active') -- a repeated or
+-- out-of-order callback tap matches zero rows and is rejected deterministically,
+-- no separate "consumed" bookkeeping needed.
+CREATE TABLE IF NOT EXISTS depression_disclosure_flows (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id            INTEGER NOT NULL REFERENCES users(id),
+    status             TEXT NOT NULL DEFAULT 'active',
+    step               TEXT NOT NULL DEFAULT 'SAFETY_CHECK',
+    diagnosis_source   TEXT,
+    answers_json       TEXT NOT NULL DEFAULT '{}',
+    lang               TEXT NOT NULL DEFAULT 'ru',
+    origin_message_id  INTEGER,
+    prompt_message_id  INTEGER,
+    handoff_status     TEXT,
+    superseded_reason  TEXT,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at         TEXT NOT NULL DEFAULT (datetime('now', '+24 hours')),
+    completed_at       TEXT,
+    CHECK(status IN ('active','completed','cancelled','superseded_by_crisis','expired')),
+    CHECK(step IN ('SAFETY_CHECK','DIAGNOSIS_SOURCE','DURATION','FUNCTIONING',
+                   'BASIC_ACTIVITIES','SUPPORT','PURPOSE','HANDOFF_READY')),
+    CHECK(handoff_status IS NULL OR handoff_status IN ('ready','claimed')),
+    CHECK(length(answers_json) <= 2000)
+);
+CREATE INDEX IF NOT EXISTS idx_dd_flows_user ON depression_disclosure_flows(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dd_one_active_flow_per_user
+    ON depression_disclosure_flows(user_id) WHERE status='active';
 """
 
 # Additive column migrations (no migration system in this repo; ADD COLUMN is
@@ -663,6 +697,15 @@ _MIGRATIONS = [
     # constraint -- these columns must exist first on an upgraded DB).
     ("intervention_results", "source_chat_id", "INTEGER"),
     ("intervention_results", "source_message_id", "INTEGER"),
+    # Phase 2 correction §3/§13: truthful crisis-source metadata. NULL for
+    # every pre-existing row (this column didn't exist yet). Every current
+    # trigger_crisis() call defaults to "EXPLICIT_MESSAGE" (self-documenting,
+    # strictly additive, no behavior change at any call site); the
+    # Depression Disclosure Gate's callbacks pass "DIRECT_SAFETY_YES" /
+    # "DIRECT_SAFETY_UNSURE" instead, so the audit trail never has to guess
+    # whether a RED event came from pattern-matched text or a direct button
+    # answer.
+    ("crisis_events", "source", "TEXT"),
 ]
 
 
@@ -1380,17 +1423,52 @@ async def get_memory_overview(uid: int) -> dict:
 
 # ── Crisis Events (Epic 1) ────────────────────────────────────────────────────
 
+CRISIS_SOURCE_KINDS = {"EXPLICIT_MESSAGE", "DIRECT_SAFETY_YES", "DIRECT_SAFETY_UNSURE"}
+
+
 async def log_crisis_event(uid: int, level: str, risk_score: int,
                             categories: list, message_excerpt: str,
-                            lang: str = "ru", admin_notified: bool = False) -> int:
+                            lang: str = "ru", admin_notified: bool = False,
+                            source: str | None = None) -> int:
+    """`source` is optional, truthful provenance metadata -- closed-set
+    (CRISIS_SOURCE_KINDS), never an arbitrary caller-supplied string; None is
+    also accepted (legacy call sites/rows predating this column). This
+    function is audit logging ONLY -- Phase 2 correction §2 explicitly moved
+    disclosure-flow supersession OUT of here and into trigger_crisis (before
+    this is even called), because logging is a side effect that can fail or
+    be skipped and must never be the sole mechanism enforcing a safety
+    invariant. Do not put supersession logic back here."""
+    if source is not None and source not in CRISIS_SOURCE_KINDS:
+        raise ValueError(f"log_crisis_event: unknown source {source!r}; "
+                         f"allowed={sorted(CRISIS_SOURCE_KINDS)}")
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             """INSERT INTO crisis_events
-               (user_id,level,risk_score,categories,message_excerpt,lang,admin_notified)
-               VALUES (?,?,?,?,?,?,?)""",
+               (user_id,level,risk_score,categories,message_excerpt,lang,admin_notified,source)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (uid, level, risk_score, ",".join(categories), message_excerpt,
-             lang, int(admin_notified)))
-        await db.commit(); return cur.lastrowid
+             lang, int(admin_notified), source))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def supersede_active_disclosure_flows_for_crisis(uid: int) -> int:
+    """The ONE canonical, logging-independent safety hook (Phase 2 correction
+    §2): atomically makes every active depression-disclosure flow for this
+    user non-actionable. Called from the TOP of trigger_crisis -- the single
+    shared crisis-entry function every route in this codebase funnels
+    through -- BEFORE the crisis screen is delivered and BEFORE
+    log_crisis_event is even attempted, so it holds regardless of whether
+    audit logging succeeds, fails, or is skipped. Returns the number of
+    flows superseded (0 or 1, since at most one can ever be active)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows
+               SET status='superseded_by_crisis', superseded_reason='crisis_activated',
+                   updated_at=datetime('now')
+               WHERE user_id=? AND status='active'""", (uid,))
+        await db.commit()
+        return cur.rowcount
 
 
 async def log_crisis_delivery(event_id, user_id: int, kind: str,
@@ -2920,3 +2998,167 @@ async def update_core_memory_item_lifecycle(item_id: str, user_id: int,
             (lifecycle.value, item_id, user_id))
         await db.commit()
         return cur.rowcount > 0
+
+
+# ── Depression Disclosure Gate (Phase 2) ────────────────────────────────────
+_DD_COLUMNS = ("id", "user_id", "status", "step", "diagnosis_source", "answers_json",
+              "lang", "origin_message_id", "prompt_message_id", "handoff_status",
+              "superseded_reason", "created_at", "updated_at", "expires_at", "completed_at")
+
+
+def _dd_row_to_dict(row) -> dict:
+    return dict(zip(_DD_COLUMNS, row))
+
+
+def safe_load_answers(raw: str | None) -> dict:
+    """Malformed/corrupted answers_json fails closed to an empty dict rather
+    than raising -- a hand-corrupted or truncated row must never crash a
+    callback handler (Phase 2 correction §10)."""
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+async def create_disclosure_flow(user_id: int, lang: str = "ru",
+                                 origin_message_id: int | None = None) -> dict:
+    """Raises sqlite3.IntegrityError if the user already has an ACTIVE flow
+    (idx_dd_one_active_flow_per_user) -- callers must supersede/close any
+    existing active flow first (see bot.py's gate) rather than relying on
+    this to fail; the index is defense-in-depth against a race, not the
+    primary control."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO depression_disclosure_flows (user_id, lang, origin_message_id)
+               VALUES (?,?,?)""",
+            (user_id, lang, origin_message_id))
+        await db.commit()
+        row = await (await db.execute(
+            f"SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows WHERE id=?",
+            (cur.lastrowid,))).fetchone()
+    return _dd_row_to_dict(row)
+
+
+async def set_disclosure_prompt_message_id(flow_id, user_id: int, message_id: int) -> bool:
+    """Best-effort metadata write (the bot's own safety-prompt message id) --
+    never gates correctness, only enriches audit/debugging."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows SET prompt_message_id=?,
+               updated_at=datetime('now') WHERE id=? AND user_id=?""",
+            (message_id, flow_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def get_active_disclosure_flow(user_id: int) -> dict | None:
+    """Only a non-expired ACTIVE flow counts -- an expired one is treated as
+    absent here (lazy expiry, no background sweep needed for Phase 2)."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"""SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows
+               WHERE user_id=? AND status='active' AND expires_at > datetime('now')""",
+            (user_id,))).fetchone()
+    return _dd_row_to_dict(row) if row else None
+
+
+async def get_disclosure_flow(flow_id, user_id: int) -> dict | None:
+    """Ownership-checked read of a flow in ANY status/expiry state -- callers
+    use this (not get_active_disclosure_flow) to decide whether a callback
+    references an expired/superseded/already-completed flow and must be
+    rejected with a specific reason rather than silently ignored."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"""SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows
+               WHERE id=? AND user_id=?""",
+            (flow_id, user_id))).fetchone()
+    return _dd_row_to_dict(row) if row else None
+
+
+def disclosure_flow_is_live(flow: dict) -> bool:
+    """True only for a flow a callback may still legitimately act on: ACTIVE
+    status and not past its expiry. Checked in Python against the already-
+    fetched row (not a second query) so callers get one consistent snapshot."""
+    from datetime import datetime, timezone
+    if flow["status"] != "active":
+        return False
+    expires = datetime.fromisoformat(flow["expires_at"]).replace(tzinfo=timezone.utc)
+    return expires > datetime.now(timezone.utc)
+
+
+async def advance_disclosure_flow(flow_id, user_id: int, *, from_step: str, to_step: str,
+                                  diagnosis_source: str | None = None,
+                                  answers_json: str | None = None) -> bool:
+    """Atomic conditional UPDATE -- WHERE also requires step=from_step AND
+    status='active' AND not expired. A duplicate tap (step already advanced
+    past from_step), a stale tap (flow superseded/expired/completed), or a
+    wrong-user tap (no row at id+user_id) all match zero rows and return
+    False identically -- the caller never needs a separate branch per failure
+    reason. Also doubles as the §7 race guard: if log_crisis_event superseded
+    this flow between the caller's read and this call, status is no longer
+    'active' and this UPDATE is a deterministic no-op -- the caller must not
+    send the next question when this returns False."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows
+               SET step=?, diagnosis_source=COALESCE(?, diagnosis_source),
+                   answers_json=COALESCE(?, answers_json), updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND step=? AND status='active'
+                     AND expires_at > datetime('now')""",
+            (to_step, diagnosis_source, answers_json, flow_id, user_id, from_step))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def close_disclosure_flow(flow_id, user_id: int, *, from_step: str, status: str,
+                                answers_json: str | None = None,
+                                superseded_reason: str | None = None) -> bool:
+    """Same atomic from_step/status guard as advance_disclosure_flow -- used
+    for terminal transitions (completed / cancelled / superseded_by_crisis).
+    One statement: a terminal answer (the PURPOSE step) is recorded and the
+    flow closed in the same atomic UPDATE, never a separate advance-then-close
+    pair. status='completed' is the ONLY status that produces a HANDOFF_READY
+    step + handoff_status='ready' -- every other terminal status (cancelled/
+    superseded_by_crisis) leaves `step` exactly where the flow was interrupted,
+    which is more informative for audit than a generic 'DONE'."""
+    is_completed = status == "completed"
+    new_step = "HANDOFF_READY" if is_completed else from_step
+    handoff_status = "ready" if is_completed else None
+    completed_at_expr = "datetime('now')" if is_completed else "completed_at"
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"""UPDATE depression_disclosure_flows
+               SET status=?, step=?, handoff_status=COALESCE(?, handoff_status),
+                   superseded_reason=COALESCE(?, superseded_reason),
+                   answers_json=COALESCE(?, answers_json),
+                   completed_at={completed_at_expr}, updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND step=? AND status='active'""",
+            (status, new_step, handoff_status, superseded_reason, answers_json,
+             flow_id, user_id, from_step))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def claim_disclosure_handoff(flow_id, user_id: int) -> dict | None:
+    """Phase 3 consumption point (not built in this PR -- this is the tested
+    accessor Phase 3 will call). Atomically transitions handoff_status
+    'ready' -> 'claimed'; a repeated claim finds handoff_status already
+    'claimed' and matches zero rows, so it fails deterministically (returns
+    None) rather than silently succeeding twice or raising. Ownership-checked
+    like every other accessor here -- a wrong user_id also matches zero rows."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows SET handoff_status='claimed',
+               updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND status='completed' AND handoff_status='ready'""",
+            (flow_id, user_id))
+        await db.commit()
+        if cur.rowcount == 0:
+            return None
+        row = await (await db.execute(
+            f"SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows WHERE id=?",
+            (flow_id,))).fetchone()
+    return _dd_row_to_dict(row)

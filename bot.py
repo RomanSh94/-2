@@ -8,6 +8,7 @@ X20 Bot — Основной файл
 """
 import asyncio
 import hmac
+import json
 import logging
 import os
 import pathlib
@@ -122,6 +123,17 @@ from database import (
     get_stored_user_language, has_privacy_notice_ack,
     record_notice_acknowledgement,
     get_response_preferences, set_response_preference,
+    create_disclosure_flow, get_active_disclosure_flow, get_disclosure_flow,
+    advance_disclosure_flow, close_disclosure_flow, disclosure_flow_is_live,
+    claim_disclosure_handoff, safe_load_answers, set_disclosure_prompt_message_id,
+    supersede_active_disclosure_flows_for_crisis,
+)
+from depression_disclosure import (
+    classify_disclosure, safety_check_text, diagnosis_source_text, duration_text,
+    functioning_text, basic_activities_text, support_text, purpose_text, closing_text,
+    DURATION_OPTIONS, FUNCTIONING_OPTIONS, BASIC_ACTIVITIES_OPTIONS, SUPPORT_OPTIONS,
+    PURPOSE_OPTIONS, DIAGNOSIS_SOURCE_OPTIONS, SAFETY_CHECK_OPTIONS,
+    STEP_ALLOWED_VALUES, STEP_TAG_TO_DB_STEP, STEP_ANSWER_KEY,
 )
 import onboarding
 import onboarding_content
@@ -211,6 +223,104 @@ def quality_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="➖ Частично", callback_data="quality:0"),
         InlineKeyboardButton(text="👎 Не помогло", callback_data="quality:-1"),
     ]])
+
+# ── Depression Disclosure Gate (Phase 2) ────────────────────────────────────
+# callback_data namespace "dd:<step>:<flow_id>:<value>" -- flow_id alone is
+# NEVER treated as proof of ownership; every handler re-fetches the row by
+# (flow_id, callback.from_user.id) and lets the DB's ownership/step/status/
+# expiry filter (database.advance_disclosure_flow's WHERE clause) be the
+# actual authority, exactly like the rest of this file's callback handlers.
+
+def _dd_options_kb(step: str, flow_id, options, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"dd:{step}:{flow_id}:{val}")]
+        for val, ru, en in options])
+
+
+def _dd_safety_check_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    # Single row (not one-per-row like the other steps) -- exact approved
+    # copy/order lives ONLY in depression_disclosure.SAFETY_CHECK_OPTIONS.
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=(ru if lang != "en" else en),
+                             callback_data=f"dd:safety:{flow_id}:{val}")
+        for val, ru, en in SAFETY_CHECK_OPTIONS]])
+
+
+def _dd_diagnosis_source_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("src", flow_id, DIAGNOSIS_SOURCE_OPTIONS, lang)
+
+
+def _dd_duration_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("dur", flow_id, DURATION_OPTIONS, lang)
+
+
+def _dd_functioning_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("func", flow_id, FUNCTIONING_OPTIONS, lang)
+
+
+def _dd_basic_activities_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("basic", flow_id, BASIC_ACTIVITIES_OPTIONS, lang)
+
+
+def _dd_support_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("supp", flow_id, SUPPORT_OPTIONS, lang)
+
+
+def _dd_purpose_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("purp", flow_id, PURPOSE_OPTIONS, lang)
+
+
+async def _dd_reject_stale_callback(callback: CallbackQuery, lang: str) -> None:
+    await callback.answer(
+        "Этот вопрос уже неактуален." if lang != "en" else "This question is no longer active.",
+        show_alert=False)
+
+
+async def _dd_validate_callback(callback: CallbackQuery, expected_step: str):
+    """The full 7-point validation chain (Phase 2 correction §1): parse exact
+    namespace/step tag -> validate step tag -> validate ownership -> validate
+    current DB step -> validate status+expiry -> validate value against the
+    step's closed allowlist -> [caller performs the atomic transition]. Any
+    failure answers the callback (no state change, no next question) and
+    returns None -- ownership failures, duplicate/stale/expired/superseded
+    taps, and unsupported values are ALL rejected the same safe way, never
+    coerced into a different meaning (e.g. an unknown SAFETY_CHECK value is
+    never treated as "no").
+
+    Crisis supersession is NOT re-checked here separately: trigger_crisis
+    (the one canonical crisis-entry point) supersedes every active flow for
+    the user UNCONDITIONALLY, before it even attempts audit logging (Phase 2
+    correction §2 -- logging must never be the sole mechanism enforcing this
+    invariant), so a flow's own `status` is already truthful the instant ANY
+    crisis route runs -- disclosure_flow_is_live() below already returns
+    False for it. Duplicating a second get_active_crisis() lookup here would
+    be exactly the kind of per-handler duplication the correction asked NOT
+    to have."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4 or parts[0] != "dd":
+        await callback.answer()
+        return None
+    _, tag, flow_id, value = parts
+    if STEP_TAG_TO_DB_STEP.get(tag) != expected_step:
+        await callback.answer()
+        return None
+    flow = await get_disclosure_flow(flow_id, uid)
+    if flow is None:
+        await callback.answer()
+        return None
+    lang = flow["lang"]
+    if not await access_control.depression_disclosure_allowed_for(uid):
+        await _dd_reject_stale_callback(callback, lang)
+        return None
+    if flow["step"] != expected_step or not disclosure_flow_is_live(flow):
+        await _dd_reject_stale_callback(callback, lang)
+        return None
+    if value not in STEP_ALLOWED_VALUES[expected_step]:
+        await _dd_reject_stale_callback(callback, lang)
+        return None
+    return flow, value
 
 # ── Voice and Adaptive Response UX ──────────────────────────────────────────
 # Everything below is inert while VOICE_REPLIES_ENABLED / EMOTIONAL_REACTIONS_
@@ -631,7 +741,8 @@ async def send_crisis(send, text, kb, lang, uid, eid, kind) -> str:
 
 
 async def trigger_crisis(message: Message, uid: int, username: str,
-                         user_text: str, risk: dict, lang: str) -> None:
+                         user_text: str, risk: dict, lang: str, *,
+                         source: str = "EXPLICIT_MESSAGE") -> None:
     """Deterministic Crisis Protocol (LLM is NEVER called here). Extracted from
     pipeline so other entry points (e.g. the journals risk-gate) can REUSE the
     exact same flow instead of duplicating it.
@@ -657,12 +768,34 @@ async def trigger_crisis(message: Message, uid: int, username: str,
     when the user taps a button a moment later (cb_crisis's own DB reads can
     then raise — see cb_crisis's own try/except around that resolve, item 1B).
     get_crisis_text already contains the hotline/plain emergency guidance in
-    the message body itself, so no button is needed to deliver the number."""
+    the message body itself, so no button is needed to deliver the number.
+
+    `source` (Phase 2 correction §3): truthful provenance for the audit trail.
+    EXPLICIT_MESSAGE (default, unchanged) means risk/categories came from
+    risk_detector pattern-matching real message text. DIRECT_SAFETY_YES/
+    DIRECT_SAFETY_UNSURE (Depression Disclosure Gate) mean a direct button
+    answer -- `risk["score"]` is None (never a fabricated number) and
+    `user_text` is "" (never invented placeholder text) for those.
+
+    Phase 2 correction §2 -- disclosure-flow supersession is NOT a side
+    effect of logging: THIS function is the one canonical crisis-entry point
+    every route in the codebase funnels through (pipeline()'s RED branch,
+    journal_guard's RED branch, the Depression Disclosure Gate's own
+    "yes"/"unsure" callback), so it supersedes any active disclosure flow
+    FIRST -- unconditionally, in its own try/except, BEFORE even attempting
+    log_crisis_event -- so the invariant holds even if audit logging raises,
+    times out, or is skipped entirely."""
+    try:
+        await supersede_active_disclosure_flows_for_crisis(uid)
+    except Exception as e:
+        print(f"[crisis] disclosure-flow supersession FAILED uid={uid}: {type(e).__name__}: {e}")
+
     eid = None
     try:
         # Create the event first — its id is baked into the crisis screen buttons.
         eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
-                                     user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
+                                     user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS),
+                                     source=source)
     except Exception as e:
         # Sanitized: no raw user_text/username in this log line.
         print(f"[crisis] log_crisis_event FAILED: {type(e).__name__}: {e}")
@@ -697,7 +830,13 @@ async def trigger_crisis(message: Message, uid: int, username: str,
         # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
         # UNKNOWN (uninvited, not onboarded) does NOT get ordinary memory/profile
         # building — only the deterministic crisis_events audit row above exists.
-        if role != access_control.UNKNOWN:
+        # `and user_text` (Phase 2 correction §3): a direct-safety-answer
+        # trigger has NO original message text (user_text == "") -- saving an
+        # empty "user" message would fabricate a phantom entry in the
+        # conversation history, so it is skipped. Every EXPLICIT_MESSAGE call
+        # site always has non-empty user_text (risk_detector only matches
+        # non-empty text), so this is unchanged behavior for them.
+        if role != access_control.UNKNOWN and user_text:
             await save_message(uid, "user", user_text, "crisis", lang,
                                risk["score"], risk["categories"])
             await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
@@ -895,6 +1034,45 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         if "aggression" in risk["categories"] and access_control.should_alert_owner(uid):
             await push_alert("Aggression Detected", uid, username, risk["level"],
                              risk["score"], risk["categories"], user_text)
+
+        # 4.3 Depression Disclosure Gate (Phase 2, master prompt §13). Deterministic
+        # only -- no LLM call. Runs strictly AFTER the RED crisis check near the top
+        # of this function, so explicit suicide/self-harm language always wins: a
+        # message containing BOTH crisis language AND a depression disclosure never
+        # reaches this line at all (RED already returned). classify_disclosure()
+        # itself excludes negation/third-person/meta-question/quoted-or-hypothetical
+        # -- only a genuinely eligible first-person disclosure reaches here.
+        # Gated by the ONE centralized rollout helper (Phase 2 correction §4) --
+        # gate flag AND core_rollout_allowed -- entirely inert while either is off
+        # (byte-for-byte prior behavior, nothing created).
+        if await access_control.depression_disclosure_allowed_for(uid):
+            active_flow = await get_active_disclosure_flow(uid)
+            if classify_disclosure(user_text, lang) == "POSITIVE":
+                # §8: a new eligible disclosure supersedes an older pending flow
+                # (rather than being silently skipped) before creating the new one.
+                if active_flow is not None:
+                    await close_disclosure_flow(active_flow["id"], uid,
+                                                from_step=active_flow["step"],
+                                                status="cancelled",
+                                                superseded_reason="new_disclosure")
+                flow = await create_disclosure_flow(uid, lang, origin_message_id=message.message_id)
+                await save_message(uid, "user", user_text, "depression_disclosure", lang,
+                                   risk["score"], risk["categories"])
+                text = safety_check_text(lang)
+                sent = await message.answer(text, reply_markup=_dd_safety_check_kb(flow["id"], lang))
+                prompt_mid = getattr(sent, "message_id", None)
+                if prompt_mid is not None:
+                    await set_disclosure_prompt_message_id(flow["id"], uid, prompt_mid)
+                await save_message(uid, "assistant", text, "depression_disclosure", lang)
+                return
+            if active_flow is not None:
+                # §8: an unrelated ordinary message while a flow is pending is a
+                # topic change -- the old flow's buttons become inert (silently;
+                # the ordinary message below still gets its normal reply, the
+                # user is never forced back to the old topic).
+                await close_disclosure_flow(active_flow["id"], uid,
+                                            from_step=active_flow["step"],
+                                            status="cancelled", superseded_reason="new_topic")
 
         # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
         # (current one not saved yet). Used to amplify ambiguity and bias routing.
@@ -1472,6 +1650,172 @@ async def cb_before_skip(callback: CallbackQuery, fsm_state: FSMContext):
     await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}", parse_mode="HTML")
     await callback.answer()
 
+# ── Depression Disclosure Gate callbacks (Phase 2) ──────────────────────────
+# Every handler: parse+validate via _dd_validate_callback (§1's 7-point chain)
+# -> perform ONE atomic transition -> answer -> send the next question. A
+# transition returning False (lost the race -- e.g. superseded by a crisis
+# event logged between validation and this call) means "do not send the next
+# question", which is exactly what §7's TOCTOU requirement asks for; it falls
+# out of the atomic UPDATE's own WHERE clause, not a second explicit check.
+
+async def _dd_record_answer_and_advance(flow: dict, uid: int, key: str, value: str,
+                                        from_step: str, to_step: str) -> bool:
+    answers = safe_load_answers(flow["answers_json"])
+    answers[key] = value
+    return await advance_disclosure_flow(flow["id"], uid, from_step=from_step,
+                                         to_step=to_step, answers_json=json.dumps(answers))
+
+
+@dp.callback_query(F.data.startswith("dd:safety:"))
+async def cb_dd_safety(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "SAFETY_CHECK")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+
+    if value in ("yes", "unsure"):
+        # §2/§6: "Да" is a direct, truthful positive answer to the explicit
+        # safety question -> routes to the SAME deterministic crisis system
+        # ("EXPLICIT_MESSAGE"'s sibling, not a parallel one) with truthful
+        # source metadata: DIRECT_SAFETY_YES, risk_score=None (never a
+        # fabricated 100), categories=["suicide"] (truthful -- this genuinely
+        # IS a direct confirmed report). "Не уверен" gets the SAME crisis-
+        # support UI/priority (this codebase's existing, documented
+        # philosophy: "anything unclear keeps the crisis screen, never assume
+        # safety" -- see the active-crisis reassurance gate near the top of
+        # pipeline()) but source=DIRECT_SAFETY_UNSURE and categories=[] --
+        # uncertainty is never recorded as a confirmed suicide statement.
+        # user_text="" (not the fabricated bracket placeholder): there is no
+        # original message for a button tap, and trigger_crisis/log_crisis_
+        # event now handle an empty user_text truthfully (no fabricated
+        # "user" message is saved -- see trigger_crisis's own comment).
+        if not await close_disclosure_flow(flow["id"], uid, from_step=flow["step"],
+                                           status="superseded_by_crisis",
+                                           superseded_reason=f"direct_safety_{value}"):
+            await _dd_reject_stale_callback(callback, lang)
+            return
+        await callback.answer()
+        source = "DIRECT_SAFETY_YES" if value == "yes" else "DIRECT_SAFETY_UNSURE"
+        categories = ["suicide"] if value == "yes" else []
+        risk = {"score": None, "level": "critical", "categories": categories,
+               "implicit": False, "ambiguous_phrases": []}
+        await trigger_crisis(callback.message, uid, callback.from_user.username or "",
+                             "", risk, lang, source=source)
+        return
+
+    # value == "no"
+    if not await advance_disclosure_flow(flow["id"], uid, from_step="SAFETY_CHECK",
+                                         to_step="DIAGNOSIS_SOURCE"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(diagnosis_source_text(lang),
+                                  reply_markup=_dd_diagnosis_source_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:src:"))
+async def cb_dd_source(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "DIAGNOSIS_SOURCE")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    # value in {"specialist","self","unknown"} -- never used to confirm OR deny
+    # a diagnosis (§13.3/§8), only stored as reported provenance.
+    if not await advance_disclosure_flow(flow["id"], uid, from_step="DIAGNOSIS_SOURCE",
+                                         to_step="DURATION", diagnosis_source=value):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(duration_text(lang),
+                                  reply_markup=_dd_duration_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:dur:"))
+async def cb_dd_duration(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "DURATION")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    if not await _dd_record_answer_and_advance(flow, uid, "duration", value,
+                                               "DURATION", "FUNCTIONING"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(functioning_text(lang),
+                                  reply_markup=_dd_functioning_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:func:"))
+async def cb_dd_functioning(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "FUNCTIONING")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    if not await _dd_record_answer_and_advance(flow, uid, "functioning", value,
+                                               "FUNCTIONING", "BASIC_ACTIVITIES"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(basic_activities_text(lang),
+                                  reply_markup=_dd_basic_activities_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:basic:"))
+async def cb_dd_basic_activities(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "BASIC_ACTIVITIES")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    if not await _dd_record_answer_and_advance(flow, uid, "basic_activities", value,
+                                               "BASIC_ACTIVITIES", "SUPPORT"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(support_text(lang),
+                                  reply_markup=_dd_support_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:supp:"))
+async def cb_dd_support(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "SUPPORT")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    if not await _dd_record_answer_and_advance(flow, uid, "support", value,
+                                               "SUPPORT", "PURPOSE"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(purpose_text(lang),
+                                  reply_markup=_dd_purpose_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:purp:"))
+async def cb_dd_purpose(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "PURPOSE")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    answers = safe_load_answers(flow["answers_json"])
+    answers["purpose"] = value
+    # §9: PURPOSE is the last question, not a discard point -- close_disclosure_
+    # flow(status="completed") is what actually produces the typed HANDOFF_READY
+    # step + handoff_status='ready' for Phase 3 to later claim_disclosure_handoff().
+    if not await close_disclosure_flow(flow["id"], uid, from_step="PURPOSE", status="completed",
+                                       answers_json=json.dumps(answers)):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(closing_text(lang))
+
+
 @dp.callback_query(F.data.startswith("after:"))
 async def cb_after(callback: CallbackQuery, fsm_state: FSMContext):
     score = int(callback.data.split(":")[1])
@@ -2002,6 +2346,17 @@ async def cmd_start(message: Message):
     # /start is a new turn: bump the generation so any ordinary answer still
     # being generated for this user is superseded and not delivered afterward.
     _bump_user_generation(uid)
+    # Phase 2 correction §8: /start supersedes any pending Depression
+    # Disclosure Gate flow -- old buttons become inert, the new /start menu
+    # is never blocked by it. Best-effort (never blocks /start itself).
+    try:
+        active_dd_flow = await get_active_disclosure_flow(uid)
+        if active_dd_flow is not None:
+            await close_disclosure_flow(active_dd_flow["id"], uid,
+                                        from_step=active_dd_flow["step"],
+                                        status="cancelled", superseded_reason="start_command")
+    except Exception as e:
+        print(f"[depression-disclosure] /start supersession failed uid={uid}: {e}")
     # PR C3a.1 -- parse a /start deep-link payload BEFORE the access gate.
     # This is the critical ordering: a temp-invite-code holder has no prior
     # access, so if we ran ensure_full_access_or_closed_test first they'd be
