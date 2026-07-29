@@ -197,6 +197,19 @@ def _validate_core_rollout_mode(raw: str) -> str:
 THERAPEUTIC_CORE_ROLLOUT_MODE = _validate_core_rollout_mode(
     os.getenv("THERAPEUTIC_CORE_ROLLOUT_MODE", "off"))
 
+# Depression Disclosure Gate (Phase 2, master prompt §13) — default OFF, own
+# flag rather than THERAPEUTIC_CORE_ROLLOUT_MODE: this gate is a standalone
+# deterministic safety feature that runs independently of the Core session/
+# hypothesis/intervention surface, not part of that Core rollout contract.
+# Flag false => pipeline() behaves byte-for-byte as before this phase; no
+# first-person depression disclosure is intercepted, no new DB row is ever
+# created. Deploys dormant; do not flip true for owner/all except through an
+# explicit later canary phase.
+DEPRESSION_DISCLOSURE_GATE_ENABLED = (
+    os.getenv("DEPRESSION_DISCLOSURE_GATE_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
 # ── Voice and Adaptive Response UX — both default OFF ───────────────────────
 # VOICE_REPLIES_ENABLED gates: the /format selector, the "🔊 Прослушать"
 # listen button, natural-language format/voice meta-commands, and the

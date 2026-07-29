@@ -118,6 +118,23 @@ async def core_rollout_allowed(uid: int) -> bool:
     return False
 
 
+async def depression_disclosure_allowed_for(uid: int) -> bool:
+    """Phase 2 correction §4 -- the ONE centralized effective-rollout helper
+    for the Depression Disclosure Gate. DEPRESSION_DISCLOSURE_GATE_ENABLED is
+    a feature-specific kill switch, not an independent rollout system: the
+    effective contract is ALWAYS gate_flag AND core_rollout_allowed(uid),
+    reusing the same off/owner/invited/all contract the Core uses rather than
+    inventing a second one. Every pipeline entry, every callback, and any
+    future typed-answer handling must call this (not read the two underlying
+    signals separately) -- in particular this makes "rollout changed to off
+    between the prompt and the callback" fail closed automatically, since a
+    callback re-checks this fresh rather than trusting the state at prompt time."""
+    import config
+    if not config.DEPRESSION_DISCLOSURE_GATE_ENABLED:
+        return False
+    return await core_rollout_allowed(uid)
+
+
 def resolved_reviewers_for(tester_uid: int) -> list[int]:
     """Reviewers explicitly mapped to this tester.
 

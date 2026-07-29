@@ -370,6 +370,22 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
                   "any other row (export is not filtered by lifecycle) but must "
                   "never be read back into a live response (see "
                   "MemoryLifecycle.influences_responses in therapeutic_domain.py)."),
+
+    # Depression Disclosure Gate (Phase 2, master prompt SS13). CRISIS_SAFETY
+    # category (like crisis_events) because a flow record proves the safety
+    # question was asked and answered -- but CASCADE_DELETE, not RETAIN: unlike
+    # crisis_events this is a routing/assessment record, not the audit trail of
+    # an actual crisis response being delivered, so a delete-all request removes
+    # it in full.
+    "depression_disclosure_flows": _e(
+        table="depression_disclosure_flows", user_id_column="user_id",
+        category="CRISIS_SAFETY",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`answers_json` holds only the closed-set button values from "
+                  "DURATION_OPTIONS/FUNCTIONING_OPTIONS/SUPPORT_OPTIONS/"
+                  "PURPOSE_OPTIONS (depression_disclosure.py) -- never raw user "
+                  "text; never in logs/alerts."),
 }
 
 
