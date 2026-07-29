@@ -16,9 +16,11 @@ allowlist entry for this file — see that test file's purity check, which
 would fail the moment this module imports anything beyond the four stdlib
 names above.
 
-therapeutic_domain.py has no callers yet (Phase 1 ships storage in
-database.py that serializes these models, nothing in bot.pipeline() reads or
-writes any of it) — it is inert foundation, safe with every rollout flag off.
+database.py serializes these models into the additive core_* tables from
+Phase 1 onward. As of Phase 3, bot.pipeline() reads/writes SessionState
+through database.py's accessors (never this module directly) -- the
+Conversation Controller runtime lives in conversation_controller.py, not
+here; this module still stays pure vocabulary only.
 
 Two hard rules from the spec are enforced here:
 
@@ -434,6 +436,11 @@ class SessionState:
     active_intervention_id: str | None = None
     pending_outcome: bool = False
     repair_constraints: set[RepairConstraint] = field(default_factory=set)
+    # Phase 3: reference to the Phase 2 depression_disclosure_flows row this
+    # session was seeded from (claim_disclosure_handoff's flow id), so a
+    # session can be traced back to its originating handoff without
+    # duplicating that data here. None for a session not seeded from a handoff.
+    handoff_flow_id: str | None = None
 
     def __post_init__(self):
         if not str(self.session_id).strip():
@@ -464,8 +471,92 @@ class SessionState:
             "active_intervention_id": self.active_intervention_id,
             "pending_outcome": self.pending_outcome,
             "repair_constraints": sorted(c.value for c in self.repair_constraints),
+            "handoff_flow_id": self.handoff_flow_id,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "SessionState":
         return cls(**d)
+
+
+@dataclass
+class ResponsePlan:
+    """Phase 3 §8 — the validated, bounded contract a controller-generated
+    response must satisfy. Built deterministically from intent + repair
+    constraints BEFORE the LLM call; the Controller Fidelity Validator
+    (conversation_controller.py) checks the actual generated text against it
+    after the call. Every field is a closed type -- no unrestricted string
+    fields that could carry an instruction."""
+    intent: Intent
+    listening_only: bool = False
+    advice_allowed: bool = True
+    intervention_allowed: bool = True
+    explanation_required: bool = False
+    direct_answer_required: bool = False
+    consent_required: bool = False
+    question_allowed: bool = True
+    max_questions: int = 1
+    max_actions: int = 1
+    max_interventions: int = 1
+    repair_constraints: set[RepairConstraint] = field(default_factory=set)
+
+    def __post_init__(self):
+        self.intent = as_enum(Intent, self.intent)
+        self.repair_constraints = {
+            as_enum(RepairConstraint, c) for c in self.repair_constraints}
+        if not 0 <= self.max_questions <= 1:
+            raise ValueError("ResponsePlan.max_questions must be 0 or 1 (SS9: "
+                             "normally no more than one main question)")
+        if not 0 <= self.max_actions <= 1:
+            raise ValueError("ResponsePlan.max_actions must be 0 or 1 (SS9: "
+                             "no more than one requested action)")
+        if not 0 <= self.max_interventions <= 1:
+            raise ValueError("ResponsePlan.max_interventions must be 0 or 1 "
+                             "(SS9: no more than one primary intervention)")
+        if RepairConstraint.QUESTION_OVERLOAD in self.repair_constraints:
+            self.question_allowed = False
+            self.max_questions = 0
+        if RepairConstraint.ADVICE_REJECTED in self.repair_constraints:
+            self.advice_allowed = False
+        if RepairConstraint.EXERCISE_REJECTED in self.repair_constraints:
+            self.intervention_allowed = False
+        # Phase 3 correction §9 -- per-intent cross-field invariants FAIL
+        # CLOSED (raise) rather than being silently coerced into something
+        # permissive. This makes an inconsistent plan for these four intents
+        # impossible to construct, not just discouraged by convention.
+        if self.question_allowed is False and self.max_questions != 0:
+            raise ValueError("ResponsePlan: question_allowed=False requires max_questions=0")
+        if self.intent is Intent.VENT:
+            if not (self.listening_only and not self.advice_allowed
+                    and not self.intervention_allowed):
+                raise ValueError(
+                    "ResponsePlan: VENT requires listening_only=True, "
+                    "advice_allowed=False, intervention_allowed=False")
+        if self.intent is Intent.EXPLAIN:
+            if not (self.explanation_required and self.direct_answer_required):
+                raise ValueError(
+                    "ResponsePlan: EXPLAIN requires explanation_required=True "
+                    "and direct_answer_required=True")
+        if self.intent is Intent.ACTION:
+            if self.max_actions != 1 or self.question_allowed:
+                raise ValueError(
+                    "ResponsePlan: ACTION requires max_actions=1 and "
+                    "question_allowed=False (the bot chooses, it does not ask)")
+        if self.intent is Intent.PRACTICE and not self.consent_required:
+            raise ValueError("ResponsePlan: PRACTICE requires consent_required=True")
+
+    def to_dict(self) -> dict:
+        return {
+            "intent": self.intent.value,
+            "listening_only": self.listening_only,
+            "advice_allowed": self.advice_allowed,
+            "intervention_allowed": self.intervention_allowed,
+            "explanation_required": self.explanation_required,
+            "direct_answer_required": self.direct_answer_required,
+            "consent_required": self.consent_required,
+            "question_allowed": self.question_allowed,
+            "max_questions": self.max_questions,
+            "max_actions": self.max_actions,
+            "max_interventions": self.max_interventions,
+            "repair_constraints": sorted(c.value for c in self.repair_constraints),
+        }

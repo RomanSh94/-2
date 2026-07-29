@@ -1051,15 +1051,37 @@ def test_migration_from_pre_phase2_schema_preserves_existing_data_and_adds_new_o
 
 
 def test_completed_and_superseded_flows_coexist_in_history(tmp_db):
-    """§8/§10: history accumulates -- a completed flow and a later
-    superseded-by-crisis flow for the SAME user both remain queryable, only
-    one of them was ever 'active' at a time."""
+    """§8/§10: history accumulates -- a completed, ALREADY-CLAIMED flow and a
+    later superseded-by-crisis flow for the SAME user both remain queryable.
+
+    The completed flow must be claimed first: Phase 3's correction to
+    supersede_active_disclosure_flows_for_crisis also invalidates a
+    completed-but-UNCLAIMED handoff (status stays 'completed' only once a
+    Conversation Controller turn has actually claimed it) -- see
+    test_crisis_supersedes_unclaimed_completed_handoff_too below for that
+    invariant directly."""
     run(_seed_user(1))
     completed = _complete_flow(1)
     assert completed["status"] == "completed"
+    claimed = run(database.claim_disclosure_handoff(completed["id"], 1))
+    assert claimed["handoff_status"] == "claimed"
     second = run(database.create_disclosure_flow(1, "ru"))
     run(database.supersede_active_disclosure_flows_for_crisis(1))
     second_reloaded = run(database.get_disclosure_flow(second["id"], 1))
     assert second_reloaded["status"] == "superseded_by_crisis"
     still_completed = run(database.get_disclosure_flow(completed["id"], 1))
     assert still_completed["status"] == "completed"
+
+
+def test_crisis_supersedes_unclaimed_completed_handoff_too(tmp_db):
+    """The Phase 3 correction directly: a crisis beginning AFTER the
+    disclosure assessment completed but BEFORE the Conversation Controller
+    claimed it must invalidate that stale handoff -- it must never become
+    claimable once the crisis is resolved."""
+    run(_seed_user(1))
+    completed = _complete_flow(1)
+    assert completed["handoff_status"] == "ready"
+    run(database.supersede_active_disclosure_flows_for_crisis(1))
+    superseded = run(database.get_disclosure_flow(completed["id"], 1))
+    assert superseded["status"] == "superseded_by_crisis"
+    assert run(database.get_unclaimed_handoff(1)) is None
