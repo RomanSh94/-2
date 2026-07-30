@@ -138,10 +138,15 @@ from depression_disclosure import (
 from database import (
     create_core_session, get_core_session, list_core_sessions, update_core_session,
     claim_handoff_and_get_or_create_session, supersede_active_core_sessions_for_crisis,
-    transition_core_session_consent,
+    update_core_session_authoritative,
+    session_json_snapshot, create_practice_proposal, get_practice_proposal,
+    transition_practice_proposal, mark_proposal_delivered,
+    supersede_active_practice_proposals,
 )
 import conversation_controller as controller
-from therapeutic_domain import Intent, RepairConstraint, LifecycleStatus, ConsentState
+from therapeutic_domain import (
+    Intent, RepairConstraint, LifecycleStatus, ConsentState, PracticeProposalStatus,
+)
 import onboarding
 import onboarding_content
 from onboarding_content import ONBOARDING_VERSION, PRIVACY_NOTICE_VERSION, FIRST_STEP, LAST_STEP
@@ -388,7 +393,7 @@ _LEGACY_KB_MAX_TRACKED = 10_000
 _legacy_kb_cleared: set[int] = set()
 
 
-async def _answer_evicting_legacy_kb(message: Message, uid: int, text: str) -> None:
+async def _answer_evicting_legacy_kb(message: Message, uid: int, text: str) -> Message:
     """Send one ordinary reply, evicting the legacy reply keyboard the first
     time we successfully reply to this user.
 
@@ -398,18 +403,17 @@ async def _answer_evicting_legacy_kb(message: Message, uid: int, text: str) -> N
     is marked only AFTER a confirmed successful send -- marking first would
     make a failed eviction permanent for that user."""
     if uid in _legacy_kb_cleared:
-        await message.answer(text)
-        return
+        return await message.answer(text)
     try:
-        await message.answer(text, reply_markup=ReplyKeyboardRemove())
+        sent = await message.answer(text, reply_markup=ReplyKeyboardRemove())
     except Exception:
         # The removal never got through, so nothing was delivered either --
         # retry the plain answer (not a duplicate) and leave uid unmarked.
-        await message.answer(text)
-        return
+        return await message.answer(text)
     if len(_legacy_kb_cleared) >= _LEGACY_KB_MAX_TRACKED:
         _legacy_kb_cleared.clear()
     _legacy_kb_cleared.add(uid)
+    return sent
 
 
 def _voice_ux_enabled_for(uid: int) -> bool:
@@ -526,41 +530,52 @@ async def _synthesize_and_send_voice(target, uid: int, text: str, lang: str) -> 
 
 async def deliver_response(message: Message, uid: int, answer: str, lang: str,
                             *, one_shot_voice: bool = False,
-                            one_shot_concise: bool = False) -> None:
+                            one_shot_concise: bool = False,
+                            reply_markup=None) -> Message | None:
     """The SINGLE shared point where a final, Safety-Validator-approved
-    ordinary response is delivered — text / voice / voice_and_concise_text,
-    from the user's stored preference or a one-shot meta-command override.
-    Flag OFF => always plain text, byte-for-byte the prior
+    response is delivered — text / voice / voice_and_concise_text, from the
+    user's stored preference or a one-shot meta-command override. Flag OFF
+    => always plain text, byte-for-byte the prior
     `await message.answer(answer)` behavior. Also private-chat-only (§4):
     even if a preference were somehow set, delivery from a non-private chat
     always falls back to plain text with no listen button -- defense in
     depth alongside the pipeline()-level guard that never lets a group
-    message reach the format-command/override code at all."""
+    message reach the format-command/override code at all.
+
+    Hardening §12: `reply_markup` (used for the Conversation Controller's
+    PRACTICE consent buttons) always forces plain text -- a consent prompt
+    is never voiced or condensed, matching its existing dedicated contract
+    exactly, byte-for-byte. Returns the sent Telegram Message (or None when
+    voice delivery consumed it) so a caller needing the message id (e.g. to
+    record a PracticeProposal's delivered message) can read it -- every
+    other existing caller already ignored the previous None return, so this
+    is additive, not a breaking change."""
     is_private = getattr(message.chat, "type", "private") == "private"
+    if reply_markup is not None:
+        return await message.answer(answer, reply_markup=reply_markup)
     if not _voice_ux_enabled_for(uid) or not is_private:
-        await _answer_evicting_legacy_kb(message, uid, answer)
-        return
+        return await _answer_evicting_legacy_kb(message, uid, answer)
 
     prefs = await get_response_preferences(uid)
     fmt = "voice" if one_shot_voice else prefs["response_format"]
     concise = one_shot_concise or prefs["response_length"] == "concise"
 
     if fmt == "text":
-        await message.answer(answer, reply_markup=_listen_kb(uid, lang))
-        return
+        return await message.answer(answer, reply_markup=_listen_kb(uid, lang))
 
     if fmt == "voice_and_concise_text":
         visible = _safe_concise_version(answer, lang)
         voice_text = visible if concise else answer
-        await message.answer(visible)
+        sent = await message.answer(visible)
         await _synthesize_and_send_voice(message, uid, voice_text, lang)
-        return
+        return sent
 
     # fmt == "voice"
     voice_text = _safe_concise_version(answer, lang) if concise else answer
     ok = await _synthesize_and_send_voice(message, uid, voice_text, lang)
     if not ok:
-        await message.answer(answer)  # TTS failed -- never silent; full text stands in
+        return await message.answer(answer)  # TTS failed -- never silent; full text stands in
+    return None  # delivered as a voice message -- no text Message object to return
 
 
 async def _maybe_react(message: Message, uid: int, category: ReactionCategory,
@@ -936,11 +951,25 @@ async def journal_guard(message: Message, uid: int, lang: str,
     return "ok", risk
 
 
-def _practice_consent_kb(session_id, lang: str) -> InlineKeyboardMarkup:
+# Hardening §3: MUST be a member of practice_registry.PRODUCTION_PRACTICE_IDS
+# -- "grounding_5senses_v1" (the pre-hardening constant here) is CATALOG_ONLY,
+# not production-approved, so get_production_practice_by_id() for it always
+# returned None; every Controller-issued PRACTICE consent silently fell back
+# to generic filler text instead of real steps. box breathing is strong-
+# evidence, low-adverse-risk, no contraindications -- a safe universal
+# default for "the bot itself picks one low-risk practice" (no scenario/
+# category selection logic exists at the Controller layer yet).
+_PRACTICE_ID = "breathing_box_v1"
+
+
+def _practice_consent_kb(session_id, proposal_id, lang: str) -> InlineKeyboardMarkup:
+    # Hardening §3: callback data carries the exact PROPOSAL identity, not
+    # just the session -- a stale/superseded proposal's buttons can never be
+    # mistaken for a newer one's, even within the same session.
     labels = [("yes", "Да", "Yes"), ("no", "Нет", "No")]
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=(ru if lang != "en" else en),
-                             callback_data=f"cc:consent:{session_id}:{val}")
+                             callback_data=f"cc:consent:{session_id}:{proposal_id}:{val}")
         for val, ru, en in labels]])
 
 
@@ -955,7 +984,24 @@ def _known_facts_from_handoff(flow: dict) -> list[str]:
     return facts
 
 
-async def _controller_claim_turn(uid: int, user_text: str, lang: str) -> dict | None:
+def _linked_handoff_is_valid(flow: dict | None) -> bool:
+    """Hardening §13: handoff_flow_id existing on a session is NOT enough on
+    its own -- re-verified on EVERY turn (a link claimed while healthy can
+    go stale later, e.g. a crisis superseding the flow after the fact).
+    Only a still-completed, still-claimed, well-formed flow may feed known
+    facts into the Controller's prompt."""
+    if flow is None:
+        return False
+    if flow.get("status") != "completed" or flow.get("handoff_status") != "claimed":
+        return False
+    try:
+        answers = safe_load_answers(flow.get("answers_json"))
+    except Exception:
+        return False
+    return isinstance(answers, dict)
+
+
+async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict) -> dict | None:
     """Phase 3 hardening §5: the FAST, DB-only half of a controller turn --
     called from INSIDE the per-user ingestion lock, exactly where the
     ordinary path does its own inbound persistence, and containing no LLM
@@ -975,8 +1021,14 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str) -> dict | 
     classified explicit intent always overrides, in that priority order,
     the handoff-derived intent, which in turn overrides plain continuation
     of an already-OPEN session's existing intent. Only when NONE of those
-    apply -- no signal at all, no active session -- does the controller
-    decline the turn."""
+    apply -- no signal at all, no active session with a real base intent --
+    does the controller decline the turn.
+
+    Hardening §6: REPAIR never becomes the persisted base intent (`intent`
+    on SessionState) -- it is an overlay, computed fresh into `turn_intent`
+    for THIS turn's ResponsePlan only. `base_intent` is what gets written to
+    the session."""
+    from datetime import datetime, timezone
     handoff, handoff_session = await claim_handoff_and_get_or_create_session(uid)
     known_facts: list[str] = []
     handoff_intent = None
@@ -986,6 +1038,7 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str) -> dict | 
         handoff_intent = controller.HANDOFF_PURPOSE_TO_INTENT.get(purpose, Intent.UNKNOWN)
 
     repair_now = controller.classify_repair_signals(user_text)
+    overrides = controller.classify_repair_overrides(user_text)
     text_intent = controller.classify_intent(user_text, lang)
 
     existing_session = handoff_session
@@ -993,66 +1046,103 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str) -> dict | 
         active_sessions = await list_core_sessions(uid, active_only=True)
         existing_session = active_sessions[0] if active_sessions else None
 
+    has_base = existing_session is not None and existing_session.intent is not Intent.UNKNOWN
     if repair_now:
-        intent = Intent.REPAIR
+        turn_intent = Intent.REPAIR
     elif text_intent is not Intent.UNKNOWN:
-        intent = text_intent
+        turn_intent = text_intent
     elif handoff_intent is not None and handoff_intent is not Intent.UNKNOWN:
-        intent = handoff_intent
-    elif existing_session is not None and existing_session.lifecycle_status is LifecycleStatus.OPEN:
-        intent = existing_session.intent  # continuation: no new signal, keep governing
+        turn_intent = handoff_intent
+    elif existing_session is not None and existing_session.lifecycle_status is LifecycleStatus.OPEN and has_base:
+        turn_intent = existing_session.intent  # continuation: no new signal, keep governing
     else:
         return None
 
+    base_intent = (existing_session.intent if (repair_now and has_base)
+                   else Intent.UNKNOWN if repair_now else turn_intent)
+    is_topic_change = (not repair_now and text_intent is not Intent.UNKNOWN
+                       and has_base and existing_session.intent is not turn_intent)
+
     session = existing_session
     if session is None:
-        session = await create_core_session(uid, intent=intent)
-    elif session.lifecycle_status is LifecycleStatus.PAUSED:
+        # §2: never an interpretation-dependent intent at creation -- stays
+        # UNKNOWN until the SAME authoritative, CAS-protected write this
+        # turn's mutations go through in _controller_generate_and_deliver.
+        session = await create_core_session(uid)
+
+    # §2: snapshot BEFORE ANY of this turn's own mutations (including the
+    # PAUSED->OPEN resume just below) -- must be the exact value still on
+    # the DB row right now, or update_core_session_authoritative's CAS would
+    # reject this turn's own write as if it were already stale.
+    base_state_json = session_json_snapshot(session)
+
+    if session.lifecycle_status is LifecycleStatus.PAUSED:
         # §17: a new explicit-intent message (or a continuation decision,
         # which by construction only fires for an OPEN session) resumes a
         # /start-paused session -- engaging IS the continuation signal.
         session.lifecycle_status = LifecycleStatus.OPEN
-    session.intent = intent
+
+    session.intent = base_intent
     if handoff is not None:
         session.handoff_flow_id = str(handoff["id"])
 
-    # §11: re-fetch known facts from the LINKED handoff on every turn, not
-    # just the turn that claimed it -- otherwise Phase 2 context is only
-    # ever used once and then forgotten.
     if not known_facts and session.handoff_flow_id:
         linked = await get_disclosure_flow(session.handoff_flow_id, uid)
-        if linked:
+        if _linked_handoff_is_valid(linked):
             known_facts = _known_facts_from_handoff(linked)
 
-    # §9: bounded multi-turn repair persistence (not one-shot, not forever).
-    # A fresh signal resets a small window; PRACTICE explicitly overrides a
-    # lingering EXERCISE_REJECTED (the one named override case).
+    # §7: per-constraint repair lifecycle -- decay every currently-active
+    # record ONE turn FIRST, then apply this turn's fresh signal (refreshes
+    # ONLY the constraints it names) and any explicit override (clears ONLY
+    # the constraint it names). An unrelated already-active constraint's own
+    # countdown is never touched by either.
+    session.decay_repair_turns()
     if repair_now:
-        carried = session.repair_constraints if session.repair_turns_remaining > 0 else set()
-        session.repair_constraints = carried | repair_now
-        session.repair_turns_remaining = 3
-    elif session.repair_turns_remaining > 0:
-        session.repair_turns_remaining -= 1
-        if session.repair_turns_remaining == 0:
-            session.repair_constraints = set()
-    else:
-        session.repair_constraints = set()
-    if intent is Intent.PRACTICE:
-        session.repair_constraints.discard(RepairConstraint.EXERCISE_REJECTED)
+        session.add_repair_signal(repair_now, source_turn_id=None,
+                                  created_at=datetime.now(timezone.utc).isoformat(),
+                                  window_turns=controller.REPAIR_WINDOW_TURNS)
+    for cleared in overrides:
+        session.clear_repair_constraint(cleared, "explicit_override")
+    if turn_intent is Intent.PRACTICE:
+        session.clear_repair_constraint(RepairConstraint.EXERCISE_REJECTED, "explicit_practice_request")
 
-    plan = controller.build_response_plan(intent, session.repair_constraints)
+    plan = controller.build_response_plan(turn_intent, session.active_repair_constraints)
 
-    # §7/§8: bounded recent context -- this user's own last few turns (any
+    # §8: an explicit topic change invalidates a standing PRACTICE proposal
+    # -- old consent must not survive a real subject change.
+    if is_topic_change:
+        await supersede_active_practice_proposals(uid, "topic_change")
+
+    # §3: the exact practice is selected deterministically NOW, before any
+    # LLM call, as a persisted proposal -- this turn's prompt AND the
+    # eventual consent buttons both reference it by proposal_id, so the LLM
+    # can never describe one practice while the callback delivers another.
+    proposal = None
+    if turn_intent is Intent.PRACTICE:
+        practice = get_production_practice_by_id(_PRACTICE_ID, lang)
+        if practice:
+            proposal = await create_practice_proposal(
+                uid, session.session_id, practice["id"], practice.get("version", "v1"),
+                purpose=practice.get("name", _PRACTICE_ID),
+                expected_duration=f"{practice.get('duration_min', 5)} минут")
+
+    # §7/§8/§9: bounded recent context -- this user's own last few turns (any
     # scenario, not just prior controller ones), fetched BEFORE this turn's
     # own message is saved below so it reflects PRIOR turns only. Small,
     # bounded (get_recent_messages already caps at `limit`), never the full
-    # unrestricted history, never treated as instructions.
+    # unrestricted history, never treated as instructions (see
+    # conversation_controller.build_system_prompt's injection guard).
     recent_rows = await get_recent_messages(uid, limit=6)
     recent_context = [c for r, c in recent_rows if r == "user"]
 
-    await save_message(uid, "user", user_text, "controller", lang, 0, [])
+    # §1: the ACTUAL risk score/categories for this turn, not a hardcoded
+    # placeholder -- a Controller-owned turn is still a real inbound message
+    # for research/audit purposes.
+    await save_message(uid, "user", user_text, "controller", lang,
+                       risk.get("score", 0), risk.get("categories", []))
     return {"session": session, "plan": plan, "known_facts": known_facts,
-           "recent_context": recent_context, "user_text": user_text, "lang": lang}
+           "recent_context": recent_context, "user_text": user_text, "lang": lang,
+           "base_state_json": base_state_json, "proposal": proposal}
 
 
 async def _controller_generate_and_deliver(message: Message, uid: int, claim: dict,
@@ -1063,7 +1153,20 @@ async def _controller_generate_and_deliver(message: Message, uid: int, claim: di
     session, plan, known_facts = claim["session"], claim["plan"], claim["known_facts"]
     recent_context = claim.get("recent_context")
     user_text, lang = claim["user_text"], claim["lang"]
+    proposal = claim.get("proposal")
+    practice_name = proposal.purpose if proposal is not None else None
+    expected_duration = proposal.expected_duration if proposal is not None else None
     system_prompt = controller.build_system_prompt(plan, lang, known_facts, recent_context)
+    if proposal is not None:
+        # §3: tell the model the EXACT proposal it must describe -- the
+        # consent buttons below reference this SAME proposal_id, so a
+        # mismatch between "what the model described" and "what gets
+        # delivered on GRANTED" is structurally impossible, not just unlikely.
+        system_prompt += (
+            f" Точная практика для описания (назови именно её, не другую): "
+            f"{practice_name} ({expected_duration})." if lang != "en" else
+            f" Exact practice to describe (name it exactly, not a different "
+            f"one): {practice_name} ({expected_duration}).")
 
     async def _generate() -> str:
         try:
@@ -1072,13 +1175,18 @@ async def _controller_generate_and_deliver(message: Message, uid: int, claim: di
                 messages=[{"role": "system", "content": system_prompt},
                          {"role": "user", "content": user_text}])
             out = (completion.choices[0].message.content or "").strip()
-            return out or controller.fallback_text(lang, plan.intent)
+            return out or controller.fallback_text(
+                lang, plan.intent, known_facts=known_facts,
+                practice_name=practice_name, expected_duration=expected_duration)
         except Exception as e:
             print(f"[controller] LLM call failed uid={uid}: {type(e).__name__}: {e}")
-            return controller.fallback_text(lang, plan.intent)
+            return controller.fallback_text(
+                lang, plan.intent, known_facts=known_facts,
+                practice_name=practice_name, expected_duration=expected_duration)
 
     def _valid(candidate: str) -> bool:
-        ok, _ = controller.validate_controller_response(candidate, plan)
+        ok, _ = controller.validate_controller_response(
+            candidate, plan, known_facts=known_facts, practice_name=practice_name)
         if not ok:
             return False
         # §12: the STRONGER context-aware validator, not the plain one --
@@ -1088,32 +1196,85 @@ async def _controller_generate_and_deliver(message: Message, uid: int, claim: di
 
     text = await _generate()
     if not _valid(text):
-        text = controller.fallback_text(lang, plan.intent)
+        text = controller.fallback_text(
+            lang, plan.intent, known_facts=known_facts,
+            practice_name=practice_name, expected_duration=expected_duration)
         if not _valid(text):
-            text = controller.fallback_text(lang)  # minimal generic, last resort
+            # §11: fall back to the STATIC per-intent table entry -- no
+            # dynamic known_facts/practice_name substitution that could
+            # itself be what made the previous attempt fail. Proven to pass
+            # validate_controller_response for EVERY Intent, in both
+            # languages, by test_static_per_intent_fallbacks_pass_validation.
+            text = controller.fallback_text(lang, plan.intent)
+            if not _valid(text):
+                # Absolute last resort -- kept as a real (validated, not
+                # assumed) fourth tier rather than delivering unvalidated
+                # text; unreachable in practice given the tier above is
+                # proven to always pass, but never trusted blindly either.
+                text = controller.fallback_text(lang)
 
-    # Stale-response guard (§3): the SAME suppression the ordinary LLM path
-    # uses (PR#67) -- a newer turn for this user superseded this one while
-    # the LLM call above was in flight. No state mutation, no persistence,
-    # no delivery.
+    # Stale-response guard (§3 of round 2): the SAME suppression the
+    # ordinary LLM path uses (PR#67) -- a newer turn for this user
+    # superseded this one while the LLM call above was in flight. No state
+    # mutation, no persistence, no delivery.
     if _user_generation_superseded(uid, turn_gen):
         return
 
-    # PRACTICE requires explicit consent (§10) -- deterministic Да/Нет
-    # buttons, never LLM-parsed free text. The ENTIRE session write
-    # (including consent=PENDING) happens in ONE update_core_session call
-    # BEFORE the buttons are ever shown, closing the fast-tap race: a
-    # callback arriving the instant the buttons render always finds a
-    # durably PENDING row, never a stale pre-write state.
+    # PRACTICE requires explicit consent (§3/§10) -- deterministic Да/Нет
+    # buttons tied to the exact proposal, never LLM-parsed free text. The
+    # ENTIRE session write (including the best-effort consent=PENDING
+    # mirror) happens in ONE authoritative, CAS-protected write BEFORE the
+    # buttons are ever shown, closing the fast-tap race: a callback arriving
+    # the instant the buttons render always finds a durably PENDING row.
     reply_markup = None
-    if plan.intent is Intent.PRACTICE:
+    if plan.intent is Intent.PRACTICE and proposal is not None:
+        # session.consent mirrors the proposal's status for older readers;
+        # the proposal's OWN status (see below) is the real gate now (§3).
         session.consent = ConsentState.PENDING
-        reply_markup = _practice_consent_kb(session.session_id, lang)
+        reply_markup = _practice_consent_kb(session.session_id, proposal.proposal_id, lang)
+    elif plan.intent is Intent.CLOSE_CONVERSATION:
+        # §8: an explicit close is a deliberate, user-initiated end -- a
+        # terminal status, distinct from PAUSED (which is for /start/crisis
+        # interruptions the user did not ask to end).
+        session.lifecycle_status = LifecycleStatus.COMPLETED
 
-    if not await update_core_session(session):
-        return  # session vanished/ownership issue -- do not deliver orphaned state
+    # §2: authoritative CAS write -- rejects this turn if ANYTHING else
+    # (a newer turn's own write, /start's pause, a crisis supersession)
+    # touched this row since claim time, closing the TOCTOU gap between the
+    # generation check above and this write reaching the database.
+    if not await update_core_session_authoritative(session, claim["base_state_json"]):
+        return  # superseded -- do not persist assistant output, do not deliver
 
-    await message.answer(text, reply_markup=reply_markup)
+    if plan.intent is Intent.PRACTICE and proposal is not None:
+        # §4: the proposal itself may have been superseded/invalidated
+        # between claim time and now (e.g. a concurrent topic-change turn's
+        # claim ran and superseded it) -- its own CAS is the authority.
+        if not await transition_practice_proposal(
+                proposal.proposal_id, uid, from_status="PROPOSED", to_status="PENDING"):
+            return
+    elif plan.intent is Intent.CLOSE_CONVERSATION:
+        # §8: closing the conversation invalidates any standing proposal too.
+        await supersede_active_practice_proposals(uid, "conversation_closed")
+
+    # §5/§12: persist PENDING before the send attempt (already done above),
+    # then handle a real Telegram delivery failure explicitly -- never leave
+    # a proposal PENDING forever with no way for the user to act on it.
+    # Delivery goes through the ONE shared delivery contract (deliver_response)
+    # -- reply_markup forces plain text there, matching this flow's existing
+    # "consent is never voiced" contract byte-for-byte, while still keeping
+    # stale-suppression (already checked above, before any write) and future
+    # voice/reaction compatibility for the non-PRACTICE case.
+    try:
+        sent = await deliver_response(message, uid, text, lang, reply_markup=reply_markup)
+    except Exception as e:
+        print(f"[controller] delivery failed uid={uid}: {type(e).__name__}: {e}")
+        if plan.intent is Intent.PRACTICE and proposal is not None:
+            await transition_practice_proposal(
+                proposal.proposal_id, uid, from_status="PENDING",
+                to_status="DELIVERY_FAILED", reason="send_exception")
+        return
+    if plan.intent is Intent.PRACTICE and proposal is not None:
+        await mark_proposal_delivered(proposal.proposal_id, uid, sent.message_id)
     await save_message(uid, "assistant", text, "controller", lang)
 
 
@@ -1250,6 +1411,10 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                                                 from_step=active_flow["step"],
                                                 status="cancelled",
                                                 superseded_reason="new_disclosure")
+                # Hardening §4: a new Depression Disclosure flow (a fresh
+                # safety re-assessment) also invalidates any standing
+                # PRACTICE proposal for this user.
+                await supersede_active_practice_proposals(uid, "new_disclosure_flow")
                 flow = await create_disclosure_flow(uid, lang, origin_message_id=message.message_id)
                 await save_message(uid, "user", user_text, "depression_disclosure", lang,
                                    risk["score"], risk["categories"])
@@ -1446,7 +1611,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # invoked right after the `finally` below releases it.
         controller_claim = None
         if await access_control.core_rollout_allowed(uid):
-            controller_claim = await _controller_claim_turn(uid, user_text, lang)
+            controller_claim = await _controller_claim_turn(uid, user_text, lang, risk)
 
         # 6. Detect stage
         stage = detect_stage(user_text, lang)
@@ -2046,23 +2211,21 @@ async def cb_dd_purpose(callback: CallbackQuery):
     await callback.message.answer(closing_text(lang))
 
 
-# ── Conversation Controller: PRACTICE consent (Phase 3 §12) ────────────────
-# callback_data "cc:consent:<session_id>:<yes|no>" -- deterministic Да/Нет,
-# never LLM-parsed free text. Same ownership/rollout/status discipline as
-# every other callback in this file: session_id alone is never proof of
-# ownership, and consent is only actionable while status=='PENDING'.
-
-_PRACTICE_ID = "grounding_5senses_v1"
-
+# ── Conversation Controller: PRACTICE consent (Phase 3 §12, hardening §3/§4) ─
+# callback_data "cc:consent:<session_id>:<proposal_id>:<yes|no>" -- carries
+# the exact PROPOSAL identity, not just the session, so consent applies to
+# one exact practice proposal. Deterministic Да/Нет, never LLM-parsed free
+# text. Every check below is independent and additive -- a callback that
+# fails any one of them is rejected the same way (non-actionable, no delivery).
 
 @dp.callback_query(F.data.startswith("cc:consent:"))
 async def cb_cc_consent(callback: CallbackQuery):
     uid = callback.from_user.id
-    parts = callback.data.split(":", 3)
-    if len(parts) != 4:
+    parts = callback.data.split(":", 4)
+    if len(parts) != 5:
         await callback.answer()
         return
-    _, _tag, session_id, value = parts
+    _, _tag, session_id, proposal_id, value = parts
     if value not in ("yes", "no"):
         await callback.answer()
         return
@@ -2070,27 +2233,50 @@ async def cb_cc_consent(callback: CallbackQuery):
         await callback.answer()
         return
     # Hardening §4: defense-in-depth. supersede_active_core_sessions_for_crisis
-    # (called from trigger_crisis) already PAUSES the session on crisis, which
-    # the atomic transition below independently rejects (requires lifecycle_
-    # status=='OPEN') -- this direct get_active_crisis check is a SECOND,
-    # independent guard so a crisis is caught even if that supersession step
-    # itself failed for any reason.
+    # (called from trigger_crisis) already PAUSES the session and supersedes
+    # any actionable proposal, which the atomic transition below independently
+    # rejects -- this direct get_active_crisis check is a SECOND, independent
+    # guard so a crisis is caught even if that supersession step itself failed.
     if await get_active_crisis(uid) is not None:
         await callback.answer()
         return
-    lang = await get_user_language(uid) or "ru"
-    to_consent = ConsentState.DECLINED.value if value == "no" else ConsentState.GRANTED.value
-
-    # Atomic CAS (database.transition_core_session_consent): PENDING -> to_consent.
-    # Ownership (user_id in the WHERE), current consent state, and session
-    # lifecycle are all verified INSIDE the same atomic operation -- a
-    # duplicate tap, a stale tap after /start-pause or crisis-pause, or two
-    # concurrent taps racing each other all resolve to exactly one winner,
-    # never a lost-update or a double delivery.
-    if not await transition_core_session_consent(
-            session_id, uid, from_consent=ConsentState.PENDING.value, to_consent=to_consent):
+    # §4: a new Depression Disclosure flow (a fresh safety re-assessment)
+    # also makes a standing PRACTICE proposal non-actionable, independent of
+    # the proposal's own status.
+    if await get_active_disclosure_flow(uid) is not None:
         await callback.answer()
         return
+    session = await get_core_session(session_id, uid)
+    if session is None or session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    # §4: exact proposal AND session identity must both match -- ownership is
+    # already enforced by get_practice_proposal's own WHERE, this additionally
+    # rejects a forged/mismatched session_id paired with a real proposal_id.
+    if proposal is None or str(proposal.session_id) != str(session_id):
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+    to_status = (PracticeProposalStatus.DECLINED if value == "no"
+                else PracticeProposalStatus.GRANTED).value
+
+    # Atomic CAS (database.transition_practice_proposal): PENDING -> to_status,
+    # with expiry enforced INSIDE the same conditional UPDATE (require_
+    # unexpired=True). Ownership, current status, and freshness are all
+    # verified in the ONE atomic write -- a duplicate tap, a stale tap, an
+    # expired proposal, or two concurrent taps racing each other all resolve
+    # to exactly one winner, never a lost-update or a double delivery.
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.PENDING.value,
+            to_status=to_status, require_unexpired=True):
+        await callback.answer()
+        return
+    # Best-effort mirror on the session for older readers -- the proposal's
+    # own status (just transitioned above) is the real, authoritative gate.
+    prior_json = session_json_snapshot(session)
+    session.consent = ConsentState.DECLINED if value == "no" else ConsentState.GRANTED
+    await update_core_session_authoritative(session, prior_json)
     await callback.answer()
 
     if value == "no":
@@ -2099,12 +2285,15 @@ async def cb_cc_consent(callback: CallbackQuery):
             else "Okay, we won't. Just say the word if you want to try later.")
         return
 
-    practice = get_production_practice_by_id(_PRACTICE_ID, lang)
+    practice = get_production_practice_by_id(proposal.practice_id, lang)
     if practice:
+        await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.GRANTED.value,
+            to_status=PracticeProposalStatus.STARTED.value)
         steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
         await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}",
                                       parse_mode="HTML")
-    else:  # pragma: no cover -- defensive, the id above is a real production practice
+    else:  # pragma: no cover -- defensive, proposal.practice_id is always a real production id
         await callback.message.answer(controller.fallback_text(lang, Intent.PRACTICE))
 
 
@@ -2659,6 +2848,9 @@ async def cmd_start(message: Message):
             if s.lifecycle_status is LifecycleStatus.OPEN:
                 s.lifecycle_status = LifecycleStatus.PAUSED
                 await update_core_session(s)
+        # Hardening §4: /start also invalidates any standing PRACTICE
+        # proposal -- old consent must not survive a /start reset.
+        await supersede_active_practice_proposals(uid, "start_command")
     except Exception as e:
         print(f"[controller] /start session pause failed uid={uid}: {e}")
     # PR C3a.1 -- parse a /start deep-link payload BEFORE the access gate.

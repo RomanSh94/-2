@@ -61,8 +61,11 @@ def test_session_phase_and_lifecycle_are_independent_axes():
 
 def test_session_state_round_trips_through_dict():
     s = core.SessionState(session_id="7", user_id=42, intent=core.Intent.VENT,
-                           repair_constraints={core.RepairConstraint.QUESTION_OVERLOAD})
+                           repair_records=[core.RepairRecord(
+                               constraint=core.RepairConstraint.QUESTION_OVERLOAD,
+                               source_turn_id=None, created_at="", remaining_turns=3)])
     assert core.SessionState.from_dict(s.to_dict()).to_dict() == s.to_dict()
+    assert s.active_repair_constraints == {core.RepairConstraint.QUESTION_OVERLOAD}
 
 
 def test_formulation_confidence_out_of_range_rejected():

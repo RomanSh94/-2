@@ -115,6 +115,27 @@ class RepairConstraint(str, Enum):
     TOPIC_REJECTED = "TOPIC_REJECTED"
 
 
+class PracticeProposalStatus(str, Enum):
+    """Hardening §3 -- consent applies to one exact, persisted proposal, not
+    to the session in general."""
+    PROPOSED = "PROPOSED"
+    PENDING = "PENDING"
+    GRANTED = "GRANTED"
+    DECLINED = "DECLINED"
+    STARTED = "STARTED"
+    COMPLETED = "COMPLETED"
+    WITHDRAWN = "WITHDRAWN"
+    EXPIRED = "EXPIRED"
+    SUPERSEDED = "SUPERSEDED"
+    DELIVERY_FAILED = "DELIVERY_FAILED"
+
+
+# A proposal is still actionable (a consent tap can still mean something) only
+# in these two statuses -- every other status is a terminal or invalidated
+# state (hardening §4).
+ACTIONABLE_PROPOSAL_STATUSES = (PracticeProposalStatus.PROPOSED, PracticeProposalStatus.PENDING)
+
+
 class CapabilityLevel(str, Enum):
     """What the system may do with a method WITHOUT a human clinician (§12).
     Ordered by escalating restriction; `rank` supports 'no lower-capability
@@ -421,6 +442,108 @@ class MemoryItem:
         return cls(**d)
 
 
+# Upper bound accepted by RepairRecord.__post_init__ -- a validation ceiling,
+# not the operational window (conversation_controller.REPAIR_WINDOW_TURNS is
+# the actual value new signals are set to). Keeps a corrupted/adversarial
+# persisted value from creating an effectively-permanent constraint.
+MAX_REPAIR_TTL_TURNS = 10
+
+
+@dataclass
+class RepairRecord:
+    """Hardening §7 -- one independently-timed repair constraint. Replaces
+    the single shared `repair_turns_remaining` int: a fresh BOT_REPEATS
+    signal must not reset an unrelated ADVICE_REJECTED record's countdown."""
+    constraint: RepairConstraint
+    source_turn_id: int | None
+    created_at: str
+    remaining_turns: int
+    clearing_reason: str | None = None
+
+    def __post_init__(self):
+        self.constraint = as_enum(RepairConstraint, self.constraint)
+        if not 0 <= self.remaining_turns <= MAX_REPAIR_TTL_TURNS:
+            raise ValueError(
+                f"RepairRecord.remaining_turns out of [0,{MAX_REPAIR_TTL_TURNS}]: "
+                f"{self.remaining_turns}")
+        self.clearing_reason = _clip(self.clearing_reason, 100)
+
+    @property
+    def active(self) -> bool:
+        return self.remaining_turns > 0
+
+    def to_dict(self) -> dict:
+        return {
+            "constraint": self.constraint.value,
+            "source_turn_id": self.source_turn_id,
+            "created_at": self.created_at,
+            "remaining_turns": self.remaining_turns,
+            "clearing_reason": self.clearing_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RepairRecord":
+        return cls(**d)
+
+
+@dataclass
+class PracticeProposal:
+    """Hardening §3 -- a bounded, persisted, exact practice proposal. Consent
+    applies to THIS proposal, never to "whatever practice the session is
+    currently about" -- closes the gap where the LLM could describe one
+    practice while a stale callback delivers a different hard-coded one."""
+    proposal_id: str
+    user_id: int
+    session_id: str
+    practice_id: str
+    practice_version: str
+    purpose: str
+    expected_duration: str
+    status: PracticeProposalStatus = PracticeProposalStatus.PROPOSED
+    proposal_message_id: int | None = None
+    created_at: str = ""
+    expires_at: str = ""
+    delivered_at: str | None = None
+    superseded_reason: str | None = None
+
+    def __post_init__(self):
+        if not str(self.proposal_id).strip():
+            raise ValueError("PracticeProposal.proposal_id must be non-empty")
+        if not isinstance(self.user_id, int):
+            raise ValueError("PracticeProposal.user_id must be an int (owner key)")
+        if not str(self.practice_id).strip():
+            raise ValueError("PracticeProposal.practice_id must be non-empty")
+        self.status = as_enum(PracticeProposalStatus, self.status)
+        self.purpose = _clip(self.purpose, 300) or ""
+        self.expected_duration = _clip(self.expected_duration, 50) or ""
+        self.superseded_reason = _clip(self.superseded_reason, 100)
+
+    @property
+    def is_actionable(self) -> bool:
+        return self.status in ACTIONABLE_PROPOSAL_STATUSES
+
+    def to_dict(self) -> dict:
+        return {
+            "proposal_id": self.proposal_id,
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "practice_id": self.practice_id,
+            "practice_version": self.practice_version,
+            "purpose": self.purpose,
+            "expected_duration": self.expected_duration,
+            "status": self.status.value,
+            "proposal_message_id": self.proposal_message_id,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "delivered_at": self.delivered_at,
+            "superseded_reason": self.superseded_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PracticeProposal":
+        return cls(**d)
+
+
 @dataclass
 class SessionState:
     """Canonical, restart-safe session state (§15.3). Phase and lifecycle are
@@ -435,18 +558,16 @@ class SessionState:
     active_goal: str | None = None
     active_intervention_id: str | None = None
     pending_outcome: bool = False
-    repair_constraints: set[RepairConstraint] = field(default_factory=set)
+    # Hardening §6/§7: `intent` is ALWAYS the base/governing intent -- REPAIR
+    # is an overlay, never persisted here (see conversation_controller and
+    # bot._controller_claim_turn). Each RepairConstraint gets its own
+    # independently-timed record instead of one shared countdown.
+    repair_records: list[RepairRecord] = field(default_factory=list)
     # Phase 3: reference to the Phase 2 depression_disclosure_flows row this
     # session was seeded from (claim_disclosure_handoff's flow id), so a
     # session can be traced back to its originating handoff without
     # duplicating that data here. None for a session not seeded from a handoff.
     handoff_flow_id: str | None = None
-    # Phase 3 hardening: bounded multi-turn repair persistence. A repair
-    # signal sets this to a small fixed window (not "forever", not "one
-    # turn only" -- SS9 explicitly rejected both extremes); each subsequent
-    # controller turn without a fresh repair signal decrements it, and
-    # repair_constraints is cleared the turn this reaches 0.
-    repair_turns_remaining: int = 0
 
     def __post_init__(self):
         if not str(self.session_id).strip():
@@ -458,14 +579,56 @@ class SessionState:
         self.lifecycle_status = as_enum(LifecycleStatus, self.lifecycle_status)
         self.consent = as_enum(ConsentState, self.consent)
         self.active_goal = _clip(self.active_goal, 300)
-        self.repair_constraints = {
-            as_enum(RepairConstraint, c) for c in self.repair_constraints}
-        if self.repair_turns_remaining < 0:
-            raise ValueError("SessionState.repair_turns_remaining must be >= 0")
+        self.repair_records = [
+            r if isinstance(r, RepairRecord) else RepairRecord.from_dict(r)
+            for r in self.repair_records]
 
     @property
     def is_active(self) -> bool:
         return self.lifecycle_status in (LifecycleStatus.OPEN, LifecycleStatus.PAUSED)
+
+    @property
+    def active_repair_constraints(self) -> set[RepairConstraint]:
+        """The read-only view every caller outside this class should use --
+        only constraints with a still-live record are active (§7)."""
+        return {r.constraint for r in self.repair_records if r.active}
+
+    def add_repair_signal(self, constraints: set[RepairConstraint],
+                          source_turn_id: int | None, created_at: str,
+                          window_turns: int) -> None:
+        """A fresh repair signal refreshes ONLY the constraints it names --
+        an unrelated already-active constraint's own countdown is untouched
+        (§7's core requirement)."""
+        by_constraint = {r.constraint: r for r in self.repair_records}
+        for c in constraints:
+            existing = by_constraint.get(c)
+            if existing is not None:
+                existing.remaining_turns = window_turns
+                existing.source_turn_id = source_turn_id
+                existing.created_at = created_at
+                existing.clearing_reason = None
+            else:
+                self.repair_records.append(RepairRecord(
+                    constraint=c, source_turn_id=source_turn_id,
+                    created_at=created_at, remaining_turns=window_turns))
+
+    def decay_repair_turns(self) -> None:
+        """Called once per controller turn that is NOT itself a fresh repair
+        signal -- every still-active record's independent countdown ticks
+        down by one; reaching 0 clears that record only."""
+        for r in self.repair_records:
+            if r.remaining_turns > 0:
+                r.remaining_turns -= 1
+                if r.remaining_turns == 0 and r.clearing_reason is None:
+                    r.clearing_reason = "expired"
+
+    def clear_repair_constraint(self, constraint: RepairConstraint, reason: str) -> None:
+        """An explicit override (e.g. an explicit advice request clearing
+        ADVICE_REJECTED) -- clears only the named constraint's record."""
+        for r in self.repair_records:
+            if r.constraint is constraint and r.active:
+                r.remaining_turns = 0
+                r.clearing_reason = reason
 
     def to_dict(self) -> dict:
         return {
@@ -478,13 +641,28 @@ class SessionState:
             "active_goal": self.active_goal,
             "active_intervention_id": self.active_intervention_id,
             "pending_outcome": self.pending_outcome,
-            "repair_constraints": sorted(c.value for c in self.repair_constraints),
+            "repair_records": [r.to_dict() for r in self.repair_records],
             "handoff_flow_id": self.handoff_flow_id,
-            "repair_turns_remaining": self.repair_turns_remaining,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "SessionState":
+        d = dict(d)
+        # Backward compatibility: pre-hardening persisted JSON has
+        # `repair_constraints` (a list of constraint values) + a single
+        # shared `repair_turns_remaining` int instead of `repair_records`.
+        # Migrate it into one record per constraint rather than raising --
+        # a restart must not lose an in-flight repair window.
+        if "repair_records" not in d:
+            old_constraints = d.pop("repair_constraints", [])
+            old_remaining = d.pop("repair_turns_remaining", 0)
+            d["repair_records"] = [
+                {"constraint": c, "source_turn_id": None, "created_at": "",
+                 "remaining_turns": old_remaining, "clearing_reason": None}
+                for c in old_constraints]
+        else:
+            d.pop("repair_constraints", None)
+            d.pop("repair_turns_remaining", None)
         return cls(**d)
 
 
