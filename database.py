@@ -684,8 +684,11 @@ CREATE TABLE IF NOT EXISTS core_practice_proposals (
     expires_at          TEXT NOT NULL,
     delivered_at        TEXT,
     superseded_reason   TEXT,
+    outcome             TEXT,
+    outcome_recorded_at TEXT,
     CHECK(status IN ('PROPOSED','PENDING','GRANTED','DECLINED','STARTED','COMPLETED',
-                     'WITHDRAWN','EXPIRED','SUPERSEDED','DELIVERY_FAILED'))
+                     'WITHDRAWN','EXPIRED','SUPERSEDED','DELIVERY_FAILED')),
+    CHECK(outcome IS NULL OR outcome IN ('HELPED','PARTLY_HELPED','NO_CHANGE','WORSE'))
 );
 CREATE INDEX IF NOT EXISTS idx_core_practice_proposals_user ON core_practice_proposals(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_core_one_actionable_proposal_per_session
@@ -732,6 +735,11 @@ _MIGRATIONS = [
     # whether a RED event came from pattern-matched text or a direct button
     # answer.
     ("crisis_events", "source", "TEXT"),
+    # Phase 3 final closure: qualitative self-reported outcome for a
+    # COMPLETED PracticeProposal -- no before score, no estimation, see
+    # PracticeOutcome in therapeutic_domain.py.
+    ("core_practice_proposals", "outcome", "TEXT"),
+    ("core_practice_proposals", "outcome_recorded_at", "TEXT"),
 ]
 
 
@@ -3058,7 +3066,8 @@ async def update_core_session_authoritative(state: _core.SessionState,
 
 _PP_COLUMNS = ("id", "user_id", "session_id", "practice_id", "practice_version",
               "purpose", "expected_duration", "status", "proposal_message_id",
-              "created_at", "expires_at", "delivered_at", "superseded_reason")
+              "created_at", "expires_at", "delivered_at", "superseded_reason",
+              "outcome", "outcome_recorded_at")
 
 
 def _pp_row_to_obj(row) -> "_core.PracticeProposal":
@@ -3146,6 +3155,22 @@ async def mark_proposal_delivered(proposal_id, user_id: int, message_id: int) ->
             """UPDATE core_practice_proposals SET proposal_message_id=?,
                delivered_at=datetime('now') WHERE id=? AND user_id=? AND status='PENDING'""",
             (message_id, proposal_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def record_practice_outcome(proposal_id, user_id: int, outcome: str) -> bool:
+    """Phase 3 final closure §5: records a purely qualitative, explicit
+    self-reported outcome on an ALREADY-COMPLETED proposal (status is not
+    touched -- this is an info-only update, same pattern as
+    mark_proposal_delivered). Only meaningful once (WHERE outcome IS NULL),
+    so a duplicate/replayed outcome callback cannot silently overwrite the
+    user's first answer."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_practice_proposals SET outcome=?, outcome_recorded_at=datetime('now')
+               WHERE id=? AND user_id=? AND status='COMPLETED' AND outcome IS NULL""",
+            (outcome, proposal_id, user_id))
         await db.commit()
         return cur.rowcount > 0
 

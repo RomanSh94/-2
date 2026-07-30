@@ -135,6 +135,25 @@ class PracticeProposalStatus(str, Enum):
 # state (hardening §4).
 ACTIONABLE_PROPOSAL_STATUSES = (PracticeProposalStatus.PROPOSED, PracticeProposalStatus.PENDING)
 
+# A STARTED proposal (steps successfully delivered) is still actionable for
+# the post-practice outcome buttons.
+STARTED_ACTIONABLE_STATUS = PracticeProposalStatus.STARTED
+
+
+class PracticeOutcome(str, Enum):
+    """Phase 3 final closure §5 -- a purely qualitative, explicit,
+    user-reported outcome. Deliberately has NO before/after numeric scores:
+    a Controller-owned practice never collected a before score, so there is
+    nothing safe to compute a delta from -- fabricating or estimating one is
+    explicitly forbidden. This is NOT OutcomeMeasurement/MetricKind (Phase 1,
+    for method-level scored interventions with a real before/after pair);
+    reusing that machinery here would mean inventing the missing before
+    value, which is exactly what is forbidden."""
+    HELPED = "HELPED"
+    PARTLY_HELPED = "PARTLY_HELPED"
+    NO_CHANGE = "NO_CHANGE"
+    WORSE = "WORSE"
+
 
 class CapabilityLevel(str, Enum):
     """What the system may do with a method WITHOUT a human clinician (§12).
@@ -505,6 +524,8 @@ class PracticeProposal:
     expires_at: str = ""
     delivered_at: str | None = None
     superseded_reason: str | None = None
+    outcome: "PracticeOutcome | None" = None
+    outcome_recorded_at: str | None = None
 
     def __post_init__(self):
         if not str(self.proposal_id).strip():
@@ -517,6 +538,8 @@ class PracticeProposal:
         self.purpose = _clip(self.purpose, 300) or ""
         self.expected_duration = _clip(self.expected_duration, 50) or ""
         self.superseded_reason = _clip(self.superseded_reason, 100)
+        if self.outcome is not None:
+            self.outcome = as_enum(PracticeOutcome, self.outcome)
 
     @property
     def is_actionable(self) -> bool:
@@ -537,6 +560,8 @@ class PracticeProposal:
             "expires_at": self.expires_at,
             "delivered_at": self.delivered_at,
             "superseded_reason": self.superseded_reason,
+            "outcome": self.outcome.value if self.outcome else None,
+            "outcome_recorded_at": self.outcome_recorded_at,
         }
 
     @classmethod

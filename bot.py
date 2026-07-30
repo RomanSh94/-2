@@ -141,11 +141,12 @@ from database import (
     update_core_session_authoritative,
     session_json_snapshot, create_practice_proposal, get_practice_proposal,
     transition_practice_proposal, mark_proposal_delivered,
-    supersede_active_practice_proposals,
+    supersede_active_practice_proposals, record_practice_outcome,
 )
 import conversation_controller as controller
 from therapeutic_domain import (
     Intent, RepairConstraint, LifecycleStatus, ConsentState, PracticeProposalStatus,
+    PracticeOutcome,
 )
 import onboarding
 import onboarding_content
@@ -955,10 +956,16 @@ async def journal_guard(message: Message, uid: int, lang: str,
 # -- "grounding_5senses_v1" (the pre-hardening constant here) is CATALOG_ONLY,
 # not production-approved, so get_production_practice_by_id() for it always
 # returned None; every Controller-issued PRACTICE consent silently fell back
-# to generic filler text instead of real steps. box breathing is strong-
-# evidence, low-adverse-risk, no contraindications -- a safe universal
-# default for "the bot itself picks one low-risk practice" (no scenario/
-# category selection logic exists at the Controller layer yet).
+# to generic filler text instead of real steps.
+#
+# Final closure §6: box breathing is NOT claimed here as universal, suitable
+# for every user, or contraindication-free -- it is a temporary, production-
+# approved, low-complexity practice used to validate the consent/lifecycle
+# infrastructure itself (proposal -> consent -> delivery -> outcome) for an
+# explicit PRACTICE request, pending the real Method Registry/selection logic
+# a later phase builds. Trains a specific, named skill (slowing attention,
+# observing breathing rhythm, practising deliberate regulation) -- it is not
+# framed as treating the user's underlying problem.
 _PRACTICE_ID = "breathing_box_v1"
 
 
@@ -2286,15 +2293,181 @@ async def cb_cc_consent(callback: CallbackQuery):
         return
 
     practice = get_production_practice_by_id(proposal.practice_id, lang)
-    if practice:
-        await transition_practice_proposal(
-            proposal_id, uid, from_status=PracticeProposalStatus.GRANTED.value,
-            to_status=PracticeProposalStatus.STARTED.value)
-        steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
+    if not practice:  # pragma: no cover -- defensive, proposal.practice_id is always a real production id
+        await callback.message.answer(controller.fallback_text(lang, Intent.PRACTICE))
+        return
+
+    # §3 final closure: STARTED means the exact steps were SUCCESSFULLY
+    # delivered -- the send is attempted FIRST, and the GRANTED->STARTED
+    # transition only happens once it actually succeeded. A send failure
+    # leaves the proposal at GRANTED (never falsely STARTED) and shows no
+    # outcome buttons for content the user never received.
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
+    try:
         await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}",
                                       parse_mode="HTML")
-    else:  # pragma: no cover -- defensive, proposal.practice_id is always a real production id
-        await callback.message.answer(controller.fallback_text(lang, Intent.PRACTICE))
+    except Exception as e:
+        print(f"[controller] practice steps delivery failed uid={uid}: {type(e).__name__}: {e}")
+        return
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.GRANTED.value,
+            to_status=PracticeProposalStatus.STARTED.value):
+        return  # lost a race (e.g. crisis/superseded) between delivery and this write
+    await callback.message.answer(
+        "Как прошло?" if lang != "en" else "How did it go?",
+        reply_markup=_practice_outcome_kb(proposal_id, lang))
+
+
+def _practice_outcome_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [
+        ("done", "✅ Выполнил(а)", "✅ Done"),
+        ("stopped", "⏸ Остановился(ась)", "⏸ Stopped"),
+        ("refused", "❌ Не хочу продолжать", "❌ Don't want to continue"),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:outcome:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+def _practice_helped_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [
+        ("helped", "Помогло", "Helped"),
+        ("partly", "Помогло отчасти", "Partly helped"),
+        ("none", "Не изменилось", "No change"),
+        ("worse", "Стало хуже", "Became worse"),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:helped:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+# ── Conversation Controller: post-practice outcome (Phase 3 final closure §3
+# /§4/§5) -- callback_data "cc:outcome:<proposal_id>:<done|stopped|refused>".
+# STARTED is the only actionable prior state; every check below is
+# independent and additive, matching cb_cc_consent's discipline exactly.
+
+@dp.callback_query(F.data.startswith("cc:outcome:"))
+async def cb_cc_outcome(callback: CallbackQuery):
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    if value not in ("done", "stopped", "refused"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None:
+        await callback.answer()
+        return
+    # Final closure §7 boundary: a /start (or any other) reset that PAUSED
+    # the owning session makes a dangling outcome-report button inert too --
+    # same discipline as cb_cc_consent, reusing the existing session-pause
+    # mechanism rather than adding a second, competing invalidation path.
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+
+    if value == "done":
+        # §3: COMPLETED means the user explicitly reported completion --
+        # never inferred from delivery. Atomic CAS: STARTED -> COMPLETED.
+        if not await transition_practice_proposal(
+                proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
+                to_status=PracticeProposalStatus.COMPLETED.value):
+            await callback.answer()
+            return
+        await callback.answer()
+        await callback.message.answer(
+            "Хорошо. Как это подействовало?" if lang != "en" else "Good. How did that go?",
+            reply_markup=_practice_helped_kb(proposal_id, lang))
+        return
+
+    # "stopped" (paused, no pressure to retry) and "refused" (explicit
+    # decline to continue) both WITHDRAW -- §3: withdrawal is never treated
+    # as resistance or failure, only distinguished by whether
+    # EXERCISE_REJECTED gets persisted (§4's "refusal prevents automatic
+    # re-proposal" -- there is no automatic re-proposal path at all, but a
+    # LATER unprompted LLM offer is additionally blocked by this constraint).
+    reason = "user_stopped" if value == "stopped" else "user_refused"
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
+            to_status=PracticeProposalStatus.WITHDRAWN.value, reason=reason):
+        await callback.answer()
+        return
+    await callback.answer()
+    if value == "refused":
+        session = await get_core_session(proposal.session_id, uid)
+        if session is not None and session.lifecycle_status is LifecycleStatus.OPEN:
+            from datetime import datetime, timezone
+            prior_json = session_json_snapshot(session)
+            session.add_repair_signal(
+                {RepairConstraint.EXERCISE_REJECTED}, source_turn_id=None,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                window_turns=controller.REPAIR_WINDOW_TURNS)
+            await update_core_session_authoritative(session, prior_json)
+        text = ("Понял, больше не буду предлагать это упражнение." if lang != "en"
+               else "Got it, I won't suggest this exercise again.")
+    else:
+        text = ("Хорошо, останавливаемся. Ты не обязан(а) продолжать." if lang != "en"
+               else "Okay, let's stop. You don't have to continue.")
+    await callback.message.answer(text)
+
+
+_HELPED_TO_OUTCOME = {
+    "helped": PracticeOutcome.HELPED.value,
+    "partly": PracticeOutcome.PARTLY_HELPED.value,
+    "none": PracticeOutcome.NO_CHANGE.value,
+    "worse": PracticeOutcome.WORSE.value,
+}
+
+
+@dp.callback_query(F.data.startswith("cc:helped:"))
+async def cb_cc_outcome_detail(callback: CallbackQuery):
+    """§5: purely qualitative, explicit, self-reported outcome -- no before
+    score, none estimated. Recorded once (the DB write is a no-op past the
+    first answer); worsening is recorded truthfully with no causality claim
+    and no repeat-practice/crisis side effect (crisis detection stays fully
+    independent, driven only by message-text risk scoring, never by this
+    button)."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    outcome = _HELPED_TO_OUTCOME.get(value)
+    if outcome is None:
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    ok = await record_practice_outcome(proposal_id, uid, outcome)
+    await callback.answer()
+    if not ok:
+        return
+    lang = await get_user_language(uid) or "ru"
+    if outcome == PracticeOutcome.WORSE.value:
+        text = ("Спасибо, что сказал(а) честно — я это записал(а). Если станет тяжелее, "
+                "напиши мне об этом." if lang != "en" else
+                "Thanks for being honest — I've noted that. If things get harder, tell me.")
+    else:
+        text = "Спасибо, что рассказал(а)." if lang != "en" else "Thanks for telling me."
+    await callback.message.answer(text)
 
 
 @dp.callback_query(F.data.startswith("after:"))
