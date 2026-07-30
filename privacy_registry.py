@@ -371,6 +371,19 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
                   "never be read back into a live response (see "
                   "MemoryLifecycle.influences_responses in therapeutic_domain.py)."),
 
+    # PRACTICE proposal entity (Phase 3 hardening SS3). Same PSYCH_PROFILE
+    # treatment as core_sessions -- a proposal is structured consent-flow
+    # state (which practice, purpose, duration, status), not raw message
+    # text or a safety-audit record.
+    "core_practice_proposals": _e(
+        table="core_practice_proposals", user_id_column="user_id",
+        category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`purpose`/`expected_duration` are short catalog strings "
+                  "describing the proposed practice, never raw user text — "
+                  "never in logs/alerts."),
+
     # Depression Disclosure Gate (Phase 2, master prompt SS13). CRISIS_SAFETY
     # category (like crisis_events) because a flow record proves the safety
     # question was asked and answered -- but CASCADE_DELETE, not RETAIN: unlike

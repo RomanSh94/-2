@@ -664,6 +664,32 @@ CREATE TABLE IF NOT EXISTS depression_disclosure_flows (
 CREATE INDEX IF NOT EXISTS idx_dd_flows_user ON depression_disclosure_flows(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_dd_one_active_flow_per_user
     ON depression_disclosure_flows(user_id) WHERE status='active';
+
+-- Phase 3 hardening SS3: a PRACTICE proposal is its own persisted, versioned
+-- entity -- consent applies to THIS exact proposal, never to "whatever
+-- practice the session happens to be about". The partial unique index makes
+-- "supersede the old proposal before creating a new one" a hard DB
+-- invariant, not a convention callers might forget.
+CREATE TABLE IF NOT EXISTS core_practice_proposals (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id             INTEGER NOT NULL REFERENCES users(id),
+    session_id          INTEGER NOT NULL REFERENCES core_sessions(id),
+    practice_id         TEXT NOT NULL,
+    practice_version    TEXT NOT NULL,
+    purpose             TEXT NOT NULL DEFAULT '',
+    expected_duration   TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'PROPOSED',
+    proposal_message_id INTEGER,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at          TEXT NOT NULL,
+    delivered_at        TEXT,
+    superseded_reason   TEXT,
+    CHECK(status IN ('PROPOSED','PENDING','GRANTED','DECLINED','STARTED','COMPLETED',
+                     'WITHDRAWN','EXPIRED','SUPERSEDED','DELIVERY_FAILED'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_practice_proposals_user ON core_practice_proposals(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_core_one_actionable_proposal_per_session
+    ON core_practice_proposals(session_id) WHERE status IN ('PROPOSED','PENDING');
 """
 
 # Additive column migrations (no migration system in this repo; ADD COLUMN is
@@ -1501,7 +1527,11 @@ async def supersede_active_core_sessions_for_crisis(uid: int) -> int:
 
     Goes through the existing list_core_sessions/update_core_session
     accessors (not raw SQL) so state_json and its denormalized columns never
-    drift out of sync -- the same discipline as Phase 1's create_core_session."""
+    drift out of sync -- the same discipline as Phase 1's create_core_session.
+
+    Hardening §4: also supersedes every actionable PRACTICE proposal for
+    this user (the proposal's own `status` is now the real consent gate --
+    session.consent is kept in sync too, best-effort, for older readers)."""
     sessions = await list_core_sessions(uid, active_only=True)
     count = 0
     for s in sessions:
@@ -1512,6 +1542,7 @@ async def supersede_active_core_sessions_for_crisis(uid: int) -> int:
             s.consent = _core.ConsentState.WITHDRAWN
         if await update_core_session(s):
             count += 1
+    await supersede_active_practice_proposals(uid, "crisis_activated")
     return count
 
 
@@ -2933,6 +2964,15 @@ def _load_session(row_id, raw_json: str) -> _core.SessionState:
     return _core.SessionState.from_dict(d)
 
 
+def session_json_snapshot(state: _core.SessionState) -> str:
+    """Public wrapper around _dump_session_json -- hardening §2: bot.py calls
+    this to capture the EXACT `expected_prior_json` a Controller turn's
+    mutations were computed from, for update_core_session_authoritative's
+    CAS. Public (not underscore-prefixed) because it is a cross-module
+    contract now, not an internal helper."""
+    return _dump_session_json(state)
+
+
 async def create_core_session(user_id: int, intent=_core.Intent.UNKNOWN) -> _core.SessionState:
     """Single INSERT, single commit. Raises sqlite3.IntegrityError if `user_id`
     already has an OPEN/PAUSED session (idx_core_one_open_session_per_user) --
@@ -2986,6 +3026,141 @@ async def update_core_session(state: _core.SessionState) -> bool:
              _dump_session_json(state), state.session_id, state.user_id))
         await db.commit()
         return cur.rowcount > 0
+
+
+async def update_core_session_authoritative(state: _core.SessionState,
+                                            expected_prior_json: str) -> bool:
+    """Hardening §2: the TOCTOU-safe replacement for plain update_core_session
+    on the Controller's delivery path. `expected_prior_json` is the exact
+    state_json this turn's mutations were computed FROM (captured in
+    bot._controller_claim_turn, before any in-memory mutation) -- the write
+    only lands if nothing else touched the row since then (optimistic
+    concurrency, same CAS pattern as transition_core_session_consent).
+
+    This closes the gap the in-process generation counter alone cannot: a
+    DIFFERENT writer (a /start pause, a crisis supersession, another process)
+    mutating the SAME row between this turn's claim and its final write. Both
+    of those call sites do a plain unconditional UPDATE (they are meant to
+    always win over a stale Controller turn) -- so if either ran in the gap,
+    this CAS's WHERE clause no longer matches and the stale turn's write is
+    correctly rejected, exactly like a superseded generation."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_sessions SET intent=?, phase=?, lifecycle_status=?,
+               state_json=?, updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND state_json=?""",
+            (state.intent.value, state.phase.value, state.lifecycle_status.value,
+             _dump_session_json(state), state.session_id, state.user_id,
+             expected_prior_json))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+_PP_COLUMNS = ("id", "user_id", "session_id", "practice_id", "practice_version",
+              "purpose", "expected_duration", "status", "proposal_message_id",
+              "created_at", "expires_at", "delivered_at", "superseded_reason")
+
+
+def _pp_row_to_obj(row) -> "_core.PracticeProposal":
+    d = dict(zip(_PP_COLUMNS, row))
+    pid = d.pop("id")
+    return _core.PracticeProposal(proposal_id=str(pid), **d)
+
+
+async def create_practice_proposal(uid: int, session_id, practice_id: str,
+                                   practice_version: str, purpose: str,
+                                   expected_duration: str,
+                                   ttl_seconds: int = 1800) -> "_core.PracticeProposal":
+    """Hardening §3/§4: supersedes any still-actionable proposal for this
+    SESSION in the same transaction before inserting the new one -- the
+    partial unique index (one actionable proposal per session) turns a
+    forgotten supersession into a hard DB error, never a silent duplicate."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            """UPDATE core_practice_proposals SET status='SUPERSEDED',
+               superseded_reason='newer_proposal'
+               WHERE session_id=? AND user_id=? AND status IN ('PROPOSED','PENDING')""",
+            (session_id, uid))
+        cur = await db.execute(
+            """INSERT INTO core_practice_proposals
+               (user_id, session_id, practice_id, practice_version, purpose,
+                expected_duration, status, expires_at)
+               VALUES (?,?,?,?,?,?,'PROPOSED', datetime('now', ?))""",
+            (uid, session_id, practice_id, practice_version, purpose,
+             expected_duration, f"+{int(ttl_seconds)} seconds"))
+        pid = cur.lastrowid
+        row = await (await db.execute(
+            f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals WHERE id=?",
+            (pid,))).fetchone()
+        await db.commit()
+        return _pp_row_to_obj(row)
+
+
+async def get_latest_proposal_for_session(session_id, user_id: int) -> "_core.PracticeProposal | None":
+    """Most recent proposal (any status) for this session -- used where a
+    caller has a session but not yet a proposal_id (e.g. building the
+    callback for a just-delivered PENDING proposal)."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals "
+            "WHERE session_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
+            (session_id, user_id))).fetchone()
+        return _pp_row_to_obj(row) if row else None
+
+
+async def get_practice_proposal(proposal_id, user_id: int) -> "_core.PracticeProposal | None":
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals "
+            "WHERE id=? AND user_id=?", (proposal_id, user_id))).fetchone()
+        return _pp_row_to_obj(row) if row else None
+
+
+async def transition_practice_proposal(proposal_id, user_id: int, *, from_status: str,
+                                       to_status: str, reason: str | None = None,
+                                       require_unexpired: bool = False) -> bool:
+    """Atomic status CAS (hardening §4/§5) -- mirrors
+    transition_core_session_consent's pattern. `require_unexpired=True`
+    (used for the GRANTED/DECLINED consent transitions) makes expiry
+    enforcement itself atomic: an expired PENDING proposal fails this CAS
+    exactly like a wrong-owner or wrong-status one, no separate read-then-
+    decide race."""
+    query = ("""UPDATE core_practice_proposals SET status=?,
+                 superseded_reason=COALESCE(?, superseded_reason)
+                 WHERE id=? AND user_id=? AND status=?""")
+    params = [to_status, reason, proposal_id, user_id, from_status]
+    if require_unexpired:
+        query += " AND expires_at > datetime('now')"
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(query, params)
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def mark_proposal_delivered(proposal_id, user_id: int, message_id: int) -> bool:
+    """Info-only update (not a status transition) -- records the Telegram
+    message id a successfully-sent proposal landed as, so a later delivery-
+    failure/edit path can find it. Only meaningful while still PENDING."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_practice_proposals SET proposal_message_id=?,
+               delivered_at=datetime('now') WHERE id=? AND user_id=? AND status='PENDING'""",
+            (message_id, proposal_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def supersede_active_practice_proposals(uid: int, reason: str) -> int:
+    """Hardening §4: invalidate every actionable proposal for this user in
+    one call -- used on crisis, /start, a new Depression Disclosure flow,
+    rollout-off, and any other event that makes standing consent stale."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_practice_proposals SET status='SUPERSEDED', superseded_reason=?
+               WHERE user_id=? AND status IN ('PROPOSED','PENDING')""",
+            (reason, uid))
+        await db.commit()
+        return cur.rowcount
 
 
 async def transition_core_session_consent(session_id, user_id: int, *,
