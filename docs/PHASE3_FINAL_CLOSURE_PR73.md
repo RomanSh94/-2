@@ -483,11 +483,18 @@ this file plus the exact final head/CI run below.
   skipped, 0 failed, 877.54s (0:14:37)** — up from 2183/1/0 in the prior
   round's §11, the +45 delta accounted for entirely by this round's new
   tests (sections T–Y plus the migration file's 4 new tests).
-- Exact final head: see below (filled in after this round's commit/push).
-- Exact-head CI: see below (filled in after CI completes on that head, per
-  this round's instruction that GitHub CI is the authoritative final gate —
+- Exact final head: `a28ebf3a9dbc75773c097af26e65c356ef8f6c73` — verified
+  equal via `git rev-parse HEAD`, `git rev-parse origin/fix/phase3-practice-lifecycle-closure`,
+  and `gh pr view 73 --json headRefOid` (all three agree).
+- Exact-head CI: run [30607642878](https://github.com/RomanSh94/-2/actions/runs/30607642878/job/91083238398),
+  job `smoke`, conclusion **pass**, `3m46s`. Log line inspected directly via
+  `gh run view 30607642878 --log`: `2228 passed, 1 skipped in 203.09s
+  (0:03:23)` — the exact same pass/skip counts as the local frozen run
+  above (CI's Linux runner completes the identical natural-order suite
+  faster, with no failures either place). Per this round's explicit
+  instruction, this CI result is the authoritative final regression gate —
   the local full-suite run above is corroborating evidence, not the gate
-  itself).
+  itself.
 - Known external-I/O limitation (restated, unchanged): the narrow window
   strictly *during* Telegram's own network call for the practice-steps send
   cannot be closed by any application-level check — §3's pre-send recheck
