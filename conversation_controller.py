@@ -359,7 +359,7 @@ _FALLBACK_RU: dict[Intent, str] = {
     Intent.CHANGE_PATTERN: ("Похоже на повторяющуюся ситуацию, хотя по одному разу "
                             "сложно сказать наверняка. Расскажи о последнем случае подробнее."),
     Intent.DECISION_SUPPORT: "Давай начнём с одного: что именно нужно решить прямо сейчас?",
-    Intent.PRACTICE: "Есть простая низкорисковая практика (около 5 минут). Хочешь попробовать?",
+    Intent.PRACTICE: "Есть практика на 5 минут — она тренирует осознанное дыхание и внимание. Хочешь попробовать?",
     Intent.REPAIR: "Ты прав, я не учёл это. Меняю подход и продолжаю с учётом уже сказанного.",
     Intent.CLOSE_CONVERSATION: "Хорошо, на этом остановимся. Береги себя — здесь всегда можно вернуться.",
 }
@@ -373,7 +373,7 @@ _FALLBACK_EN: dict[Intent, str] = {
     Intent.CHANGE_PATTERN: ("This sounds like it could be a recurring pattern, though "
                             "one instance alone isn't enough to be sure. Tell me more about the last time."),
     Intent.DECISION_SUPPORT: "Let's start with one thing: what exactly needs to be decided right now?",
-    Intent.PRACTICE: "There's a simple low-risk practice (about 5 minutes). Want to try it?",
+    Intent.PRACTICE: "There's a practice (about 5 minutes) that trains deliberate breathing and attention. Want to try it?",
     Intent.REPAIR: "You're right, I missed that. Changing approach and continuing from what you already told me.",
     Intent.CLOSE_CONVERSATION: "Okay, let's stop here. Take care — you can always come back.",
 }
@@ -407,9 +407,11 @@ def fallback_text(lang: str, intent: Intent | None = None, *,
                 f"Changing approach and continuing from that.")
     if intent is Intent.PRACTICE and practice_name:
         duration = f" ({expected_duration})" if expected_duration else ""
-        return (f"Есть практика «{practice_name}»{duration}. Хочешь попробовать?"
+        return (f"Есть практика «{practice_name}»{duration} — она тренирует "
+                f"осознанное дыхание и внимание. Хочешь попробовать?"
                 if lang != "en" else
-                f"There's a practice called «{practice_name}»{duration}. Want to try it?")
+                f"There's a practice called «{practice_name}»{duration} that "
+                f"trains deliberate breathing and attention. Want to try it?")
     if intent is not None and intent in table:
         return table[intent]
     return _GENERIC_FALLBACK_EN if lang == "en" else _GENERIC_FALLBACK_RU
@@ -467,9 +469,12 @@ _INTENT_INSTRUCTIONS_RU: dict[Intent, str] = {
                               "опасений/прогнозов. Не принимай решение за "
                               "пользователя. Не более одного вопроса."),
     Intent.PRACTICE: ("Пользователь просит практику/технику. Опиши ОДНУ "
-                      "простую низкорисковую практику, её цель и примерную "
-                      "длительность, и явно спроси согласие, прежде чем "
-                      "начинать её проводить."),
+                      "конкретную практику: какой именно навык она тренирует "
+                      "(например, осознанное дыхание, внимание, "
+                      "переключение) и примерную длительность. Не называй её "
+                      "универсальной или подходящей всем и не утверждай, что "
+                      "она решит проблему пользователя. Явно спроси согласие, "
+                      "прежде чем начинать её проводить."),
     Intent.REPAIR: ("Пользователь указал на ошибку в разговоре. Сначала "
                     "назови конкретную ошибку. Затем кратко перечисли уже "
                     "известные факты. Затем скажи, что изменится. "
@@ -499,9 +504,12 @@ _INTENT_INSTRUCTIONS_EN: dict[Intent, str] = {
                               "predictions. Do not decide for them. At most "
                               "one question."),
     Intent.PRACTICE: ("The user is asking for a practice/technique. Describe "
-                      "ONE simple low-risk practice, its purpose and rough "
-                      "duration, and explicitly ask for consent before "
-                      "starting it."),
+                      "ONE specific practice: name the exact skill it trains "
+                      "(e.g. deliberate breathing, attention, shifting focus) "
+                      "and its rough duration. Do not call it universal or "
+                      "suitable for everyone, and do not claim it will solve "
+                      "the user's underlying problem. Explicitly ask for "
+                      "consent before starting it."),
     Intent.REPAIR: ("The user flagged a mistake. Name the specific mistake "
                     "first. Briefly restate already-known facts. State what "
                     "changes. Apply the new approach immediately in this "
