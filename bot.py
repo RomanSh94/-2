@@ -143,7 +143,7 @@ from database import (
     transition_practice_proposal, mark_proposal_delivered,
     supersede_active_practice_proposals, record_practice_outcome,
     get_latest_outcome_for_practice, mark_prompt_delivered, mark_prompt_failed,
-    get_proposals_with_failed_prompts,
+    get_proposals_with_failed_prompts, claim_prompt_send,
 )
 import conversation_controller as controller
 from therapeutic_domain import (
@@ -1136,12 +1136,19 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict
     # things worse, never invent a substitute.
     proposal = None
     adverse_guard = False
+    adverse_guard_practice_id = None
     if turn_intent is Intent.PRACTICE:
         practice = get_production_practice_by_id(_PRACTICE_ID, lang)
         if practice:
             latest_outcome = await get_latest_outcome_for_practice(uid, practice["id"])
             if latest_outcome == PracticeOutcome.WORSE.value:
+                # PR #73 FINAL REQUEST CHANGES §5: still no AUTOMATIC re-
+                # proposal (a generic "дай упражнение" always lands here) --
+                # the ONLY way back to this exact practice is the explicit
+                # informed-override button on the message below, never a
+                # free-text request, however specific.
                 adverse_guard = True
+                adverse_guard_practice_id = practice["id"]
             else:
                 proposal = await create_practice_proposal(
                     uid, session.session_id, practice["id"], practice.get("version", "v1"),
@@ -1165,7 +1172,8 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict
     return {"session": session, "plan": plan, "known_facts": known_facts,
            "recent_context": recent_context, "user_text": user_text, "lang": lang,
            "base_state_json": base_state_json, "proposal": proposal,
-           "adverse_guard": adverse_guard}
+           "adverse_guard": adverse_guard,
+           "adverse_guard_practice_id": adverse_guard_practice_id}
 
 
 async def _controller_generate_and_deliver(message: Message, uid: int, claim: dict,
@@ -1177,20 +1185,32 @@ async def _controller_generate_and_deliver(message: Message, uid: int, claim: di
     recent_context = claim.get("recent_context")
     user_text, lang = claim["user_text"], claim["lang"]
 
-    # PR #73 request-changes §7: adverse-history guard fired during claim --
-    # skip the LLM entirely and answer with a fixed, honest, non-inviting
-    # message. No alternative practice is offered automatically.
+    # PR #73 request-changes §7 / FINAL REQUEST CHANGES §5: adverse-history
+    # guard fired during claim -- skip the LLM entirely and answer with a
+    # fixed, honest, non-inviting message. No alternative practice is
+    # offered automatically. The message reminds the user of their own
+    # prior report (never claiming the practice CAUSED the worsening) and
+    # offers -- via button only, never inferred from free text -- an
+    # explicit, informed override that requires a fresh, renewed consent
+    # tap before anything is delivered.
     if claim.get("adverse_guard"):
         text = ("В прошлый раз эта практика, судя по твоему отклику, не "
-                "помогла — стало хуже. Не буду предлагать её снова."
+                "помогла — стало хуже. Это не обязательно значит, что дело "
+                "именно в ней, но я не буду предлагать её снова без твоего "
+                "явного согласия."
                 if lang != "en" else
                 "Last time, based on what you told me, this practice made "
-                "things worse. I won't suggest it again.")
+                "things worse. That doesn't necessarily mean the practice "
+                "was the cause, but I won't suggest it again without your "
+                "explicit OK.")
         if _user_generation_superseded(uid, turn_gen):
             return
         if not await update_core_session_authoritative(session, claim["base_state_json"]):
             return
-        await deliver_response(message, uid, text, lang)
+        practice_id = claim.get("adverse_guard_practice_id")
+        reply_markup = (_worse_override_kb(session.session_id, practice_id, lang)
+                        if practice_id else None)
+        await deliver_response(message, uid, text, lang, reply_markup=reply_markup)
         await save_message(uid, "assistant", text, "controller", lang)
         return
 
@@ -2335,8 +2355,20 @@ async def cb_cc_consent(callback: CallbackQuery):
             else "Okay, we won't. Just say the word if you want to try later.")
         return
 
-    practice = get_production_practice_by_id(proposal.practice_id, lang)
-    if not practice:  # pragma: no cover -- defensive, proposal.practice_id is always a real production id
+    await _deliver_granted_practice(callback, uid, session_id, proposal_id, proposal.practice_id, lang)
+
+
+async def _deliver_granted_practice(callback: CallbackQuery, uid: int, session_id, proposal_id,
+                                    practice_id: str, lang: str) -> None:
+    """Shared GRANTED->...->STARTED delivery pipeline -- used by both
+    cb_cc_consent's ordinary "yes" tap and cb_cc_worse_override's explicit
+    renewed-consent tap (PR #73 FINAL REQUEST CHANGES §5). Factored out so
+    the two callers can never drift apart on the safety rechecks (the same
+    root cause a previous round found and fixed for cc:helped vs cc:outcome
+    parity). The caller is responsible for the PENDING/PROPOSED -> GRANTED
+    transition itself; this function owns everything from GRANTED onward."""
+    practice = get_production_practice_by_id(practice_id, lang)
+    if not practice:  # pragma: no cover -- defensive, practice_id is always a real production id
         await callback.message.answer(controller.fallback_text(lang, Intent.PRACTICE))
         return
 
@@ -2374,6 +2406,29 @@ async def cb_cc_consent(callback: CallbackQuery):
             proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
             to_status=PracticeProposalStatus.SUPERSEDED.value, reason="crisis_before_send")
         return
+    # PR #73 FINAL REQUEST CHANGES §3: the crisis-only recheck above was not
+    # enough -- a new disclosure flow or rollout turning off between the
+    # DELIVERING claim and the send need the exact same guarantee.
+    if (await get_active_disclosure_flow(uid) is not None
+            or not await access_control.core_rollout_allowed(uid)):
+        await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
+            to_status=PracticeProposalStatus.SUPERSEDED.value, reason="unsafe_before_send")
+        return
+    # Owning session no longer OPEN (e.g. /start paused it between the claim
+    # and here) -- /start's own supersede_active_practice_proposals call
+    # already flipped this proposal away from DELIVERING, so no further
+    # write is needed, just stop.
+    resession2 = await get_core_session(session_id, uid)
+    if resession2 is None or resession2.lifecycle_status is not LifecycleStatus.OPEN:
+        return
+    # The proposal itself may already be superseded (by /start, a topic
+    # change, a new disclosure flow, or a racing duplicate claim) even if
+    # none of the checks above caught it directly -- this is the final,
+    # authoritative recheck immediately before the external Telegram call.
+    reproposal = await get_practice_proposal(proposal_id, uid)
+    if reproposal is None or reproposal.status is not PracticeProposalStatus.DELIVERING:
+        return
 
     # §3 final closure: STARTED means the exact steps were SUCCESSFULLY
     # delivered -- the send is attempted FIRST, and DELIVERING->STARTED only
@@ -2392,25 +2447,103 @@ async def cb_cc_consent(callback: CallbackQuery):
             to_status=PracticeProposalStatus.DELIVERY_FAILED.value, reason="send_exception")
         return
     # Only the delivery owner (this exact callback invocation, having won
-    # the GRANTED->DELIVERING CAS above) may mark STARTED.
+    # the GRANTED->DELIVERING CAS above) may mark STARTED. PR #73 FINAL
+    # REQUEST CHANGES §1: the reporting window opens in this SAME atomic
+    # write -- the cc:outcome buttons about to be shown become actionable
+    # exactly when STARTED becomes true, never before.
     if not await transition_practice_proposal(
             proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
-            to_status=PracticeProposalStatus.STARTED.value):
+            to_status=PracticeProposalStatus.STARTED.value, open_reporting_window=True):
         return  # superseded between the send and this write -- steps went out, but
                 # were also invalidated moments later; the outcome UI stays silent
-    # PR #73 request-changes §6: restart-safe delivery tracking -- a send
-    # failure is recorded (mark_prompt_failed), not just logged, and a
-    # later ordinary turn's _retry_failed_practice_prompts recovers it
-    # idempotently (mark_prompt_delivered never fires twice for the same
-    # prompt_kind, so a duplicate retry cannot create a second active prompt).
-    try:
-        sent = await callback.message.answer(
-            "Как прошло?" if lang != "en" else "How did it go?",
-            reply_markup=_practice_outcome_kb(proposal_id, lang))
-        await mark_prompt_delivered(proposal_id, uid, "outcome", sent.message_id)
-    except Exception as e:
-        print(f"[controller] outcome-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
-        await mark_prompt_failed(proposal_id, uid, "outcome")
+    # PR #73 request-changes §6 / FINAL REQUEST CHANGES §2: restart-safe,
+    # claim-first delivery tracking -- claim_prompt_send's atomic CAS to
+    # RETRYING is what makes this idempotent under concurrency (a post-send
+    # CAS alone only dedupes the DB write, not a second Telegram message).
+    # A lost claim (another caller already owns this send, or it is already
+    # terminal) means this call must not attempt to send at all.
+    if await claim_prompt_send(proposal_id, uid, "outcome"):
+        try:
+            sent = await callback.message.answer(
+                "Как прошло?" if lang != "en" else "How did it go?",
+                reply_markup=_practice_outcome_kb(proposal_id, lang))
+            await mark_prompt_delivered(proposal_id, uid, "outcome", sent.message_id)
+        except Exception as e:
+            print(f"[controller] outcome-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+            await mark_prompt_failed(proposal_id, uid, "outcome")
+
+
+# ── Conversation Controller: informed explicit repeat after WORSE
+# (PR #73 FINAL REQUEST CHANGES §5) -- callback_data
+# "cc:worseover:<session_id>:<practice_id>:<yes|no>". This is the ONLY path
+# back to a practice whose latest recorded outcome was WORSE: the automatic
+# guard in _controller_claim_turn never re-proposes it from free text, no
+# matter how explicit the wording ("дай упражнение" always still hits the
+# guard). Tapping "yes" here IS the fresh, renewed, informed consent the
+# spec requires -- it creates a BRAND NEW proposal (never reuses the
+# WORSE-outcome one) and reuses _deliver_granted_practice, the exact same
+# GRANTED->STARTED pipeline ordinary consent uses, so the two paths cannot
+# drift apart on safety rechecks.
+
+@dp.callback_query(F.data.startswith("cc:worseover:"))
+async def cb_cc_worse_override(callback: CallbackQuery):
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 4)
+    if len(parts) != 5:
+        await callback.answer()
+        return
+    _, _tag, session_id, practice_id, value = parts
+    if value not in ("yes", "no"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    session = await get_core_session(session_id, uid)
+    if session is None or session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+    await callback.answer()
+
+    if value == "no":
+        await callback.message.answer(
+            "Хорошо, не повторяем." if lang != "en" else "Okay, we won't repeat it.")
+        return
+
+    practice = get_production_practice_by_id(practice_id, lang)
+    if not practice:  # pragma: no cover -- defensive, practice_id always names a real production practice
+        await callback.message.answer(controller.fallback_text(lang, Intent.PRACTICE))
+        return
+
+    # A brand-new proposal -- §5: "record that consent as a NEW exact
+    # proposal (never reuse the old one)". create_practice_proposal's own
+    # supersede-then-insert already invalidates any other standing proposal
+    # for this session first.
+    proposal = await create_practice_proposal(
+        uid, session.session_id, practice["id"], practice.get("version", "v1"),
+        purpose=practice.get("name", practice_id),
+        expected_duration=f"{practice.get('duration_min', 5)} минут")
+    # This exact button tap IS the informed consent -- PROPOSED -> GRANTED
+    # directly, mirroring cb_cc_consent's PENDING -> GRANTED CAS one step
+    # earlier in the ordinary flow (there is no separate Да/Нет prompt here;
+    # the override buttons already asked, and "yes" already answered).
+    if not await transition_practice_proposal(
+            proposal.proposal_id, uid, from_status=PracticeProposalStatus.PROPOSED.value,
+            to_status=PracticeProposalStatus.GRANTED.value, require_unexpired=True):
+        return
+    prior_json = session_json_snapshot(session)
+    session.consent = ConsentState.GRANTED
+    await update_core_session_authoritative(session, prior_json)
+
+    await _deliver_granted_practice(callback, uid, session.session_id, proposal.proposal_id,
+                                    practice["id"], lang)
 
 
 def _practice_outcome_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
@@ -2438,14 +2571,42 @@ def _practice_helped_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
         for val, ru, en in labels])
 
 
+def _worse_override_kb(session_id, practice_id: str, lang: str) -> InlineKeyboardMarkup:
+    """PR #73 FINAL REQUEST CHANGES §5: at most two buttons, exactly as
+    specified -- no free-text override path."""
+    labels = [
+        ("no", "Не повторять", "Don't repeat"),
+        ("yes", "Всё равно попробовать", "Try anyway"),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:worseover:{session_id}:{practice_id}:{val}")]
+        for val, ru, en in labels])
+
+
 async def _retry_failed_practice_prompts(message: Message, uid: int) -> None:
-    """PR #73 request-changes §6: restart-safe recovery, called on every
-    real inbound turn. Resends whichever post-practice follow-up prompt
-    previously failed, exactly once each (mark_prompt_delivered's own CAS
-    is what makes a duplicate call here harmless -- it only ever succeeds
-    once per prompt_kind per proposal). Never sent during an active crisis
-    (a crisis screen, not a practice follow-up, owns the conversation then)."""
+    """PR #73 request-changes §6 / FINAL REQUEST CHANGES §2/§4: restart-safe
+    recovery, called on every real inbound turn. Resends whichever post-
+    practice follow-up prompt previously failed (or is stuck in a timed-out
+    RETRYING claim -- a prior attempt crashed between claiming and sending),
+    exactly once each -- claim_prompt_send's atomic CAS is what makes this
+    idempotent under concurrency, including two overlapping inbound turns
+    both running this sweep for the same user.
+
+    Never retried unless every one of the stale-prompt guards holds: rollout
+    allowed, no active crisis, no active disclosure flow, the owning session
+    still exists and is OPEN, and -- critically -- the reporting window is
+    still ACTIVE. That last check is what stops a failed prompt from an old
+    topic reappearing in a new conversation: a topic change, /start, a new
+    disclosure flow, a conversation close, or a crisis all invalidate the
+    window (database.supersede_active_practice_proposals), so a proposal
+    whose prompt failed before one of those events simply drops out of this
+    sweep for good, exactly once it becomes stale."""
     if await get_active_crisis(uid) is not None:
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        return
+    if not await access_control.core_rollout_allowed(uid):
         return
     try:
         pending = await get_proposals_with_failed_prompts(uid)
@@ -2455,7 +2616,15 @@ async def _retry_failed_practice_prompts(message: Message, uid: int) -> None:
         return
     lang = await get_user_language(uid) or "ru"
     for p in pending:
-        if p.status is PracticeProposalStatus.STARTED and p.outcome_prompt_status == "FAILED":
+        if p.reporting_window_status != "ACTIVE":
+            continue  # stale -- invalidated since the send failed, never resurrect it
+        owning_session = await get_core_session(p.session_id, uid)
+        if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+            continue
+        if (p.status is PracticeProposalStatus.STARTED
+                and p.outcome_prompt_status in ("FAILED", "RETRYING")):
+            if not await claim_prompt_send(p.proposal_id, uid, "outcome"):
+                continue
             try:
                 sent = await message.answer(
                     "Как прошло?" if lang != "en" else "How did it go?",
@@ -2463,7 +2632,11 @@ async def _retry_failed_practice_prompts(message: Message, uid: int) -> None:
                 await mark_prompt_delivered(p.proposal_id, uid, "outcome", sent.message_id)
             except Exception as e:
                 print(f"[controller] outcome-prompt retry failed uid={uid}: {type(e).__name__}: {e}")
-        elif p.status is PracticeProposalStatus.COMPLETED and p.helped_prompt_status == "FAILED":
+                await mark_prompt_failed(p.proposal_id, uid, "outcome")
+        elif (p.status is PracticeProposalStatus.COMPLETED
+              and p.helped_prompt_status in ("FAILED", "RETRYING")):
+            if not await claim_prompt_send(p.proposal_id, uid, "helped"):
+                continue
             try:
                 sent = await message.answer(
                     "Как это подействовало?" if lang != "en" else "How did that go?",
@@ -2471,6 +2644,7 @@ async def _retry_failed_practice_prompts(message: Message, uid: int) -> None:
                 await mark_prompt_delivered(p.proposal_id, uid, "helped", sent.message_id)
             except Exception as e:
                 print(f"[controller] helped-prompt retry failed uid={uid}: {type(e).__name__}: {e}")
+                await mark_prompt_failed(p.proposal_id, uid, "helped")
 
 
 # ── Conversation Controller: post-practice outcome (Phase 3 final closure §3
@@ -2502,6 +2676,14 @@ async def cb_cc_outcome(callback: CallbackQuery):
     if proposal is None:
         await callback.answer()
         return
+    # PR #73 FINAL REQUEST CHANGES §1: a stale callback (topic change, new
+    # disclosure, /start, close, or crisis already invalidated the reporting
+    # window) must not mutate the proposal AND must not produce a Telegram
+    # answer -- `status` itself (STARTED etc.) stays a truthful, untouched
+    # historical record; only the window governs whether the BUTTON is still
+    # actionable right now.
+    if proposal.reporting_window_status != "ACTIVE":
+        return
     # Final closure §7 boundary: a /start (or any other) reset that PAUSED
     # the owning session makes a dangling outcome-report button inert too --
     # same discipline as cb_cc_consent, reusing the existing session-pause
@@ -2515,21 +2697,25 @@ async def cb_cc_outcome(callback: CallbackQuery):
     if value == "done":
         # §3: COMPLETED means the user explicitly reported completion --
         # never inferred from delivery. Atomic CAS: STARTED -> COMPLETED.
+        # The reporting window STAYS ACTIVE here -- the helped-prompt report
+        # is still pending, closed only once THAT is answered or withdrawn.
         if not await transition_practice_proposal(
                 proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
                 to_status=PracticeProposalStatus.COMPLETED.value):
             await callback.answer()
             return
         await callback.answer()
-        # Same restart-safe delivery tracking as the outcome prompt above.
-        try:
-            sent = await callback.message.answer(
-                "Хорошо. Как это подействовало?" if lang != "en" else "Good. How did that go?",
-                reply_markup=_practice_helped_kb(proposal_id, lang))
-            await mark_prompt_delivered(proposal_id, uid, "helped", sent.message_id)
-        except Exception as e:
-            print(f"[controller] helped-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
-            await mark_prompt_failed(proposal_id, uid, "helped")
+        # PR #73 FINAL REQUEST CHANGES §2: claim-first send -- see cb_cc_
+        # consent's outcome-prompt send for the full rationale.
+        if await claim_prompt_send(proposal_id, uid, "helped"):
+            try:
+                sent = await callback.message.answer(
+                    "Хорошо. Как это подействовало?" if lang != "en" else "Good. How did that go?",
+                    reply_markup=_practice_helped_kb(proposal_id, lang))
+                await mark_prompt_delivered(proposal_id, uid, "helped", sent.message_id)
+            except Exception as e:
+                print(f"[controller] helped-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+                await mark_prompt_failed(proposal_id, uid, "helped")
         return
 
     # "stopped" (paused, no pressure to retry) and "refused" (explicit
@@ -2538,10 +2724,13 @@ async def cb_cc_outcome(callback: CallbackQuery):
     # EXERCISE_REJECTED gets persisted (§4's "refusal prevents automatic
     # re-proposal" -- there is no automatic re-proposal path at all, but a
     # LATER unprompted LLM offer is additionally blocked by this constraint).
+    # No further report is expected after a withdrawal, so the reporting
+    # window closes in the same atomic write (§1).
     reason = "user_stopped" if value == "stopped" else "user_refused"
     if not await transition_practice_proposal(
             proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
-            to_status=PracticeProposalStatus.WITHDRAWN.value, reason=reason):
+            to_status=PracticeProposalStatus.WITHDRAWN.value, reason=reason,
+            close_reporting_window=True):
         await callback.answer()
         return
     await callback.answer()
@@ -2628,6 +2817,11 @@ async def cb_cc_outcome_detail(callback: CallbackQuery):
     proposal = await get_practice_proposal(proposal_id, uid)
     if proposal is None or proposal.status is not PracticeProposalStatus.COMPLETED:
         await callback.answer()
+        return
+    # PR #73 FINAL REQUEST CHANGES §1: same stale-window discipline as
+    # cb_cc_outcome -- no mutation, no Telegram answer, `status`/`outcome`
+    # left untouched.
+    if proposal.reporting_window_status != "ACTIVE":
         return
     owning_session = await get_core_session(proposal.session_id, uid)
     if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:

@@ -539,9 +539,15 @@ class PracticeProposal:
     outcome_prompt_message_id: int | None = None
     outcome_prompt_delivered_at: str | None = None
     outcome_prompt_status: str | None = None
+    outcome_prompt_claimed_at: str | None = None
     helped_prompt_message_id: int | None = None
     helped_prompt_delivered_at: str | None = None
     helped_prompt_status: str | None = None
+    helped_prompt_claimed_at: str | None = None
+    # PR #73 FINAL REQUEST CHANGES §1: a callback/reporting-window lifecycle
+    # SEPARATE from `status`/`outcome` -- see database.py's schema comment
+    # for the full rationale (never rewrites truthful history).
+    reporting_window_status: str | None = None
 
     def __post_init__(self):
         if not str(self.proposal_id).strip():
@@ -558,8 +564,14 @@ class PracticeProposal:
             self.outcome = as_enum(PracticeOutcome, self.outcome)
         for field_name in ("outcome_prompt_status", "helped_prompt_status"):
             value = getattr(self, field_name)
-            if value is not None and value not in ("FAILED", "DELIVERED"):
-                raise ValueError(f"PracticeProposal.{field_name} must be None/FAILED/DELIVERED, got {value!r}")
+            if value is not None and value not in ("FAILED", "DELIVERED", "RETRYING"):
+                raise ValueError(
+                    f"PracticeProposal.{field_name} must be None/FAILED/DELIVERED/RETRYING, got {value!r}")
+        if self.reporting_window_status is not None and self.reporting_window_status not in (
+                "ACTIVE", "INVALIDATED", "CLOSED"):
+            raise ValueError(
+                "PracticeProposal.reporting_window_status must be None/ACTIVE/INVALIDATED/CLOSED, "
+                f"got {self.reporting_window_status!r}")
 
     @property
     def is_actionable(self) -> bool:
@@ -585,9 +597,12 @@ class PracticeProposal:
             "outcome_prompt_message_id": self.outcome_prompt_message_id,
             "outcome_prompt_delivered_at": self.outcome_prompt_delivered_at,
             "outcome_prompt_status": self.outcome_prompt_status,
+            "outcome_prompt_claimed_at": self.outcome_prompt_claimed_at,
             "helped_prompt_message_id": self.helped_prompt_message_id,
             "helped_prompt_delivered_at": self.helped_prompt_delivered_at,
             "helped_prompt_status": self.helped_prompt_status,
+            "helped_prompt_claimed_at": self.helped_prompt_claimed_at,
+            "reporting_window_status": self.reporting_window_status,
         }
 
     @classmethod
