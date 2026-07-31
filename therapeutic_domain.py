@@ -540,16 +540,26 @@ class PracticeProposal:
     outcome_prompt_delivered_at: str | None = None
     outcome_prompt_status: str | None = None
     outcome_prompt_claimed_at: str | None = None
+    # PR #73 ATOMIC CLOSURE §2: a persisted, unforgeable claim identity --
+    # see database.py's schema comment for the full rationale (RETRYING
+    # alone is a status, not an owner).
+    outcome_prompt_claim_id: str | None = None
     helped_prompt_message_id: int | None = None
     helped_prompt_delivered_at: str | None = None
     helped_prompt_status: str | None = None
     helped_prompt_claimed_at: str | None = None
+    helped_prompt_claim_id: str | None = None
     # PR #73 FINAL REQUEST CHANGES §1: a callback/reporting-window lifecycle
     # SEPARATE from `status`/`outcome` -- see database.py's schema comment
     # for the full rationale (never rewrites truthful history).
     reporting_window_status: str | None = None
+    # PR #73 ATOMIC CLOSURE §4: true when this exact proposal is an
+    # explicit, informed repeat of a practice whose latest recorded outcome
+    # was WORSE -- always a brand-new row, never a mutation of the old one.
+    is_worse_override: bool = False
 
     def __post_init__(self):
+        self.is_worse_override = bool(self.is_worse_override)
         if not str(self.proposal_id).strip():
             raise ValueError("PracticeProposal.proposal_id must be non-empty")
         if not isinstance(self.user_id, int):
@@ -598,11 +608,14 @@ class PracticeProposal:
             "outcome_prompt_delivered_at": self.outcome_prompt_delivered_at,
             "outcome_prompt_status": self.outcome_prompt_status,
             "outcome_prompt_claimed_at": self.outcome_prompt_claimed_at,
+            "outcome_prompt_claim_id": self.outcome_prompt_claim_id,
             "helped_prompt_message_id": self.helped_prompt_message_id,
             "helped_prompt_delivered_at": self.helped_prompt_delivered_at,
             "helped_prompt_status": self.helped_prompt_status,
             "helped_prompt_claimed_at": self.helped_prompt_claimed_at,
+            "helped_prompt_claim_id": self.helped_prompt_claim_id,
             "reporting_window_status": self.reporting_window_status,
+            "is_worse_override": self.is_worse_override,
         }
 
     @classmethod

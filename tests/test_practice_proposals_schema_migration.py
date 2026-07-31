@@ -113,17 +113,15 @@ def test_pre_pr73_shaped_db_upgrades_in_place_preserving_the_row(old_db):
     # also exist and be usable on the upgraded (not just fresh) table.
     assert row.outcome_prompt_status is None
     assert row.helped_prompt_status is None
-    # FINAL REQUEST CHANGES §2: the claim-first contract (claim_prompt_send
-    # -> mark_prompt_delivered) must also work end to end on an upgraded
-    # row, not just a freshly-created one.
     assert row.reporting_window_status is None
-    claimed = run(database.claim_prompt_send(1, 1, "helped"))
-    assert claimed is True
-    ok = run(database.mark_prompt_delivered(1, 1, "helped", 999))
-    assert ok is True
-    reloaded = run(database.get_practice_proposal(1, 1))
-    assert reloaded.helped_prompt_status == "DELIVERED"
-    assert reloaded.helped_prompt_message_id == 999
+    assert row.outcome_prompt_claim_id is None
+    assert row.is_worse_override is False
+    # The claim-first contract itself (claim_prompt_send -> mark_prompt_
+    # delivered) needs a STARTED proposal with an ACTIVE window to claim
+    # against -- this pre-seeded COMPLETED/no-window row can't legitimately
+    # claim one; that full end-to-end proof lives in
+    # test_delivering_status_is_actually_usable_after_migration below,
+    # which builds a fresh proposal through the real pipeline instead.
 
 
 def test_fresh_db_has_delivering_and_outcome_check_from_the_start(tmp_path, monkeypatch):
@@ -313,12 +311,14 @@ def test_in_between_shaped_db_delivering_and_retrying_are_usable_end_to_end(in_b
     assert run(database.transition_practice_proposal(
         proposal.proposal_id, 1, from_status="DELIVERING", to_status="STARTED",
         open_reporting_window=True)) is True
-    assert run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome")) is True
-    assert run(database.mark_prompt_delivered(proposal.proposal_id, 1, "outcome", 42)) is True
+    claim_id = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
+    assert claim_id is not None
+    assert run(database.mark_prompt_delivered(proposal.proposal_id, 1, "outcome", 42, claim_id)) is True
     final = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert final.status.value == "STARTED"
     assert final.reporting_window_status == "ACTIVE"
     assert final.outcome_prompt_status == "DELIVERED"
+    assert final.outcome_prompt_claim_id == claim_id
 
 
 def test_in_between_shaped_db_rejects_invalid_status(in_between_db):

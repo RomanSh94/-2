@@ -8,7 +8,7 @@ Tables:
   moderation_logs, checkins, validator_blocks, response_quality (👍/👎),
   ab_assignments
 """
-import aiosqlite, sqlite3, json
+import aiosqlite, sqlite3, json, uuid
 import logging
 from datetime import datetime, timezone
 
@@ -696,10 +696,24 @@ CREATE TABLE IF NOT EXISTS core_practice_proposals (
     outcome_prompt_delivered_at TEXT,
     outcome_prompt_status       TEXT,
     outcome_prompt_claimed_at   TEXT,
+    -- PR #73 ATOMIC CLOSURE §2: RETRYING is a status, not an owner identity
+    -- -- a persisted claim_id makes claim_prompt_send's win unforgeable by a
+    -- stale prior claimant (e.g. one that crashed, got reclaimed by a
+    -- second caller, then resumed and tried to finalize the SECOND
+    -- caller's claim as if it were its own).
+    outcome_prompt_claim_id     TEXT,
     helped_prompt_message_id    INTEGER,
     helped_prompt_delivered_at  TEXT,
     helped_prompt_status        TEXT,
     helped_prompt_claimed_at    TEXT,
+    helped_prompt_claim_id      TEXT,
+    -- PR #73 ATOMIC CLOSURE §4: true when this proposal is an explicit,
+    -- informed repeat of a practice whose latest recorded outcome was
+    -- WORSE -- created fresh (never reusing the old WORSE proposal) the
+    -- moment the guard fires, so its consent buttons carry a REAL,
+    -- persisted proposal_id through the ordinary cb_cc_consent contract
+    -- instead of an unpersisted callback payload.
+    is_worse_override           INTEGER NOT NULL DEFAULT 0,
     -- PR #73 FINAL REQUEST CHANGES §1: a callback/reporting-window lifecycle
     -- SEPARATE from `status`/`outcome` above -- those stay a truthful,
     -- never-rewritten historical record (STARTED/COMPLETED/WITHDRAWN mean
@@ -1003,7 +1017,8 @@ async def _rename_old_practice_proposals_if_needed(db) -> None:
         return  # no table yet -- executescript's CREATE TABLE IF NOT EXISTS makes a fresh one
     sql = row[0] or ""
     if ("DELIVERING" in sql and "outcome" in sql and "outcome_prompt_status" in sql
-            and "reporting_window_status" in sql):
+            and "reporting_window_status" in sql and "outcome_prompt_claim_id" in sql
+            and "is_worse_override" in sql):
         return  # already on the current shape -- nothing to migrate
     await db.execute(
         f"ALTER TABLE core_practice_proposals RENAME TO {_OLD_PRACTICE_PROPOSALS_TABLE}")
@@ -1022,6 +1037,9 @@ async def _finish_practice_proposals_migration(db) -> None:
     def col_or_null(name: str) -> str:
         return name if name in old_cols else "NULL"
 
+    def col_or_default(name: str, default_sql: str) -> str:
+        return name if name in old_cols else default_sql
+
     cur = await db.execute(f"SELECT COUNT(*) FROM {_OLD_PRACTICE_PROPOSALS_TABLE}")
     total = (await cur.fetchone())[0]
     await db.execute(
@@ -1030,18 +1048,22 @@ async def _finish_practice_proposals_migration(db) -> None:
         " expected_duration, status, proposal_message_id, created_at, "
         " expires_at, delivered_at, superseded_reason, outcome, outcome_recorded_at, "
         " outcome_prompt_message_id, outcome_prompt_delivered_at, outcome_prompt_status, "
-        " outcome_prompt_claimed_at, "
+        " outcome_prompt_claimed_at, outcome_prompt_claim_id, "
         " helped_prompt_message_id, helped_prompt_delivered_at, helped_prompt_status, "
-        " helped_prompt_claimed_at, reporting_window_status) "
+        " helped_prompt_claimed_at, helped_prompt_claim_id, reporting_window_status, "
+        " is_worse_override) "
         "SELECT id, user_id, session_id, practice_id, practice_version, purpose, "
         "expected_duration, status, proposal_message_id, created_at, "
         f"expires_at, delivered_at, superseded_reason, {col_or_null('outcome')}, "
         f"{col_or_null('outcome_recorded_at')}, "
         f"{col_or_null('outcome_prompt_message_id')}, {col_or_null('outcome_prompt_delivered_at')}, "
         f"{col_or_null('outcome_prompt_status')}, {col_or_null('outcome_prompt_claimed_at')}, "
+        f"{col_or_null('outcome_prompt_claim_id')}, "
         f"{col_or_null('helped_prompt_message_id')}, "
         f"{col_or_null('helped_prompt_delivered_at')}, {col_or_null('helped_prompt_status')}, "
-        f"{col_or_null('helped_prompt_claimed_at')}, {col_or_null('reporting_window_status')} "
+        f"{col_or_null('helped_prompt_claimed_at')}, {col_or_null('helped_prompt_claim_id')}, "
+        f"{col_or_null('reporting_window_status')}, "
+        f"{col_or_default('is_worse_override', '0')} "
         f"FROM {_OLD_PRACTICE_PROPOSALS_TABLE}")
     cur = await db.execute("SELECT changes()")
     inserted = (await cur.fetchone())[0]
@@ -3173,10 +3195,11 @@ _PP_COLUMNS = ("id", "user_id", "session_id", "practice_id", "practice_version",
               "created_at", "expires_at", "delivered_at", "superseded_reason",
               "outcome", "outcome_recorded_at",
               "outcome_prompt_message_id", "outcome_prompt_delivered_at",
-              "outcome_prompt_status", "outcome_prompt_claimed_at",
+              "outcome_prompt_status", "outcome_prompt_claimed_at", "outcome_prompt_claim_id",
               "helped_prompt_message_id",
               "helped_prompt_delivered_at", "helped_prompt_status",
-              "helped_prompt_claimed_at", "reporting_window_status")
+              "helped_prompt_claimed_at", "helped_prompt_claim_id",
+              "reporting_window_status", "is_worse_override")
 
 
 def _pp_row_to_obj(row) -> "_core.PracticeProposal":
@@ -3188,11 +3211,18 @@ def _pp_row_to_obj(row) -> "_core.PracticeProposal":
 async def create_practice_proposal(uid: int, session_id, practice_id: str,
                                    practice_version: str, purpose: str,
                                    expected_duration: str,
-                                   ttl_seconds: int = 1800) -> "_core.PracticeProposal":
+                                   ttl_seconds: int = 1800,
+                                   is_worse_override: bool = False) -> "_core.PracticeProposal":
     """Hardening §3/§4: supersedes any still-actionable proposal for this
     SESSION in the same transaction before inserting the new one -- the
     partial unique index (one actionable proposal per session) turns a
-    forgotten supersession into a hard DB error, never a silent duplicate."""
+    forgotten supersession into a hard DB error, never a silent duplicate.
+
+    PR #73 ATOMIC CLOSURE §4: `is_worse_override=True` persists that THIS
+    exact proposal is an explicit, informed repeat of a practice whose
+    latest recorded outcome was WORSE -- always a brand-new row (this
+    function never reuses an existing one), never touching the old
+    WORSE-outcome proposal's own history."""
     async with aiosqlite.connect(DB) as db:
         await db.execute(
             """UPDATE core_practice_proposals SET status='SUPERSEDED',
@@ -3203,10 +3233,10 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
         cur = await db.execute(
             """INSERT INTO core_practice_proposals
                (user_id, session_id, practice_id, practice_version, purpose,
-                expected_duration, status, expires_at)
-               VALUES (?,?,?,?,?,?,'PROPOSED', datetime('now', ?))""",
+                expected_duration, status, expires_at, is_worse_override)
+               VALUES (?,?,?,?,?,?,'PROPOSED', datetime('now', ?), ?)""",
             (uid, session_id, practice_id, practice_version, purpose,
-             expected_duration, f"+{int(ttl_seconds)} seconds"))
+             expected_duration, f"+{int(ttl_seconds)} seconds", int(is_worse_override)))
         pid = cur.lastrowid
         row = await (await db.execute(
             f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals WHERE id=?",
@@ -3255,7 +3285,8 @@ async def transition_practice_proposal(proposal_id, user_id: int, *, from_status
                                        to_status: str, reason: str | None = None,
                                        require_unexpired: bool = False,
                                        open_reporting_window: bool = False,
-                                       close_reporting_window: bool = False) -> bool:
+                                       close_reporting_window: bool = False,
+                                       require_active_reporting_window: bool = False) -> bool:
     """Atomic status CAS (hardening §4/§5) -- mirrors
     transition_core_session_consent's pattern. `require_unexpired=True`
     (used for the GRANTED/DECLINED consent transitions) makes expiry
@@ -3268,7 +3299,13 @@ async def transition_practice_proposal(proposal_id, user_id: int, *, from_status
     this SAME atomic UPDATE as the status transition (DELIVERING->STARTED
     opens it; STARTED->WITHDRAWN closes it) -- never a second, separately-
     racing write. `status`/`outcome` -- the truthful historical record --
-    are never touched by this window bookkeeping."""
+    are never touched by this window bookkeeping.
+
+    PR #73 ATOMIC CLOSURE §1: `require_active_reporting_window=True` closes
+    the TOCTOU gap between a caller's own earlier (non-atomic) read of
+    `reporting_window_status` and this write -- the WHERE clause itself,
+    not just a Python-level check beforehand, is what actually enforces it.
+    Used for STARTED->COMPLETED and STARTED->WITHDRAWN."""
     window_set = ""
     if open_reporting_window:
         window_set = ", reporting_window_status='ACTIVE'"
@@ -3280,6 +3317,8 @@ async def transition_practice_proposal(proposal_id, user_id: int, *, from_status
     params = [to_status, reason, proposal_id, user_id, from_status]
     if require_unexpired:
         query += " AND expires_at > datetime('now')"
+    if require_active_reporting_window:
+        query += " AND reporting_window_status='ACTIVE'"
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(query, params)
         await db.commit()
@@ -3299,7 +3338,8 @@ async def mark_proposal_delivered(proposal_id, user_id: int, message_id: int) ->
         return cur.rowcount > 0
 
 
-async def record_practice_outcome(proposal_id, user_id: int, outcome: str) -> bool:
+async def record_practice_outcome(proposal_id, user_id: int, outcome: str,
+                                  require_active_reporting_window: bool = False) -> bool:
     """Phase 3 final closure §5: records a purely qualitative, explicit
     self-reported outcome on an ALREADY-COMPLETED proposal (status is not
     touched -- this is an info-only update, same pattern as
@@ -3307,13 +3347,18 @@ async def record_practice_outcome(proposal_id, user_id: int, outcome: str) -> bo
     so a duplicate/replayed outcome callback cannot silently overwrite the
     user's first answer. PR #73 FINAL REQUEST CHANGES §1: a successful
     outcome report is the normal end of the reporting window -- closed in
-    the same atomic write."""
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            """UPDATE core_practice_proposals SET outcome=?, outcome_recorded_at=datetime('now'),
+    the same atomic write.
+
+    PR #73 ATOMIC CLOSURE §1: `require_active_reporting_window=True` makes
+    the WHERE clause itself the authority on window freshness, closing the
+    TOCTOU gap between a caller's earlier read and this write."""
+    query = ("""UPDATE core_practice_proposals SET outcome=?, outcome_recorded_at=datetime('now'),
                reporting_window_status='CLOSED'
-               WHERE id=? AND user_id=? AND status='COMPLETED' AND outcome IS NULL""",
-            (outcome, proposal_id, user_id))
+               WHERE id=? AND user_id=? AND status='COMPLETED' AND outcome IS NULL""")
+    if require_active_reporting_window:
+        query += " AND reporting_window_status='ACTIVE'"
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(query, (outcome, proposal_id, user_id))
         await db.commit()
         return cur.rowcount > 0
 
@@ -3331,9 +3376,11 @@ async def record_practice_outcome(proposal_id, user_id: int, outcome: str) -> bo
 # send is only attempted by whichever caller wins the claim.
 _PROMPT_COLUMNS = {
     "outcome": ("outcome_prompt_status", "outcome_prompt_message_id",
-               "outcome_prompt_delivered_at", "outcome_prompt_claimed_at"),
+               "outcome_prompt_delivered_at", "outcome_prompt_claimed_at",
+               "outcome_prompt_claim_id"),
     "helped": ("helped_prompt_status", "helped_prompt_message_id",
-              "helped_prompt_delivered_at", "helped_prompt_claimed_at"),
+              "helped_prompt_delivered_at", "helped_prompt_claimed_at",
+              "helped_prompt_claim_id"),
 }
 # A claim older than this is treated as abandoned (the claiming process
 # crashed or restarted between the claim and the send/mark) and becomes
@@ -3342,51 +3389,64 @@ _PROMPT_COLUMNS = {
 _PROMPT_RETRY_CLAIM_TIMEOUT_SECONDS = 120
 
 
-async def claim_prompt_send(proposal_id, user_id: int, prompt_kind: str) -> bool:
-    """Atomic pre-send claim: NULL/FAILED (or a stale, timed-out RETRYING)
-    -> RETRYING. Only the caller that wins this CAS may attempt the Telegram
-    send for this prompt_kind -- a concurrent second caller's claim always
-    loses, so at most one Telegram message is ever sent per prompt_kind per
-    proposal, regardless of how many callers race the send."""
-    status_col, _, _, claimed_col = _PROMPT_COLUMNS[prompt_kind]
+async def claim_prompt_send(proposal_id, user_id: int, prompt_kind: str,
+                            expected_status: str) -> str | None:
+    """PR #73 ATOMIC CLOSURE §2: atomic pre-send claim: NULL/FAILED (or a
+    stale, timed-out RETRYING) -> RETRYING, stamped with a fresh, unforgeable
+    claim_id (not just the RETRYING status value, which a stale prior
+    claimant could otherwise mistake for its own win after a second caller
+    legitimately reclaimed it). Only the caller that wins this CAS may
+    attempt the Telegram send for this prompt_kind. `expected_status`
+    additionally requires the PROPOSAL's own status (STARTED for the
+    outcome prompt, COMPLETED for the helped prompt) to still hold, and the
+    reporting window to still be ACTIVE -- both in the SAME atomic WHERE
+    clause, not a separate read beforehand.
+
+    Returns the winning claim_id, or None if the claim was not won."""
+    status_col, _, _, claimed_col, claimid_col = _PROMPT_COLUMNS[prompt_kind]
+    claim_id = uuid.uuid4().hex
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             f"""UPDATE core_practice_proposals SET {status_col}='RETRYING',
-               {claimed_col}=datetime('now')
-               WHERE id=? AND user_id=? AND (
-                     {status_col} IS NULL OR {status_col}='FAILED'
-                     OR ({status_col}='RETRYING' AND {claimed_col} < datetime(
-                         'now', '-{_PROMPT_RETRY_CLAIM_TIMEOUT_SECONDS} seconds')))""",
-            (proposal_id, user_id))
+               {claimid_col}=?, {claimed_col}=datetime('now')
+               WHERE id=? AND user_id=? AND status=? AND reporting_window_status='ACTIVE'
+                 AND ({status_col} IS NULL OR {status_col}='FAILED'
+                      OR ({status_col}='RETRYING' AND {claimed_col} < datetime(
+                          'now', '-{_PROMPT_RETRY_CLAIM_TIMEOUT_SECONDS} seconds')))""",
+            (claim_id, proposal_id, user_id, expected_status))
         await db.commit()
-        return cur.rowcount > 0
+        return claim_id if cur.rowcount > 0 else None
 
 
-async def mark_prompt_delivered(proposal_id, user_id: int, prompt_kind: str, message_id: int) -> bool:
-    """Only the claim owner may mark DELIVERED: requires the row to still be
-    RETRYING (this caller's own claim_prompt_send win). A duplicate/late
-    caller that never won the claim cannot mark a send it never made."""
-    status_col, msgid_col, at_col, _ = _PROMPT_COLUMNS[prompt_kind]
+async def mark_prompt_delivered(proposal_id, user_id: int, prompt_kind: str, message_id: int,
+                                claim_id: str) -> bool:
+    """Only the EXACT claim owner may mark DELIVERED: requires the row to
+    still be RETRYING under THIS claim_id, not merely RETRYING under
+    whatever claim currently holds it. A stale prior claimant that resumed
+    after a second caller reclaimed the same prompt can never finalize the
+    NEWER claim as if it were its own."""
+    status_col, msgid_col, at_col, _, claimid_col = _PROMPT_COLUMNS[prompt_kind]
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             f"""UPDATE core_practice_proposals SET {status_col}='DELIVERED',
                {msgid_col}=?, {at_col}=datetime('now')
-               WHERE id=? AND user_id=? AND {status_col}='RETRYING'""",
-            (message_id, proposal_id, user_id))
+               WHERE id=? AND user_id=? AND {status_col}='RETRYING' AND {claimid_col}=?""",
+            (message_id, proposal_id, user_id, claim_id))
         await db.commit()
         return cur.rowcount > 0
 
 
-async def mark_prompt_failed(proposal_id, user_id: int, prompt_kind: str) -> bool:
-    """Only the claim owner may revert to FAILED: requires the row to still
-    be RETRYING (this caller's own claim). Never overwrites an already-
-    DELIVERED prompt or a claim some OTHER caller currently owns."""
-    status_col, _, _, _ = _PROMPT_COLUMNS[prompt_kind]
+async def mark_prompt_failed(proposal_id, user_id: int, prompt_kind: str, claim_id: str) -> bool:
+    """Only the EXACT claim owner may revert to FAILED -- same claim_id
+    discipline as mark_prompt_delivered. Never overwrites an already-
+    DELIVERED prompt or a claim some OTHER (including a newer) caller
+    currently owns."""
+    status_col, _, _, _, claimid_col = _PROMPT_COLUMNS[prompt_kind]
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             f"""UPDATE core_practice_proposals SET {status_col}='FAILED'
-               WHERE id=? AND user_id=? AND {status_col}='RETRYING'""",
-            (proposal_id, user_id))
+               WHERE id=? AND user_id=? AND {status_col}='RETRYING' AND {claimid_col}=?""",
+            (proposal_id, user_id, claim_id))
         await db.commit()
         return cur.rowcount > 0
 

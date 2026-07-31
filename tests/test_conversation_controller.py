@@ -2209,22 +2209,29 @@ async def _complete_practice_with_outcome(uid: int, user, monkeypatch, outcome_v
 
 
 def test_worse_outcome_prevents_automatic_same_practice_reproposal(monkeypatch, tmp_db):
+    """PR #73 ATOMIC CLOSURE §4: the guard still skips the LLM entirely and
+    never silently re-delivers the practice -- but it now creates a REAL,
+    brand-new PENDING proposal (is_worse_override=True) with the ordinary
+    Да/Нет consent buttons, instead of an unpersisted flat decline."""
     user = FakeUser(1)
-    run(_complete_practice_with_outcome(1, user, monkeypatch, "worse"))
+    session, old_proposal = run(_complete_practice_with_outcome(1, user, monkeypatch, "worse"))
     llm_calls = {"n": 0}
     _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
     msg = FakeMessage(user, "Дай упражнение.")
     run(bot.pipeline(msg, msg.text, None, tg_user=user))
     assert llm_calls["n"] == 0, "the adverse guard must skip the LLM call entirely"
-    assert msg.answers, "the user must still get a reply -- an honest decline, not silence"
-    assert "не буду предлагать" in msg.answers[0][0].lower() or \
-        "won't suggest" in msg.answers[0][0].lower()
-    sessions = run(database.list_core_sessions(1))
-    proposals_after = [p for p in [run(database.get_latest_proposal_for_session(
-        sessions[0].session_id, 1))] if p is not None]
-    # No NEW proposal was created by this turn (the one from the completed
-    # practice is still the latest, already COMPLETED).
-    assert proposals_after[0].status is PracticeProposalStatus.COMPLETED
+    assert msg.answers, "the user must still get a reply -- an honest warning, not silence"
+    text = msg.answers[0][0].lower()
+    assert "стало хуже" in text or "made things worse" in text
+    kb = msg.answers[0][1]["reply_markup"]
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert labels == ["Да", "Нет"], "reuses the ordinary consent buttons, not a bespoke override UI"
+    new_proposal = run(database.get_latest_proposal_for_session(session.session_id, 1))
+    assert new_proposal.proposal_id != old_proposal.proposal_id, "a brand-new proposal, never the old WORSE one"
+    assert new_proposal.status is PracticeProposalStatus.PENDING
+    assert new_proposal.is_worse_override is True
+    old_reloaded = run(database.get_practice_proposal(old_proposal.proposal_id, 1))
+    assert old_reloaded.outcome is PracticeOutcome.WORSE, "the old proposal's history is untouched"
 
 
 def test_worse_outcome_for_one_user_does_not_affect_another(monkeypatch, tmp_db):
@@ -2460,7 +2467,7 @@ def test_topic_change_after_started_invalidates_window_not_status(monkeypatch, t
     cb = _fake_callback(user, msg, f"cc:outcome:{proposal.proposal_id}:done")
     run(bot.cb_cc_outcome(cb))
     assert msg.answers == [], "a stale button must not mutate or reply"
-    assert cb.answered == 0, "a stale callback must not even produce a Telegram answer"
+    assert cb.answered == 1, "ATOMIC CLOSURE §5: still answered (silently) to clear the loading spinner"
     final = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert final.status is PracticeProposalStatus.STARTED, "still untouched"
 
@@ -2476,7 +2483,7 @@ def test_new_disclosure_flow_invalidates_reporting_window_on_started_proposal(mo
     cb = _fake_callback(user, msg, f"cc:outcome:{proposal.proposal_id}:done")
     run(bot.cb_cc_outcome(cb))
     assert msg.answers == []
-    assert cb.answered == 0
+    assert cb.answered == 1
 
 
 def test_crisis_invalidates_reporting_window_on_completed_proposal(monkeypatch, tmp_db):
@@ -2500,7 +2507,7 @@ def test_crisis_invalidates_reporting_window_on_completed_proposal(monkeypatch, 
     cb = _fake_callback(user, msg, f"cc:helped:{proposal.proposal_id}:helped")
     run(bot.cb_cc_outcome_detail(cb))
     assert msg.answers == []
-    assert cb.answered == 0
+    assert cb.answered == 1
     final = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert final.outcome is None, "a stale cc:helped tap must never record an outcome"
 
@@ -2560,75 +2567,142 @@ def test_stale_reporting_window_does_not_block_an_unrelated_new_proposal(monkeyp
 # ── U. Prompt-delivery claim-first idempotency under concurrency
 # (PR #73 FINAL REQUEST CHANGES §2) ─────────────────────────────────────────
 
+async def _seed_started_proposal_db_only(uid: int = 1) -> "_core.PracticeProposal":
+    """DB-only equivalent of _seed_started_practice, for tests exercising
+    claim_prompt_send/mark_prompt_delivered/mark_prompt_failed directly
+    (no callback/bot layer involved) -- a real STARTED proposal with an
+    ACTIVE reporting window, the only state these functions are ever
+    legitimately called against in production."""
+    await _seed_user(uid)
+    session = await database.create_core_session(uid)
+    proposal = await database.create_practice_proposal(
+        uid, session.session_id, "breathing_box_v1", "v1", "p", "5 минут")
+    await database.transition_practice_proposal(
+        proposal.proposal_id, uid, from_status="PROPOSED", to_status="PENDING")
+    await database.transition_practice_proposal(
+        proposal.proposal_id, uid, from_status="PENDING", to_status="GRANTED",
+        require_unexpired=True)
+    await database.transition_practice_proposal(
+        proposal.proposal_id, uid, from_status="GRANTED", to_status="DELIVERING",
+        require_unexpired=True)
+    await database.transition_practice_proposal(
+        proposal.proposal_id, uid, from_status="DELIVERING", to_status="STARTED",
+        open_reporting_window=True)
+    return await database.get_practice_proposal(proposal.proposal_id, uid)
+
+
 def test_claim_prompt_send_exactly_one_of_two_concurrent_claims_wins(tmp_db):
-    run(_seed_user(1))
-    session = run(database.create_core_session(1))
-    proposal = run(database.create_practice_proposal(
-        1, session.session_id, "breathing_box_v1", "v1", "p", "5 минут"))
-    run(database.transition_practice_proposal(
-        proposal.proposal_id, 1, from_status="PROPOSED", to_status="PENDING"))
-    run(database.transition_practice_proposal(
-        proposal.proposal_id, 1, from_status="PENDING", to_status="GRANTED",
-        require_unexpired=True))
-    run(database.transition_practice_proposal(
-        proposal.proposal_id, 1, from_status="GRANTED", to_status="DELIVERING",
-        require_unexpired=True))
-    run(database.transition_practice_proposal(
-        proposal.proposal_id, 1, from_status="DELIVERING", to_status="STARTED",
-        open_reporting_window=True))
+    proposal = run(_seed_started_proposal_db_only())
 
     async def go():
         return await asyncio.gather(
-            database.claim_prompt_send(proposal.proposal_id, 1, "outcome"),
-            database.claim_prompt_send(proposal.proposal_id, 1, "outcome"))
+            database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"),
+            database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
     results = run(go())
-    assert sorted(results) == [False, True], "exactly one concurrent claim must win"
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1, "exactly one concurrent claim must win"
+    assert results.count(None) == 1
 
 
 def test_stale_retrying_claim_is_reclaimable_after_timeout(tmp_db):
     import sqlite3
     from datetime import datetime, timezone, timedelta
-    run(_seed_user(1))
-    session = run(database.create_core_session(1))
-    proposal = run(database.create_practice_proposal(
-        1, session.session_id, "breathing_box_v1", "v1", "p", "5 минут"))
-    run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome"))
+    proposal = run(_seed_started_proposal_db_only())
+    first_claim = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
+    assert first_claim is not None
     con = sqlite3.connect(database.DB)
     old = (datetime.now(timezone.utc) - timedelta(seconds=999)).strftime("%Y-%m-%d %H:%M:%S")
     con.execute("UPDATE core_practice_proposals SET outcome_prompt_claimed_at=? WHERE id=?",
                (old, proposal.proposal_id))
     con.commit()
     con.close()
-    reclaimed = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome"))
-    assert reclaimed is True, "a claim older than the bounded timeout must be reclaimable"
+    reclaimed = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
+    assert reclaimed is not None, "a claim older than the bounded timeout must be reclaimable"
+    assert reclaimed != first_claim, "a reclaim must mint a FRESH claim_id, not reuse the stale one"
 
 
 def test_fresh_retrying_claim_is_not_reclaimable(tmp_db):
-    run(_seed_user(1))
-    session = run(database.create_core_session(1))
-    proposal = run(database.create_practice_proposal(
-        1, session.session_id, "breathing_box_v1", "v1", "p", "5 минут"))
-    run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome"))
-    reclaimed = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome"))
-    assert reclaimed is False, "a fresh (non-timed-out) RETRYING claim must not be reclaimable"
+    proposal = run(_seed_started_proposal_db_only())
+    run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
+    reclaimed = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
+    assert reclaimed is None, "a fresh (non-timed-out) RETRYING claim must not be reclaimable"
 
 
 def test_mark_delivered_requires_retrying_claim_ownership(tmp_db):
-    run(_seed_user(1))
-    session = run(database.create_core_session(1))
-    proposal = run(database.create_practice_proposal(
-        1, session.session_id, "breathing_box_v1", "v1", "p", "5 минут"))
-    ok = run(database.mark_prompt_delivered(proposal.proposal_id, 1, "outcome", 999))
+    proposal = run(_seed_started_proposal_db_only())
+    ok = run(database.mark_prompt_delivered(proposal.proposal_id, 1, "outcome", 999, "not-a-real-claim"))
     assert ok is False, "mark_prompt_delivered must require an existing RETRYING claim"
 
 
 def test_mark_failed_requires_retrying_claim_ownership(tmp_db):
-    run(_seed_user(1))
-    session = run(database.create_core_session(1))
-    proposal = run(database.create_practice_proposal(
-        1, session.session_id, "breathing_box_v1", "v1", "p", "5 минут"))
-    ok = run(database.mark_prompt_failed(proposal.proposal_id, 1, "outcome"))
+    proposal = run(_seed_started_proposal_db_only())
+    ok = run(database.mark_prompt_failed(proposal.proposal_id, 1, "outcome", "not-a-real-claim"))
     assert ok is False, "mark_prompt_failed must require an existing RETRYING claim"
+
+
+def test_stale_prior_claimant_cannot_finalize_a_newer_reclaimed_claim_as_delivered(tmp_db):
+    """PR #73 ATOMIC CLOSURE §2: the exact scenario the claim_id exists to
+    prevent -- claimant A wins, times out (simulated), claimant B reclaims
+    and wins, and A then belatedly tries to mark DELIVERED using ITS OWN
+    (now stale) claim_id. A's write must be rejected; B's claim must remain
+    the only one that can finalize."""
+    import sqlite3
+    from datetime import datetime, timezone, timedelta
+    proposal = run(_seed_started_proposal_db_only())
+    claim_a = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
+    con = sqlite3.connect(database.DB)
+    old = (datetime.now(timezone.utc) - timedelta(seconds=999)).strftime("%Y-%m-%d %H:%M:%S")
+    con.execute("UPDATE core_practice_proposals SET outcome_prompt_claimed_at=? WHERE id=?",
+               (old, proposal.proposal_id))
+    con.commit()
+    con.close()
+    claim_b = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
+    assert claim_b is not None and claim_b != claim_a
+
+    stale_ok = run(database.mark_prompt_delivered(proposal.proposal_id, 1, "outcome", 111, claim_a))
+    assert stale_ok is False, "a stale prior claimant must never finalize a newer reclaimed claim"
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome_prompt_status == "RETRYING", "B's claim must still be live"
+
+    fresh_ok = run(database.mark_prompt_delivered(proposal.proposal_id, 1, "outcome", 222, claim_b))
+    assert fresh_ok is True, "the CURRENT claimant (B) must still be able to finalize"
+
+
+def test_stale_prior_claimant_cannot_fail_a_newer_reclaimed_claim(tmp_db):
+    import sqlite3
+    from datetime import datetime, timezone, timedelta
+    proposal = run(_seed_started_proposal_db_only())
+    claim_a = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
+    con = sqlite3.connect(database.DB)
+    old = (datetime.now(timezone.utc) - timedelta(seconds=999)).strftime("%Y-%m-%d %H:%M:%S")
+    con.execute("UPDATE core_practice_proposals SET outcome_prompt_claimed_at=? WHERE id=?",
+               (old, proposal.proposal_id))
+    con.commit()
+    con.close()
+    claim_b = run(database.claim_prompt_send(proposal.proposal_id, 1, "outcome", "STARTED"))
+
+    stale_ok = run(database.mark_prompt_failed(proposal.proposal_id, 1, "outcome", claim_a))
+    assert stale_ok is False, "a stale prior claimant must never fail a newer reclaimed claim"
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome_prompt_status == "RETRYING", "B's claim must still be live"
+
+    fresh_ok = run(database.mark_prompt_failed(proposal.proposal_id, 1, "outcome", claim_b))
+    assert fresh_ok is True
+
+
+def test_helped_path_also_uses_claim_identity(tmp_db):
+    """§2: 'outcome and helped paths both use claim identity' -- proven
+    directly against the helped-prompt column pair, not just outcome."""
+    proposal = run(_seed_started_proposal_db_only())
+    run(database.transition_practice_proposal(
+        proposal.proposal_id, 1, from_status="STARTED", to_status="COMPLETED",
+        require_active_reporting_window=True))
+    claim_id = run(database.claim_prompt_send(proposal.proposal_id, 1, "helped", "COMPLETED"))
+    assert claim_id is not None
+    wrong = run(database.mark_prompt_delivered(proposal.proposal_id, 1, "helped", 1, "wrong-claim"))
+    assert wrong is False
+    right = run(database.mark_prompt_delivered(proposal.proposal_id, 1, "helped", 1, claim_id))
+    assert right is True
 
 
 def test_concurrent_retry_sweeps_send_exactly_once(monkeypatch, tmp_db):
@@ -2873,64 +2947,73 @@ def test_failed_prompt_invalidation_survives_restart(monkeypatch, tmp_db):
     # covered by test_concurrent_retry_sweeps_send_exactly_once (section U).
 
 
-# ── X. Informed explicit repeat after WORSE (PR #73 FINAL REQUEST CHANGES §5) ─
+# ── X. Informed explicit repeat after WORSE (PR #73 ATOMIC CLOSURE §4) ─────
+# The warning proposal is a REAL, persisted, brand-new PENDING proposal
+# (is_worse_override=True) carrying ordinary Да/Нет buttons through the
+# SAME cb_cc_consent contract every other PRACTICE proposal uses -- no
+# separate "cc:worseover" callback contract exists anymore.
 
-def test_worse_guard_message_offers_override_buttons(monkeypatch, tmp_db):
-    user = FakeUser(1)
-    run(_complete_practice_with_outcome(1, user, monkeypatch, "worse"))
-    llm_calls = {"n": 0}
-    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+async def _seed_worse_override_pending(uid: int, user, monkeypatch) -> tuple:
+    """Completes a practice with a WORSE outcome, then triggers the guard
+    once more and returns (session, old_worse_proposal, new_pending_
+    proposal, callback_data_for_yes)."""
+    session, old_proposal = await _complete_practice_with_outcome(uid, user, monkeypatch, "worse")
+    _full_pipeline_stub_set(monkeypatch, llm_calls={"n": 0})
     msg = FakeMessage(user, "Дай упражнение.")
-    run(bot.pipeline(msg, msg.text, None, tg_user=user))
-    assert llm_calls["n"] == 0
+    await bot.pipeline(msg, msg.text, None, tg_user=user)
+    new_proposal = await database.get_latest_proposal_for_session(session.session_id, uid)
+    data = f"cc:consent:{session.session_id}:{new_proposal.proposal_id}:yes"
+    return session, old_proposal, new_proposal, data, msg
+
+
+def test_worse_guard_message_offers_ordinary_consent_buttons_for_a_real_proposal(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, old_proposal, new_proposal, _, msg = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
+    text = msg.answers[0][0].lower()
+    assert "стало хуже" in text
     kb = msg.answers[0][1]["reply_markup"]
     labels = [b.text for row in kb.inline_keyboard for b in row]
-    assert labels == ["Не повторять", "Всё равно попробовать"], \
-        "at most two buttons, exactly as specified -- no free-text override path"
+    assert labels == ["Да", "Нет"], "reuses the ordinary consent buttons, no bespoke override UI"
+    assert new_proposal.status is PracticeProposalStatus.PENDING
+    assert new_proposal.is_worse_override is True
+    assert new_proposal.proposal_id != old_proposal.proposal_id, "exact new proposal identity"
 
 
-def test_worse_override_decline_does_not_create_proposal(monkeypatch, tmp_db):
+def test_worse_override_no_declines_without_touching_old_proposal(monkeypatch, tmp_db):
     user = FakeUser(1)
-    session, old_proposal = run(_complete_practice_with_outcome(1, user, monkeypatch, "worse"))
-    _full_pipeline_stub_set(monkeypatch, llm_calls={"n": 0})
-    msg = FakeMessage(user, "Дай упражнение.")
-    run(bot.pipeline(msg, msg.text, None, tg_user=user))
-    kb = msg.answers[0][1]["reply_markup"]
-    data = kb.inline_keyboard[0][0].callback_data  # "Не повторять"
+    session, old_proposal, new_proposal, _, _ = run(_seed_worse_override_pending(1, user, monkeypatch))
+    msg2 = FakeMessage(user)
+    cb = _fake_callback(user, msg2,
+                        f"cc:consent:{session.session_id}:{new_proposal.proposal_id}:no")
+    run(bot.cb_cc_consent(cb))
+    reloaded = run(database.get_practice_proposal(new_proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.DECLINED
+    old_reloaded = run(database.get_practice_proposal(old_proposal.proposal_id, 1))
+    assert old_reloaded.outcome is PracticeOutcome.WORSE, "declining must not touch the old proposal"
+
+
+def test_worse_override_yes_delivers_via_a_brand_new_proposal(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, old_proposal, new_proposal, data, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
     msg2 = FakeMessage(user)
     cb = _fake_callback(user, msg2, data)
-    run(bot.cb_cc_worse_override(cb))
-    assert cb.answered == 1
-    assert "не повторя" in msg2.answers[0][0].lower()
-    latest = run(database.get_latest_proposal_for_session(session.session_id, 1))
-    assert latest.proposal_id == old_proposal.proposal_id, "declining must not touch the old proposal"
-    assert latest.outcome is PracticeOutcome.WORSE
-
-
-def test_worse_override_accept_creates_new_proposal_and_delivers(monkeypatch, tmp_db):
-    user = FakeUser(1)
-    session, old_proposal = run(_complete_practice_with_outcome(1, user, monkeypatch, "worse"))
-    _full_pipeline_stub_set(monkeypatch, llm_calls={"n": 0})
-    msg = FakeMessage(user, "Дай упражнение.")
-    run(bot.pipeline(msg, msg.text, None, tg_user=user))
-    kb = msg.answers[0][1]["reply_markup"]
-    data = kb.inline_keyboard[1][0].callback_data  # "Всё равно попробовать"
-    msg2 = FakeMessage(user)
-    cb = _fake_callback(user, msg2, data)
-    run(bot.cb_cc_worse_override(cb))
-    assert cb.answered == 1
+    run(bot.cb_cc_consent(cb))
     assert len(msg2.answers) == 2, "steps, then the outcome-report prompt"
-    latest = run(database.get_latest_proposal_for_session(session.session_id, 1))
-    assert latest.proposal_id != old_proposal.proposal_id, "must be a BRAND NEW proposal"
-    assert latest.status is PracticeProposalStatus.STARTED
+    reloaded = run(database.get_practice_proposal(new_proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.STARTED
+    assert reloaded.is_worse_override is True
     old_reloaded = run(database.get_practice_proposal(old_proposal.proposal_id, 1))
     assert old_reloaded.outcome is PracticeOutcome.WORSE, "the old proposal's history is untouched"
+    assert old_reloaded.proposal_id != reloaded.proposal_id
 
 
 def test_worse_override_generic_free_text_does_not_bypass_guard(monkeypatch, tmp_db):
-    """§5's explicit requirement: a generic request such as "дай упражнение"
+    """§4's explicit requirement: a generic request such as "дай упражнение"
     -- however specific the wording -- must never automatically expose the
-    same worsened practice. Only the button counts as consent."""
+    same worsened practice via free text. Only the button (reused ordinary
+    consent flow) counts as informed consent."""
     user = FakeUser(1)
     run(_complete_practice_with_outcome(1, user, monkeypatch, "worse"))
     llm_calls = {"n": 0}
@@ -2938,23 +3021,123 @@ def test_worse_override_generic_free_text_does_not_bypass_guard(monkeypatch, tmp
     run(bot.pipeline(FakeMessage(user, "Дай упражнение."), "Дай упражнение.", None, tg_user=user))
     msg2 = FakeMessage(user, "Всё равно дай мне ту практику.")
     run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
-    assert llm_calls["n"] == 0, "free text -- however explicit -- must never bypass the button-only override"
-    assert "не буду предлагать" in msg2.answers[0][0].lower() or \
-        "won't suggest" in msg2.answers[0][0].lower()
+    assert llm_calls["n"] == 0, "free text -- however explicit -- must never bypass the guard"
+    assert "стало хуже" in msg2.answers[0][0].lower(), \
+        "still the warning + buttons, never a delivered practice from free text"
+
+
+def test_worse_override_old_button_after_start_rejected(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, old_proposal, new_proposal, data, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
+    run(bot.cmd_start(FakeMessage(user)))
+    msg2 = FakeMessage(user)
+    run(bot.cb_cc_consent(_fake_callback(user, msg2, data)))
+    assert msg2.answers == []
+    reloaded = run(database.get_practice_proposal(new_proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.SUPERSEDED
+
+
+def test_worse_override_old_button_after_topic_change_rejected(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, old_proposal, new_proposal, data, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Расскажи подробнее.")
+    run(bot.pipeline(FakeMessage(user, "Мне нужно выговориться."),
+                     "Мне нужно выговориться.", None, tg_user=user))
+    msg2 = FakeMessage(user)
+    run(bot.cb_cc_consent(_fake_callback(user, msg2, data)))
+    assert msg2.answers == []
+    reloaded = run(database.get_practice_proposal(new_proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.SUPERSEDED
+
+
+def test_worse_override_old_button_after_new_disclosure_rejected(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, old_proposal, new_proposal, data, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
+    run(database.create_disclosure_flow(1, "ru"))
+    run(database.supersede_active_practice_proposals(1, "new_disclosure_flow"))
+    msg2 = FakeMessage(user)
+    run(bot.cb_cc_consent(_fake_callback(user, msg2, data)))
+    assert msg2.answers == []
+
+
+def test_worse_override_old_button_after_expiry_rejected(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, old_proposal, new_proposal, data, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    con.execute("UPDATE core_practice_proposals SET expires_at=datetime('now','-1 hour') WHERE id=?",
+               (new_proposal.proposal_id,))
+    con.commit()
+    con.close()
+    msg2 = FakeMessage(user)
+    run(bot.cb_cc_consent(_fake_callback(user, msg2, data)))
+    assert msg2.answers == []
+    reloaded = run(database.get_practice_proposal(new_proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.PENDING, \
+        "expiry rejects the CAS but does not itself rewrite status"
+
+
+def test_worse_override_old_button_after_a_newer_proposal_rejected(monkeypatch, tmp_db):
+    """A second WORSE-guard turn supersedes the first warning proposal --
+    its OLD button must not resurrect it."""
+    user = FakeUser(1)
+    session, old_proposal, first_new, first_data, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
+    _full_pipeline_stub_set(monkeypatch, llm_calls={"n": 0})
+    msg2 = FakeMessage(user, "Дай упражнение.")
+    run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
+    second_new = run(database.get_latest_proposal_for_session(session.session_id, 1))
+    assert second_new.proposal_id != first_new.proposal_id
+
+    msg3 = FakeMessage(user)
+    run(bot.cb_cc_consent(_fake_callback(user, msg3, first_data)))
+    assert msg3.answers == []
+    reloaded = run(database.get_practice_proposal(first_new.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.SUPERSEDED
+
+
+def test_worse_override_cross_user_rejected(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, old_proposal, new_proposal, data, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
+    run(_seed_user(2))
+    attacker = FakeUser(2)
+    msg2 = FakeMessage(attacker)
+    run(bot.cb_cc_consent(_fake_callback(attacker, msg2, data)))
+    assert msg2.answers == []
+    reloaded = run(database.get_practice_proposal(new_proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.PENDING
+
+
+def test_worse_override_duplicate_yes_no_race_exactly_one_wins(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, old_proposal, new_proposal, data, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
+
+    async def go():
+        msg_a, msg_b = FakeMessage(user), FakeMessage(user)
+        await asyncio.gather(
+            bot.cb_cc_consent(_fake_callback(user, msg_a, data)),
+            bot.cb_cc_consent(_fake_callback(user, msg_b, data)))
+        return msg_a, msg_b
+    msg_a, msg_b = run(go())
+    delivered = [m for m in (msg_a, msg_b) if m.answers]
+    assert len(delivered) == 1, "exactly one of two concurrent yes taps must deliver"
+    reloaded = run(database.get_practice_proposal(new_proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.STARTED
 
 
 def test_worse_override_rejected_during_crisis(monkeypatch, tmp_db):
     user = FakeUser(1)
-    run(_complete_practice_with_outcome(1, user, monkeypatch, "worse"))
-    _full_pipeline_stub_set(monkeypatch, llm_calls={"n": 0})
-    msg = FakeMessage(user, "Дай упражнение.")
-    run(bot.pipeline(msg, msg.text, None, tg_user=user))
-    kb = msg.answers[0][1]["reply_markup"]
-    data = kb.inline_keyboard[1][0].callback_data
+    session, old_proposal, new_proposal, data, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
     run(bot.trigger_crisis(FakeMessage(user), 1, "u1", "text", _CRISIS_RISK, "ru"))
     msg2 = FakeMessage(user)
-    cb = _fake_callback(user, msg2, data)
-    run(bot.cb_cc_worse_override(cb))
+    run(bot.cb_cc_consent(_fake_callback(user, msg2, data)))
     assert msg2.answers == []
 
 
@@ -2974,7 +3157,7 @@ def test_helped_detail_after_start_rejected(monkeypatch, tmp_db):
     cb = _fake_callback(user, msg, f"cc:helped:{proposal.proposal_id}:helped")
     run(bot.cb_cc_outcome_detail(cb))
     assert msg.answers == []
-    assert cb.answered == 0
+    assert cb.answered == 1
     reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert reloaded.outcome is None
 
@@ -3085,7 +3268,7 @@ def test_helped_detail_stale_reporting_window_rejected(monkeypatch, tmp_db):
     cb = _fake_callback(user, msg, f"cc:helped:{proposal.proposal_id}:helped")
     run(bot.cb_cc_outcome_detail(cb))
     assert msg.answers == []
-    assert cb.answered == 0
+    assert cb.answered == 1
     reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert reloaded.status is PracticeProposalStatus.COMPLETED, "truthful status untouched"
     assert reloaded.outcome is None
@@ -3103,3 +3286,180 @@ def test_helped_detail_restart_safe(monkeypatch, tmp_db):
     run(bot.cb_cc_outcome_detail(cb))
     final = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert final.outcome is PracticeOutcome.HELPED
+
+
+# ── Z. Reporting-window authority is ATOMIC, not TOCTOU (PR #73 ATOMIC
+# CLOSURE §1). Each test lets the handler's own early "reporting_window_
+# status == ACTIVE" read pass, then invalidates the window via the exact
+# real mechanism (topic change) INSIDE the single await between that read
+# and the atomic write -- proving require_active_reporting_window on the
+# WHERE clause itself is what actually stops the mutation, not the earlier
+# non-atomic check. ───────────────────────────────────────────────────────
+
+def test_toctou_race_completed_write_fails_after_window_invalidated_mid_call(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+
+    real_get_session = bot.get_core_session
+    async def _read_then_invalidate(session_id, uid):
+        result = await real_get_session(session_id, uid)
+        await database.supersede_active_practice_proposals(uid, "test_topic_change")
+        return result
+    monkeypatch.setattr(bot, "get_core_session", _read_then_invalidate)
+
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:outcome:{proposal.proposal_id}:done")
+    run(bot.cb_cc_outcome(cb))
+    assert msg.answers == [], "the atomic CAS must fail even though the earlier read saw ACTIVE"
+    assert cb.answered == 1
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.STARTED, "historical state unchanged"
+
+
+def test_toctou_race_withdrawn_write_fails_after_window_invalidated_mid_call(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+
+    real_get_session = bot.get_core_session
+    async def _read_then_invalidate(session_id, uid):
+        result = await real_get_session(session_id, uid)
+        await database.supersede_active_practice_proposals(uid, "test_topic_change")
+        return result
+    monkeypatch.setattr(bot, "get_core_session", _read_then_invalidate)
+
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:outcome:{proposal.proposal_id}:stopped")
+    run(bot.cb_cc_outcome(cb))
+    assert msg.answers == []
+    assert cb.answered == 1
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.STARTED, "historical state unchanged"
+
+
+def test_toctou_race_outcome_recording_fails_after_window_invalidated_mid_call(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(bot.cb_cc_outcome(_fake_callback(
+        user, FakeMessage(user), f"cc:outcome:{proposal.proposal_id}:done")))
+
+    real_get_session = bot.get_core_session
+    async def _read_then_invalidate(session_id, uid):
+        result = await real_get_session(session_id, uid)
+        await database.supersede_active_practice_proposals(uid, "test_topic_change")
+        return result
+    monkeypatch.setattr(bot, "get_core_session", _read_then_invalidate)
+
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:helped:{proposal.proposal_id}:helped")
+    run(bot.cb_cc_outcome_detail(cb))
+    assert msg.answers == []
+    assert cb.answered == 1
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is None, "no outcome recorded despite the earlier read seeing ACTIVE"
+
+
+# ── AA. Revalidate after prompt claim, before send (PR #73 ATOMIC CLOSURE
+# §3). Injection at the exact claim_prompt_send call site -- the side
+# effect fires strictly AFTER the claim is won but BEFORE _prompt_claim_
+# still_safe's recheck runs, proving the recheck (not just the claim win)
+# is what stops a stale send. ───────────────────────────────────────────────
+
+def _wrap_claim_prompt_send_with_side_effect(monkeypatch, side_effect):
+    real_claim = bot.claim_prompt_send
+    async def _wrapped(proposal_id, uid, prompt_kind, expected_status):
+        claim_id = await real_claim(proposal_id, uid, prompt_kind, expected_status)
+        if claim_id:
+            await side_effect(uid)
+        return claim_id
+    monkeypatch.setattr(bot, "claim_prompt_send", _wrapped)
+
+
+def test_start_after_prompt_claim_before_send_stops_delivery(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_practice_consent(1, user, monkeypatch))
+
+    async def _start(uid):
+        await bot.cmd_start(FakeMessage(user))
+    _wrap_claim_prompt_send_with_side_effect(monkeypatch, _start)
+
+    msg2 = FakeMessage(user)
+    cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_consent(cb))
+    assert not any("Как прошло" in a[0] for a in msg2.answers), \
+        "no stale outcome-prompt may be sent once /start invalidates the claim"
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome_prompt_status in (None, "FAILED"), \
+        "the claim must be released, never left stuck in RETRYING"
+
+    # No automatic resurrection later: a subsequent retry sweep must not
+    # resend it either (the session is now PAUSED / window invalidated).
+    _full_pipeline_stub_set(monkeypatch, llm_reply="ok")
+    msg3 = FakeMessage(user, "Обычное сообщение.")
+    run(bot.pipeline(msg3, msg3.text, None, tg_user=user))
+    assert not any("Как прошло" in a[0] for a in msg3.answers)
+
+
+def test_topic_change_after_prompt_claim_before_send_stops_delivery(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_practice_consent(1, user, monkeypatch))
+
+    async def _topic_change(uid):
+        await database.supersede_active_practice_proposals(uid, "test_topic_change")
+    _wrap_claim_prompt_send_with_side_effect(monkeypatch, _topic_change)
+
+    msg2 = FakeMessage(user)
+    cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_consent(cb))
+    assert not any("Как прошло" in a[0] for a in msg2.answers)
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome_prompt_status in (None, "FAILED")
+
+
+def test_disclosure_after_prompt_claim_before_send_stops_delivery(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_practice_consent(1, user, monkeypatch))
+
+    async def _disclosure(uid):
+        await database.create_disclosure_flow(uid, "ru")
+    _wrap_claim_prompt_send_with_side_effect(monkeypatch, _disclosure)
+
+    msg2 = FakeMessage(user)
+    cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_consent(cb))
+    assert not any("Как прошло" in a[0] for a in msg2.answers)
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome_prompt_status in (None, "FAILED")
+
+
+def test_crisis_after_prompt_claim_before_send_stops_delivery(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_practice_consent(1, user, monkeypatch))
+
+    async def _crisis(uid):
+        await bot.trigger_crisis(FakeMessage(user), uid, "u1", "text", _CRISIS_RISK, "ru")
+    _wrap_claim_prompt_send_with_side_effect(monkeypatch, _crisis)
+
+    msg2 = FakeMessage(user)
+    cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_consent(cb))
+    assert not any("Как прошло" in a[0] for a in msg2.answers)
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome_prompt_status in (None, "FAILED")
+
+
+def test_conversation_close_after_prompt_claim_before_send_stops_delivery(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_practice_consent(1, user, monkeypatch))
+
+    async def _close(uid):
+        s = await database.get_core_session(session.session_id, uid)
+        s.lifecycle_status = LifecycleStatus.COMPLETED
+        await database.update_core_session(s)
+    _wrap_claim_prompt_send_with_side_effect(monkeypatch, _close)
+
+    msg2 = FakeMessage(user)
+    cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_consent(cb))
+    assert not any("Как прошло" in a[0] for a in msg2.answers)
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome_prompt_status in (None, "FAILED")

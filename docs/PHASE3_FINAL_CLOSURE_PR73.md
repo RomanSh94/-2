@@ -504,9 +504,166 @@ this file plus the exact final head/CI run below.
 
 **PR #73 ALL MANDATORY ROWS DONE — EXACT-HEAD CI PASS — DRAFT AWAITING EXTERNAL REVIEW**
 
+---
+
+# PR #73 ATOMIC CLOSURE — Four remaining correctness gaps
+
+A note on this section's own evidence discipline, per this round's explicit
+instruction ("reference the final CODE commit, not a self-referential final
+PR head"): the code changes and this ledger entry are committed TOGETHER in
+one commit, so describing "what changed" never depends on a hash that
+didn't exist yet when it was written. The exact-head CI run/log-line
+evidence for that one commit lives in the **PR body** (updated via `gh pr
+edit` after CI completes, which does not create a new commit) rather than
+in a follow-up "record CI evidence" ledger commit — the pattern the two
+prior rounds used, which moved the head every time and required re-chasing
+CI against a new SHA each time. The PR body is the authoritative pointer to
+the current exact head; this file documents the changes themselves.
+
+## §1 — Reporting-window authority is now atomic (no TOCTOU)
+
+**Status: DONE.** The three writes that used to trust an earlier, separate
+`reporting_window_status == "ACTIVE"` read now enforce it in the SAME
+atomic `UPDATE`'s `WHERE` clause: `transition_practice_proposal(...,
+require_active_reporting_window=True)` for `STARTED→COMPLETED` and
+`STARTED→WITHDRAWN`, and `record_practice_outcome(...,
+require_active_reporting_window=True)`. The earlier non-atomic read stays
+as a fast path only (avoids an unnecessary session fetch on an obviously
+stale callback); the CAS itself is the real authority.
+
+Controlled-race tests (section Z, `tests/test_conversation_controller.py`):
+inject the invalidation (a real `supersede_active_practice_proposals` call)
+inside the single `await get_core_session(...)` between the handler's own
+early ACTIVE read and the atomic write —
+`test_toctou_race_completed_write_fails_after_window_invalidated_mid_call`,
+`test_toctou_race_withdrawn_write_fails_after_window_invalidated_mid_call`,
+`test_toctou_race_outcome_recording_fails_after_window_invalidated_mid_call`.
+All three assert: the mutation fails, historical `status`/`outcome` is
+unchanged, no Telegram message, and the callback is still answered
+(silently — see §5 below).
+
+## §2 — Real claim ownership (persisted claim_id, not just a status value)
+
+**Status: DONE.** Two new columns, `outcome_prompt_claim_id` /
+`helped_prompt_claim_id`. `claim_prompt_send(proposal_id, uid, prompt_kind,
+expected_status)` mints a fresh `uuid4().hex` claim_id and atomically
+writes it together with `RETRYING`, requiring BOTH the proposal's own
+`status=expected_status` AND `reporting_window_status='ACTIVE'` in the same
+`WHERE` clause; returns the claim_id (or `None`, not a bare bool).
+`mark_prompt_delivered`/`mark_prompt_failed` now require the caller's exact
+`claim_id` to match the row's current one, not merely `status='RETRYING'`
+— a stale prior claimant that resumes after a second caller legitimately
+reclaimed the same prompt can never finalize (or fail) the newer claim as
+if it were its own.
+
+Honest, explicitly documented limitation (unchanged, restated per this
+round's instruction): exactly-once delivery across a process crash that
+happens strictly *after* Telegram accepts the message but *before*
+`mark_prompt_delivered` persists is not and cannot be guaranteed by any
+in-process claim mechanism — that boundary is external I/O, the same class
+of limitation already documented for the practice-steps send in §3/below.
+
+Tests: `test_claim_prompt_send_exactly_one_of_two_concurrent_claims_wins`,
+`test_stale_retrying_claim_is_reclaimable_after_timeout`,
+`test_fresh_retrying_claim_is_not_reclaimable`,
+`test_mark_delivered_requires_retrying_claim_ownership`,
+`test_mark_failed_requires_retrying_claim_ownership`,
+`test_stale_prior_claimant_cannot_finalize_a_newer_reclaimed_claim_as_delivered`,
+`test_stale_prior_claimant_cannot_fail_a_newer_reclaimed_claim` (the exact
+scenario the claim_id exists to prevent, proven directly), `test_helped_path_also_uses_claim_identity`
+("outcome and helped paths both use claim identity").
+
+## §3 — Revalidate after prompt claim, before send
+
+**Status: DONE.** `_prompt_claim_still_safe(uid, proposal_id, prompt_kind,
+claim_id, expected_status)` — shared by all three prompt-send sites
+(`cb_cc_consent`'s outcome-prompt send, `cb_cc_outcome`'s helped-prompt
+send, `_retry_failed_practice_prompts`) — re-verifies, immediately before
+the Telegram call: no active crisis, no active disclosure, rollout allowed,
+the proposal's own status still matches, the reporting window still
+ACTIVE, the claim_id still belongs to this caller, and the owning session
+still OPEN. A claim that becomes unsafe between winning and sending is
+released immediately (`mark_prompt_failed`) rather than left stuck for the
+full stale-claim timeout.
+
+Five controlled races (section AA), injected at the exact `claim_prompt_
+send` call site via a shared wrapper (`_wrap_claim_prompt_send_with_side_
+effect`) so the side effect fires strictly after the claim is won but
+before the revalidation runs:
+`test_start_after_prompt_claim_before_send_stops_delivery` (also proves no
+automatic resurrection via a subsequent ordinary turn),
+`test_topic_change_after_prompt_claim_before_send_stops_delivery`,
+`test_disclosure_after_prompt_claim_before_send_stops_delivery`,
+`test_crisis_after_prompt_claim_before_send_stops_delivery`,
+`test_conversation_close_after_prompt_claim_before_send_stops_delivery`
+(this one specifically exercises the owning-session-OPEN axis, since a
+direct lifecycle change doesn't touch the window or claim_id at all).
+
+## §4 — WORSE override bound to a real, persisted proposal
+
+**Status: DONE.** The unpersisted `cc:worseover:<session_id>:<practice_id>:
+<yes|no>` callback contract and its dedicated handler/keyboard
+(`cb_cc_worse_override`, `_worse_override_kb`) are deleted entirely. When
+the WORSE guard fires, `_controller_claim_turn` now creates a real,
+brand-new `PROPOSED` proposal via the SAME `create_practice_proposal` call
+every ordinary PRACTICE turn uses, with a new `is_worse_override=True` flag
+persisted on it (never on the old WORSE-outcome row — that history stays
+untouched). `_controller_generate_and_deliver`'s adverse-guard branch names
+the exact practice, the user's own prior WORSE report (no causality
+claim), the purpose, and the approximate duration, then transitions
+`PROPOSED→PENDING` and shows the ordinary `_practice_consent_kb` (Да/Нет)
+— from that point on it is indistinguishable from any other PRACTICE
+proposal, going through `cb_cc_consent`/`_deliver_granted_practice`
+unchanged: same ownership, expiry, session, and supersession rules, with
+zero new callback surface.
+
+Tests (section X):
+`test_worse_guard_message_offers_ordinary_consent_buttons_for_a_real_proposal`
+(exact new proposal identity, ordinary Да/Нет buttons),
+`test_worse_override_no_declines_without_touching_old_proposal`,
+`test_worse_override_yes_delivers_via_a_brand_new_proposal`,
+`test_worse_override_generic_free_text_does_not_bypass_guard`,
+`test_worse_override_old_button_after_start_rejected`,
+`test_worse_override_old_button_after_topic_change_rejected`,
+`test_worse_override_old_button_after_new_disclosure_rejected`,
+`test_worse_override_old_button_after_expiry_rejected`,
+`test_worse_override_old_button_after_a_newer_proposal_rejected`,
+`test_worse_override_cross_user_rejected`,
+`test_worse_override_duplicate_yes_no_race_exactly_one_wins`,
+`test_worse_override_rejected_during_crisis`. Also updated:
+`test_worse_outcome_prevents_automatic_same_practice_reproposal` (section
+R) now asserts the new proposal/keyboard contract instead of the old flat
+decline text.
+
+## §5 — Stale callbacks are acknowledged, not left hanging
+
+**Status: DONE — a correction from the prior round.** The prior round's
+literal "no Telegram answer" requirement left the client's loading spinner
+active indefinitely on a stale callback, which is worse UX than a silent
+acknowledgment. Both `cb_cc_outcome` and `cb_cc_outcome_detail`'s stale-
+reporting-window early exits now call `callback.answer()` (no text) before
+returning — no DB mutation, no user-visible message, spinner cleared.
+Existing tests from the prior round (`test_topic_change_after_started_
+invalidates_window_not_status` and three others) updated from asserting
+`cb.answered == 0` to `cb.answered == 1`.
+
+## §6 — Evidence
+
+- Focused suite (`tests/test_conversation_controller.py` +
+  `tests/test_practice_proposals_schema_migration.py`): **246 passed**, one
+  continuous local run, 0 failed, 142.42s.
+- Full local suite: see the PR body for this round's exact numbers (kept
+  out of this file for the reason stated at the top of this section).
+- Exact current PR head, exact-head CI run, and exact test result: see the
+  PR body, updated after this ledger commit without a further commit.
+
+**PR #73 ATOMIC CORRECTNESS GAPS FIXED — EXACT-HEAD CI PASS — DRAFT AWAITING FINAL EXTERNAL REVIEW**
+
 ## §13 — Stop for external review
 
 This PR stays in Draft. Not merged, not deployed, Phase 4 not started,
 per the explicit standing instruction from this round's prompt (repeated
 verbatim in the FINAL REQUEST CHANGES round above: "PR #73 must remain
-Draft; do not mark Ready/merge/deploy/begin Phase 4").
+Draft; do not mark Ready/merge/deploy/begin Phase 4"), and again in the
+ATOMIC CLOSURE round above ("Keep PR #73 Draft. Do not mark Ready. Do not
+merge. Do not deploy. Do not begin Phase 4.").
