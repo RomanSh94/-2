@@ -686,13 +686,28 @@ CREATE TABLE IF NOT EXISTS core_practice_proposals (
     superseded_reason   TEXT,
     outcome             TEXT,
     outcome_recorded_at TEXT,
-    CHECK(status IN ('PROPOSED','PENDING','GRANTED','DECLINED','STARTED','COMPLETED',
-                     'WITHDRAWN','EXPIRED','SUPERSEDED','DELIVERY_FAILED')),
-    CHECK(outcome IS NULL OR outcome IN ('HELPED','PARTLY_HELPED','NO_CHANGE','WORSE'))
+    -- PR #73 request-changes §6: restart-safe delivery tracking for the two
+    -- post-practice follow-up UI prompts (distinct from proposal_message_id/
+    -- delivered_at above, which track the PRACTICE STEPS message only).
+    -- NULL = never attempted; 'FAILED' = attempted, Telegram rejected it,
+    -- eligible for one idempotent retry; 'DELIVERED' = terminal, never
+    -- retried or overwritten again.
+    outcome_prompt_message_id   INTEGER,
+    outcome_prompt_delivered_at TEXT,
+    outcome_prompt_status       TEXT,
+    helped_prompt_message_id    INTEGER,
+    helped_prompt_delivered_at  TEXT,
+    helped_prompt_status        TEXT,
+    CHECK(status IN ('PROPOSED','PENDING','GRANTED','DELIVERING','DECLINED','STARTED',
+                     'COMPLETED','WITHDRAWN','EXPIRED','SUPERSEDED','DELIVERY_FAILED')),
+    CHECK(outcome IS NULL OR outcome IN ('HELPED','PARTLY_HELPED','NO_CHANGE','WORSE')),
+    CHECK(outcome_prompt_status IS NULL OR outcome_prompt_status IN ('FAILED','DELIVERED')),
+    CHECK(helped_prompt_status IS NULL OR helped_prompt_status IN ('FAILED','DELIVERED'))
 );
 CREATE INDEX IF NOT EXISTS idx_core_practice_proposals_user ON core_practice_proposals(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_core_one_actionable_proposal_per_session
-    ON core_practice_proposals(session_id) WHERE status IN ('PROPOSED','PENDING');
+    ON core_practice_proposals(session_id)
+    WHERE status IN ('PROPOSED','PENDING','GRANTED','DELIVERING');
 """
 
 # Additive column migrations (no migration system in this repo; ADD COLUMN is
@@ -735,11 +750,11 @@ _MIGRATIONS = [
     # whether a RED event came from pattern-matched text or a direct button
     # answer.
     ("crisis_events", "source", "TEXT"),
-    # Phase 3 final closure: qualitative self-reported outcome for a
-    # COMPLETED PracticeProposal -- no before score, no estimation, see
-    # PracticeOutcome in therapeutic_domain.py.
-    ("core_practice_proposals", "outcome", "TEXT"),
-    ("core_practice_proposals", "outcome_recorded_at", "TEXT"),
+    # core_practice_proposals.outcome/outcome_recorded_at are handled by the
+    # dedicated _rename_old_practice_proposals_if_needed/_finish_practice_
+    # proposals_migration rebuild below (a plain ADD COLUMN cannot also fix
+    # that table's CHECK constraint and partial-index WHERE clause, so a
+    # full rebuild is needed anyway -- no separate ADD COLUMN entry required).
 ]
 
 
@@ -949,11 +964,81 @@ async def _backfill_notice_acknowledgements(db) -> None:
         "AND privacy_notice_acknowledged_at IS NOT NULL")
 
 
+# PR #73 request-changes §9: a fresh-schema CHECK constraint (status now
+# allows DELIVERING; outcome has its own CHECK) is NOT the same invariant as
+# what a plain ADD-COLUMN migration gives an already-deployed table -- SQLite
+# CHECK constraints are baked into the table definition at CREATE time and
+# cannot be altered in place. Rebuilt the same way _rename_old_onboarding_
+# state_if_needed/_finish_onboarding_state_migration already do: rename the
+# old-shape table aside BEFORE executescript (whose CREATE TABLE IF NOT
+# EXISTS then makes a fresh, correctly-constrained one), copy every row
+# across AFTER, then drop the renamed table. Both steps are idempotent/
+# crash-safe to rerun. This also naturally fixes the partial UNIQUE index's
+# WHERE clause (GRANTED/DELIVERING now also block a second actionable
+# proposal per session) -- CREATE INDEX IF NOT EXISTS alone would never have
+# updated an already-existing index's definition, but dropping the table
+# drops its indexes too, and the fresh CREATE TABLE recreates the correct one.
+_OLD_PRACTICE_PROPOSALS_TABLE = "_core_practice_proposals_pre_delivering"
+
+
+async def _rename_old_practice_proposals_if_needed(db) -> None:
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='core_practice_proposals'")
+    row = await cur.fetchone()
+    if row is None:
+        return  # no table yet -- executescript's CREATE TABLE IF NOT EXISTS makes a fresh one
+    sql = row[0] or ""
+    if "DELIVERING" in sql and "outcome" in sql and "outcome_prompt_status" in sql:
+        return  # already on the current shape -- nothing to migrate
+    await db.execute(
+        f"ALTER TABLE core_practice_proposals RENAME TO {_OLD_PRACTICE_PROPOSALS_TABLE}")
+    logging.info("core_practice_proposals: old schema detected, renamed for migration")
+
+
+async def _finish_practice_proposals_migration(db) -> None:
+    cur = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name="
+        f"'{_OLD_PRACTICE_PROPOSALS_TABLE}'")
+    if not await cur.fetchone():
+        return  # nothing was renamed in step 1 -- no old-schema table existed
+    cur = await db.execute(f"PRAGMA table_info({_OLD_PRACTICE_PROPOSALS_TABLE})")
+    old_cols = {r[1] for r in await cur.fetchall()}
+
+    def col_or_null(name: str) -> str:
+        return name if name in old_cols else "NULL"
+
+    cur = await db.execute(f"SELECT COUNT(*) FROM {_OLD_PRACTICE_PROPOSALS_TABLE}")
+    total = (await cur.fetchone())[0]
+    await db.execute(
+        "INSERT INTO core_practice_proposals "
+        "(id, user_id, session_id, practice_id, practice_version, purpose, "
+        " expected_duration, status, proposal_message_id, created_at, "
+        " expires_at, delivered_at, superseded_reason, outcome, outcome_recorded_at, "
+        " outcome_prompt_message_id, outcome_prompt_delivered_at, outcome_prompt_status, "
+        " helped_prompt_message_id, helped_prompt_delivered_at, helped_prompt_status) "
+        "SELECT id, user_id, session_id, practice_id, practice_version, purpose, "
+        "expected_duration, status, proposal_message_id, created_at, "
+        f"expires_at, delivered_at, superseded_reason, {col_or_null('outcome')}, "
+        f"{col_or_null('outcome_recorded_at')}, "
+        f"{col_or_null('outcome_prompt_message_id')}, {col_or_null('outcome_prompt_delivered_at')}, "
+        f"{col_or_null('outcome_prompt_status')}, {col_or_null('helped_prompt_message_id')}, "
+        f"{col_or_null('helped_prompt_delivered_at')}, {col_or_null('helped_prompt_status')} "
+        f"FROM {_OLD_PRACTICE_PROPOSALS_TABLE}")
+    cur = await db.execute("SELECT changes()")
+    inserted = (await cur.fetchone())[0]
+    await db.execute(f"DROP TABLE {_OLD_PRACTICE_PROPOSALS_TABLE}")
+    logging.info(
+        "core_practice_proposals migration: %d/%d row(s) copied to the new schema",
+        inserted, total)
+
+
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await _rename_old_onboarding_state_if_needed(db)
+        await _rename_old_practice_proposals_if_needed(db)
         await db.executescript(SCHEMA)
         await _finish_onboarding_state_migration(db)
+        await _finish_practice_proposals_migration(db)
         await _apply_migrations(db)
         await _migrate_questionnaire_response_uniqueness(db)
         await _migrate_intervention_baseline_uniqueness(db)
@@ -3067,7 +3152,10 @@ async def update_core_session_authoritative(state: _core.SessionState,
 _PP_COLUMNS = ("id", "user_id", "session_id", "practice_id", "practice_version",
               "purpose", "expected_duration", "status", "proposal_message_id",
               "created_at", "expires_at", "delivered_at", "superseded_reason",
-              "outcome", "outcome_recorded_at")
+              "outcome", "outcome_recorded_at",
+              "outcome_prompt_message_id", "outcome_prompt_delivered_at",
+              "outcome_prompt_status", "helped_prompt_message_id",
+              "helped_prompt_delivered_at", "helped_prompt_status")
 
 
 def _pp_row_to_obj(row) -> "_core.PracticeProposal":
@@ -3088,7 +3176,8 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
         await db.execute(
             """UPDATE core_practice_proposals SET status='SUPERSEDED',
                superseded_reason='newer_proposal'
-               WHERE session_id=? AND user_id=? AND status IN ('PROPOSED','PENDING')""",
+               WHERE session_id=? AND user_id=?
+                 AND status IN ('PROPOSED','PENDING','GRANTED','DELIVERING')""",
             (session_id, uid))
         cur = await db.execute(
             """INSERT INTO core_practice_proposals
@@ -3115,6 +3204,22 @@ async def get_latest_proposal_for_session(session_id, user_id: int) -> "_core.Pr
             "WHERE session_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
             (session_id, user_id))).fetchone()
         return _pp_row_to_obj(row) if row else None
+
+
+async def get_latest_outcome_for_practice(user_id: int, practice_id: str) -> str | None:
+    """PR #73 request-changes §7: the minimum adverse-history guard --
+    the user's most recently RECORDED outcome for this exact practice_id
+    (across ALL of their sessions, any status), or None if they have never
+    reported one. Callers use this to refuse automatically re-proposing a
+    practice whose latest outcome was WORSE -- HELPED/PARTLY_HELPED/
+    NO_CHANGE/never-reported all permit reuse."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            "SELECT outcome FROM core_practice_proposals "
+            "WHERE user_id=? AND practice_id=? AND outcome IS NOT NULL "
+            "ORDER BY outcome_recorded_at DESC, id DESC LIMIT 1",
+            (user_id, practice_id))).fetchone()
+        return row[0] if row else None
 
 
 async def get_practice_proposal(proposal_id, user_id: int) -> "_core.PracticeProposal | None":
@@ -3175,14 +3280,72 @@ async def record_practice_outcome(proposal_id, user_id: int, outcome: str) -> bo
         return cur.rowcount > 0
 
 
+# PR #73 request-changes §6 -- restart-safe delivery tracking for the two
+# post-practice follow-up UI prompts. Both prompt_kind values below map 1:1
+# onto the outcome_prompt_*/helped_prompt_* column pairs; a single
+# parametrized pair of functions avoids duplicating the same CAS logic twice.
+_PROMPT_COLUMNS = {
+    "outcome": ("outcome_prompt_status", "outcome_prompt_message_id", "outcome_prompt_delivered_at"),
+    "helped": ("helped_prompt_status", "helped_prompt_message_id", "helped_prompt_delivered_at"),
+}
+
+
+async def mark_prompt_delivered(proposal_id, user_id: int, prompt_kind: str, message_id: int) -> bool:
+    """Idempotent: only writes if the prompt was never DELIVERED before (NULL
+    or a prior FAILED attempt) -- a duplicate/retried success can never
+    create two 'active' deliveries or downgrade an already-terminal DELIVERED."""
+    status_col, msgid_col, at_col = _PROMPT_COLUMNS[prompt_kind]
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"""UPDATE core_practice_proposals SET {status_col}='DELIVERED',
+               {msgid_col}=?, {at_col}=datetime('now')
+               WHERE id=? AND user_id=? AND ({status_col} IS NULL OR {status_col}='FAILED')""",
+            (message_id, proposal_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def mark_prompt_failed(proposal_id, user_id: int, prompt_kind: str) -> bool:
+    """Never overwrites an already-DELIVERED prompt (e.g. a stale retry
+    racing a just-succeeded send) -- only NULL (first attempt) or FAILED
+    (a previous failure) may transition to FAILED."""
+    status_col, _, _ = _PROMPT_COLUMNS[prompt_kind]
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"""UPDATE core_practice_proposals SET {status_col}='FAILED'
+               WHERE id=? AND user_id=? AND ({status_col} IS NULL OR {status_col}='FAILED')""",
+            (proposal_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def get_proposals_with_failed_prompts(user_id: int) -> list:
+    """Restart-safe recovery query: every proposal for this user whose
+    outcome-stage or helped-stage follow-up prompt failed to deliver and is
+    still eligible for exactly one idempotent retry (STARTED with a failed
+    outcome prompt, or COMPLETED with a failed helped prompt -- both are the
+    ONLY states where that specific prompt is still meaningful to resend)."""
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals "
+            "WHERE user_id=? AND ((status='STARTED' AND outcome_prompt_status='FAILED') "
+            "OR (status='COMPLETED' AND helped_prompt_status='FAILED'))",
+            (user_id,))).fetchall()
+        return [_pp_row_to_obj(r) for r in rows]
+
+
 async def supersede_active_practice_proposals(uid: int, reason: str) -> int:
-    """Hardening §4: invalidate every actionable proposal for this user in
-    one call -- used on crisis, /start, a new Depression Disclosure flow,
-    rollout-off, and any other event that makes standing consent stale."""
+    """Hardening §4; PR #73 request-changes §3: invalidate every actionable
+    OR in-flight-delivery proposal for this user in one call -- used on
+    crisis, /start, a new Depression Disclosure flow, rollout-off, and any
+    other event that makes standing consent (or an in-progress delivery
+    claim) stale. GRANTED/DELIVERING are included, not just PROPOSED/
+    PENDING: a crisis beginning after consent was granted but before the
+    practice steps were actually sent must still stop that send."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             """UPDATE core_practice_proposals SET status='SUPERSEDED', superseded_reason=?
-               WHERE user_id=? AND status IN ('PROPOSED','PENDING')""",
+               WHERE user_id=? AND status IN ('PROPOSED','PENDING','GRANTED','DELIVERING')""",
             (reason, uid))
         await db.commit()
         return cur.rowcount

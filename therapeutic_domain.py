@@ -122,6 +122,13 @@ class PracticeProposalStatus(str, Enum):
     PENDING = "PENDING"
     GRANTED = "GRANTED"
     DECLINED = "DECLINED"
+    # PR #73 request-changes §3: a real delivery-claim state -- GRANTED means
+    # "the user said yes", DELIVERING means "this callback invocation has
+    # claimed the exclusive right to attempt the Telegram send and has
+    # rechecked safety immediately before doing so". Closes the race where a
+    # crisis/​start beginning between GRANTED and the actual send would
+    # otherwise let practice steps go out to a user now in crisis.
+    DELIVERING = "DELIVERING"
     STARTED = "STARTED"
     COMPLETED = "COMPLETED"
     WITHDRAWN = "WITHDRAWN"
@@ -526,6 +533,15 @@ class PracticeProposal:
     superseded_reason: str | None = None
     outcome: "PracticeOutcome | None" = None
     outcome_recorded_at: str | None = None
+    # PR #73 request-changes §6: restart-safe delivery tracking for the two
+    # post-practice follow-up UI prompts, distinct from proposal_message_id/
+    # delivered_at above (which track the PRACTICE STEPS message only).
+    outcome_prompt_message_id: int | None = None
+    outcome_prompt_delivered_at: str | None = None
+    outcome_prompt_status: str | None = None
+    helped_prompt_message_id: int | None = None
+    helped_prompt_delivered_at: str | None = None
+    helped_prompt_status: str | None = None
 
     def __post_init__(self):
         if not str(self.proposal_id).strip():
@@ -540,6 +556,10 @@ class PracticeProposal:
         self.superseded_reason = _clip(self.superseded_reason, 100)
         if self.outcome is not None:
             self.outcome = as_enum(PracticeOutcome, self.outcome)
+        for field_name in ("outcome_prompt_status", "helped_prompt_status"):
+            value = getattr(self, field_name)
+            if value is not None and value not in ("FAILED", "DELIVERED"):
+                raise ValueError(f"PracticeProposal.{field_name} must be None/FAILED/DELIVERED, got {value!r}")
 
     @property
     def is_actionable(self) -> bool:
@@ -562,6 +582,12 @@ class PracticeProposal:
             "superseded_reason": self.superseded_reason,
             "outcome": self.outcome.value if self.outcome else None,
             "outcome_recorded_at": self.outcome_recorded_at,
+            "outcome_prompt_message_id": self.outcome_prompt_message_id,
+            "outcome_prompt_delivered_at": self.outcome_prompt_delivered_at,
+            "outcome_prompt_status": self.outcome_prompt_status,
+            "helped_prompt_message_id": self.helped_prompt_message_id,
+            "helped_prompt_delivered_at": self.helped_prompt_delivered_at,
+            "helped_prompt_status": self.helped_prompt_status,
         }
 
     @classmethod

@@ -142,6 +142,8 @@ from database import (
     session_json_snapshot, create_practice_proposal, get_practice_proposal,
     transition_practice_proposal, mark_proposal_delivered,
     supersede_active_practice_proposals, record_practice_outcome,
+    get_latest_outcome_for_practice, mark_prompt_delivered, mark_prompt_failed,
+    get_proposals_with_failed_prompts,
 )
 import conversation_controller as controller
 from therapeutic_domain import (
@@ -1124,14 +1126,27 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict
     # LLM call, as a persisted proposal -- this turn's prompt AND the
     # eventual consent buttons both reference it by proposal_id, so the LLM
     # can never describe one practice while the callback delivers another.
+    #
+    # PR #73 request-changes §7: the minimum adverse-history guard -- if the
+    # user's LATEST recorded outcome for this exact practice was WORSE,
+    # never automatically re-propose it. No alternative-selection logic
+    # exists at this layer (that is Phase 5's Method Registry, deliberately
+    # out of scope here), so the honest response is to say so and offer
+    # nothing else automatically -- never silently repeat what already made
+    # things worse, never invent a substitute.
     proposal = None
+    adverse_guard = False
     if turn_intent is Intent.PRACTICE:
         practice = get_production_practice_by_id(_PRACTICE_ID, lang)
         if practice:
-            proposal = await create_practice_proposal(
-                uid, session.session_id, practice["id"], practice.get("version", "v1"),
-                purpose=practice.get("name", _PRACTICE_ID),
-                expected_duration=f"{practice.get('duration_min', 5)} минут")
+            latest_outcome = await get_latest_outcome_for_practice(uid, practice["id"])
+            if latest_outcome == PracticeOutcome.WORSE.value:
+                adverse_guard = True
+            else:
+                proposal = await create_practice_proposal(
+                    uid, session.session_id, practice["id"], practice.get("version", "v1"),
+                    purpose=practice.get("name", _PRACTICE_ID),
+                    expected_duration=f"{practice.get('duration_min', 5)} минут")
 
     # §7/§8/§9: bounded recent context -- this user's own last few turns (any
     # scenario, not just prior controller ones), fetched BEFORE this turn's
@@ -1149,7 +1164,8 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict
                        risk.get("score", 0), risk.get("categories", []))
     return {"session": session, "plan": plan, "known_facts": known_facts,
            "recent_context": recent_context, "user_text": user_text, "lang": lang,
-           "base_state_json": base_state_json, "proposal": proposal}
+           "base_state_json": base_state_json, "proposal": proposal,
+           "adverse_guard": adverse_guard}
 
 
 async def _controller_generate_and_deliver(message: Message, uid: int, claim: dict,
@@ -1160,6 +1176,24 @@ async def _controller_generate_and_deliver(message: Message, uid: int, claim: di
     session, plan, known_facts = claim["session"], claim["plan"], claim["known_facts"]
     recent_context = claim.get("recent_context")
     user_text, lang = claim["user_text"], claim["lang"]
+
+    # PR #73 request-changes §7: adverse-history guard fired during claim --
+    # skip the LLM entirely and answer with a fixed, honest, non-inviting
+    # message. No alternative practice is offered automatically.
+    if claim.get("adverse_guard"):
+        text = ("В прошлый раз эта практика, судя по твоему отклику, не "
+                "помогла — стало хуже. Не буду предлагать её снова."
+                if lang != "en" else
+                "Last time, based on what you told me, this practice made "
+                "things worse. I won't suggest it again.")
+        if _user_generation_superseded(uid, turn_gen):
+            return
+        if not await update_core_session_authoritative(session, claim["base_state_json"]):
+            return
+        await deliver_response(message, uid, text, lang)
+        await save_message(uid, "assistant", text, "controller", lang)
+        return
+
     proposal = claim.get("proposal")
     practice_name = proposal.purpose if proposal is not None else None
     expected_duration = proposal.expected_duration if proposal is not None else None
@@ -1675,6 +1709,15 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                                risk["score"], risk["categories"])
     finally:
         _ingest_leave(uid, _ingest)
+
+    # PR #73 request-changes §6: best-effort, restart-safe recovery for any
+    # post-practice follow-up prompt that previously failed to deliver --
+    # runs on every real inbound turn (independent of whether THIS turn is
+    # Controller-claimed), never holds the ingestion lock, and is fully
+    # idempotent (mark_prompt_delivered's own CAS prevents a duplicate
+    # active prompt even if this fires more than once).
+    if await access_control.core_rollout_allowed(uid):
+        await _retry_failed_practice_prompts(message, uid)
 
     # Conversation Controller: the SLOW half (LLM call, validation, delivery)
     # -- strictly AFTER the ingestion lock above is released (hardening §5),
@@ -2297,25 +2340,77 @@ async def cb_cc_consent(callback: CallbackQuery):
         await callback.message.answer(controller.fallback_text(lang, Intent.PRACTICE))
         return
 
+    # PR #73 request-changes §3: a real delivery-claim state machine closes
+    # the consent-to-delivery crisis race. GRANTED alone was not enough --
+    # a crisis/​start beginning between GRANTED and the actual Telegram send
+    # could not be caught (supersede_active_practice_proposals now DOES
+    # cover GRANTED/DELIVERING too, but only a fresh safety recheck right
+    # here, immediately before claiming delivery, closes the narrow window
+    # between "the crisis write landed" and "this callback re-reads it").
+    if (await get_active_crisis(uid) is not None
+            or await get_active_disclosure_flow(uid) is not None
+            or not await access_control.core_rollout_allowed(uid)):
+        return
+    resession = await get_core_session(session_id, uid)
+    if resession is None or resession.lifecycle_status is not LifecycleStatus.OPEN:
+        return
+    # Atomic delivery claim: GRANTED -> DELIVERING. Only ONE callback
+    # invocation can ever win this (the CAS's own ownership+status+expiry
+    # checks), so a duplicate/racing tap here is rejected the same way a
+    # duplicate PENDING->GRANTED tap already is.
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.GRANTED.value,
+            to_status=PracticeProposalStatus.DELIVERING.value, require_unexpired=True):
+        return
+    # Recheck safety ONE more time, immediately before the actual external
+    # (unsendable-boundary) Telegram call -- the narrowest possible window
+    # is between this check and the send itself, which cannot be closed
+    # further without controlling Telegram's own delivery latency. Honest
+    # guarantee: crisis/​start beginning BEFORE this line is always caught;
+    # crisis/​start beginning strictly AFTER this line and DURING the network
+    # call itself is not (no system can close an external I/O boundary).
+    if await get_active_crisis(uid) is not None:
+        await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
+            to_status=PracticeProposalStatus.SUPERSEDED.value, reason="crisis_before_send")
+        return
+
     # §3 final closure: STARTED means the exact steps were SUCCESSFULLY
-    # delivered -- the send is attempted FIRST, and the GRANTED->STARTED
-    # transition only happens once it actually succeeded. A send failure
-    # leaves the proposal at GRANTED (never falsely STARTED) and shows no
-    # outcome buttons for content the user never received.
+    # delivered -- the send is attempted FIRST, and DELIVERING->STARTED only
+    # happens once it actually succeeded. A send failure records
+    # DELIVERY_FAILED (never leaves the proposal stuck in DELIVERING, never
+    # falsely STARTED, never shows outcome buttons for content the user
+    # never received).
     steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
     try:
         await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}",
                                       parse_mode="HTML")
     except Exception as e:
         print(f"[controller] practice steps delivery failed uid={uid}: {type(e).__name__}: {e}")
+        await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
+            to_status=PracticeProposalStatus.DELIVERY_FAILED.value, reason="send_exception")
         return
+    # Only the delivery owner (this exact callback invocation, having won
+    # the GRANTED->DELIVERING CAS above) may mark STARTED.
     if not await transition_practice_proposal(
-            proposal_id, uid, from_status=PracticeProposalStatus.GRANTED.value,
+            proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
             to_status=PracticeProposalStatus.STARTED.value):
-        return  # lost a race (e.g. crisis/superseded) between delivery and this write
-    await callback.message.answer(
-        "Как прошло?" if lang != "en" else "How did it go?",
-        reply_markup=_practice_outcome_kb(proposal_id, lang))
+        return  # superseded between the send and this write -- steps went out, but
+                # were also invalidated moments later; the outcome UI stays silent
+    # PR #73 request-changes §6: restart-safe delivery tracking -- a send
+    # failure is recorded (mark_prompt_failed), not just logged, and a
+    # later ordinary turn's _retry_failed_practice_prompts recovers it
+    # idempotently (mark_prompt_delivered never fires twice for the same
+    # prompt_kind, so a duplicate retry cannot create a second active prompt).
+    try:
+        sent = await callback.message.answer(
+            "Как прошло?" if lang != "en" else "How did it go?",
+            reply_markup=_practice_outcome_kb(proposal_id, lang))
+        await mark_prompt_delivered(proposal_id, uid, "outcome", sent.message_id)
+    except Exception as e:
+        print(f"[controller] outcome-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+        await mark_prompt_failed(proposal_id, uid, "outcome")
 
 
 def _practice_outcome_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
@@ -2341,6 +2436,41 @@ def _practice_helped_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=(ru if lang != "en" else en),
                               callback_data=f"cc:helped:{proposal_id}:{val}")]
         for val, ru, en in labels])
+
+
+async def _retry_failed_practice_prompts(message: Message, uid: int) -> None:
+    """PR #73 request-changes §6: restart-safe recovery, called on every
+    real inbound turn. Resends whichever post-practice follow-up prompt
+    previously failed, exactly once each (mark_prompt_delivered's own CAS
+    is what makes a duplicate call here harmless -- it only ever succeeds
+    once per prompt_kind per proposal). Never sent during an active crisis
+    (a crisis screen, not a practice follow-up, owns the conversation then)."""
+    if await get_active_crisis(uid) is not None:
+        return
+    try:
+        pending = await get_proposals_with_failed_prompts(uid)
+    except Exception:
+        return
+    if not pending:
+        return
+    lang = await get_user_language(uid) or "ru"
+    for p in pending:
+        if p.status is PracticeProposalStatus.STARTED and p.outcome_prompt_status == "FAILED":
+            try:
+                sent = await message.answer(
+                    "Как прошло?" if lang != "en" else "How did it go?",
+                    reply_markup=_practice_outcome_kb(p.proposal_id, lang))
+                await mark_prompt_delivered(p.proposal_id, uid, "outcome", sent.message_id)
+            except Exception as e:
+                print(f"[controller] outcome-prompt retry failed uid={uid}: {type(e).__name__}: {e}")
+        elif p.status is PracticeProposalStatus.COMPLETED and p.helped_prompt_status == "FAILED":
+            try:
+                sent = await message.answer(
+                    "Как это подействовало?" if lang != "en" else "How did that go?",
+                    reply_markup=_practice_helped_kb(p.proposal_id, lang))
+                await mark_prompt_delivered(p.proposal_id, uid, "helped", sent.message_id)
+            except Exception as e:
+                print(f"[controller] helped-prompt retry failed uid={uid}: {type(e).__name__}: {e}")
 
 
 # ── Conversation Controller: post-practice outcome (Phase 3 final closure §3
@@ -2391,9 +2521,15 @@ async def cb_cc_outcome(callback: CallbackQuery):
             await callback.answer()
             return
         await callback.answer()
-        await callback.message.answer(
-            "Хорошо. Как это подействовало?" if lang != "en" else "Good. How did that go?",
-            reply_markup=_practice_helped_kb(proposal_id, lang))
+        # Same restart-safe delivery tracking as the outcome prompt above.
+        try:
+            sent = await callback.message.answer(
+                "Хорошо. Как это подействовало?" if lang != "en" else "Good. How did that go?",
+                reply_markup=_practice_helped_kb(proposal_id, lang))
+            await mark_prompt_delivered(proposal_id, uid, "helped", sent.message_id)
+        except Exception as e:
+            print(f"[controller] helped-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+            await mark_prompt_failed(proposal_id, uid, "helped")
         return
 
     # "stopped" (paused, no pressure to retry) and "refused" (explicit
@@ -2410,17 +2546,39 @@ async def cb_cc_outcome(callback: CallbackQuery):
         return
     await callback.answer()
     if value == "refused":
-        session = await get_core_session(proposal.session_id, uid)
-        if session is not None and session.lifecycle_status is LifecycleStatus.OPEN:
+        # PR #73 request-changes §8: check the CAS result -- never claim a
+        # write persisted when it did not, and never overwrite a NEWER
+        # turn's session state with a stale snapshot. One bounded retry from
+        # a fresh snapshot covers the common case (no other write landed in
+        # between); if that also loses, the truthful copy below reflects
+        # what actually happened instead of promising something moot.
+        persisted = False
+        for _ in range(2):
+            session = await get_core_session(proposal.session_id, uid)
+            if session is None or session.lifecycle_status is not LifecycleStatus.OPEN:
+                break
             from datetime import datetime, timezone
             prior_json = session_json_snapshot(session)
             session.add_repair_signal(
                 {RepairConstraint.EXERCISE_REJECTED}, source_turn_id=None,
                 created_at=datetime.now(timezone.utc).isoformat(),
                 window_turns=controller.REPAIR_WINDOW_TURNS)
-            await update_core_session_authoritative(session, prior_json)
-        text = ("Понял, больше не буду предлагать это упражнение." if lang != "en"
-               else "Got it, I won't suggest this exercise again.")
+            if await update_core_session_authoritative(session, prior_json):
+                persisted = True
+                break
+        # Truthful, scope-accurate copy either way: EXERCISE_REJECTED is a
+        # bounded-turn-window constraint, explicitly overrideable by a later
+        # explicit request (conversation_controller.classify_repair_
+        # overrides) -- never "never again", and never claimed as recorded
+        # if the write actually did not land.
+        if persisted:
+            text = ("Понял. Не буду предлагать упражнения без твоего явного "
+                    "запроса в ближайшем продолжении разговора." if lang != "en" else
+                    "Got it. I won't suggest exercises without your explicit "
+                    "request for the next while.")
+        else:
+            text = ("Понял, что не хочешь продолжать сейчас." if lang != "en" else
+                    "Got it, you don't want to continue right now.")
     else:
         text = ("Хорошо, останавливаемся. Ты не обязан(а) продолжать." if lang != "en"
                else "Okay, let's stop. You don't have to continue.")
@@ -2454,6 +2612,25 @@ async def cb_cc_outcome_detail(callback: CallbackQuery):
         await callback.answer()
         return
     if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    # PR #73 request-changes §4: cc:helped must independently verify
+    # ownership/existence/status/session-lifecycle exactly like cc:outcome
+    # does -- not rely on record_practice_outcome's own CAS alone (that CAS
+    # already enforces ownership+COMPLETED+not-yet-recorded atomically, but
+    # the session-lifecycle check below is a SEPARATE axis it cannot see).
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None or proposal.status is not PracticeProposalStatus.COMPLETED:
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
         await callback.answer()
         return
     ok = await record_practice_outcome(proposal_id, uid, outcome)
