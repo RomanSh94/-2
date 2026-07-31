@@ -1022,6 +1022,22 @@ async def _rename_old_practice_proposals_if_needed(db) -> None:
         return  # already on the current shape -- nothing to migrate
     await db.execute(
         f"ALTER TABLE core_practice_proposals RENAME TO {_OLD_PRACTICE_PROPOSALS_TABLE}")
+    # PR #73 MIGRATION COMPATIBILITY GATE: SQLite does NOT rename a table's
+    # indexes when the table itself is renamed -- they keep their original
+    # names, still attached to the now-renamed-aside table. The fresh
+    # schema's executescript() below creates indexes with the SAME names
+    # (CREATE ... INDEX IF NOT EXISTS idx_core_practice_proposals_user /
+    # idx_core_one_actionable_proposal_per_session), so leaving the old
+    # ones in place would silently block the NEW ones from ever being
+    # created -- IF NOT EXISTS treats the name as already taken, even
+    # though it is the OLD (narrower) index definition still doing the
+    # work. This was a real, previously-undetected latent bug: it made the
+    # new partial unique index a no-op on every migrated (non-fresh)
+    # database, never actually enforced by SQLite after an upgrade.
+    # Dropping the index (not the table) leaves the renamed-aside table's
+    # rows fully intact for the later copy step.
+    await db.execute("DROP INDEX IF EXISTS idx_core_practice_proposals_user")
+    await db.execute("DROP INDEX IF EXISTS idx_core_one_actionable_proposal_per_session")
     logging.info("core_practice_proposals: old schema detected, renamed for migration")
 
 
@@ -1042,6 +1058,34 @@ async def _finish_practice_proposals_migration(db) -> None:
 
     cur = await db.execute(f"SELECT COUNT(*) FROM {_OLD_PRACTICE_PROPOSALS_TABLE}")
     total = (await cur.fetchone())[0]
+
+    # PR #73 MIGRATION COMPATIBILITY GATE: the OLD partial unique index (and
+    # the OLD create_practice_proposal) only ever enforced "one actionable
+    # proposal per session" across PROPOSED/PENDING -- GRANTED (and later
+    # DELIVERING) were never covered by either. Real old-schema data can
+    # therefore legally contain MORE THAN ONE actionable row for the same
+    # (user_id, session_id) -- e.g. two GRANTED rows, or a GRANTED plus a
+    # newer PENDING. Copying such rows verbatim into the NEW schema's wider
+    # partial unique index (PROPOSED/PENDING/GRANTED/DELIVERING) would raise
+    # IntegrityError and crash init_db(). Every row is still copied here
+    # (row-count preserving, no history deleted) -- only the LOSING
+    # duplicate's status/superseded_reason are normalized. The winner is
+    # deterministic (newest created_at, ties broken by highest id), computed
+    # with a correlated subquery rather than a window function so this works
+    # on any SQLite version. COMPLETED/WITHDRAWN/DECLINED/EXPIRED/
+    # DELIVERY_FAILED/already-SUPERSEDED rows are untouched -- the CASE only
+    # ever fires for a row whose OWN status is still in the actionable set.
+    is_duplicate_loser = (
+        "T.status IN ('PROPOSED','PENDING','GRANTED','DELIVERING') AND EXISTS ("
+        f"SELECT 1 FROM {_OLD_PRACTICE_PROPOSALS_TABLE} R2 "
+        "WHERE R2.user_id=T.user_id AND R2.session_id=T.session_id "
+        "AND R2.status IN ('PROPOSED','PENDING','GRANTED','DELIVERING') "
+        "AND (R2.created_at > T.created_at OR (R2.created_at = T.created_at AND R2.id > T.id)))"
+    )
+    status_expr = f"CASE WHEN {is_duplicate_loser} THEN 'SUPERSEDED' ELSE T.status END"
+    reason_expr = (f"CASE WHEN {is_duplicate_loser} THEN 'migration_duplicate_actionable' "
+                   f"ELSE {col_or_null('superseded_reason')} END")
+
     await db.execute(
         "INSERT INTO core_practice_proposals "
         "(id, user_id, session_id, practice_id, practice_version, purpose, "
@@ -1052,9 +1096,9 @@ async def _finish_practice_proposals_migration(db) -> None:
         " helped_prompt_message_id, helped_prompt_delivered_at, helped_prompt_status, "
         " helped_prompt_claimed_at, helped_prompt_claim_id, reporting_window_status, "
         " is_worse_override) "
-        "SELECT id, user_id, session_id, practice_id, practice_version, purpose, "
-        "expected_duration, status, proposal_message_id, created_at, "
-        f"expires_at, delivered_at, superseded_reason, {col_or_null('outcome')}, "
+        "SELECT T.id, T.user_id, T.session_id, T.practice_id, T.practice_version, T.purpose, "
+        f"T.expected_duration, {status_expr}, T.proposal_message_id, T.created_at, "
+        f"T.expires_at, T.delivered_at, {reason_expr}, {col_or_null('outcome')}, "
         f"{col_or_null('outcome_recorded_at')}, "
         f"{col_or_null('outcome_prompt_message_id')}, {col_or_null('outcome_prompt_delivered_at')}, "
         f"{col_or_null('outcome_prompt_status')}, {col_or_null('outcome_prompt_claimed_at')}, "
@@ -1064,7 +1108,7 @@ async def _finish_practice_proposals_migration(db) -> None:
         f"{col_or_null('helped_prompt_claimed_at')}, {col_or_null('helped_prompt_claim_id')}, "
         f"{col_or_null('reporting_window_status')}, "
         f"{col_or_default('is_worse_override', '0')} "
-        f"FROM {_OLD_PRACTICE_PROPOSALS_TABLE}")
+        f"FROM {_OLD_PRACTICE_PROPOSALS_TABLE} AS T")
     cur = await db.execute("SELECT changes()")
     inserted = (await cur.fetchone())[0]
     await db.execute(f"DROP TABLE {_OLD_PRACTICE_PROPOSALS_TABLE}")

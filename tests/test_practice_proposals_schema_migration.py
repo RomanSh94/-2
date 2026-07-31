@@ -369,3 +369,268 @@ def test_interrupted_migration_recovers_on_next_boot(old_db):
     con.close()
     assert renamed_after is None, "the temporary renamed-aside table must be cleaned up"
 
+
+# ── Duplicate-actionable-row migration compatibility (PR #73 FINAL
+# MIGRATION COMPATIBILITY GATE). The OLD partial unique index (see
+# _OLD_SCHEMA_DDL above: `WHERE status IN ('PROPOSED','PENDING')`) and the
+# OLD create_practice_proposal (which only ever superseded PROPOSED/
+# PENDING before inserting) never covered GRANTED -- real old-schema data
+# can therefore legally contain MORE than one actionable row for the same
+# (user_id, session_id). Copying such rows verbatim into the NEW schema's
+# wider partial unique index (PROPOSED/PENDING/GRANTED/DELIVERING) would
+# raise IntegrityError and crash init_db(). database._finish_practice_
+# proposals_migration now normalizes: the newest actionable row (by
+# created_at, ties broken by id) keeps its real status; every older
+# conflicting one becomes SUPERSEDED/'migration_duplicate_actionable'.
+# No row is ever deleted, and no non-actionable historical status is ever
+# rewritten. ───────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def old_db_with_duplicates(tmp_path, monkeypatch):
+    """A realistic OLD-schema database with exactly the three duplicate
+    shapes named in the spec (two old GRANTED; old GRANTED + newer
+    PENDING; old PROPOSED + newer GRANTED), plus same-user/different-
+    session and different-user control rows, plus a historical COMPLETED
+    row sharing a session with duplicates -- to prove normalization never
+    leaks across session or user boundaries and never touches non-
+    actionable history."""
+    path = str(tmp_path / "dup.db")
+    con = sqlite3.connect(path)
+    con.executescript(_OLD_SCHEMA_DDL)
+    con.execute("INSERT INTO users (id, username, first_name) VALUES (1, 'u1', 'U1')")
+    con.execute("INSERT INTO users (id, username, first_name) VALUES (2, 'u2', 'U2')")
+    # lifecycle_status='COMPLETED' on every seeded session -- the REAL
+    # schema's idx_core_one_open_session_per_user (at most one OPEN/PAUSED
+    # session per user) applies to core_sessions unconditionally on
+    # executescript(SCHEMA), and user 1 here legitimately has several
+    # historical sessions, none of which need to be OPEN for this test.
+    for sid, uid in ((10, 1), (11, 1), (12, 1), (13, 1), (20, 2)):
+        con.execute(
+            "INSERT INTO core_sessions (id, user_id, lifecycle_status, state_json) VALUES "
+            f'({sid}, {uid}, \'COMPLETED\', \'{{"user_id": {uid}}}\')')
+
+    def seed(pid, uid, sid, status, created_at):
+        con.execute(
+            "INSERT INTO core_practice_proposals "
+            "(id, user_id, session_id, practice_id, practice_version, purpose, "
+            " expected_duration, status, expires_at, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,datetime('now'),?)",
+            (pid, uid, sid, "breathing_box_v1", "v1", "Box breathing", "5 минут",
+             status, created_at))
+
+    # Session 10: two old GRANTED rows -- the OLD create_practice_proposal
+    # never superseded either (it only ever superseded PROPOSED/PENDING).
+    seed(101, 1, 10, "GRANTED", "2026-01-01 00:00:01")
+    seed(102, 1, 10, "GRANTED", "2026-01-01 00:00:02")
+    # A historical row in the SAME session -- must stay untouched even
+    # though its session also has duplicate actionable rows.
+    seed(103, 1, 10, "COMPLETED", "2026-01-01 00:00:03")
+    # Session 11: an old GRANTED plus a newer PENDING.
+    seed(111, 1, 11, "GRANTED", "2026-01-01 00:00:01")
+    seed(112, 1, 11, "PENDING", "2026-01-01 00:00:02")
+    # Session 12: an old PROPOSED plus a newer GRANTED.
+    seed(121, 1, 12, "PROPOSED", "2026-01-01 00:00:01")
+    seed(122, 1, 12, "GRANTED", "2026-01-01 00:00:02")
+    # Session 13: same user, single actionable row -- control.
+    seed(131, 1, 13, "PENDING", "2026-01-01 00:00:01")
+    # Session 20: different user, single actionable row -- control.
+    seed(201, 2, 20, "PENDING", "2026-01-01 00:00:01")
+
+    con.commit()
+    con.close()
+    monkeypatch.setattr(database, "DB", path)
+    return path
+
+
+def test_migration_normalizes_two_old_granted_rows_in_one_session(old_db_with_duplicates):
+    run(database.init_db())
+    p101 = run(database.get_practice_proposal(101, 1))
+    p102 = run(database.get_practice_proposal(102, 1))
+    assert p102.status.value == "GRANTED", "the newest row wins and keeps its real status"
+    assert p101.status.value == "SUPERSEDED"
+    assert p101.superseded_reason == "migration_duplicate_actionable"
+
+
+def test_migration_normalizes_old_granted_plus_newer_pending(old_db_with_duplicates):
+    run(database.init_db())
+    p111 = run(database.get_practice_proposal(111, 1))
+    p112 = run(database.get_practice_proposal(112, 1))
+    assert p112.status.value == "PENDING"
+    assert p111.status.value == "SUPERSEDED"
+    assert p111.superseded_reason == "migration_duplicate_actionable"
+
+
+def test_migration_normalizes_old_proposed_plus_newer_granted(old_db_with_duplicates):
+    run(database.init_db())
+    p121 = run(database.get_practice_proposal(121, 1))
+    p122 = run(database.get_practice_proposal(122, 1))
+    assert p122.status.value == "GRANTED"
+    assert p121.status.value == "SUPERSEDED"
+    assert p121.superseded_reason == "migration_duplicate_actionable"
+
+
+def test_migration_duplicate_normalization_does_not_cross_sessions(old_db_with_duplicates):
+    run(database.init_db())
+    p131 = run(database.get_practice_proposal(131, 1))
+    assert p131.status.value == "PENDING", \
+        "session 13's single actionable row must be untouched by duplicates in sessions 10-12"
+
+
+def test_migration_duplicate_normalization_does_not_cross_users(old_db_with_duplicates):
+    run(database.init_db())
+    p201 = run(database.get_practice_proposal(201, 2))
+    assert p201.status.value == "PENDING", "user 2's row must be untouched by user 1's duplicates"
+
+
+def test_migration_duplicate_normalization_preserves_unrelated_historical_row(old_db_with_duplicates):
+    run(database.init_db())
+    p103 = run(database.get_practice_proposal(103, 1))
+    assert p103.status.value == "COMPLETED", \
+        "a COMPLETED row must never be rewritten, even in a session that also has duplicates"
+
+
+def test_migration_preserves_total_row_count_with_duplicates(old_db_with_duplicates):
+    run(database.init_db())
+    con = sqlite3.connect(old_db_with_duplicates)
+    count = con.execute("SELECT COUNT(*) FROM core_practice_proposals").fetchone()[0]
+    con.close()
+    assert count == 9, "every row must survive the migration -- normalization never deletes"
+
+
+def test_migration_installs_a_valid_new_partial_unique_index_with_duplicates(old_db_with_duplicates):
+    """The whole point: init_db() must not raise, AND the resulting index
+    must actually be enforceable afterward -- a second actionable row for
+    an already-normalized session must now be rejected. Also proves, via
+    sqlite_master directly, that the rebuilt index (a) belongs to the LIVE
+    core_practice_proposals table (not an orphan still attached to some
+    other table) and (b) reflects the NEW, wider WHERE clause -- the exact
+    proof the index-name-collision bug (see database._rename_old_practice_
+    proposals_if_needed) would have failed before it was fixed."""
+    run(database.init_db())  # must not raise IntegrityError
+    con = sqlite3.connect(old_db_with_duplicates)
+    idx_row = con.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_core_one_actionable_proposal_per_session'").fetchone()
+    assert idx_row is not None, "the index must exist at all -- this is exactly what the collision bug broke"
+    tbl_name, idx_sql = idx_row
+    assert tbl_name == "core_practice_proposals", \
+        "the index must belong to the LIVE table, not an orphan renamed-aside one"
+    assert "DELIVERING" in idx_sql, "must be the NEW (wider) index definition, not the old PROPOSED/PENDING-only one"
+
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(
+            "INSERT INTO core_practice_proposals "
+            "(user_id, session_id, practice_id, practice_version, purpose, "
+            " expected_duration, status, expires_at) "
+            "VALUES (1, 10, 'breathing_box_v1', 'v1', 'p', '5 минут', 'GRANTED', datetime('now'))")
+
+    # No orphan artifacts left behind: the renamed-aside temp table is gone,
+    # and there is exactly one index by this name in the whole database
+    # (not a stale one plus a fresh one under a mangled/duplicate name).
+    orphan_table = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (database._OLD_PRACTICE_PROPOSALS_TABLE,)).fetchone()
+    assert orphan_table is None, "the renamed-aside old table must not survive migration"
+    index_count = con.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
+        "AND name='idx_core_one_actionable_proposal_per_session'").fetchone()[0]
+    assert index_count == 1, "exactly one index by this name, never a leftover duplicate"
+    con.close()
+
+
+def test_migration_deterministic_winner_uses_id_as_tiebreak(tmp_path, monkeypatch):
+    """Two actionable rows with an IDENTICAL created_at -- the tiebreak
+    (highest id) must still produce exactly one deterministic winner."""
+    path = str(tmp_path / "tie.db")
+    con = sqlite3.connect(path)
+    con.executescript(_OLD_SCHEMA_DDL)
+    con.execute("INSERT INTO users (id, username, first_name) VALUES (1, 'u', 'U')")
+    con.execute('INSERT INTO core_sessions (id, user_id, state_json) VALUES (30, 1, \'{"user_id": 1}\')')
+    for pid in (301, 302):
+        con.execute(
+            "INSERT INTO core_practice_proposals "
+            "(id, user_id, session_id, practice_id, practice_version, purpose, "
+            " expected_duration, status, expires_at, created_at) "
+            "VALUES (?, 1, 30, 'breathing_box_v1', 'v1', 'p', '5 минут', 'GRANTED', "
+            "datetime('now'), '2026-01-01 00:00:00')",
+            (pid,))
+    con.commit()
+    con.close()
+    monkeypatch.setattr(database, "DB", path)
+    run(database.init_db())
+    p301 = run(database.get_practice_proposal(301, 1))
+    p302 = run(database.get_practice_proposal(302, 1))
+    assert p302.status.value == "GRANTED", "identical created_at -- the higher id must win"
+    assert p301.status.value == "SUPERSEDED"
+    assert p301.superseded_reason == "migration_duplicate_actionable"
+
+
+def test_migration_with_duplicates_is_idempotent_on_second_boot(old_db_with_duplicates):
+    run(database.init_db())
+    run(database.init_db())
+    p101 = run(database.get_practice_proposal(101, 1))
+    p102 = run(database.get_practice_proposal(102, 1))
+    assert p102.status.value == "GRANTED"
+    assert p101.status.value == "SUPERSEDED"
+
+
+def test_interrupted_migration_with_duplicates_recovers_on_next_boot(old_db_with_duplicates):
+    import aiosqlite
+
+    async def simulate_crash_after_rename():
+        async with aiosqlite.connect(old_db_with_duplicates) as db:
+            await database._rename_old_practice_proposals_if_needed(db)
+            await db.commit()
+    run(simulate_crash_after_rename())
+
+    run(database.init_db())  # the "next boot"
+    p101 = run(database.get_practice_proposal(101, 1))
+    p102 = run(database.get_practice_proposal(102, 1))
+    assert p102.status.value == "GRANTED"
+    assert p101.status.value == "SUPERSEDED"
+    con = sqlite3.connect(old_db_with_duplicates)
+    count = con.execute("SELECT COUNT(*) FROM core_practice_proposals").fetchone()[0]
+    con.close()
+    assert count == 9
+
+
+@pytest.fixture
+def in_between_db_with_duplicates(tmp_path, monkeypatch):
+    """The in-between shape's OWN partial index (PROPOSED/PENDING/GRANTED)
+    already prevents duplicate actionable rows in real use, unlike the
+    original pre-PR-73 shape above -- its index already covers GRANTED, and
+    DELIVERING cannot exist as data at all under its own CHECK constraint
+    (the CHECK and the wider index were introduced together in the same
+    rebuild). This fixture drops the index before seeding, not to claim
+    real in-between-shaped production data could contain duplicates today,
+    but to prove the migration's normalization logic is unconditional --
+    it does not silently rely on the old table's own index having caught
+    everything."""
+    path = str(tmp_path / "inbetween_dup.db")
+    con = sqlite3.connect(path)
+    con.executescript(_IN_BETWEEN_SCHEMA_DDL)
+    con.execute("DROP INDEX idx_core_one_actionable_proposal_per_session")
+    con.execute("INSERT INTO users (id, username, first_name) VALUES (1, 'u', 'U')")
+    con.execute('INSERT INTO core_sessions (id, user_id, state_json) VALUES (40, 1, \'{"user_id": 1}\')')
+    for pid, status, created_at in ((401, "GRANTED", "2026-01-01 00:00:01"),
+                                    (402, "GRANTED", "2026-01-01 00:00:02")):
+        con.execute(
+            "INSERT INTO core_practice_proposals "
+            "(id, user_id, session_id, practice_id, practice_version, purpose, "
+            " expected_duration, status, expires_at, created_at) "
+            "VALUES (?, 1, 40, 'breathing_box_v1', 'v1', 'p', '5 минут', ?, datetime('now'), ?)",
+            (pid, status, created_at))
+    con.commit()
+    con.close()
+    monkeypatch.setattr(database, "DB", path)
+    return path
+
+
+def test_in_between_schema_migration_normalizes_duplicate_actionable_rows(in_between_db_with_duplicates):
+    run(database.init_db())
+    p401 = run(database.get_practice_proposal(401, 1))
+    p402 = run(database.get_practice_proposal(402, 1))
+    assert p402.status.value == "GRANTED", "newest wins"
+    assert p401.status.value == "SUPERSEDED"
+    assert p401.superseded_reason == "migration_duplicate_actionable"
+

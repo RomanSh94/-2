@@ -659,6 +659,183 @@ invalidates_window_not_status` and three others) updated from asserting
 
 **PR #73 ATOMIC CORRECTNESS GAPS FIXED — EXACT-HEAD CI PASS — DRAFT AWAITING FINAL EXTERNAL REVIEW**
 
+---
+
+# PR #73 FINAL MIGRATION COMPATIBILITY GATE — one production migration blocker
+
+## §1/§2 — Reproduce and fix: valid old data could crash init_db()
+
+**Status: DONE.** The OLD partial unique index (`_OLD_SCHEMA_DDL`:
+`idx_core_one_actionable_proposal_per_session ... WHERE status IN
+('PROPOSED','PENDING')`) and the OLD `create_practice_proposal` (which only
+ever superseded `PROPOSED`/`PENDING` before inserting) never covered
+`GRANTED` at all. Real old-schema data can therefore legally contain more
+than one actionable row for the same `(user_id, session_id)` — e.g. two
+`GRANTED` rows, or a `GRANTED` plus a newer `PENDING`. The NEW schema's
+partial unique index is wider (`PROPOSED`/`PENDING`/`GRANTED`/
+`DELIVERING`), and the rebuild used to copy such rows verbatim — a real
+IntegrityError, crashing `init_db()` and the whole bot process, on any
+production database that happened to have this shape.
+
+`database._finish_practice_proposals_migration` now normalizes during the
+copy itself, via a correlated subquery (not a window function, so it works
+on any SQLite version): for every row whose own status is still in the
+actionable set, if another row in the SAME `(user_id, session_id)` group
+has a newer `created_at` (ties broken by higher `id`), this row's copied
+`status`/`superseded_reason` become `SUPERSEDED`/
+`'migration_duplicate_actionable'`. The newest row keeps its real status
+unchanged. Every row is still copied — nothing is deleted — and
+`COMPLETED`/`WITHDRAWN`/`DECLINED`/`EXPIRED`/`DELIVERY_FAILED`/already-
+`SUPERSEDED` rows are never touched (the `CASE` only ever fires for a row
+whose own status is actionable).
+
+**A second, more serious latent bug was found while writing the proof that
+the new index is actually enforced after migration** (not part of the
+original ask, but a direct correctness blocker for this exact fix): SQLite
+does not rename a table's indexes when the table itself is renamed —
+`_rename_old_practice_proposals_if_needed`'s `ALTER TABLE ... RENAME TO`
+left the OLD `idx_core_one_actionable_proposal_per_session` (and
+`idx_core_practice_proposals_user`) still attached, under their original
+names, to the renamed-aside table. The following `executescript(SCHEMA)`'s
+`CREATE UNIQUE INDEX IF NOT EXISTS` for the fresh table therefore silently
+did nothing — the name was "already taken" by the old, narrower index sitting
+on the renamed-aside table. **This meant the new partial unique index has
+never actually been enforced by SQLite on any migrated (non-fresh)
+database since this rebuild-based migration was first written** — only a
+freshly-created database ever got real enforcement. Fixed by dropping both
+index names explicitly, right after the rename, before `executescript`
+runs. (The onboarding-state migration has the identical bug pattern —
+flagged separately as out of scope for this PR; not touched here.)
+
+### Index-name-collision fix — audited
+
+- **Exact old index name**: `idx_core_one_actionable_proposal_per_session`
+  (also `idx_core_practice_proposals_user`, non-unique, same pattern but
+  lower stakes). Both names are reused verbatim by the fresh schema.
+- **Why `ALTER TABLE ... RENAME TO` preserved the name globally**: SQLite
+  index names live in the database's single, table-independent
+  `sqlite_master` namespace. Renaming a table moves its row in
+  `sqlite_master` and repoints the table's own indexes' internal `tbl_name`
+  reference, but does **not** rename the indexes themselves — they keep
+  whatever name they were created with, now simply "belonging" to the
+  renamed-aside table under their original name.
+- **Why `CREATE INDEX IF NOT EXISTS` previously skipped the replacement**:
+  `IF NOT EXISTS` checks the `sqlite_master` name namespace only, not which
+  table an existing entry belongs to. Since the OLD index by that exact
+  name still existed (attached to the renamed-aside table), SQLite
+  considered the name already taken and silently skipped creating the NEW
+  index on the fresh table — no error, no log line, just silent no-op.
+- **How the fix avoids the collision**: `_rename_old_practice_proposals_if_
+  needed` now runs `DROP INDEX IF EXISTS idx_core_practice_proposals_user`
+  and `DROP INDEX IF EXISTS idx_core_one_actionable_proposal_per_session`
+  immediately after the rename, before `executescript(SCHEMA)` ever runs —
+  freeing both names so the fresh table's `CREATE ... IF NOT EXISTS`
+  actually creates them this time. Dropping an index never touches the
+  underlying table's rows.
+- **Proof from `sqlite_master`** (captured directly against a real
+  duplicate-shaped database, not asserted from memory):
+  - Before migration: `('core_practice_proposals', "CREATE UNIQUE INDEX
+    idx_core_one_actionable_proposal_per_session ON
+    core_practice_proposals(session_id) WHERE status IN
+    ('PROPOSED','PENDING')")` — the OLD, narrower definition.
+  - After migration: exactly **1** row in `sqlite_master` for that index
+    name (`SELECT COUNT(*) ... = 1`, not 0 and not 2), `tbl_name =
+    'core_practice_proposals'` (the LIVE table, confirmed by name), `sql`
+    containing the NEW clause `WHERE status IN
+    ('PROPOSED','PENDING','GRANTED','DELIVERING')`.
+  - `SELECT name FROM sqlite_master WHERE type='table' AND name=
+    '_core_practice_proposals_pre_delivering'` → `None` — no orphan
+    renamed-aside table survives.
+  - This exact assertion sequence is now a permanent regression test:
+    `test_migration_installs_a_valid_new_partial_unique_index_with_duplicates`
+    (`tests/test_practice_proposals_schema_migration.py`), which is also
+    the test that originally caught this bug.
+
+## §3 — Read-only production preflight
+
+**Status: DONE, evidence below.** Queried production directly and
+read-only via `sqlite3.connect('file:/root/-2/x20.db?mode=ro', uri=True)`
+over SSH (`root@178.105.244.227:/root/-2/x20.db`) — a read-only URI
+connection, so no write was possible regardless of the query. No `.backup`
+or file copy was needed since nothing was written.
+
+- `core_practice_proposals` exists: **yes**.
+- Total row count: **0**.
+- Count by status: *(no rows)*.
+- Table SQL: exactly the `_OLD_SCHEMA_DDL` shape used in this file's
+  `old_db` fixture — no `outcome`, no prompt-tracking columns, status
+  `CHECK` lacks `DELIVERING`.
+- Index SQL: `idx_core_one_actionable_proposal_per_session ...  WHERE
+  status IN ('PROPOSED','PENDING')` — confirms GRANTED is not covered in
+  production today, exactly as described.
+- Duplicate-actionable-row query result: **0 groups** (impossible to have
+  duplicates with zero rows).
+
+Production currently carries zero risk from this bug (the table has never
+been written to, consistent with `THERAPEUTIC_CORE_ROLLOUT_MODE=off` being
+dormant throughout). The code still handles duplicates defensively
+regardless, per the explicit instruction not to assume production data
+shape from today's emptiness.
+
+## §4 — Corrected the misleading race test
+
+**Status: DONE.** `test_worse_override_duplicate_yes_no_race_exactly_one_wins`
+(despite its name) raced YES against YES. Renamed to
+`test_worse_override_duplicate_yes_yes_race_exactly_one_wins` and kept
+as-is (still useful duplicate-tap coverage). Added a NEW
+`test_worse_override_yes_no_race_exactly_one_wins` that races one YES
+callback against one NO callback on the same PENDING proposal: asserts
+exactly one produces any reply, the final status is a real terminal one
+(`STARTED` or `DECLINED`, never left `PENDING`/`GRANTED`), and a `STARTED`
+winner never also shows a `DECLINED` reply or vice versa (no double
+delivery, no invalid intermediate state).
+
+## §5 — Migration verification
+
+**Status: DONE.** New fixture `old_db_with_duplicates`
+(`tests/test_practice_proposals_schema_migration.py`): three duplicate
+shapes named in the spec (two old `GRANTED`; old `GRANTED` + newer
+`PENDING`; old `PROPOSED` + newer `GRANTED`), plus a same-user/different-
+session control row, a different-user control row, and a historical
+`COMPLETED` row sharing a session with duplicates. Tests:
+`test_migration_normalizes_two_old_granted_rows_in_one_session`,
+`test_migration_normalizes_old_granted_plus_newer_pending`,
+`test_migration_normalizes_old_proposed_plus_newer_granted`,
+`test_migration_duplicate_normalization_does_not_cross_sessions`,
+`test_migration_duplicate_normalization_does_not_cross_users`,
+`test_migration_duplicate_normalization_preserves_unrelated_historical_row`,
+`test_migration_preserves_total_row_count_with_duplicates`,
+`test_migration_installs_a_valid_new_partial_unique_index_with_duplicates`
+(the test that caught the index-collision bug above),
+`test_migration_deterministic_winner_uses_id_as_tiebreak` (identical
+`created_at`, tiebreak by `id`),
+`test_migration_with_duplicates_is_idempotent_on_second_boot`,
+`test_interrupted_migration_with_duplicates_recovers_on_next_boot`. A
+second fixture, `in_between_db_with_duplicates`, proves the same
+normalization logic is unconditional on the OTHER realistic upgrade path
+too (that shape's own index already covers `GRANTED` in real use, so its
+index is dropped first to construct a duplicate scenario for the proof —
+documented in the fixture as not a claim that real in-between data could
+contain duplicates today). Pre-existing invalid-enum-value rejection tests
+re-verified unaffected.
+
+## §6 — Final gate
+
+- Migration suite + focused Controller suite
+  (`tests/test_practice_proposals_schema_migration.py` +
+  `tests/test_conversation_controller.py`): **259 passed**, one continuous
+  local run, 0 failed, 147.86s (re-run after adding the sqlite_master
+  orphan-index/table proof to the index-enforcement test).
+- Full local suite (`pytest tests/ -q`, one continuous background-tracked
+  process, natural collection order): **2259 passed, 1 skipped, 0 failed,
+  818.92s (0:13:38)**.
+- Exact current PR head, exact-head CI run, and exact test result: see the
+  PR body (updated without a docs-only commit, per the standing instruction
+  against self-referential follow-up commits established in the ATOMIC
+  CLOSURE round above).
+
+**PR #73 MIGRATION COMPATIBILITY FIXED — EXACT-HEAD CI PASS — DRAFT AWAITING MERGE AUTHORIZATION**
+
 ## §13 — Stop for external review
 
 This PR stays in Draft. Not merged, not deployed, Phase 4 not started,

@@ -3113,7 +3113,41 @@ def test_worse_override_cross_user_rejected(monkeypatch, tmp_db):
     assert reloaded.status is PracticeProposalStatus.PENDING
 
 
-def test_worse_override_duplicate_yes_no_race_exactly_one_wins(monkeypatch, tmp_db):
+def test_worse_override_yes_no_race_exactly_one_wins(monkeypatch, tmp_db):
+    """PR #73 MIGRATION COMPATIBILITY GATE §4 correction: the previous
+    version of this test raced YES against YES, which only ever proves the
+    duplicate-tap CAS, not that a genuine YES/NO race resolves safely. This
+    races one YES callback against one NO callback on the SAME PENDING
+    proposal -- exactly one must win, the final status must be a real
+    terminal one (STARTED or DECLINED, never left PENDING/GRANTED), and
+    there must never be a double delivery."""
+    user = FakeUser(1)
+    session, old_proposal, new_proposal, data_yes, _ = run(
+        _seed_worse_override_pending(1, user, monkeypatch))
+    data_no = f"cc:consent:{session.session_id}:{new_proposal.proposal_id}:no"
+
+    async def go():
+        msg_yes, msg_no = FakeMessage(user), FakeMessage(user)
+        await asyncio.gather(
+            bot.cb_cc_consent(_fake_callback(user, msg_yes, data_yes)),
+            bot.cb_cc_consent(_fake_callback(user, msg_no, data_no)))
+        return msg_yes, msg_no
+    msg_yes, msg_no = run(go())
+    delivered = [m for m in (msg_yes, msg_no) if m.answers]
+    assert len(delivered) == 1, "exactly one of a racing yes/no pair may produce any reply"
+    reloaded = run(database.get_practice_proposal(new_proposal.proposal_id, 1))
+    assert reloaded.status in (PracticeProposalStatus.STARTED, PracticeProposalStatus.DECLINED), \
+        "the race must resolve to a real terminal status, never an invalid intermediate one"
+    if reloaded.status is PracticeProposalStatus.STARTED:
+        assert len(msg_yes.answers) == 2, "a STARTED winner must have delivered steps + outcome prompt"
+        assert msg_no.answers == []
+    else:
+        assert msg_yes.answers == [], "a DECLINED winner must never also have delivered practice content"
+
+
+def test_worse_override_duplicate_yes_yes_race_exactly_one_wins(monkeypatch, tmp_db):
+    """Kept alongside the yes/no race above: two concurrent YES taps on the
+    SAME proposal must also resolve to exactly one delivery, never two."""
     user = FakeUser(1)
     session, old_proposal, new_proposal, data, _ = run(
         _seed_worse_override_pending(1, user, monkeypatch))
