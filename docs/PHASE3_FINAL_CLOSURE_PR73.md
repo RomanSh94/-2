@@ -231,10 +231,10 @@ constraint.
 
 ## §12 — Exact-head CI
 
-See the completion report appended after this line for this round's PR
-number, head SHA, and CI run ID/conclusion (filled in after push, per the
-required sequence: commit → push → verify remote head → wait for CI →
-inspect logs → require PASS).
+- PR: [#73](https://github.com/RomanSh94/-2/pull/73)
+- Head SHA: `f6aa7f15f4a334b698315ddf2f1df0ff51adabe0` — verified equal to `git rev-parse origin/fix/phase3-practice-lifecycle-closure` before waiting on CI.
+- CI run: [30601801928](https://github.com/RomanSh94/-2/actions/runs/30601801928), job `smoke`, conclusion **success**, `3m10s`.
+- Log line inspected directly (not inferred from the green checkmark alone): `2183 passed, 1 skipped in 171.93s (0:02:51)` — the exact same pass/skip counts as the local frozen §11 run (CI's Linux runner completes the identical natural-order suite faster, with no failures either place).
 
 ## §13 — Stop for external review
 
