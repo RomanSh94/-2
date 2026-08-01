@@ -26,6 +26,7 @@ import database
 from therapeutic_domain import (
     Intent, RepairConstraint, LifecycleStatus, ConsentState, ResponsePlan,
     PracticeProposalStatus, PracticeOutcome,
+    UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL,
 )
 
 run = asyncio.run
@@ -931,7 +932,7 @@ def test_practice_consent_yes_delivers_practice_content(monkeypatch, tmp_db):
     # Final closure §3/§4: steps message, then the post-practice outcome
     # buttons ("Как прошло?") -- two messages, not one.
     assert len(msg2.answers) == 2
-    assert "Как прошло" in msg2.answers[1][0]
+    assert "Получилось выполнить практику" in msg2.answers[1][0]
     reloaded = run(database.get_core_session(session.session_id, 1))
     assert reloaded.consent is ConsentState.GRANTED
     reloaded_proposal = run(database.get_practice_proposal(proposal.proposal_id, 1))
@@ -2335,7 +2336,7 @@ def test_failed_outcome_prompt_is_retried_on_the_next_ordinary_turn(monkeypatch,
     _full_pipeline_stub_set(monkeypatch, llm_reply="ok")
     msg2 = FakeMessage(user, "Сегодня был обычный день.")
     run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
-    assert any("Как прошло" in a[0] for a in msg2.answers), \
+    assert any("Получилось выполнить практику" in a[0] for a in msg2.answers), \
         "the next ordinary turn must retry the failed outcome prompt"
     reloaded2 = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert reloaded2.outcome_prompt_status == "DELIVERED"
@@ -2353,7 +2354,7 @@ def test_delivered_outcome_prompt_is_never_retried_again(monkeypatch, tmp_db):
     _full_pipeline_stub_set(monkeypatch, llm_reply="ok")
     msg2 = FakeMessage(user, "Сегодня был обычный день.")
     run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
-    assert not any("Как прошло" in a[0] for a in msg2.answers), \
+    assert not any("Получилось выполнить практику" in a[0] for a in msg2.answers), \
         "an already-DELIVERED prompt must never be resent"
 
 
@@ -2381,7 +2382,7 @@ def test_helped_prompt_send_failure_is_retried_on_next_turn(monkeypatch, tmp_db)
     _full_pipeline_stub_set(monkeypatch, llm_reply="ok")
     msg2 = FakeMessage(user, "Сегодня был обычный день.")
     run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
-    assert any("подействовало" in a[0] for a in msg2.answers)
+    assert any("Помогла ли практика" in a[0] for a in msg2.answers)
     reloaded2 = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert reloaded2.helped_prompt_status == "DELIVERED"
 
@@ -2740,7 +2741,7 @@ def test_concurrent_retry_sweeps_send_exactly_once(monkeypatch, tmp_db):
             bot._retry_failed_practice_prompts(msg_b, 1))
         return msg_a, msg_b
     msg_a, msg_b = run(go())
-    total_sent = sum(1 for a in (msg_a.answers + msg_b.answers) if "Как прошло" in a[0])
+    total_sent = sum(1 for a in (msg_a.answers + msg_b.answers) if "Получилось выполнить практику" in a[0])
     assert total_sent == 1, "exactly one of two concurrent retry sweeps may send the prompt"
     final = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert final.outcome_prompt_status == "DELIVERED"
@@ -2875,7 +2876,7 @@ def test_failed_prompt_not_retried_after_start(monkeypatch, tmp_db):
     _full_pipeline_stub_set(monkeypatch, llm_reply="ok")
     msg2 = FakeMessage(user, "Привет.")
     run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
-    assert not any("Как прошло" in a[0] for a in msg2.answers), \
+    assert not any("Получилось выполнить практику" in a[0] for a in msg2.answers), \
         "a failed prompt from before /start must not reappear after it"
 
 
@@ -2885,7 +2886,7 @@ def test_failed_prompt_not_retried_after_topic_change(monkeypatch, tmp_db):
     _full_pipeline_stub_set(monkeypatch, llm_reply="ok")
     msg2 = FakeMessage(user, "Мне нужно выговориться.")
     run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
-    assert not any("Как прошло" in a[0] for a in msg2.answers), \
+    assert not any("Получилось выполнить практику" in a[0] for a in msg2.answers), \
         "a failed prompt from an old topic must not reappear in a new conversation"
 
 
@@ -2905,7 +2906,7 @@ def test_failed_prompt_not_retried_after_conversation_close(monkeypatch, tmp_db)
     _full_pipeline_stub_set(monkeypatch, llm_reply="ok")
     msg2 = FakeMessage(user, "Мне пора.")
     run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
-    assert not any("Как прошло" in a[0] for a in msg2.answers)
+    assert not any("Получилось выполнить практику" in a[0] for a in msg2.answers)
 
 
 def test_failed_prompt_not_retried_after_crisis_resolves(monkeypatch, tmp_db):
@@ -3419,7 +3420,7 @@ def test_start_after_prompt_claim_before_send_stops_delivery(monkeypatch, tmp_db
     msg2 = FakeMessage(user)
     cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
     run(bot.cb_cc_consent(cb))
-    assert not any("Как прошло" in a[0] for a in msg2.answers), \
+    assert not any("Получилось выполнить практику" in a[0] for a in msg2.answers), \
         "no stale outcome-prompt may be sent once /start invalidates the claim"
     reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert reloaded.outcome_prompt_status in (None, "FAILED"), \
@@ -3430,7 +3431,7 @@ def test_start_after_prompt_claim_before_send_stops_delivery(monkeypatch, tmp_db
     _full_pipeline_stub_set(monkeypatch, llm_reply="ok")
     msg3 = FakeMessage(user, "Обычное сообщение.")
     run(bot.pipeline(msg3, msg3.text, None, tg_user=user))
-    assert not any("Как прошло" in a[0] for a in msg3.answers)
+    assert not any("Получилось выполнить практику" in a[0] for a in msg3.answers)
 
 
 def test_topic_change_after_prompt_claim_before_send_stops_delivery(monkeypatch, tmp_db):
@@ -3444,7 +3445,7 @@ def test_topic_change_after_prompt_claim_before_send_stops_delivery(monkeypatch,
     msg2 = FakeMessage(user)
     cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
     run(bot.cb_cc_consent(cb))
-    assert not any("Как прошло" in a[0] for a in msg2.answers)
+    assert not any("Получилось выполнить практику" in a[0] for a in msg2.answers)
     reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert reloaded.outcome_prompt_status in (None, "FAILED")
 
@@ -3460,7 +3461,7 @@ def test_disclosure_after_prompt_claim_before_send_stops_delivery(monkeypatch, t
     msg2 = FakeMessage(user)
     cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
     run(bot.cb_cc_consent(cb))
-    assert not any("Как прошло" in a[0] for a in msg2.answers)
+    assert not any("Получилось выполнить практику" in a[0] for a in msg2.answers)
     reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert reloaded.outcome_prompt_status in (None, "FAILED")
 
@@ -3476,7 +3477,7 @@ def test_crisis_after_prompt_claim_before_send_stops_delivery(monkeypatch, tmp_d
     msg2 = FakeMessage(user)
     cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
     run(bot.cb_cc_consent(cb))
-    assert not any("Как прошло" in a[0] for a in msg2.answers)
+    assert not any("Получилось выполнить практику" in a[0] for a in msg2.answers)
     reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert reloaded.outcome_prompt_status in (None, "FAILED")
 
@@ -3494,6 +3495,708 @@ def test_conversation_close_after_prompt_claim_before_send_stops_delivery(monkey
     msg2 = FakeMessage(user)
     cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
     run(bot.cb_cc_consent(cb))
-    assert not any("Как прошло" in a[0] for a in msg2.answers)
+    assert not any("Получилось выполнить практику" in a[0] for a in msg2.answers)
     reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
     assert reloaded.outcome_prompt_status in (None, "FAILED")
+
+
+# ── AB. Progressive two-button practice UX ──────────────────────────────────
+# Product principle: never more than two buttons; free text always remains
+# valid; an unfinished practice is never framed as failure. The legacy
+# cc:outcome/cc:helped handlers (section O/Q/R/S/etc. above) stay completely
+# unchanged and continue to pass unmodified -- that IS the backward-
+# compatibility proof (item 22).
+
+async def _seed_new_flow_completed(uid: int, user, monkeypatch) -> tuple:
+    """STARTED -> COMPLETED via the real cb_cc_practdone 'yes' ('Получилось')
+    tap."""
+    session, proposal = await _seed_started_practice(uid, user, monkeypatch)
+    await bot.cb_cc_practdone(_fake_callback(
+        user, FakeMessage(user), f"cc:practdone:{proposal.proposal_id}:yes"))
+    reloaded = await database.get_practice_proposal(proposal.proposal_id, uid)
+    return session, reloaded
+
+
+async def _complete_new_flow_with_outcome(uid: int, user, monkeypatch, outcome_value: str):
+    """outcome_value in ('helped', 'same', 'worse') -- drives Step B (and
+    Step C when needed) via the real new-flow handlers."""
+    session, proposal = await _seed_new_flow_completed(uid, user, monkeypatch)
+    if outcome_value == "helped":
+        await bot.cb_cc_practhelp(_fake_callback(
+            user, FakeMessage(user), f"cc:practhelp:{proposal.proposal_id}:yes"))
+    else:
+        await bot.cb_cc_practhelp(_fake_callback(
+            user, FakeMessage(user), f"cc:practhelp:{proposal.proposal_id}:no"))
+        await bot.cb_cc_practhelpwhy(_fake_callback(
+            user, FakeMessage(user), f"cc:practhelpwhy:{proposal.proposal_id}:{outcome_value}"))
+    return session, proposal
+
+
+# §8 item 1 -- every new keyboard has at most two buttons.
+@pytest.mark.progressive_ux
+def test_all_new_practice_keyboards_have_at_most_two_buttons():
+    for kb in (bot._practice_did_kb(1, "ru"), bot._practice_notdone_kb(1, "ru"),
+              bot._practice_help_kb(1, "ru"), bot._practice_helpwhy_kb(1, "ru")):
+        total = sum(len(row) for row in kb.inline_keyboard)
+        assert total <= 2, kb.inline_keyboard
+
+
+# §8 item 2 -- first prompt contains "Получилось"/"Не получилось".
+@pytest.mark.progressive_ux
+def test_first_practice_prompt_has_progressive_two_buttons(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_practice_consent(1, user, monkeypatch))
+    msg2 = FakeMessage(user)
+    cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_consent(cb))
+    assert len(msg2.answers) == 2, "steps, then the progressive first prompt"
+    text, kw = msg2.answers[1]
+    assert "Получилось выполнить практику" in text
+    labels = [b.text for row in kw["reply_markup"].inline_keyboard for b in row]
+    assert labels == ["Получилось", "Не получилось"]
+
+
+# §8 item 3 -- "Получилось" records COMPLETED exactly once.
+@pytest.mark.progressive_ux
+def test_did_yes_records_completed_exactly_once(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    assert proposal.status is PracticeProposalStatus.COMPLETED
+
+
+# §8 item 4 -- duplicate "Получилось" tap is inert.
+@pytest.mark.progressive_ux
+def test_did_yes_duplicate_tap_is_inert(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(bot.cb_cc_practdone(_fake_callback(
+        user, FakeMessage(user), f"cc:practdone:{proposal.proposal_id}:yes")))
+    msg2 = FakeMessage(user)
+    run(bot.cb_cc_practdone(_fake_callback(user, msg2, f"cc:practdone:{proposal.proposal_id}:yes")))
+    assert msg2.answers == [], "a second 'Получилось' tap must not re-fire the help prompt"
+
+
+# §8 item 5 -- "Помогло" records HELPED exactly once.
+@pytest.mark.progressive_ux
+def test_help_yes_records_helped_exactly_once(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_complete_new_flow_with_outcome(1, user, monkeypatch, "helped"))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is PracticeOutcome.HELPED
+    assert reloaded.superseded_reason is None, "no UX marker may survive a terminal outcome"
+
+
+# §8 item 6 -- "Не помогло" does not prematurely record NO_CHANGE.
+@pytest.mark.progressive_ux
+def test_help_no_does_not_prematurely_record_no_change(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practhelp:{proposal.proposal_id}:no")
+    run(bot.cb_cc_practhelp(cb))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is None, "must not write NO_CHANGE (or anything) before the follow-up answer"
+    assert reloaded.status is PracticeProposalStatus.COMPLETED
+    labels = [b.text for row in msg.answers[0][1]["reply_markup"].inline_keyboard for b in row]
+    assert labels == ["Без изменений", "Стало хуже"]
+
+
+# §8 item 7 -- "Без изменений" records NO_CHANGE.
+@pytest.mark.progressive_ux
+def test_helpwhy_same_records_no_change(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_complete_new_flow_with_outcome(1, user, monkeypatch, "same"))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is PracticeOutcome.NO_CHANGE
+    # The pending UX_PENDING_OUTCOME_DETAIL marker must be cleared in the
+    # SAME atomic write that recorded the outcome -- never left stuck.
+    assert reloaded.superseded_reason is None
+    assert reloaded.reporting_window_status == "CLOSED"
+
+
+# §8 item 8 -- "Стало хуже" records WORSE, with no causality claim.
+@pytest.mark.progressive_ux
+def test_helpwhy_worse_records_worse_without_causality_claim(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, FakeMessage(user), f"cc:practhelp:{proposal.proposal_id}:no")))
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practhelpwhy:{proposal.proposal_id}:worse")
+    run(bot.cb_cc_practhelpwhy(cb))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is PracticeOutcome.WORSE
+    # The pending marker must be cleared atomically here too, not just on
+    # the NO_CHANGE branch.
+    assert reloaded.superseded_reason is None
+    assert reloaded.reporting_window_status == "CLOSED"
+    text = msg.answers[0][0].lower()
+    assert "стало хуже" in text
+    assert "навредил" not in text and "ухудшил" not in text, "no causality claim"
+
+
+# §8 item 9 -- WORSE continues to block automatic repetition (same guard,
+# reached via the new flow this time).
+@pytest.mark.progressive_ux
+def test_new_flow_worse_outcome_blocks_automatic_reproposal(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    run(_complete_new_flow_with_outcome(1, user, monkeypatch, "worse"))
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
+    msg = FakeMessage(user, "Дай упражнение.")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+    assert llm_calls["n"] == 0
+    assert "стало хуже" in msg.answers[0][0].lower()
+
+
+# §8 item 10 -- "Начал, но остановился" produces the correct non-completed
+# history (WITHDRAWN, reason=user_stopped, never COMPLETED).
+@pytest.mark.progressive_ux
+def test_notdone_stopped_produces_truthful_withdrawn_history(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(bot.cb_cc_practdone(_fake_callback(
+        user, FakeMessage(user), f"cc:practdone:{proposal.proposal_id}:no")))
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practwhy:{proposal.proposal_id}:stopped")
+    run(bot.cb_cc_practwhy(cb))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.WITHDRAWN
+    assert reloaded.superseded_reason == "user_stopped"
+    assert "помешало" in msg.answers[0][0].lower() or "way most" in msg.answers[0][0].lower()
+    assert msg.answers[0][1].get("reply_markup") is None, "the open follow-up question needs no keyboard"
+
+
+# §8 item 11 -- "Не начал" does not persist EXERCISE_REJECTED automatically.
+@pytest.mark.progressive_ux
+def test_notdone_never_does_not_persist_exercise_rejected(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(bot.cb_cc_practdone(_fake_callback(
+        user, FakeMessage(user), f"cc:practdone:{proposal.proposal_id}:no")))
+    run(bot.cb_cc_practwhy(_fake_callback(
+        user, FakeMessage(user), f"cc:practwhy:{proposal.proposal_id}:never")))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.WITHDRAWN
+    assert reloaded.superseded_reason == "user_did_not_start"
+    s = run(database.list_core_sessions(1))[0]
+    assert RepairConstraint.EXERCISE_REJECTED not in s.active_repair_constraints, \
+        "'Не начал' must never be treated as proof of refusal or dislike"
+
+
+# §8 item 12 -- free text remains accepted after every progressive prompt
+# (goes through the ordinary pipeline, never trapped by a keyboard).
+@pytest.mark.progressive_ux
+def test_free_text_after_did_prompt_goes_through_ordinary_pipeline(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Расскажи подробнее.", llm_calls=llm_calls)
+    msg2 = FakeMessage(user, "В целом получилось, но было трудно сосредоточиться.")
+    run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
+    assert msg2.answers, "free text must still get an ordinary conversational reply"
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.STARTED, \
+        "free text must never fabricate a persisted completion status"
+
+
+@pytest.mark.progressive_ux
+def test_free_text_after_help_prompt_goes_through_ordinary_pipeline(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Понимаю.", llm_calls=llm_calls)
+    msg2 = FakeMessage(user, "Сложно сказать, наверное отчасти.")
+    run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
+    assert msg2.answers
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is None, "free text must never fabricate a persisted outcome"
+
+
+# §8 items 13-17 -- topic change / /start / crisis / disclosure / close all
+# invalidate old (new-flow) buttons, mirroring the legacy race tests.
+@pytest.mark.progressive_ux
+def test_new_flow_topic_change_invalidates_did_buttons(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Расскажи подробнее.")
+    run(bot.pipeline(FakeMessage(user, "Мне нужно выговориться."),
+                     "Мне нужно выговориться.", None, tg_user=user))
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practdone:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_practdone(cb))
+    assert msg.answers == []
+    assert cb.answered == 1
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.STARTED, "truthful history untouched"
+
+
+@pytest.mark.progressive_ux
+def test_new_flow_start_invalidates_did_buttons(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(bot.cmd_start(FakeMessage(user)))
+    msg = FakeMessage(user)
+    run(bot.cb_cc_practdone(_fake_callback(user, msg, f"cc:practdone:{proposal.proposal_id}:yes")))
+    assert msg.answers == []
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.STARTED
+
+
+@pytest.mark.progressive_ux
+def test_new_flow_crisis_invalidates_did_buttons(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(bot.trigger_crisis(FakeMessage(user), 1, "u1", "text", _CRISIS_RISK, "ru"))
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practdone:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_practdone(cb))
+    assert msg.answers == []
+    assert cb.answered == 1
+
+
+@pytest.mark.progressive_ux
+def test_new_flow_disclosure_invalidates_did_buttons(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(database.create_disclosure_flow(1, "ru"))
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practdone:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_practdone(cb))
+    assert msg.answers == []
+    assert cb.answered == 1
+
+
+@pytest.mark.progressive_ux
+def test_new_flow_conversation_close_invalidates_did_buttons(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Хорошо.")
+    run(bot.pipeline(FakeMessage(user, "Мне пора."), "Мне пора.", None, tg_user=user))
+    msg = FakeMessage(user)
+    run(bot.cb_cc_practdone(_fake_callback(user, msg, f"cc:practdone:{proposal.proposal_id}:yes")))
+    assert msg.answers == []
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.STARTED
+
+
+# §8 item 18 -- an expired proposal never even reaches the new flow (the
+# pre-existing consent-expiry mechanism, untouched, blocks it upstream).
+@pytest.mark.progressive_ux
+def test_expired_proposal_never_reaches_progressive_flow(monkeypatch, tmp_db):
+    import sqlite3
+    user = FakeUser(1)
+    session, proposal = run(_seed_practice_consent(1, user, monkeypatch))
+    con = sqlite3.connect(database.DB)
+    con.execute("UPDATE core_practice_proposals SET expires_at=datetime('now','-1 hour') WHERE id=?",
+               (proposal.proposal_id,))
+    con.commit()
+    con.close()
+    msg2 = FakeMessage(user)
+    cb = _fake_callback(user, msg2, f"cc:consent:{session.session_id}:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_consent(cb))
+    assert msg2.answers == [], "an expired proposal must never reach GRANTED, let alone STARTED"
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.PENDING
+
+
+# §8 item 19 -- cross-user callback is rejected.
+@pytest.mark.progressive_ux
+def test_new_flow_cross_user_did_callback_rejected(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(_seed_user(2))
+    attacker = FakeUser(2)
+    msg = FakeMessage(attacker)
+    cb = _fake_callback(attacker, msg, f"cc:practdone:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_practdone(cb))
+    assert msg.answers == []
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.STARTED
+
+
+# §8 item 20 -- rollout-off callback is non-actionable.
+@pytest.mark.progressive_ux
+def test_new_flow_rollout_off_did_callback_rejected(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    monkeypatch.setattr(config, "THERAPEUTIC_CORE_ROLLOUT_MODE", "off")
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practdone:{proposal.proposal_id}:yes")
+    run(bot.cb_cc_practdone(cb))
+    assert msg.answers == []
+
+
+# §8 item 21 -- restart preserves the active progressive step (no in-memory
+# FSM -- the DB row IS the state).
+@pytest.mark.progressive_ux
+def test_restart_preserves_active_progressive_step(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(bot.cb_cc_practdone(_fake_callback(
+        user, FakeMessage(user), f"cc:practdone:{proposal.proposal_id}:no")))
+    # Simulate "restart": a completely fresh accessor read.
+    reread = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reread.status is PracticeProposalStatus.WITHDRAWN
+    assert reread.superseded_reason == UX_PENDING_NOT_COMPLETED_REASON
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practwhy:{reread.proposal_id}:stopped")
+    run(bot.cb_cc_practwhy(cb))
+    final = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert final.superseded_reason == "user_stopped"
+
+
+# §8 item 22 -- old three-button/four-button callbacks do not crash or
+# mutate stale state (the legacy handlers are byte-for-byte unchanged --
+# every test in sections O/Q/R/S/T/Y above already proves this directly;
+# this test additionally proves OLD and NEW callback formats coexist
+# safely against the SAME proposal without cross-contamination).
+@pytest.mark.progressive_ux
+def test_legacy_and_new_callback_formats_coexist_safely(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    # A legacy-format callback tapped against a proposal that was actually
+    # delivered with the NEW keyboard: must not crash, must not mutate
+    # incorrectly (the value "done" is a real legacy value, so it WILL be
+    # accepted by cb_cc_outcome's own contract -- proving the two contracts
+    # are independent, not that legacy callbacks are blocked outright).
+    msg = FakeMessage(user)
+    run(bot.cb_cc_outcome(_fake_callback(user, msg, f"cc:outcome:{proposal.proposal_id}:done")))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.COMPLETED
+    # A garbage/unknown legacy-shaped callback must not crash either.
+    msg2 = FakeMessage(user)
+    cb2 = _fake_callback(user, msg2, f"cc:outcome:{proposal.proposal_id}:not_a_real_value")
+    run(bot.cb_cc_outcome(cb2))  # must not raise
+    assert msg2.answers == []
+
+
+# §8 item 23 -- stale callbacks call callback.answer() and send no visible
+# message (already exercised above for practdone; this covers practwhy/
+# practhelp too).
+@pytest.mark.progressive_ux
+def test_stale_practwhy_practhelp_are_acknowledged_silently(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(bot.cb_cc_practdone(_fake_callback(
+        user, FakeMessage(user), f"cc:practdone:{proposal.proposal_id}:no")))
+    run(bot.cmd_start(FakeMessage(user)))  # invalidates the (still-open) reporting window
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practwhy:{proposal.proposal_id}:stopped")
+    run(bot.cb_cc_practwhy(cb))
+    assert msg.answers == []
+    assert cb.answered == 1
+
+    monkeypatch.setattr(ac, "has_full_access", _async(True))  # this suite's OWNER=1-only gate
+    user2 = FakeUser(2)
+    session2, proposal2 = run(_seed_new_flow_completed(2, user2, monkeypatch))
+    run(bot.cmd_start(FakeMessage(user2)))
+    msg2 = FakeMessage(user2)
+    cb2 = _fake_callback(user2, msg2, f"cc:practhelp:{proposal2.proposal_id}:yes")
+    run(bot.cb_cc_practhelp(cb2))
+    assert msg2.answers == []
+    assert cb2.answered == 1
+
+
+# §8 item 24 -- concurrent opposite taps produce exactly one persisted result.
+@pytest.mark.progressive_ux
+def test_concurrent_did_yes_no_race_exactly_one_wins(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+
+    async def go():
+        msg_yes, msg_no = FakeMessage(user), FakeMessage(user)
+        await asyncio.gather(
+            bot.cb_cc_practdone(_fake_callback(
+                user, msg_yes, f"cc:practdone:{proposal.proposal_id}:yes")),
+            bot.cb_cc_practdone(_fake_callback(
+                user, msg_no, f"cc:practdone:{proposal.proposal_id}:no")))
+        return msg_yes, msg_no
+    msg_yes, msg_no = run(go())
+    delivered = [m for m in (msg_yes, msg_no) if m.answers]
+    assert len(delivered) == 1
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status in (PracticeProposalStatus.COMPLETED, PracticeProposalStatus.WITHDRAWN)
+
+
+@pytest.mark.progressive_ux
+def test_concurrent_help_yes_no_race_exactly_one_wins(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+
+    async def go():
+        msg_yes, msg_no = FakeMessage(user), FakeMessage(user)
+        await asyncio.gather(
+            bot.cb_cc_practhelp(_fake_callback(
+                user, msg_yes, f"cc:practhelp:{proposal.proposal_id}:yes")),
+            bot.cb_cc_practhelp(_fake_callback(
+                user, msg_no, f"cc:practhelp:{proposal.proposal_id}:no")))
+        return msg_yes, msg_no
+    msg_yes, msg_no = run(go())
+    delivered = [m for m in (msg_yes, msg_no) if m.answers]
+    assert len(delivered) == 1
+
+
+@pytest.mark.progressive_ux
+def test_concurrent_helpwhy_same_worse_race_exactly_one_wins(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, FakeMessage(user), f"cc:practhelp:{proposal.proposal_id}:no")))
+
+    async def go():
+        msg_same, msg_worse = FakeMessage(user), FakeMessage(user)
+        await asyncio.gather(
+            bot.cb_cc_practhelpwhy(_fake_callback(
+                user, msg_same, f"cc:practhelpwhy:{proposal.proposal_id}:same")),
+            bot.cb_cc_practhelpwhy(_fake_callback(
+                user, msg_worse, f"cc:practhelpwhy:{proposal.proposal_id}:worse")))
+        return msg_same, msg_worse
+    msg_same, msg_worse = run(go())
+    delivered = [m for m in (msg_same, msg_worse) if m.answers]
+    assert len(delivered) == 1
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome in (PracticeOutcome.NO_CHANGE, PracticeOutcome.WORSE)
+    assert reloaded.superseded_reason is None, "the winner must clear the marker atomically"
+
+
+# Atomic outcome-finalization contract audit follow-up -- sequential
+# ordering, legacy fail-closed behavior, restart safety, and a deterministic
+# (non-scheduling-luck) proof that the yes/no race is now structurally
+# impossible to double-win, not just usually inert.
+
+@pytest.mark.progressive_ux
+def test_practhelp_yes_wins_before_practhelp_no(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    msg_yes = FakeMessage(user)
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, msg_yes, f"cc:practhelp:{proposal.proposal_id}:yes")))
+    assert msg_yes.answers != []
+    msg_no = FakeMessage(user)
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, msg_no, f"cc:practhelp:{proposal.proposal_id}:no")))
+    assert msg_no.answers == [], "yes already closed the window -- no must fail closed"
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is PracticeOutcome.HELPED
+    assert reloaded.superseded_reason is None
+
+
+@pytest.mark.progressive_ux
+def test_practhelp_no_wins_before_practhelp_yes(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    msg_no = FakeMessage(user)
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, msg_no, f"cc:practhelp:{proposal.proposal_id}:no")))
+    assert msg_no.answers != []
+    msg_yes = FakeMessage(user)
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, msg_yes, f"cc:practhelp:{proposal.proposal_id}:yes")))
+    assert msg_yes.answers == [], "the pending marker must block a later direct HELPED"
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is None
+    assert reloaded.superseded_reason == UX_PENDING_OUTCOME_DETAIL
+
+
+@pytest.mark.progressive_ux
+def test_concurrent_help_yes_no_race_exactly_one_wins_deterministic_barrier(monkeypatch, tmp_db):
+    """Same property as test_concurrent_help_yes_no_race_exactly_one_wins,
+    but forces genuine overlap at the real-DB-call boundary via an explicit
+    rendezvous instead of relying on asyncio scheduling order -- both
+    coroutines are held until BOTH have reached their write, then released
+    together, so the CAS predicates (not scheduling luck) decide the winner.
+    Unlike the plain version, this one also captures each real CAS function's
+    actual True/False return value and re-reads the row from the real tmp
+    SQLite database afterward, so the proof covers the persisted row and the
+    CAS results directly -- not just the message-delivery side effect."""
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+
+    ready = asyncio.Event()
+    remaining = {"n": 2}
+    real_record = bot.record_practice_outcome
+    real_transition = bot.transition_practice_proposal
+    results = {}
+
+    async def _rendezvous():
+        remaining["n"] -= 1
+        if remaining["n"] == 0:
+            ready.set()
+        else:
+            await ready.wait()
+
+    async def barrier_record(*a, **kw):
+        await _rendezvous()
+        results["yes"] = await real_record(*a, **kw)
+        return results["yes"]
+
+    async def barrier_transition(*a, **kw):
+        await _rendezvous()
+        results["no"] = await real_transition(*a, **kw)
+        return results["no"]
+
+    monkeypatch.setattr(bot, "record_practice_outcome", barrier_record)
+    monkeypatch.setattr(bot, "transition_practice_proposal", barrier_transition)
+
+    async def go():
+        msg_yes, msg_no = FakeMessage(user), FakeMessage(user)
+        await asyncio.gather(
+            bot.cb_cc_practhelp(_fake_callback(
+                user, msg_yes, f"cc:practhelp:{proposal.proposal_id}:yes")),
+            bot.cb_cc_practhelp(_fake_callback(
+                user, msg_no, f"cc:practhelp:{proposal.proposal_id}:no")))
+        return msg_yes, msg_no
+    msg_yes, msg_no = run(go())
+    delivered = [m for m in (msg_yes, msg_no) if m.answers]
+
+    # Exactly one real CAS succeeded, exactly one failed -- captured directly
+    # from the real record_practice_outcome/transition_practice_proposal
+    # return values, neither mocked nor inferred from a side effect.
+    assert {results["yes"], results["no"]} == {True, False}, \
+        f"exactly one CAS must return True and one False, got {results}"
+    assert len(delivered) == 1
+
+    # The final row, re-read from the real temporary SQLite database, must be
+    # exactly one of the two valid terminal states, and it must correspond to
+    # whichever CAS actually returned True -- not asserted independent of it.
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    if results["yes"] is True:
+        assert results["no"] is False
+        assert reloaded.status is PracticeProposalStatus.COMPLETED
+        assert reloaded.outcome is PracticeOutcome.HELPED
+        assert reloaded.superseded_reason is None
+        assert reloaded.reporting_window_status == "CLOSED"
+    else:
+        assert results["no"] is True
+        assert reloaded.status is PracticeProposalStatus.COMPLETED
+        assert reloaded.outcome is None
+        assert reloaded.superseded_reason == UX_PENDING_OUTCOME_DETAIL
+        assert reloaded.reporting_window_status == "ACTIVE"
+
+
+@pytest.mark.progressive_ux
+@pytest.mark.parametrize("legacy_value", ["helped", "partly", "none", "worse"])
+def test_pending_marker_blocks_every_legacy_direct_outcome(monkeypatch, tmp_db, legacy_value):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, FakeMessage(user), f"cc:practhelp:{proposal.proposal_id}:no")))
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:helped:{proposal.proposal_id}:{legacy_value}")
+    run(bot.cb_cc_outcome_detail(cb))
+    assert msg.answers == [], f"legacy '{legacy_value}' must fail closed during refinement"
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is None
+    assert reloaded.superseded_reason == UX_PENDING_OUTCOME_DETAIL
+
+
+@pytest.mark.progressive_ux
+def test_legacy_outcome_first_blocks_pending_marker_creation(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    run(bot.cb_cc_outcome_detail(_fake_callback(
+        user, FakeMessage(user), f"cc:helped:{proposal.proposal_id}:helped")))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is PracticeOutcome.HELPED
+    msg = FakeMessage(user)
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, msg, f"cc:practhelp:{proposal.proposal_id}:no")))
+    assert msg.answers == [], "legacy HELPED already closed the window"
+    reloaded2 = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded2.superseded_reason is None
+
+
+@pytest.mark.progressive_ux
+def test_duplicate_no_change_is_inert(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_complete_new_flow_with_outcome(1, user, monkeypatch, "same"))
+    msg2 = FakeMessage(user)
+    run(bot.cb_cc_practhelpwhy(_fake_callback(
+        user, msg2, f"cc:practhelpwhy:{proposal.proposal_id}:same")))
+    assert msg2.answers == []
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is PracticeOutcome.NO_CHANGE
+
+
+@pytest.mark.progressive_ux
+def test_restart_preserves_pending_outcome_detail_step(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, FakeMessage(user), f"cc:practhelp:{proposal.proposal_id}:no")))
+    # Simulate "restart": a completely fresh accessor read.
+    reread = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reread.status is PracticeProposalStatus.COMPLETED
+    assert reread.superseded_reason == UX_PENDING_OUTCOME_DETAIL
+    msg = FakeMessage(user)
+    run(bot.cb_cc_practhelpwhy(_fake_callback(
+        user, msg, f"cc:practhelpwhy:{reread.proposal_id}:worse")))
+    final = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert final.outcome is PracticeOutcome.WORSE
+    assert final.superseded_reason is None
+
+
+@pytest.mark.progressive_ux
+def test_stale_practhelp_yes_cannot_reopen_resolved_refinement(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_complete_new_flow_with_outcome(1, user, monkeypatch, "same"))
+    # The original Step B message's "Помогло" button is still physically
+    # tappable in Telegram even though the flow already resolved via "Не
+    # помогло" -> "Без изменений" -- it must fail closed, not overwrite the
+    # already-recorded NO_CHANGE.
+    msg = FakeMessage(user)
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, msg, f"cc:practhelp:{proposal.proposal_id}:yes")))
+    assert msg.answers == []
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is PracticeOutcome.NO_CHANGE
+    assert reloaded.superseded_reason is None
+
+
+# §8 item 25 -- no ordinary conversational response receives an automatic
+# keyboard.
+@pytest.mark.progressive_ux
+def test_ordinary_conversational_reply_has_no_automatic_keyboard(monkeypatch, tmp_db):
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Расскажи мне об этом подробнее.")
+    run(_seed_user(1))
+    user = FakeUser(1)
+    msg = FakeMessage(user, "Мне сегодня тяжело, хочу выговориться.")
+    run(bot.pipeline(msg, msg.text, None, tg_user=user))
+    assert msg.answers, "must still get an ordinary reply"
+    assert msg.answers[0][1].get("reply_markup") is None, \
+        "an ordinary conversational response must never carry an automatic keyboard"
+
+
+# EN-language coverage (the same code paths, driven with a persisted
+# language='en' user -- every RU test above exercises the identical
+# ternary-selected branch for its own language).
+@pytest.mark.progressive_ux
+def test_first_practice_prompt_en_has_progressive_two_buttons(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(database.upsert_user(1, "u1", "U1", language="en"))
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practdone:{proposal.proposal_id}:no")
+    run(bot.cb_cc_practdone(cb))
+    text, kw = msg.answers[0]
+    assert "What happened most closely" in text
+    labels = [b.text for row in kw["reply_markup"].inline_keyboard for b in row]
+    assert labels == ["I started but stopped", "I didn't start"]
+
+
+@pytest.mark.progressive_ux
+def test_helpwhy_worse_en_records_worse_without_causality_claim(monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    run(database.upsert_user(1, "u1", "U1", language="en"))
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, FakeMessage(user), f"cc:practhelp:{proposal.proposal_id}:no")))
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practhelpwhy:{proposal.proposal_id}:worse")
+    run(bot.cb_cc_practhelpwhy(cb))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.outcome is PracticeOutcome.WORSE
+    text = msg.answers[0][0].lower()
+    assert "felt worse" in text
+    assert "caused" not in text and "made you worse" not in text, "no causality claim"
