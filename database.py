@@ -3256,7 +3256,9 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
                                    practice_version: str, purpose: str,
                                    expected_duration: str,
                                    ttl_seconds: int = 1800,
-                                   is_worse_override: bool = False) -> "_core.PracticeProposal":
+                                   is_worse_override: bool = False,
+                                   block_if_refinement_pending=None
+                                   ) -> "_core.PracticeProposal | None":
     """Hardening §3/§4: supersedes any still-actionable proposal for this
     SESSION in the same transaction before inserting the new one -- the
     partial unique index (one actionable proposal per session) turns a
@@ -3266,7 +3268,21 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
     exact proposal is an explicit, informed repeat of a practice whose
     latest recorded outcome was WORSE -- always a brand-new row (this
     function never reuses an existing one), never touching the old
-    WORSE-outcome proposal's own history."""
+    WORSE-outcome proposal's own history.
+
+    Progressive practice UX atomicity fix (external review F2 follow-up):
+    `block_if_refinement_pending`, if given a non-empty sequence of internal
+    pending-marker strings (caller-supplied, never hardcoded here -- mirrors
+    transition_practice_proposal/record_practice_outcome/
+    has_active_practice_refinement's own convention), makes the row creation
+    itself conditional via a single `INSERT ... SELECT ... WHERE NOT EXISTS
+    (...) RETURNING ...` statement on this SAME connection/transaction. The
+    refinement check and the insert are ONE atomic SQL statement -- there is
+    no separate pre-read SELECT and no window for another connection's
+    concurrent write (e.g. a callback establishing the marker) to land
+    between a check and an insert, because there is no gap between them to
+    land in. Returns None if blocked (the row is never created). Default
+    (None/empty) preserves the prior unconditional-insert behavior exactly."""
     async with aiosqlite.connect(DB) as db:
         await db.execute(
             """UPDATE core_practice_proposals SET status='SUPERSEDED',
@@ -3274,19 +3290,27 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
                WHERE session_id=? AND user_id=?
                  AND status IN ('PROPOSED','PENDING','GRANTED','DELIVERING')""",
             (session_id, uid))
+        where_clause = ""
+        guard_params = ()
+        if block_if_refinement_pending:
+            placeholders = ",".join("?" for _ in block_if_refinement_pending)
+            where_clause = (
+                " WHERE NOT EXISTS (SELECT 1 FROM core_practice_proposals "
+                "WHERE user_id=? AND session_id=? AND reporting_window_status='ACTIVE' "
+                f"AND superseded_reason IN ({placeholders}))")
+            guard_params = (uid, session_id, *block_if_refinement_pending)
         cur = await db.execute(
-            """INSERT INTO core_practice_proposals
+            f"""INSERT INTO core_practice_proposals
                (user_id, session_id, practice_id, practice_version, purpose,
                 expected_duration, status, expires_at, is_worse_override)
-               VALUES (?,?,?,?,?,?,'PROPOSED', datetime('now', ?), ?)""",
+               SELECT ?, ?, ?, ?, ?, ?, 'PROPOSED', datetime('now', ?), ?{where_clause}
+               RETURNING {','.join(_PP_COLUMNS)}""",
             (uid, session_id, practice_id, practice_version, purpose,
-             expected_duration, f"+{int(ttl_seconds)} seconds", int(is_worse_override)))
-        pid = cur.lastrowid
-        row = await (await db.execute(
-            f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals WHERE id=?",
-            (pid,))).fetchone()
+             expected_duration, f"+{int(ttl_seconds)} seconds", int(is_worse_override),
+             *guard_params))
+        row = await cur.fetchone()
         await db.commit()
-        return _pp_row_to_obj(row)
+        return _pp_row_to_obj(row) if row else None
 
 
 async def get_latest_proposal_for_session(session_id, user_id: int) -> "_core.PracticeProposal | None":

@@ -142,7 +142,8 @@ from database import (
     session_json_snapshot, create_practice_proposal, get_practice_proposal,
     transition_practice_proposal, mark_proposal_delivered,
     supersede_active_practice_proposals, record_practice_outcome,
-    get_latest_outcome_for_practice, mark_prompt_delivered, mark_prompt_failed,
+    get_latest_outcome_for_practice,
+    mark_prompt_delivered, mark_prompt_failed,
     get_proposals_with_failed_prompts, claim_prompt_send,
 )
 import conversation_controller as controller
@@ -1134,6 +1135,20 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict
     # out of scope here), so the honest response is to say so and offer
     # nothing else automatically -- never silently repeat what already made
     # things worse, never invent a substitute.
+    #
+    # External review F2 follow-up: PRACTICE-intent continuation must never
+    # automatically propose ANOTHER practice while a progressive refinement
+    # is still pending (superseded_reason is a UX_PENDING_* marker and the
+    # reporting window is still ACTIVE) -- the user hasn't finished answering
+    # the current one yet. `block_if_refinement_pending` below makes this
+    # atomic AT THE INSERT ITSELF (create_practice_proposal's own same-
+    # connection INSERT...WHERE NOT EXISTS...RETURNING) -- there is no
+    # separate pre-read SELECT and therefore no TOCTOU gap for a concurrent
+    # callback to establish the marker in between a check and an insert.
+    # This does not touch the pending proposal itself (no write, no marker
+    # clear, no window change) and does not suppress crisis/disclosure/
+    # rollout/topic-change handling, all of which already ran (or already
+    # invalidated this session's window) before this point.
     proposal = None
     adverse_guard = False
     if turn_intent is Intent.PRACTICE:
@@ -1154,7 +1169,9 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict
                 uid, session.session_id, practice["id"], practice.get("version", "v1"),
                 purpose=practice.get("name", _PRACTICE_ID),
                 expected_duration=f"{practice.get('duration_min', 5)} минут",
-                is_worse_override=adverse_guard)
+                is_worse_override=adverse_guard,
+                block_if_refinement_pending=(
+                    UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL))
 
     # §7/§8/§9: bounded recent context -- this user's own last few turns (any
     # scenario, not just prior controller ones), fetched BEFORE this turn's

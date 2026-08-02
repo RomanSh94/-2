@@ -3713,6 +3713,179 @@ def test_free_text_after_help_prompt_goes_through_ordinary_pipeline(monkeypatch,
     assert reloaded.outcome is None, "free text must never fabricate a persisted outcome"
 
 
+# External review finding F2: neither test above sends free text WHILE a
+# pending progressive-refinement marker is already active (i.e. after "Не
+# помогло"/"Не получилось" was tapped, before the second button). Intended
+# product behavior (progressive disclosure): ordinary, non-topic-changing
+# free text must leave the pending marker and window completely untouched,
+# get an ordinary keyboard-free reply, and the original buttons must still
+# work afterward -- the user is never forced to answer immediately.
+
+@pytest.mark.progressive_ux
+def test_free_text_during_pending_outcome_detail_preserves_marker_and_buttons_remain_valid(
+        monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, FakeMessage(user), f"cc:practhelp:{proposal.proposal_id}:no")))
+    before = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert before.status is PracticeProposalStatus.COMPLETED
+    assert before.outcome is None
+    assert before.superseded_reason == UX_PENDING_OUTCOME_DETAIL
+    assert before.reporting_window_status == "ACTIVE"
+
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Понимаю, продолжай, когда будешь готов(а).")
+    msg2 = FakeMessage(user, "Сложно сказать, наверное отчасти.")
+    run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
+    assert msg2.answers, "free text must still get an ordinary conversational reply"
+    assert len(msg2.answers) == 1, "no automatic additional intervention may be sent"
+    # deliver_response's one-time-per-user ReplyKeyboardRemove cleanup (see
+    # its own docstring: "does not touch inline keyboards") is unrelated and
+    # may legitimately be present -- what must be absent is an actual
+    # practice-consent INLINE keyboard.
+    markup = msg2.answers[0][1].get("reply_markup")
+    consent_buttons = [b.callback_data for row in getattr(markup, "inline_keyboard", [])
+                       for b in row if b.callback_data and b.callback_data.startswith("cc:consent:")]
+    assert not consent_buttons, \
+        "an ordinary conversational response must never carry an automatic practice-consent keyboard"
+
+    mid = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert mid.status is PracticeProposalStatus.COMPLETED
+    assert mid.outcome is None, "free text must never fabricate or finalize an outcome"
+    assert mid.superseded_reason == UX_PENDING_OUTCOME_DETAIL, \
+        "the pending marker must survive an ordinary, non-topic-changing reply"
+    assert mid.reporting_window_status == "ACTIVE", "the window must stay open for later refinement"
+    latest = run(database.get_latest_proposal_for_session(session.session_id, 1))
+    assert latest.proposal_id == proposal.proposal_id, \
+        "no competing practice proposal may be auto-created while a refinement is pending"
+    mid_session = run(database.list_core_sessions(1))[0]
+    assert mid_session.intent is Intent.PRACTICE, "session intent must not change unexpectedly"
+
+    # The original "Стало хуже" button, from before the free-text turn, must
+    # still work and still atomically clear the marker on the real terminal write.
+    msg3 = FakeMessage(user)
+    run(bot.cb_cc_practhelpwhy(_fake_callback(
+        user, msg3, f"cc:practhelpwhy:{proposal.proposal_id}:worse")))
+    assert msg3.answers
+    final = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert final.outcome is PracticeOutcome.WORSE
+    assert final.superseded_reason is None, "marker must be cleared atomically on the real terminal write"
+    assert final.reporting_window_status == "CLOSED"
+
+
+@pytest.mark.progressive_ux
+def test_free_text_during_pending_not_completed_preserves_marker_and_buttons_remain_valid(
+        monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_started_practice(1, user, monkeypatch))
+    run(bot.cb_cc_practdone(_fake_callback(
+        user, FakeMessage(user), f"cc:practdone:{proposal.proposal_id}:no")))
+    before = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert before.status is PracticeProposalStatus.WITHDRAWN
+    assert before.outcome is None
+    assert before.superseded_reason == UX_PENDING_NOT_COMPLETED_REASON
+    assert before.reporting_window_status == "ACTIVE"
+
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Понимаю, не спеши.")
+    msg2 = FakeMessage(user, "Даже не знаю, как сказать.")
+    run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
+    assert msg2.answers, "free text must still get an ordinary conversational reply"
+    assert len(msg2.answers) == 1, "no automatic additional intervention may be sent"
+    # deliver_response's one-time-per-user ReplyKeyboardRemove cleanup (see
+    # its own docstring: "does not touch inline keyboards") is unrelated and
+    # may legitimately be present -- what must be absent is an actual
+    # practice-consent INLINE keyboard.
+    markup = msg2.answers[0][1].get("reply_markup")
+    consent_buttons = [b.callback_data for row in getattr(markup, "inline_keyboard", [])
+                       for b in row if b.callback_data and b.callback_data.startswith("cc:consent:")]
+    assert not consent_buttons, \
+        "an ordinary conversational response must never carry an automatic practice-consent keyboard"
+
+    mid = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert mid.status is PracticeProposalStatus.WITHDRAWN
+    assert mid.outcome is None
+    assert mid.superseded_reason == UX_PENDING_NOT_COMPLETED_REASON, \
+        "the pending marker must survive an ordinary, non-topic-changing reply"
+    assert mid.reporting_window_status == "ACTIVE"
+    latest = run(database.get_latest_proposal_for_session(session.session_id, 1))
+    assert latest.proposal_id == proposal.proposal_id, \
+        "no competing practice proposal may be auto-created while a refinement is pending"
+    mid_session = run(database.list_core_sessions(1))[0]
+    assert mid_session.intent is Intent.PRACTICE, "session intent must not change unexpectedly"
+
+    # The original "Начал, но остановился" button must still work afterward.
+    msg3 = FakeMessage(user)
+    run(bot.cb_cc_practwhy(_fake_callback(
+        user, msg3, f"cc:practwhy:{proposal.proposal_id}:stopped")))
+    assert msg3.answers
+    final = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert final.status is PracticeProposalStatus.WITHDRAWN
+    assert final.superseded_reason == "user_stopped"
+    assert final.reporting_window_status == "CLOSED"
+    s = run(database.list_core_sessions(1))[0]
+    assert RepairConstraint.EXERCISE_REJECTED not in s.active_repair_constraints, \
+        "no refusal/dislike may be fabricated from a truthful non-completion"
+
+
+@pytest.mark.progressive_ux
+def test_topic_change_while_pending_outcome_detail_invalidates_and_fails_closed_old_button(
+        monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_seed_new_flow_completed(1, user, monkeypatch))
+    run(bot.cb_cc_practhelp(_fake_callback(
+        user, FakeMessage(user), f"cc:practhelp:{proposal.proposal_id}:no")))
+
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Расскажи мне об этом подробнее.")
+    run(bot.pipeline(FakeMessage(user, "Мне нужно выговориться."),
+                     "Мне нужно выговориться.", None, tg_user=user))
+    reloaded = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert reloaded.status is PracticeProposalStatus.COMPLETED, "truthful history untouched"
+    assert reloaded.outcome is None, "a real topic change must never fabricate an outcome"
+    assert reloaded.superseded_reason == UX_PENDING_OUTCOME_DETAIL, \
+        "topic-change window invalidation is a SEPARATE update -- it never rewrites the marker"
+    assert reloaded.reporting_window_status == "INVALIDATED"
+
+    msg = FakeMessage(user)
+    cb = _fake_callback(user, msg, f"cc:practhelpwhy:{proposal.proposal_id}:worse")
+    run(bot.cb_cc_practhelpwhy(cb))
+    assert msg.answers == [], "a stale button after a real topic change must not mutate or reply"
+    assert cb.answered == 1, "still answered silently to clear the loading spinner"
+    final = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert final.outcome is None, "still not fabricated"
+    assert final.superseded_reason == UX_PENDING_OUTCOME_DETAIL, "still untouched"
+
+
+# Regression guard for the F2 fix above: the new has_active_practice_refinement
+# check must be scoped EXACTLY to an active pending marker -- it must not
+# disable ordinary PRACTICE-intent continuation once a practice cycle has
+# reached a real terminal state (HELPED, no marker, window CLOSED).
+@pytest.mark.progressive_ux
+def test_ordinary_practice_continuation_still_proposes_new_practice_when_no_refinement_pending(
+        monkeypatch, tmp_db):
+    user = FakeUser(1)
+    session, proposal = run(_complete_new_flow_with_outcome(1, user, monkeypatch, "helped"))
+    resolved = run(database.get_practice_proposal(proposal.proposal_id, 1))
+    assert resolved.outcome is PracticeOutcome.HELPED
+    assert resolved.superseded_reason is None, "sanity check: no pending marker left after HELPED"
+    assert resolved.reporting_window_status == "CLOSED"
+
+    llm_calls = {"n": 0}
+    _full_pipeline_stub_set(monkeypatch, llm_reply="Хочешь попробовать ещё раз?", llm_calls=llm_calls)
+    msg2 = FakeMessage(user, "Даже не знаю, как сказать.")
+    run(bot.pipeline(msg2, msg2.text, None, tg_user=user))
+    assert msg2.answers
+    markup = msg2.answers[0][1].get("reply_markup")
+    assert markup is not None, \
+        "ordinary PRACTICE continuation must still be able to propose a new practice " \
+        "once the previous one reached a real terminal state"
+    buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert all(cd.startswith("cc:consent:") for cd in buttons)
+
+    latest = run(database.get_latest_proposal_for_session(session.session_id, 1))
+    assert latest.proposal_id != proposal.proposal_id, \
+        "a genuinely new proposal must be created when no refinement is pending"
+
+
 # §8 items 13-17 -- topic change / /start / crisis / disclosure / close all
 # invalidate old (new-flow) buttons, mirroring the legacy race tests.
 @pytest.mark.progressive_ux
