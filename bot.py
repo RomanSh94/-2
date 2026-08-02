@@ -3098,10 +3098,15 @@ async def cb_cc_practhelp(callback: CallbackQuery):
     lang = await get_user_language(uid) or "ru"
 
     if value == "yes":
-        # Mutually exclusive with the "no" branch's same-status refinement
-        # write below: whichever commits first makes the other's CAS fail --
-        # "yes" requires superseded_reason still NULL, "no" requires the
-        # same and then closes the window, which also blocks a losing "yes".
+        # Mutually exclusive with the "no" refinement branch below:
+        # both paths require an ACTIVE reporting window and
+        # superseded_reason still NULL.
+        # If "yes" commits first, record_practice_outcome records HELPED and
+        # closes the reporting window, so the later "no" CAS fails.
+        # If "no" commits first, transition_practice_proposal atomically sets
+        # UX_PENDING_OUTCOME_DETAIL while keeping the proposal COMPLETED and
+        # the reporting window ACTIVE, so a later "yes" fails
+        # require_prior_reason_null.
         ok = await record_practice_outcome(proposal_id, uid, PracticeOutcome.HELPED.value,
                                            require_active_reporting_window=True,
                                            require_prior_reason_null=True)
