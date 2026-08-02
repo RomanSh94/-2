@@ -142,13 +142,14 @@ from database import (
     session_json_snapshot, create_practice_proposal, get_practice_proposal,
     transition_practice_proposal, mark_proposal_delivered,
     supersede_active_practice_proposals, record_practice_outcome,
-    get_latest_outcome_for_practice, mark_prompt_delivered, mark_prompt_failed,
+    get_latest_outcome_for_practice,
+    mark_prompt_delivered, mark_prompt_failed,
     get_proposals_with_failed_prompts, claim_prompt_send,
 )
 import conversation_controller as controller
 from therapeutic_domain import (
     Intent, RepairConstraint, LifecycleStatus, ConsentState, PracticeProposalStatus,
-    PracticeOutcome,
+    PracticeOutcome, UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL,
 )
 import onboarding
 import onboarding_content
@@ -1134,6 +1135,20 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict
     # out of scope here), so the honest response is to say so and offer
     # nothing else automatically -- never silently repeat what already made
     # things worse, never invent a substitute.
+    #
+    # External review F2 follow-up: PRACTICE-intent continuation must never
+    # automatically propose ANOTHER practice while a progressive refinement
+    # is still pending (superseded_reason is a UX_PENDING_* marker and the
+    # reporting window is still ACTIVE) -- the user hasn't finished answering
+    # the current one yet. `block_if_refinement_pending` below makes this
+    # atomic AT THE INSERT ITSELF (create_practice_proposal's own same-
+    # connection INSERT...WHERE NOT EXISTS...RETURNING) -- there is no
+    # separate pre-read SELECT and therefore no TOCTOU gap for a concurrent
+    # callback to establish the marker in between a check and an insert.
+    # This does not touch the pending proposal itself (no write, no marker
+    # clear, no window change) and does not suppress crisis/disclosure/
+    # rollout/topic-change handling, all of which already ran (or already
+    # invalidated this session's window) before this point.
     proposal = None
     adverse_guard = False
     if turn_intent is Intent.PRACTICE:
@@ -1154,7 +1169,9 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict
                 uid, session.session_id, practice["id"], practice.get("version", "v1"),
                 purpose=practice.get("name", _PRACTICE_ID),
                 expected_duration=f"{practice.get('duration_min', 5)} минут",
-                is_worse_override=adverse_guard)
+                is_worse_override=adverse_guard,
+                block_if_refinement_pending=(
+                    UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL))
 
     # §7/§8/§9: bounded recent context -- this user's own last few turns (any
     # scenario, not just prior controller ones), fetched BEFORE this turn's
@@ -2484,8 +2501,11 @@ async def _deliver_granted_practice(callback: CallbackQuery, uid: int, session_i
         if await _prompt_claim_still_safe(uid, proposal_id, "outcome", outcome_claim_id, "STARTED"):
             try:
                 sent = await callback.message.answer(
-                    "Как прошло?" if lang != "en" else "How did it go?",
-                    reply_markup=_practice_outcome_kb(proposal_id, lang))
+                    ("Получилось выполнить практику?\n\n"
+                     "Можно выбрать вариант или ответить своими словами.") if lang != "en" else
+                    ("Were you able to do the practice?\n\n"
+                     "You can choose an option or reply in your own words."),
+                    reply_markup=_practice_did_kb(proposal_id, lang))
                 await mark_prompt_delivered(proposal_id, uid, "outcome", sent.message_id, outcome_claim_id)
             except Exception as e:
                 print(f"[controller] outcome-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
@@ -2551,6 +2571,50 @@ def _practice_helped_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
         for val, ru, en in labels])
 
 
+# ── Progressive two-button practice UX (replaces the 3-then-4-button legacy
+# flow above for every NEWLY delivered proposal). The legacy cc:outcome/
+# cc:helped handlers and keyboards above are kept completely unchanged --
+# any proposal already carrying an old-style keyboard (a message sent
+# before this change) continues through that exact same, already-tested
+# path end to end, never switched mid-flow to the new one. Product
+# principle: never more than two buttons per message; free text always
+# remains a valid answer at every step (it flows through the ordinary
+# conversation pipeline, unchanged); an unfinished practice is never framed
+# as failure or met with pressure to continue.
+
+def _practice_did_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [("yes", "Получилось", "I did it"), ("no", "Не получилось", "I couldn't")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:practdone:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+def _practice_notdone_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [("stopped", "Начал, но остановился", "I started but stopped"),
+             ("never", "Не начал", "I didn't start")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:practwhy:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+def _practice_help_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [("yes", "Помогло", "It helped"), ("no", "Не помогло", "It didn't help")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:practhelp:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+def _practice_helpwhy_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [("same", "Без изменений", "No change"), ("worse", "Стало хуже", "I feel worse")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:practhelpwhy:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
 async def _retry_failed_practice_prompts(message: Message, uid: int) -> None:
     """PR #73 request-changes §6 / FINAL REQUEST CHANGES §2/§4: restart-safe
     recovery, called on every real inbound turn. Resends whichever post-
@@ -2598,8 +2662,11 @@ async def _retry_failed_practice_prompts(message: Message, uid: int) -> None:
                 continue
             try:
                 sent = await message.answer(
-                    "Как прошло?" if lang != "en" else "How did it go?",
-                    reply_markup=_practice_outcome_kb(p.proposal_id, lang))
+                    ("Получилось выполнить практику?\n\n"
+                     "Можно выбрать вариант или ответить своими словами.") if lang != "en" else
+                    ("Were you able to do the practice?\n\n"
+                     "You can choose an option or reply in your own words."),
+                    reply_markup=_practice_did_kb(p.proposal_id, lang))
                 await mark_prompt_delivered(p.proposal_id, uid, "outcome", sent.message_id, claim_id)
             except Exception as e:
                 print(f"[controller] outcome-prompt retry failed uid={uid}: {type(e).__name__}: {e}")
@@ -2614,8 +2681,9 @@ async def _retry_failed_practice_prompts(message: Message, uid: int) -> None:
                 continue
             try:
                 sent = await message.answer(
-                    "Как это подействовало?" if lang != "en" else "How did that go?",
-                    reply_markup=_practice_helped_kb(p.proposal_id, lang))
+                    "Помогла ли практика хотя бы немного?" if lang != "en" else
+                    "Did the practice help at least a little?",
+                    reply_markup=_practice_help_kb(p.proposal_id, lang))
                 await mark_prompt_delivered(p.proposal_id, uid, "helped", sent.message_id, claim_id)
             except Exception as e:
                 print(f"[controller] helped-prompt retry failed uid={uid}: {type(e).__name__}: {e}")
@@ -2818,7 +2886,13 @@ async def cb_cc_outcome_detail(callback: CallbackQuery):
     if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
         await callback.answer()
         return
-    ok = await record_practice_outcome(proposal_id, uid, outcome, require_active_reporting_window=True)
+    # Legacy handler predates the progressive refinement flow -- it must fail
+    # closed (not silently overwrite) once a pending UX_PENDING_OUTCOME_DETAIL
+    # marker exists, so an untouched old Telegram message can never race past
+    # a refinement already in progress.
+    ok = await record_practice_outcome(proposal_id, uid, outcome,
+                                       require_active_reporting_window=True,
+                                       require_prior_reason_null=True)
     await callback.answer()
     if not ok:
         return
@@ -2829,6 +2903,300 @@ async def cb_cc_outcome_detail(callback: CallbackQuery):
                 "Thanks for being honest — I've noted that. If things get harder, tell me.")
     else:
         text = "Спасибо, что рассказал(а)." if lang != "en" else "Thanks for telling me."
+    await callback.message.answer(text)
+
+
+# ── Progressive two-button practice UX callbacks ────────────────────────────
+# Every handler below follows the exact same independent/additive safety
+# discipline as cb_cc_outcome/cb_cc_outcome_detail above: rollout, crisis,
+# disclosure, proposal existence+ownership, reporting-window ACTIVE (fast
+# path; the atomic CAS below is the real authority), owning-session OPEN.
+# A stale callback never mutates anything and never sends a visible
+# message, but is still answered (silently) so the Telegram client's
+# loading spinner clears.
+
+@dp.callback_query(F.data.startswith("cc:practdone:"))
+async def cb_cc_practdone(callback: CallbackQuery):
+    """Step A: 'Получилось' / 'Не получилось' -- replaces the legacy
+    3-button 'Как прошло?' prompt. 'Получилось' is exactly the old 'done'
+    transition (STARTED->COMPLETED), just relabeled. 'Не получилось' is
+    NOT yet a terminal answer -- it withdraws truthfully (reason=
+    UX_PENDING_NOT_COMPLETED_REASON, an internal marker, never a real
+    withdrawal cause) but keeps the reporting window ACTIVE, then asks one
+    more question to distinguish an attempt from never starting."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    if value not in ("yes", "no"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None:
+        await callback.answer()
+        return
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+
+    if value == "yes":
+        if not await transition_practice_proposal(
+                proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
+                to_status=PracticeProposalStatus.COMPLETED.value,
+                require_active_reporting_window=True):
+            await callback.answer()
+            return
+        await callback.answer()
+        helped_claim_id = await claim_prompt_send(proposal_id, uid, "helped", "COMPLETED")
+        if helped_claim_id:
+            if await _prompt_claim_still_safe(uid, proposal_id, "helped", helped_claim_id, "COMPLETED"):
+                try:
+                    sent = await callback.message.answer(
+                        "Помогла ли практика хотя бы немного?" if lang != "en" else
+                        "Did the practice help at least a little?",
+                        reply_markup=_practice_help_kb(proposal_id, lang))
+                    await mark_prompt_delivered(proposal_id, uid, "helped", sent.message_id, helped_claim_id)
+                except Exception as e:
+                    print(f"[controller] help-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+                    await mark_prompt_failed(proposal_id, uid, "helped", helped_claim_id)
+            else:
+                await mark_prompt_failed(proposal_id, uid, "helped", helped_claim_id)
+        return
+
+    # "no": not terminal yet. Reporting window stays ACTIVE (no
+    # close_reporting_window) -- one more answer is still expected.
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
+            to_status=PracticeProposalStatus.WITHDRAWN.value, reason=UX_PENDING_NOT_COMPLETED_REASON,
+            require_active_reporting_window=True):
+        await callback.answer()
+        return
+    await callback.answer()
+    try:
+        await callback.message.answer(
+            ("Понял. Что произошло ближе всего?\n\n"
+             "Можно выбрать вариант или написать своими словами.") if lang != "en" else
+            ("Understood. What happened most closely?\n\n"
+             "You can choose an option or reply in your own words."),
+            reply_markup=_practice_notdone_kb(proposal_id, lang))
+    except Exception as e:
+        print(f"[controller] practwhy prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+
+
+@dp.callback_query(F.data.startswith("cc:practwhy:"))
+async def cb_cc_practwhy(callback: CallbackQuery):
+    """Step A2: 'Начал, но остановился' / 'Не начал'. Refines an already-
+    WITHDRAWN(reason=UX_PENDING_NOT_COMPLETED_REASON) proposal into its truthful specific
+    reason via a SAME-STATUS CAS additionally gated on the CURRENT reason
+    (require_prior_reason) -- this is what makes a duplicate/racing tap
+    lose, since `status` alone never changes across this step. Neither
+    answer persists EXERCISE_REJECTED: an attempt-then-stop and a never-
+    started are both truthful non-completions, not proof of refusal or
+    dislike."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    if value not in ("stopped", "never"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None:
+        await callback.answer()
+        return
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    reason = "user_stopped" if value == "stopped" else "user_did_not_start"
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.WITHDRAWN.value,
+            to_status=PracticeProposalStatus.WITHDRAWN.value,
+            require_prior_reason=UX_PENDING_NOT_COMPLETED_REASON, reason=reason,
+            close_reporting_window=True, require_active_reporting_window=True):
+        await callback.answer()
+        return
+    await callback.answer()
+    lang = await get_user_language(uid) or "ru"
+    try:
+        # Open question, no keyboard -- free text (or a topic change) is
+        # always the next valid move, not another forced choice.
+        await callback.message.answer(
+            "Что помешало больше всего?" if lang != "en" else "What got in the way most?")
+    except Exception as e:
+        print(f"[controller] practwhy followup delivery failed uid={uid}: {type(e).__name__}: {e}")
+
+
+@dp.callback_query(F.data.startswith("cc:practhelp:"))
+async def cb_cc_practhelp(callback: CallbackQuery):
+    """Step B: 'Помогло' / 'Не помогло' -- replaces the legacy 4-button
+    'Как это подействовало?' prompt. 'Помогло' records HELPED exactly like
+    the legacy 'helped' answer. 'Не помогло' is NOT recorded as NO_CHANGE
+    yet (the state may have worsened) -- a same-status CAS additionally
+    gated on superseded_reason being NULL (require_prior_reason_null) makes
+    this refinement step exactly-once without ever touching `outcome`
+    (whose CHECK constraint has no 'pending' value)."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    if value not in ("yes", "no"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None or proposal.status is not PracticeProposalStatus.COMPLETED:
+        await callback.answer()
+        return
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+
+    if value == "yes":
+        # Mutually exclusive with the "no" refinement branch below:
+        # both paths require an ACTIVE reporting window and
+        # superseded_reason still NULL.
+        # If "yes" commits first, record_practice_outcome records HELPED and
+        # closes the reporting window, so the later "no" CAS fails.
+        # If "no" commits first, transition_practice_proposal atomically sets
+        # UX_PENDING_OUTCOME_DETAIL while keeping the proposal COMPLETED and
+        # the reporting window ACTIVE, so a later "yes" fails
+        # require_prior_reason_null.
+        ok = await record_practice_outcome(proposal_id, uid, PracticeOutcome.HELPED.value,
+                                           require_active_reporting_window=True,
+                                           require_prior_reason_null=True)
+        await callback.answer()
+        if not ok:
+            return
+        await callback.message.answer(
+            "Понял. Отмечу, что в этот раз практика оказалась полезной." if lang != "en" else
+            "Understood. I'll record that this practice was useful this time.")
+        return
+
+    # "no": not terminal yet -- never write NO_CHANGE prematurely.
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.COMPLETED.value,
+            to_status=PracticeProposalStatus.COMPLETED.value,
+            require_prior_reason_null=True, reason=UX_PENDING_OUTCOME_DETAIL,
+            require_active_reporting_window=True):
+        await callback.answer()
+        return
+    await callback.answer()
+    try:
+        await callback.message.answer(
+            "Что ближе к твоему состоянию сейчас?" if lang != "en" else
+            "Which is closer to how you feel now?",
+            reply_markup=_practice_helpwhy_kb(proposal_id, lang))
+    except Exception as e:
+        print(f"[controller] practhelpwhy prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+
+
+@dp.callback_query(F.data.startswith("cc:practhelpwhy:"))
+async def cb_cc_practhelpwhy(callback: CallbackQuery):
+    """Step C: 'Без изменений' / 'Стало хуже'. record_practice_outcome's
+    own `outcome IS NULL` CAS is what makes this exactly-once (unaffected
+    by superseded_reason). WORSE still writes to the same `outcome` column
+    the informed-repeat guard (_controller_claim_turn's get_latest_outcome_
+    for_practice check) already reads -- that guard is completely
+    unaffected by which callback wrote the value."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    outcome = {"same": PracticeOutcome.NO_CHANGE.value, "worse": PracticeOutcome.WORSE.value}.get(value)
+    if outcome is None:
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None or proposal.status is not PracticeProposalStatus.COMPLETED:
+        await callback.answer()
+        return
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    # Finalizes the pending refinement -- the terminal outcome write and the
+    # removal of UX_PENDING_OUTCOME_DETAIL happen in the SAME atomic UPDATE
+    # (clear_superseded_reason=True), never a separate clearing write. The
+    # require_prior_reason CAS also means this can only ever finalize a row
+    # that genuinely went through "Не помогло" -- a stray/duplicate tap
+    # after the marker is already cleared loses cleanly.
+    ok = await record_practice_outcome(proposal_id, uid, outcome,
+                                       require_active_reporting_window=True,
+                                       require_prior_reason=UX_PENDING_OUTCOME_DETAIL,
+                                       clear_superseded_reason=True)
+    await callback.answer()
+    if not ok:
+        return
+    lang = await get_user_language(uid) or "ru"
+    if outcome == PracticeOutcome.WORSE.value:
+        # No causality claim -- the user's own report is noted, not
+        # attributed to the practice.
+        text = ("Ты отметил(а), что после практики стало хуже. Я не буду автоматически "
+                "предлагать её снова." if lang != "en" else
+                "You noted that you felt worse after the practice. I won't automatically "
+                "suggest it again.")
+    else:
+        text = "Понял, спасибо, что рассказал(а)." if lang != "en" else "Understood, thanks for telling me."
     await callback.message.answer(text)
 
 

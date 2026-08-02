@@ -3256,7 +3256,9 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
                                    practice_version: str, purpose: str,
                                    expected_duration: str,
                                    ttl_seconds: int = 1800,
-                                   is_worse_override: bool = False) -> "_core.PracticeProposal":
+                                   is_worse_override: bool = False,
+                                   block_if_refinement_pending=None
+                                   ) -> "_core.PracticeProposal | None":
     """Hardening §3/§4: supersedes any still-actionable proposal for this
     SESSION in the same transaction before inserting the new one -- the
     partial unique index (one actionable proposal per session) turns a
@@ -3266,7 +3268,29 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
     exact proposal is an explicit, informed repeat of a practice whose
     latest recorded outcome was WORSE -- always a brand-new row (this
     function never reuses an existing one), never touching the old
-    WORSE-outcome proposal's own history."""
+    WORSE-outcome proposal's own history.
+
+    Progressive practice UX atomicity fix (external review F2 follow-up):
+    `block_if_refinement_pending`, if given a non-empty sequence of internal
+    pending-marker strings (caller-supplied, never hardcoded here -- mirrors
+    transition_practice_proposal/record_practice_outcome's own convention),
+    makes the row creation itself conditional via a single `INSERT ...
+    SELECT ... WHERE NOT EXISTS (...) RETURNING ...` statement on this SAME
+    connection/transaction. The refinement check and the insert are ONE
+    atomic SQL statement -- there is no separate pre-read SELECT and no
+    window for another connection's concurrent write (e.g. a callback
+    establishing the marker) to land between a check and an insert, because
+    there is no gap between them to land in. Returns None if blocked (the
+    row is never created). Default (None/empty) preserves the prior
+    unconditional-insert behavior exactly.
+
+    External review correction (transaction side-effects): a block must
+    leave ZERO persisted side effects, including the supersession UPDATE
+    above. That UPDATE and the guarded INSERT share one transaction on one
+    connection; when the INSERT is blocked (RETURNING yields no row), the
+    transaction is explicitly rolled back instead of committed, so a
+    pre-existing still-actionable proposal is never flipped to SUPERSEDED
+    without a replacement ever being created."""
     async with aiosqlite.connect(DB) as db:
         await db.execute(
             """UPDATE core_practice_proposals SET status='SUPERSEDED',
@@ -3274,17 +3298,28 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
                WHERE session_id=? AND user_id=?
                  AND status IN ('PROPOSED','PENDING','GRANTED','DELIVERING')""",
             (session_id, uid))
+        where_clause = ""
+        guard_params = ()
+        if block_if_refinement_pending:
+            placeholders = ",".join("?" for _ in block_if_refinement_pending)
+            where_clause = (
+                " WHERE NOT EXISTS (SELECT 1 FROM core_practice_proposals "
+                "WHERE user_id=? AND session_id=? AND reporting_window_status='ACTIVE' "
+                f"AND superseded_reason IN ({placeholders}))")
+            guard_params = (uid, session_id, *block_if_refinement_pending)
         cur = await db.execute(
-            """INSERT INTO core_practice_proposals
+            f"""INSERT INTO core_practice_proposals
                (user_id, session_id, practice_id, practice_version, purpose,
                 expected_duration, status, expires_at, is_worse_override)
-               VALUES (?,?,?,?,?,?,'PROPOSED', datetime('now', ?), ?)""",
+               SELECT ?, ?, ?, ?, ?, ?, 'PROPOSED', datetime('now', ?), ?{where_clause}
+               RETURNING {','.join(_PP_COLUMNS)}""",
             (uid, session_id, practice_id, practice_version, purpose,
-             expected_duration, f"+{int(ttl_seconds)} seconds", int(is_worse_override)))
-        pid = cur.lastrowid
-        row = await (await db.execute(
-            f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals WHERE id=?",
-            (pid,))).fetchone()
+             expected_duration, f"+{int(ttl_seconds)} seconds", int(is_worse_override),
+             *guard_params))
+        row = await cur.fetchone()
+        if row is None:
+            await db.rollback()
+            return None
         await db.commit()
         return _pp_row_to_obj(row)
 
@@ -3330,7 +3365,9 @@ async def transition_practice_proposal(proposal_id, user_id: int, *, from_status
                                        require_unexpired: bool = False,
                                        open_reporting_window: bool = False,
                                        close_reporting_window: bool = False,
-                                       require_active_reporting_window: bool = False) -> bool:
+                                       require_active_reporting_window: bool = False,
+                                       require_prior_reason: str | None = None,
+                                       require_prior_reason_null: bool = False) -> bool:
     """Atomic status CAS (hardening §4/§5) -- mirrors
     transition_core_session_consent's pattern. `require_unexpired=True`
     (used for the GRANTED/DECLINED consent transitions) makes expiry
@@ -3349,7 +3386,28 @@ async def transition_practice_proposal(proposal_id, user_id: int, *, from_status
     the TOCTOU gap between a caller's own earlier (non-atomic) read of
     `reporting_window_status` and this write -- the WHERE clause itself,
     not just a Python-level check beforehand, is what actually enforces it.
-    Used for STARTED->COMPLETED and STARTED->WITHDRAWN."""
+    Used for STARTED->COMPLETED and STARTED->WITHDRAWN.
+
+    Progressive practice UX: `require_prior_reason`/`require_prior_reason_null`
+    let a caller CAS on `superseded_reason` too, not just `status` -- this is
+    what makes a same-status "refinement" write (from_status == to_status,
+    e.g. WITHDRAWN -> WITHDRAWN or COMPLETED -> COMPLETED) exactly-once. A
+    plain status-only CAS can't protect a refinement step, since `status`
+    never changes across it; gating on the CURRENT `superseded_reason` too
+    is what makes a duplicate/racing tap lose. `superseded_reason` remains a
+    plain descriptive TEXT column (no CHECK enum) -- reusing it here for a
+    COMPLETED-status row's "which follow-up question is this" marker does
+    not touch or reinterpret its meaning for SUPERSEDED/WITHDRAWN rows.
+
+    `require_prior_reason` and `require_prior_reason_null` are mutually
+    exclusive: passing both would generate a deterministically-unsatisfiable
+    `AND superseded_reason=? AND superseded_reason IS NULL` predicate (no row
+    can match both), which would silently make every call with this
+    combination a no-op CAS failure rather than surface the caller's bug."""
+    if require_prior_reason is not None and require_prior_reason_null:
+        raise ValueError(
+            "transition_practice_proposal: require_prior_reason and "
+            "require_prior_reason_null are mutually exclusive")
     window_set = ""
     if open_reporting_window:
         window_set = ", reporting_window_status='ACTIVE'"
@@ -3363,6 +3421,11 @@ async def transition_practice_proposal(proposal_id, user_id: int, *, from_status
         query += " AND expires_at > datetime('now')"
     if require_active_reporting_window:
         query += " AND reporting_window_status='ACTIVE'"
+    if require_prior_reason is not None:
+        query += " AND superseded_reason=?"
+        params.append(require_prior_reason)
+    if require_prior_reason_null:
+        query += " AND superseded_reason IS NULL"
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(query, params)
         await db.commit()
@@ -3383,7 +3446,10 @@ async def mark_proposal_delivered(proposal_id, user_id: int, message_id: int) ->
 
 
 async def record_practice_outcome(proposal_id, user_id: int, outcome: str,
-                                  require_active_reporting_window: bool = False) -> bool:
+                                  require_active_reporting_window: bool = False,
+                                  require_prior_reason: str | None = None,
+                                  require_prior_reason_null: bool = False,
+                                  clear_superseded_reason: bool = False) -> bool:
     """Phase 3 final closure §5: records a purely qualitative, explicit
     self-reported outcome on an ALREADY-COMPLETED proposal (status is not
     touched -- this is an info-only update, same pattern as
@@ -3395,14 +3461,41 @@ async def record_practice_outcome(proposal_id, user_id: int, outcome: str,
 
     PR #73 ATOMIC CLOSURE §1: `require_active_reporting_window=True` makes
     the WHERE clause itself the authority on window freshness, closing the
-    TOCTOU gap between a caller's earlier read and this write."""
-    query = ("""UPDATE core_practice_proposals SET outcome=?, outcome_recorded_at=datetime('now'),
-               reporting_window_status='CLOSED'
+    TOCTOU gap between a caller's earlier read and this write.
+
+    Progressive practice UX atomic outcome-finalization contract:
+    `require_prior_reason`/`require_prior_reason_null` mirror
+    transition_practice_proposal's same-named parameters, CASing on
+    `superseded_reason` so a direct outcome write and a pending-detail
+    refinement can never both succeed against the same row.
+    `clear_superseded_reason=True` removes a pending UX marker in the SAME
+    atomic UPDATE that commits the terminal outcome -- never a separate
+    SELECT-then-UPDATE, never a second write. It is only permitted alongside
+    an exact `require_prior_reason` value: a caller must never clear an
+    arbitrary lifecycle reason without proving the row contains exactly the
+    expected internal pending marker it is finalizing."""
+    if require_prior_reason is not None and require_prior_reason_null:
+        raise ValueError(
+            "record_practice_outcome: require_prior_reason and "
+            "require_prior_reason_null are mutually exclusive")
+    if clear_superseded_reason and require_prior_reason is None:
+        raise ValueError(
+            "record_practice_outcome: clear_superseded_reason=True requires "
+            "an exact require_prior_reason value")
+    reason_set = ", superseded_reason=NULL" if clear_superseded_reason else ""
+    query = (f"""UPDATE core_practice_proposals SET outcome=?, outcome_recorded_at=datetime('now'),
+               reporting_window_status='CLOSED'{reason_set}
                WHERE id=? AND user_id=? AND status='COMPLETED' AND outcome IS NULL""")
+    params = [outcome, proposal_id, user_id]
     if require_active_reporting_window:
         query += " AND reporting_window_status='ACTIVE'"
+    if require_prior_reason is not None:
+        query += " AND superseded_reason=?"
+        params.append(require_prior_reason)
+    if require_prior_reason_null:
+        query += " AND superseded_reason IS NULL"
     async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(query, (outcome, proposal_id, user_id))
+        cur = await db.execute(query, params)
         await db.commit()
         return cur.rowcount > 0
 

@@ -162,6 +162,25 @@ class PracticeOutcome(str, Enum):
     WORSE = "WORSE"
 
 
+# Progressive practice UX (feat/practice-progressive-two-button-ux): internal
+# same-status-CAS refinement markers written to
+# PracticeProposal.superseded_reason. These are NEVER a real supersession or
+# withdrawal cause -- they exist only so transition_practice_proposal's
+# require_prior_reason/require_prior_reason_null can make a two-step
+# refinement (a question whose answer doesn't change `status`) exactly-once
+# under concurrency. Namespaced with a "ux:practice:" prefix (distinct from
+# every other superseded_reason value in the codebase, which are plain
+# snake_case strings like "crisis_activated"/"newer_proposal") specifically
+# so a raw DB read, analytics query, or dashboard export can never mistake
+# one for a genuine historical reason -- never user-facing RU/EN text, never
+# duplicated as a raw string anywhere else. This branch has never been
+# merged or deployed (verified: HEAD 08a4090 contains no reference to either
+# this value or its predecessor), so no existing row anywhere can contain
+# the previous "ux_pending_*" spelling -- this rename is not a migration.
+UX_PENDING_NOT_COMPLETED_REASON = "ux:practice:not_completed_reason_pending"
+UX_PENDING_OUTCOME_DETAIL = "ux:practice:outcome_detail_pending"
+
+
 class CapabilityLevel(str, Enum):
     """What the system may do with a method WITHOUT a human clinician (§12).
     Ordered by escalating restriction; `rank` supports 'no lower-capability
