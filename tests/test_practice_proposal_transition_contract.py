@@ -13,6 +13,8 @@ Two proof styles are used deliberately, not interchangeably:
    AND-combination with require_unexpired/require_active_reporting_window.
 """
 import asyncio
+import contextlib
+import sqlite3
 
 import pytest
 
@@ -65,6 +67,8 @@ class _RecordingConn:
         self._sink.append((query, list(params) if params is not None else []))
         return _RecordingCursor()
     async def commit(self):
+        pass
+    async def rollback(self):
         pass
     async def __aenter__(self):
         return self
@@ -393,6 +397,35 @@ def test_create_proposal_blocked_by_not_completed_reason_marker(tmp_db):
     assert latest.proposal_id == str(pid)
 
 
+async def _seed_second_proposal_same_session(uid: int, session_id: int, status: str, *,
+                                             superseded_reason=None) -> int:
+    """Inserts a SECOND proposal row into an already-existing session --
+    _seed_proposal always creates a brand-new session, which cannot model a
+    session that already has both a refinement-pending terminal proposal
+    AND a separate still-actionable one."""
+    import aiosqlite
+    async with aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_practice_proposals
+               (user_id, session_id, practice_id, practice_version, purpose,
+                expected_duration, status, expires_at, superseded_reason)
+               VALUES (?, ?, 'breathing_box_v1', 'v1', 'p', 'd', ?,
+                       datetime('now', '+1800 seconds'), ?)""",
+            (uid, session_id, status, superseded_reason))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def _count_proposals_for_session(session_id, uid: int) -> int:
+    import aiosqlite
+    async with aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM core_practice_proposals WHERE session_id=? AND user_id=?",
+            (session_id, uid))
+        (n,) = await cur.fetchone()
+        return n
+
+
 async def _new_session_for(uid: int) -> int:
     # core_sessions has a partial unique index on (user_id) WHERE
     # lifecycle_status IN ('OPEN','PAUSED') -- creating a second concurrently
@@ -451,6 +484,226 @@ def test_create_proposal_not_blocked_by_non_active_window_or_unrelated_reason(tm
     assert created_b is not None, "an unrelated superseded_reason must never block"
 
 
+def test_create_proposal_blocked_call_has_zero_persisted_side_effects(tmp_db):
+    """External-review correction: a blocked guarded creation must not
+    supersede a pre-existing actionable proposal without ever creating the
+    replacement that supersession implies. Before this fix, the prior
+    supersession UPDATE and the guarded INSERT shared one db.commit()
+    regardless of whether the INSERT's WHERE NOT EXISTS blocked it -- so a
+    block could still commit 'this proposal was superseded by a newer one'
+    with no newer one ever created. Same session, same user: one
+    refinement-pending terminal proposal (ACTIVE window, a UX_PENDING
+    marker) plus one separate still-actionable proposal."""
+    uid = 5
+    refinement_pid = run(_seed_proposal(
+        uid, "COMPLETED", superseded_reason=UX_PENDING_OUTCOME_DETAIL,
+        reporting_window_status="ACTIVE"))
+    refinement_proposal = run(database.get_practice_proposal(refinement_pid, uid))
+    session_id = refinement_proposal.session_id
+
+    actionable_pid = run(_seed_second_proposal_same_session(
+        uid, session_id, "PENDING", superseded_reason=None))
+
+    # Full row captured BEFORE the blocked call. PracticeProposal is a plain
+    # @dataclass (default eq=True, comparing every field) -- every one of
+    # its persisted columns is set once by the seed INSERT above and never
+    # recomputed on SELECT (no trigger/computed column exists in the
+    # schema), so a genuinely untouched row must compare fully equal, not
+    # just on status/superseded_reason.
+    before = run(database.get_practice_proposal(actionable_pid, uid))
+
+    result = run(database.create_practice_proposal(
+        uid, session_id, "breathing_box_v1", "v1", "p2", "d2",
+        block_if_refinement_pending=(UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL)))
+
+    assert result is None, "guarded creation must be blocked by the pending refinement marker"
+
+    row_count = run(_count_proposals_for_session(session_id, uid))
+    assert row_count == 2, \
+        f"no new proposal row may be inserted when the guard blocks creation, found {row_count}"
+
+    latest = run(database.get_latest_proposal_for_session(session_id, uid))
+    assert latest.proposal_id == str(actionable_pid), \
+        "no new proposal row may be inserted when the guard blocks creation"
+
+    after = run(database.get_practice_proposal(actionable_pid, uid))
+    assert after == before, \
+        f"a blocked creation must leave every persisted column of the pre-existing " \
+        f"actionable proposal unchanged; before={before!r} after={after!r}"
+
+
+def test_create_proposal_successful_call_still_supersedes_and_inserts_atomically(tmp_db):
+    """Happy-path counterpart to the zero-side-effects test above: when the
+    guard does NOT block (no refinement pending), the pre-existing
+    actionable proposal must still be superseded AND the replacement must
+    exist -- proving the rollback-on-block branch didn't also break the
+    ordinary success path, which still needs the commit to cover both
+    statements together."""
+    uid = 6
+    session_id = run(_new_session_for(uid))
+    old_pid = run(_seed_second_proposal_same_session(
+        uid, session_id, "PENDING", superseded_reason=None))
+
+    result = run(database.create_practice_proposal(
+        uid, session_id, "breathing_box_v1", "v1", "p2", "d2",
+        block_if_refinement_pending=(UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL)))
+
+    assert result is not None, "no refinement is pending, so creation must succeed"
+
+    reread_old = run(database.get_practice_proposal(old_pid, uid))
+    assert reread_old.status is PracticeProposalStatus.SUPERSEDED
+    assert reread_old.superseded_reason == "newer_proposal"
+
+    row_count = run(_count_proposals_for_session(session_id, uid))
+    assert row_count == 2, f"expected old + replacement, found {row_count}"
+
+    latest = run(database.get_latest_proposal_for_session(session_id, uid))
+    assert latest.proposal_id == result.proposal_id
+
+
+def test_create_proposal_exception_during_insert_does_not_commit_supersession(tmp_db):
+    """Fault injection: if the guarded INSERT statement itself raises (e.g. a
+    genuine driver/I-O error), the prior supersession UPDATE on the SAME
+    connection/transaction must not survive either. Mechanism verified
+    independently: closing an aiosqlite connection without an explicit
+    commit() discards uncommitted changes -- so the exception propagating
+    out of create_practice_proposal's `async with aiosqlite.connect(DB) as
+    db:` block, with no db.commit() ever reached, must leave the
+    pre-existing actionable proposal completely unchanged. The real
+    connection is used for both statements; only the second execute() call
+    is made to raise, so the first (the real UPDATE) genuinely runs before
+    the fault, matching what a true mid-transaction failure looks like."""
+    import aiosqlite
+
+    uid = 7
+    session_id = run(_new_session_for(uid))
+    old_pid = run(_seed_second_proposal_same_session(
+        uid, session_id, "PENDING", superseded_reason=None))
+
+    real_connect = aiosqlite.connect
+
+    class _FailingConn:
+        def __init__(self, real_cm):
+            self._real_cm = real_cm
+            self._real = None
+            self._n = 0
+
+        async def __aenter__(self):
+            self._real = await self._real_cm.__aenter__()
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return await self._real_cm.__aexit__(exc_type, exc, tb)
+
+        async def execute(self, query, params=None):
+            self._n += 1
+            if self._n == 2:
+                raise sqlite3.OperationalError("injected failure for atomicity test")
+            if params is not None:
+                return await self._real.execute(query, params)
+            return await self._real.execute(query)
+
+        async def commit(self):
+            return await self._real.commit()
+
+        async def rollback(self):
+            return await self._real.rollback()
+
+    def _connect(path):
+        return _FailingConn(real_connect(path))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(database.aiosqlite, "connect", _connect)
+        with pytest.raises(sqlite3.OperationalError):
+            run(database.create_practice_proposal(
+                uid, session_id, "breathing_box_v1", "v1", "p2", "d2",
+                block_if_refinement_pending=(
+                    UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL)))
+
+    reread = run(database.get_practice_proposal(old_pid, uid))
+    assert reread.status is PracticeProposalStatus.PENDING, \
+        "an exception during the guarded INSERT must not leave the supersession UPDATE committed"
+    assert reread.superseded_reason is None
+
+    row_count = run(_count_proposals_for_session(session_id, uid))
+    assert row_count == 1, "no replacement row may have been inserted either"
+
+
+def test_create_practice_proposal_concurrent_block_has_zero_persisted_side_effects(tmp_db):
+    """Concurrency variant of the zero-side-effects proof: connection A
+    commits the pending-refinement marker while a SEPARATE, real
+    still-actionable proposal already exists in the same session. Task B
+    (the real, unmocked create_practice_proposal, guarded) must be blocked
+    by A's committed marker AND must leave that separate actionable
+    proposal completely untouched -- proving the rollback-on-block fix
+    holds under genuine concurrent execution, not only sequential calls.
+    conn_a and task_b are cleaned up on every path via try/finally."""
+    import aiosqlite
+
+    uid = 8
+
+    async def scenario():
+        refinement_pid = await _seed_proposal(
+            uid, "COMPLETED", superseded_reason=None, reporting_window_status="ACTIVE")
+        refinement_proposal = await database.get_practice_proposal(refinement_pid, uid)
+        session_id = refinement_proposal.session_id
+        actionable_pid = await _seed_second_proposal_same_session(
+            uid, session_id, "PENDING", superseded_reason=None)
+
+        conn_a = await aiosqlite.connect(database.DB)
+        b = None
+        blocked_confirmed = None
+        result = {}
+        try:
+            await conn_a.execute("BEGIN IMMEDIATE")
+            await conn_a.execute(
+                "UPDATE core_practice_proposals SET superseded_reason=? "
+                "WHERE id=? AND user_id=?",
+                (UX_PENDING_OUTCOME_DETAIL, refinement_pid, uid))
+
+            started = asyncio.Event()
+
+            async def task_b():
+                started.set()
+                result["proposal"] = await database.create_practice_proposal(
+                    uid, session_id, "breathing_box_v1", "v1", "p2", "d2",
+                    block_if_refinement_pending=(
+                        UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL))
+
+            b = asyncio.ensure_future(task_b())
+            await started.wait()
+            try:
+                await asyncio.wait_for(asyncio.shield(b), timeout=0.05)
+                blocked_confirmed = False
+            except asyncio.TimeoutError:
+                blocked_confirmed = True
+
+            await conn_a.commit()
+            await b
+        finally:
+            if b is not None and not b.done():
+                b.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await b
+            await conn_a.close()
+
+        return blocked_confirmed, actionable_pid, session_id, result.get("proposal")
+
+    blocked_confirmed, actionable_pid, session_id, b_result = run(scenario())
+    print(f"[diagnostic] task B still pending after 50ms while A held the "
+          f"RESERVED lock: {blocked_confirmed}")
+
+    assert b_result is None, "task B must be blocked once A's marker commits"
+
+    reread_actionable = run(database.get_practice_proposal(actionable_pid, uid))
+    assert reread_actionable.status is PracticeProposalStatus.PENDING, \
+        "a concurrently-blocked creation must not supersede the pre-existing actionable proposal"
+    assert reread_actionable.superseded_reason is None
+
+    row_count = run(_count_proposals_for_session(session_id, uid))
+    assert row_count == 2, "no replacement row may have been inserted"
+
+
 def test_create_practice_proposal_atomic_block_survives_concurrent_writer(tmp_db):
     """Deterministic real-SQLite proof: connection A holds an UNCOMMITTED
     BEGIN IMMEDIATE transaction that has already written the pending-
@@ -469,7 +722,12 @@ def test_create_practice_proposal_atomic_block_survives_concurrent_writer(tmp_db
     A bounded-wait probe (50ms) additionally records whether B was still
     pending while A's transaction was open, as SUPPLEMENTARY diagnostic
     evidence only -- it is asserted separately, is not required for the
-    test to pass, and does not gate correctness."""
+    test to pass, and does not gate correctness.
+
+    conn_a and task_b are cleaned up on every path via try/finally: an
+    unexpected exception anywhere in the scenario must not leave a
+    dangling aiosqlite connection holding a RESERVED lock, nor an
+    un-awaited/un-cancelled task."""
     import aiosqlite
 
     uid = 1
@@ -480,40 +738,50 @@ def test_create_practice_proposal_atomic_block_survives_concurrent_writer(tmp_db
         session_id = proposal.session_id
 
         conn_a = await aiosqlite.connect(database.DB)
-        await conn_a.execute("BEGIN IMMEDIATE")
-        await conn_a.execute(
-            "UPDATE core_practice_proposals SET status='WITHDRAWN', superseded_reason=? "
-            "WHERE id=? AND user_id=?",
-            (UX_PENDING_NOT_COMPLETED_REASON, pid, uid))
-        # Connection A now holds SQLite's RESERVED lock; the marker exists
-        # only inside this uncommitted transaction -- not yet visible to
-        # any other connection.
-
-        started = asyncio.Event()
+        b = None
+        blocked_confirmed = None
         result = {}
-
-        async def task_b():
-            started.set()
-            result["proposal"] = await database.create_practice_proposal(
-                uid, session_id, "breathing_box_v1", "v1", "p2", "d2",
-                block_if_refinement_pending=(
-                    UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL))
-
-        b = asyncio.ensure_future(task_b())
-        await started.wait()
         try:
-            await asyncio.wait_for(asyncio.shield(b), timeout=0.05)
-            blocked_confirmed = False
-        except asyncio.TimeoutError:
-            blocked_confirmed = True
+            await conn_a.execute("BEGIN IMMEDIATE")
+            await conn_a.execute(
+                "UPDATE core_practice_proposals SET status='WITHDRAWN', superseded_reason=? "
+                "WHERE id=? AND user_id=?",
+                (UX_PENDING_NOT_COMPLETED_REASON, pid, uid))
+            # Connection A now holds SQLite's RESERVED lock; the marker
+            # exists only inside this uncommitted transaction -- not yet
+            # visible to any other connection.
 
-        # A resolves its transaction only AFTER the bounded-wait probe above
-        # has already run -- so the probe result reflects A's lock genuinely
-        # being held at that moment, not a race against A's own commit.
-        await conn_a.commit()
-        await conn_a.close()
-        await b
-        return blocked_confirmed, pid, result["proposal"], session_id
+            started = asyncio.Event()
+
+            async def task_b():
+                started.set()
+                result["proposal"] = await database.create_practice_proposal(
+                    uid, session_id, "breathing_box_v1", "v1", "p2", "d2",
+                    block_if_refinement_pending=(
+                        UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL))
+
+            b = asyncio.ensure_future(task_b())
+            await started.wait()
+            try:
+                await asyncio.wait_for(asyncio.shield(b), timeout=0.05)
+                blocked_confirmed = False
+            except asyncio.TimeoutError:
+                blocked_confirmed = True
+
+            # A resolves its transaction only AFTER the bounded-wait probe
+            # above has already run -- so the probe result reflects A's
+            # lock genuinely being held at that moment, not a race against
+            # A's own commit.
+            await conn_a.commit()
+            await b
+        finally:
+            if b is not None and not b.done():
+                b.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await b
+            await conn_a.close()
+
+        return blocked_confirmed, pid, result.get("proposal"), session_id
 
     blocked_confirmed, pid, b_result, session_id = run(scenario())
 

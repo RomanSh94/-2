@@ -3273,16 +3273,24 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
     Progressive practice UX atomicity fix (external review F2 follow-up):
     `block_if_refinement_pending`, if given a non-empty sequence of internal
     pending-marker strings (caller-supplied, never hardcoded here -- mirrors
-    transition_practice_proposal/record_practice_outcome/
-    has_active_practice_refinement's own convention), makes the row creation
-    itself conditional via a single `INSERT ... SELECT ... WHERE NOT EXISTS
-    (...) RETURNING ...` statement on this SAME connection/transaction. The
-    refinement check and the insert are ONE atomic SQL statement -- there is
-    no separate pre-read SELECT and no window for another connection's
-    concurrent write (e.g. a callback establishing the marker) to land
-    between a check and an insert, because there is no gap between them to
-    land in. Returns None if blocked (the row is never created). Default
-    (None/empty) preserves the prior unconditional-insert behavior exactly."""
+    transition_practice_proposal/record_practice_outcome's own convention),
+    makes the row creation itself conditional via a single `INSERT ...
+    SELECT ... WHERE NOT EXISTS (...) RETURNING ...` statement on this SAME
+    connection/transaction. The refinement check and the insert are ONE
+    atomic SQL statement -- there is no separate pre-read SELECT and no
+    window for another connection's concurrent write (e.g. a callback
+    establishing the marker) to land between a check and an insert, because
+    there is no gap between them to land in. Returns None if blocked (the
+    row is never created). Default (None/empty) preserves the prior
+    unconditional-insert behavior exactly.
+
+    External review correction (transaction side-effects): a block must
+    leave ZERO persisted side effects, including the supersession UPDATE
+    above. That UPDATE and the guarded INSERT share one transaction on one
+    connection; when the INSERT is blocked (RETURNING yields no row), the
+    transaction is explicitly rolled back instead of committed, so a
+    pre-existing still-actionable proposal is never flipped to SUPERSEDED
+    without a replacement ever being created."""
     async with aiosqlite.connect(DB) as db:
         await db.execute(
             """UPDATE core_practice_proposals SET status='SUPERSEDED',
@@ -3309,8 +3317,11 @@ async def create_practice_proposal(uid: int, session_id, practice_id: str,
              expected_duration, f"+{int(ttl_seconds)} seconds", int(is_worse_override),
              *guard_params))
         row = await cur.fetchone()
+        if row is None:
+            await db.rollback()
+            return None
         await db.commit()
-        return _pp_row_to_obj(row) if row else None
+        return _pp_row_to_obj(row)
 
 
 async def get_latest_proposal_for_session(session_id, user_id: int) -> "_core.PracticeProposal | None":
