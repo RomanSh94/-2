@@ -24,6 +24,14 @@ AB_VARIANTS = [v.strip() for v in os.getenv("AB_VARIANTS","control,variant_a").s
 ROUTER_VERSION    = "2.0"
 PRACTICE_VERSION  = "v1"
 
+# Generic first-turn contract (persistence/concurrency foundation only in
+# this phase -- not yet wired into the pipeline). FIRST_TURN_INITIAL_ROLLOUT_
+# VERSION is frozen forever: it is the only version eligible for the lazy
+# legacy-exemption bootstrap. A later FIRST_TURN_CONTRACT_VERSION bump makes
+# every user newly eligible, independent of historical message presence.
+FIRST_TURN_CONTRACT_VERSION        = "v1"
+FIRST_TURN_INITIAL_ROLLOUT_VERSION = "v1"
+
 # PR B (questionnaire result screens) — hard kill switch, default OFF. When
 # false (the default; no .env entry sets this true), every questionnaire
 # result/calculations/explanation entrypoint must behave byte-for-byte like

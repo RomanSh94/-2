@@ -196,3 +196,88 @@ def validate_response_with_context(response_text: str,
         return False, f"toxic validation: confirmed distortion '{matched}'"
 
     return True, None
+
+
+# ── Generic first-turn contract: validation foundation ────────────────────────
+# Phase 1 only -- not yet called from the pipeline. Deterministic checks for
+# the generic first-turn response contract (see prompts/design notes): no
+# paraphrase, no premature advice, hypotheses framed as possibilities, one
+# discriminating question, provisional therapy route.
+FIRST_TURN_FALLBACK_RU = (
+    "Не нужно объяснять всё сразу. Что сейчас удерживает сильнее: само событие, "
+    "мысли о нём или чувство, которое остаётся после?"
+)
+FIRST_TURN_FALLBACK_EN = (
+    "You don't need to explain everything at once. What is holding you most right "
+    "now: the event itself, the thoughts about it, or the feeling left afterward?"
+)
+
+
+def get_first_turn_fallback(lang: str = "ru") -> str:
+    return FIRST_TURN_FALLBACK_EN if lang == "en" else FIRST_TURN_FALLBACK_RU
+
+
+FORBIDDEN_GENERIC_ADVICE_FIRST_TURN = [
+    "мне жаль это слышать", "это нормально", "дай себе время",
+    "попробуй отвлечься", "поговори с близкими",
+    "займись тем, что приносит радость",
+    "i'm sorry to hear that", "that's normal", "give yourself time",
+    "try to distract yourself", "talk to your loved ones",
+]
+
+# Narrowly defined -- named modalities/techniques only, not ordinary words
+# that happen to share a root (e.g. "принятие" alone is not flagged).
+MODALITY_ANNOUNCEMENT_LABELS = [
+    "кбт", "кпт", "act-терапия", "терапия принятия и ответственности",
+    "техника принятия", "когнитивно-поведенческ", "схема-терапия",
+    "эмдр", "психоанализ",
+    "cbt", "act therapy", "acceptance and commitment therapy",
+    "cognitive behavioral", "cognitive-behavioral", "schema therapy",
+    "emdr", "psychoanalysis",
+]
+
+_FIRST_TURN_WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+
+
+def _normalize_words_first_turn(text: str) -> list[str]:
+    return _FIRST_TURN_WORD_RE.findall(text.lower())
+
+
+def _phrase_overlap_exceeds_bound(candidate: str, user_text: str, n: int = 5,
+                                  max_shared: int = 0) -> bool:
+    """Mechanical, deterministic surface-form check.
+
+    PROVES: the candidate contains no contiguous run of >= n normalized
+    words that also appears, in the same order, in the user's own message.
+
+    DOES NOT PROVE (and must never be described as proving): absence of
+    semantic paraphrase. Restating the user's facts in different words,
+    synonyms, reordered phrasing, or a shared run shorter than n words all
+    pass this check undetected. This is a literal-echo detector only."""
+    cand_words = _normalize_words_first_turn(candidate)
+    user_words = _normalize_words_first_turn(user_text)
+    if len(cand_words) < n or len(user_words) < n:
+        return False
+    cand_ngrams = {tuple(cand_words[i:i + n]) for i in range(len(cand_words) - n + 1)}
+    user_ngrams = {tuple(user_words[i:i + n]) for i in range(len(user_words) - n + 1)}
+    return len(cand_ngrams & user_ngrams) > max_shared
+
+
+def validate_first_turn_response(candidate: str, user_text: str,
+                                 lang: str = "ru") -> tuple[bool, str | None]:
+    """Deterministic checks only -- no LLM re-prompt, no semantic analysis.
+    Returns (is_valid, reason_if_invalid)."""
+    if candidate.count("?") != 1:
+        return False, "first-turn response must contain exactly one question"
+    if len(candidate.split()) > 120:
+        return False, "response too long (>120 words)"
+    low = candidate.lower()
+    for phrase in FORBIDDEN_GENERIC_ADVICE_FIRST_TURN:
+        if phrase in low:
+            return False, f"forbidden generic advice phrase: '{phrase}'"
+    for label in MODALITY_ANNOUNCEMENT_LABELS:
+        if label in low:
+            return False, f"therapy-modality announcement: '{label}'"
+    if _phrase_overlap_exceeds_bound(candidate, user_text):
+        return False, "substantial literal overlap with the user's message"
+    return True, None
