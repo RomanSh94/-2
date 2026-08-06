@@ -497,14 +497,23 @@ def test_consumption_result_fields(db):
     assert isinstance(result.event_id, int)
 
 
+@pytest.mark.parametrize("lang", ["ru", "en"])
+def test_consumption_result_lang_matches_source_turn(db, lang):
+    async def go():
+        token, _ = await _make_bound_button(UID, action="elaborate", lang=lang)
+        return await database.consume_interaction_binding(token, UID, 100, 200)
+    result = asyncio.run(go())
+    assert result.lang == lang
+
+
 # ── finalize_callback_reply / mark_event_besteffort ──────────────────────────
 
 def test_atomic_finalization_success(db):
     async def go():
         token, _ = await _make_bound_button(UID, action="elaborate")
         result = await database.consume_interaction_binding(token, UID, 100, 200)
-        status = await database.finalize_callback_reply(
-            result.event_id, UID, "reflective", "ru", "Хорошо, слушаю.")
+        fin = await database.finalize_callback_reply(
+            result.event_id, UID, "Хорошо, слушаю.")
         async with aiosqlite.connect(database.DB) as conn:
             cur = await conn.execute(
                 "SELECT reply_status, assistant_turn_id FROM user_interaction_events WHERE id=?",
@@ -512,19 +521,99 @@ def test_atomic_finalization_success(db):
             ev_row = await cur.fetchone()
             cur2 = await conn.execute("SELECT role, content FROM messages WHERE id=?", (ev_row[1],))
             msg_row = await cur2.fetchone()
-        return status, ev_row, msg_row
-    status, ev_row, msg_row = asyncio.run(go())
-    assert status == "delivered"
+        return fin, ev_row, msg_row
+    fin, ev_row, msg_row = asyncio.run(go())
+    assert fin.status == "delivered"
+    assert fin.assistant_turn_id is not None
+    assert fin.assistant_turn_id == ev_row[1]
     assert ev_row[0] == "delivered" and ev_row[1] is not None
     assert msg_row == ("assistant", "Хорошо, слушаю.")
+
+
+async def _make_pending_event(user_id, turn_id, action="elaborate"):
+    """Inserts a user_interaction_events row directly, bypassing
+    consume_interaction_binding (which already guarantees a matching source
+    turn) so finalize_callback_reply's OWN defense-in-depth checks can be
+    exercised against an inconsistent event/turn pairing."""
+    async with aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            "INSERT INTO user_interaction_events "
+            "(user_id, turn_id, event_type, action, normalized_text, reply_status) "
+            "VALUES (?, ?, 'first_turn_button', ?, 'test', 'pending_before_send')",
+            (user_id, turn_id, action))
+        await db.commit()
+        return cur.lastrowid
+
+
+def test_finalization_inherits_scenario_and_lang_from_source_turn(db):
+    async def go():
+        token, _ = await _make_bound_button(UID, action="elaborate",
+                                            scenario="reflective", lang="ru")
+        result = await database.consume_interaction_binding(token, UID, 100, 200)
+        fin = await database.finalize_callback_reply(result.event_id, UID, "ок")
+        async with aiosqlite.connect(database.DB) as conn:
+            cur = await conn.execute(
+                "SELECT scenario, lang FROM messages WHERE id=?", (fin.assistant_turn_id,))
+            row = await cur.fetchone()
+        return row
+    assert asyncio.run(go()) == ("reflective", "ru")
+
+
+def test_finalization_inherits_cbt_thought_and_en(db):
+    async def go():
+        token, _ = await _make_bound_button(UID, action="clarify",
+                                            scenario="cbt_thought", lang="en")
+        result = await database.consume_interaction_binding(token, UID, 100, 200)
+        fin = await database.finalize_callback_reply(result.event_id, UID, "ok")
+        async with aiosqlite.connect(database.DB) as conn:
+            cur = await conn.execute(
+                "SELECT scenario, lang FROM messages WHERE id=?", (fin.assistant_turn_id,))
+            row = await cur.fetchone()
+        return row
+    assert asyncio.run(go()) == ("cbt_thought", "en")
+
+
+def test_finalization_does_not_default_to_open_chat_for_other_scenarios(db):
+    async def go():
+        token, _ = await _make_bound_button(UID, action="hard",
+                                            scenario="act_acceptance", lang="ru")
+        result = await database.consume_interaction_binding(token, UID, 100, 200)
+        fin = await database.finalize_callback_reply(result.event_id, UID, "ок")
+        async with aiosqlite.connect(database.DB) as conn:
+            cur = await conn.execute(
+                "SELECT scenario FROM messages WHERE id=?", (fin.assistant_turn_id,))
+            row = await cur.fetchone()
+        return row[0]
+    assert asyncio.run(go()) == "act_acceptance"
+
+
+def test_finalize_rejects_wrong_user_source_turn(db):
+    OTHER = UID + 1
+
+    async def go():
+        turn_id = await database.save_message(OTHER, "assistant", "чужой ответ", "reflective", "ru")
+        event_id = await _make_pending_event(UID, turn_id)
+        return await database.finalize_callback_reply(event_id, UID, "текст")
+    fin = asyncio.run(go())
+    assert fin.status == "delivered_context_missing"
+    assert fin.assistant_turn_id is None
+
+
+def test_finalize_rejects_missing_source_turn(db):
+    async def go():
+        event_id = await _make_pending_event(UID, 999999999)
+        return await database.finalize_callback_reply(event_id, UID, "текст")
+    fin = asyncio.run(go())
+    assert fin.status == "delivered_context_missing"
+    assert fin.assistant_turn_id is None
 
 
 def test_duplicate_finalization_returns_already_resolved(db):
     async def go():
         token, _ = await _make_bound_button(UID, action="elaborate")
         result = await database.consume_interaction_binding(token, UID, 100, 200)
-        first = await database.finalize_callback_reply(result.event_id, UID, "reflective", "ru", "текст1")
-        second = await database.finalize_callback_reply(result.event_id, UID, "reflective", "ru", "текст2")
+        first = await database.finalize_callback_reply(result.event_id, UID, "текст1")
+        second = await database.finalize_callback_reply(result.event_id, UID, "текст2")
         async with aiosqlite.connect(database.DB) as conn:
             cur = await conn.execute(
                 "SELECT COUNT(*) FROM messages WHERE role='assistant' AND user_id=?", (UID,))
@@ -534,8 +623,10 @@ def test_duplicate_finalization_returns_already_resolved(db):
             final_status = (await cur2.fetchone())[0]
         return first, second, assistant_count, final_status
     first, second, assistant_count, final_status = asyncio.run(go())
-    assert first == "delivered"
-    assert second == "already_resolved"
+    assert first.status == "delivered"
+    assert first.assistant_turn_id is not None
+    assert second.status == "already_resolved"
+    assert second.assistant_turn_id is None
     # exactly 2 assistant rows: the one _make_bound_button created as the
     # originating turn, plus the ONE successful finalize -- the rejected
     # second attempt inserts nothing (its pre-check short-circuits before
@@ -548,7 +639,7 @@ def test_besteffort_rowcount_zero_reports_already_resolved_not_success(db):
     async def go():
         token, _ = await _make_bound_button(UID, action="clarify")
         result = await database.consume_interaction_binding(token, UID, 100, 200)
-        await database.finalize_callback_reply(result.event_id, UID, "reflective", "ru", "ok")
+        await database.finalize_callback_reply(result.event_id, UID, "ok")
         # event is now 'delivered' -- no longer pending_before_send
         return await database.mark_event_besteffort(
             result.event_id, "delivery_uncertain", database.SEND_EXCEPTION)

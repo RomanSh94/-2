@@ -2607,6 +2607,7 @@ class ConsumptionResult:
     action: str
     turn_id: int
     post_consumption_revision: int
+    lang: str
 
 
 async def consume_interaction_binding(token: str, user_id: int, chat_id: int,
@@ -2688,7 +2689,8 @@ async def consume_interaction_binding(token: str, user_id: int, chat_id: int,
 
         await db.commit()
         return ConsumptionResult(event_id=event_id, action=action, turn_id=turn_id,
-                                 post_consumption_revision=post_consumption_revision)
+                                 post_consumption_revision=post_consumption_revision,
+                                 lang=turn_lang)
 
 
 # Localized, deterministic, enum-mapped labels -- RU/EN, matching this
@@ -2722,27 +2724,63 @@ def normalized_action_text(action: str, lang: str = "ru") -> str:
     return table[action]
 
 
-async def finalize_callback_reply(event_id: int, user_id: int, scenario: str, lang: str,
-                                  reply_text: str) -> str:
+@dataclass(frozen=True)
+class FinalizationResult:
+    status: str
+    assistant_turn_id: int | None
+
+
+async def finalize_callback_reply(event_id: int, user_id: int,
+                                  reply_text: str) -> "FinalizationResult":
     """Call ONLY after the Telegram send is already confirmed successful.
 
-    One transaction: verify the event is still pending_before_send, insert
-    the assistant message, obtain assistant_turn_id, and move the event to
-    delivered. If the event is no longer pending_before_send (already
-    resolved by an earlier/concurrent call), returns 'already_resolved' and
-    attempts NO write -- this is not treated as a DB failure and does not
-    fall through to the best-effort path. Only a genuine exception (a real
-    DB failure after Telegram delivery was already confirmed) falls through
-    to the separate best-effort delivered_context_missing transition."""
+    Server-owned context preservation: scenario and lang are never supplied
+    by the caller. Inside the same BEGIN IMMEDIATE transaction: verify the
+    event is still pending_before_send and belongs to user_id, then load the
+    source assistant `messages` row referenced by the event's turn_id (must
+    exist, belong to the same user, have role='assistant') and use ITS
+    scenario/lang for the inserted reply -- never a value chosen
+    independently of that source turn.
+
+    If the event is no longer pending_before_send (already resolved by an
+    earlier/concurrent call), returns already_resolved and attempts NO
+    write -- this is not treated as a failure. If the event's user_id
+    doesn't match, or the source turn is missing/foreign/non-assistant, that
+    is a genuine integrity failure discovered AFTER the Telegram send was
+    already confirmed -- handled the same as any other exception here: it
+    falls through to the best-effort delivered_context_missing transition.
+
+    Returns FinalizationResult(status, assistant_turn_id) -- assistant_turn_id
+    is non-None only when status == 'delivered'."""
     try:
         async with aiosqlite.connect(DB) as db:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
-                "SELECT reply_status FROM user_interaction_events WHERE id=?", (event_id,))
+                "SELECT reply_status, turn_id, user_id FROM user_interaction_events WHERE id=?",
+                (event_id,))
             row = await cur.fetchone()
             if row is None or row[0] != "pending_before_send":
                 await db.rollback()
-                return "already_resolved"
+                return FinalizationResult(status="already_resolved", assistant_turn_id=None)
+            _, turn_id, event_user_id = row
+
+            source_ok = False
+            scenario = lang = None
+            if event_user_id == user_id:
+                cur = await db.execute(
+                    "SELECT user_id, role, scenario, lang FROM messages WHERE id=?", (turn_id,))
+                turn_row = await cur.fetchone()
+                if turn_row is not None:
+                    turn_user_id, turn_role, turn_scenario, turn_lang = turn_row
+                    if turn_role == "assistant" and turn_user_id == user_id:
+                        source_ok = True
+                        scenario = turn_scenario or "open_chat"
+                        lang = turn_lang or "ru"
+
+            if not source_ok:
+                await db.rollback()
+                raise RuntimeError(
+                    "finalize_callback_reply: event/source-turn integrity check failed")
 
             cur = await db.execute(
                 "INSERT INTO messages (user_id, role, content, scenario, lang) VALUES (?,?,?,?,?)",
@@ -2755,12 +2793,13 @@ async def finalize_callback_reply(event_id: int, user_id: int, scenario: str, la
                 (assistant_turn_id, event_id))
             if cur2.rowcount != 1:
                 await db.rollback()
-                return "already_resolved"
+                return FinalizationResult(status="already_resolved", assistant_turn_id=None)
             await db.commit()
-            return "delivered"
+            return FinalizationResult(status="delivered", assistant_turn_id=assistant_turn_id)
     except Exception:
-        return await mark_event_besteffort(event_id, "delivered_context_missing",
-                                           FINALIZE_EXCEPTION)
+        besteffort_status = await mark_event_besteffort(event_id, "delivered_context_missing",
+                                                         FINALIZE_EXCEPTION)
+        return FinalizationResult(status=besteffort_status, assistant_turn_id=None)
 
 
 _EVENT_BESTEFFORT_ALLOWED_STATUSES = {"delivery_uncertain", "delivered_context_missing"}

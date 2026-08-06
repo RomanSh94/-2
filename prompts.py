@@ -257,3 +257,95 @@ def get_onboarding(lang: str = "ru") -> tuple[str, list]:
 def get_checkin_msg(lang: str = "ru") -> str:
     import random
     return random.choice(CHECKIN_EN if lang == "en" else CHECKIN_RU)
+
+
+# ── Generic first-turn contract (Phase 2) ──────────────────────────────────
+# Appended to the ordinary scenario system prompt, not a replacement for it.
+# Deliberately generic -- no lexical topic detection, no per-topic template,
+# works identically regardless of which emotional topic the user raised.
+FIRST_TURN_CONTRACT_TEXT_RU = (
+    "\n\nЭто ПЕРВЫЙ содержательный ответ по этой эмоциональной теме с пользователем.\n"
+    "- НЕ пересказывай и не перефразируй факты, которые пользователь только что сообщил.\n"
+    "- НЕ давай общих утешений и советов прямо сейчас.\n"
+    "- Предложи 2-3 ВОЗМОЖНЫХ измерения проблемы, явно как гипотезы, а не выводы.\n"
+    "- Задай РОВНО один конкретный уточняющий вопрос, который помогает различить эти гипотезы.\n"
+    "- НЕ называй и не анонсируй терапевтический подход или технику.\n"
+    "- Терапевтический маршрут остаётся предварительным.\n"
+    "- Не более 120 слов."
+)
+FIRST_TURN_CONTRACT_TEXT_EN = (
+    "\n\nThis is the FIRST substantive reply on this emotional topic with the user.\n"
+    "- Do NOT restate or paraphrase the facts the user just shared.\n"
+    "- Do NOT give generic reassurance or advice right now.\n"
+    "- Offer 2-3 POSSIBLE dimensions of the problem, explicitly as hypotheses, not conclusions.\n"
+    "- Ask EXACTLY one concrete question that helps distinguish between them.\n"
+    "- Do NOT name or announce a therapy approach or technique.\n"
+    "- The therapeutic route stays provisional.\n"
+    "- No more than 120 words."
+)
+
+
+def get_first_turn_contract_text(lang: str = "ru") -> str:
+    return FIRST_TURN_CONTRACT_TEXT_EN if lang == "en" else FIRST_TURN_CONTRACT_TEXT_RU
+
+
+# Three universal continuation buttons, reused across every emotional topic.
+UNIVERSAL_CONTINUATION_BUTTONS_RU = [
+    ("🗣 Расскажу подробнее", "elaborate"),
+    ("🧭 Помоги разобраться", "clarify"),
+    ("🤍 Мне трудно сейчас говорить", "hard"),
+]
+UNIVERSAL_CONTINUATION_BUTTONS_EN = [
+    ("🗣 I'll tell you more", "elaborate"),
+    ("🧭 Help me figure it out", "clarify"),
+    ("🤍 It's hard to talk right now", "hard"),
+]
+
+CONTINUATION_ELABORATE_RU = "Хорошо, не тороплюсь. Рассказывай так, как тебе сейчас удобно — я здесь и слушаю."
+CONTINUATION_ELABORATE_EN = "Okay, no rush. Tell me however feels comfortable right now — I'm here and listening."
+
+CONTINUATION_CLARIFY_RU = (
+    "Смотрим по частям: что сейчас ощущается тяжелее всего — само событие, "
+    "или то, что пришло вместе с ним?"
+)
+CONTINUATION_CLARIFY_EN = (
+    "Let's look at it piece by piece: what feels heaviest right now — the event "
+    "itself, or what came with it?"
+)
+
+CONTINUATION_HARD_RU = "Хорошо. Не обязательно ничего объяснять сейчас — можно просто нажать одну из кнопок ниже."
+CONTINUATION_HARD_EN = "Okay. You don't need to explain anything right now — you can just tap one of the buttons below."
+
+
+def get_continuation_reply(action: str, lang: str = "ru") -> str:
+    """Deterministic reply for the elaborate/clarify/hard branches. Fully
+    generic -- no per-topic lookup of any kind."""
+    if action == "elaborate":
+        return CONTINUATION_ELABORATE_EN if lang == "en" else CONTINUATION_ELABORATE_RU
+    if action == "clarify":
+        return CONTINUATION_CLARIFY_EN if lang == "en" else CONTINUATION_CLARIFY_RU
+    if action == "hard":
+        return CONTINUATION_HARD_EN if lang == "en" else CONTINUATION_HARD_RU
+    return ""
+
+
+HARD_REPLY_OPTIONS_RU = [("Легче", "easier"), ("Так же", "same"), ("Тяжелее", "harder")]
+HARD_REPLY_OPTIONS_EN = [("Easier", "easier"), ("Same", "same"), ("Harder", "harder")]
+
+HARD_REPLY_ACK_RU = {
+    "easier": "Хорошо, что немного легче. Я рядом.",
+    "same": "Понял(а), всё ещё так же. Я рядом.",
+    "harder": "Слышу, что тяжелее. Я рядом.",
+}
+HARD_REPLY_ACK_EN = {
+    "easier": "Good to hear it's a bit easier. I'm here.",
+    "same": "Got it, still the same. I'm here.",
+    "harder": "I hear that it's harder. I'm here.",
+}
+
+
+def get_hard_reply_ack(value: str, lang: str = "ru") -> str:
+    """Distinct acknowledgement per selected value -- never a single generic
+    line that ignores what was actually tapped."""
+    table = HARD_REPLY_ACK_EN if lang == "en" else HARD_REPLY_ACK_RU
+    return table.get(value, "")

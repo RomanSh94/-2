@@ -40,8 +40,17 @@ import access_control
 import scoped_access
 import review_pack
 import config
-from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION
+from config import (
+    BOT_TOKEN, OPENAI_API_KEY, ADMIN_USER_IDS, AB_VARIANTS, ROUTER_VERSION, PRACTICE_VERSION,
+    FIRST_TURN_CONTRACT_VERSION,
+)
 from prompts import get_system_prompt, get_crisis_text, get_onboarding
+from prompts import (
+    get_first_turn_contract_text,
+    UNIVERSAL_CONTINUATION_BUTTONS_RU, UNIVERSAL_CONTINUATION_BUTTONS_EN,
+    HARD_REPLY_OPTIONS_RU, HARD_REPLY_OPTIONS_EN,
+    get_continuation_reply, get_hard_reply_ack,
+)
 from crisis_protocol import (
     classify, crisis_keyboard, admin_alert_text, RED, ORANGE,
     crisis_screen, safe_only_keyboard, crisis_call_text, crisis_contact_template,
@@ -66,6 +75,7 @@ from practice_registry import select_practice, get_practice_by_id
 from safety_validator import (
     validate_response,
     validate_response_with_context, select_fallback,
+    validate_first_turn_response, get_first_turn_fallback,
 )
 from traced_response import Influence, traced_response_builder, persist_influence_trace
 from prompts import get_disambiguation_message
@@ -112,6 +122,11 @@ from database import (
     complete_onboarding, set_onboarding_card_ref, get_onboarding_eligibility,
     get_stored_user_language, has_privacy_notice_ack,
     record_notice_acknowledgement,
+    bump_user_revision,
+    claim_first_turn, transition_first_turn_claim,
+    create_keyboard_batch_if_current, consume_interaction_binding,
+    finalize_callback_reply, mark_event_besteffort,
+    SEND_EXCEPTION, SAVE_EXCEPTION, FINALIZE_EXCEPTION,
 )
 import onboarding
 import onboarding_content
@@ -186,6 +201,167 @@ def quality_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="➖ Частично", callback_data="quality:0"),
         InlineKeyboardButton(text="👎 Не помогло", callback_data="quality:-1"),
     ]])
+
+
+# ── Generic first-turn contract (Phase 2) ──────────────────────────────────
+# Eligibility is scenario/stage/capacity/risk driven only -- no lexical
+# topic detection, no per-topic template.
+FIRST_TURN_ALLOWED_SCENARIOS = {"open_chat", "reflective", "cbt_thought", "act_acceptance"}
+FIRST_TURN_EXCLUDED_STAGES = {"ACUTE_DISTRESS"}
+FIRST_TURN_MIN_CAPACITY = 0.3
+FIRST_TURN_EXCLUDED_RISK_LEVELS = {"high", "critical"}
+_FIRST_TURN_BINDING_LEASE_HOURS = 24
+
+
+def _binding_expiry() -> str:
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc)
+            + timedelta(hours=_FIRST_TURN_BINDING_LEASE_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def universal_continuation_kb(lang: str, tokens: dict) -> InlineKeyboardMarkup:
+    """tokens: {"elaborate": token, "clarify": token, "hard": token}.
+    callback_data carries only the opaque token -- action/topic/uid/turn_id/
+    scenario/lang/revision never travel in callback_data."""
+    buttons = UNIVERSAL_CONTINUATION_BUTTONS_EN if lang == "en" else UNIVERSAL_CONTINUATION_BUTTONS_RU
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label, callback_data=f"ucbtn:{tokens[action]}")]
+        for label, action in buttons
+    ])
+
+
+def hard_reply_kb(lang: str, tokens: dict) -> InlineKeyboardMarkup:
+    """tokens: {"easier": token, "same": token, "harder": token}."""
+    options = HARD_REPLY_OPTIONS_EN if lang == "en" else HARD_REPLY_OPTIONS_RU
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=label, callback_data=f"ucbtn:{tokens[value]}")
+        for label, value in options
+    ]])
+
+
+async def _first_turn_generate_and_validate(messages: list, user_text: str, lang: str) -> tuple[str, bool]:
+    """Returns (answer, buttons_allowed). Never raises: an LLM error or a
+    failed validate_first_turn_response both resolve to the existing
+    deterministic first-turn fallback, buttons_allowed=False. The LLM is
+    never called a second time after a first-turn validation failure."""
+    contract_messages = [{"role": "system", "content": messages[0]["content"] + get_first_turn_contract_text(lang)}]
+    contract_messages.extend(messages[1:])
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini", messages=contract_messages, temperature=0.65, max_tokens=300,
+        )
+        candidate = response.choices[0].message.content
+    except Exception as e:
+        print(f"[first-turn] LLM error: {type(e).__name__}: {e}")
+        return get_first_turn_fallback(lang), False
+
+    valid, _reason = validate_first_turn_response(candidate, user_text, lang)
+    if valid:
+        return candidate, True
+    return get_first_turn_fallback(lang), False
+
+
+async def _publish_universal_buttons(message, uid: int, turn_id: int, source_message_id: int,
+                                     response_revision: int, lang: str) -> bool:
+    """response_revision MUST be the exact user_revision captured for this
+    turn in pipeline() -- never re-read here. A fresh read would race a
+    newer ordinary message that lands between Telegram delivery and button
+    publication, incorrectly binding the buttons to a revision the user has
+    already moved past."""
+    actions = ["elaborate", "clarify", "hard"]
+    tokens = {a: secrets.token_urlsafe(9) for a in actions}
+    expires_at = _binding_expiry()
+    rows = [{"token": tokens[a], "turn_id": turn_id, "chat_id": message.chat.id,
+             "source_message_id": source_message_id, "action": a, "expires_at": expires_at}
+            for a in actions]
+    try:
+        batch_ok = await create_keyboard_batch_if_current(uid, response_revision, rows)
+    except Exception:
+        return False
+    if not batch_ok:
+        return False
+    try:
+        await bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=source_message_id,
+                                            reply_markup=universal_continuation_kb(lang, tokens))
+    except Exception:
+        return False
+    return True
+
+
+async def _publish_hard_reply_buttons(message, uid: int, turn_id: int, source_message_id: int,
+                                      post_consumption_revision: int, lang: str) -> None:
+    """Uses EXACTLY the post_consumption_revision returned by the callback
+    transaction that produced turn_id -- never a freshly re-read revision."""
+    values = ["easier", "same", "harder"]
+    tokens = {v: secrets.token_urlsafe(9) for v in values}
+    expires_at = _binding_expiry()
+    rows = [{"token": tokens[v], "turn_id": turn_id, "chat_id": message.chat.id,
+             "source_message_id": source_message_id, "action": f"hardreply:{v}",
+             "expires_at": expires_at}
+            for v in values]
+    try:
+        batch_ok = await create_keyboard_batch_if_current(uid, post_consumption_revision, rows)
+    except Exception:
+        return
+    if not batch_ok:
+        return
+    try:
+        await bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=source_message_id,
+                                            reply_markup=hard_reply_kb(lang, tokens))
+    except Exception:
+        pass
+
+
+async def _deliver_first_turn_response(message, uid: int, answer: str, buttons_allowed: bool,
+                                       scenario: str, lang: str, claim_token: str,
+                                       response_revision: int) -> None:
+    """The single primary delivery point for a claimed first-turn turn.
+    Exactly one message.answer(...) call; every path (success, LLM failure,
+    validator rejection) reaches this same function with one resolved
+    answer. Guarded transitions only -- a transition's own failure means the
+    caller leaves the claim in its last confirmed state and attempts no
+    further DB mutation to compensate."""
+    ok = await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
+                                           "pending_before_llm", "generated")
+    if not ok:
+        return
+    ok = await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
+                                           "generated", "send_started")
+    if not ok:
+        return
+
+    try:
+        sent = await message.answer(answer)
+    except Exception:
+        await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
+                                          "send_started", "delivery_uncertain")
+        return
+
+    try:
+        turn_id = await save_message(uid, "assistant", answer, scenario, lang)
+    except Exception:
+        await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
+                                          "send_started", "delivered_context_missing")
+        return
+
+    if not buttons_allowed:
+        await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
+                                          "send_started", "delivered_without_buttons", turn_id=turn_id)
+        return
+
+    ok = await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
+                                           "send_started", "reply_delivered", turn_id=turn_id)
+    if not ok:
+        return
+
+    batch_ok = await _publish_universal_buttons(message, uid, turn_id, sent.message_id,
+                                                response_revision, lang)
+    if batch_ok:
+        await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
+                                          "reply_delivered", "delivered")
+    else:
+        await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
+                                          "reply_delivered", "delivered_without_buttons")
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -548,6 +724,12 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         await _resume_onboarding_card(message.chat.id, uid)
         return
 
+    # 4.3 Per-user monotonic revision (spec item B) — bumped exactly once per
+    # ordinary turn, strictly after the crisis/access/onboarding gates above
+    # (a gate-rejected request never reaches here) and before any long
+    # pipeline work. Retained for possible first-turn button binding later.
+    user_revision = await bump_user_revision(uid)
+
     # 5. Ordinary persistence — only now that access is confirmed.
     await upsert_user(uid, username, first_name, lang)
     await reset_unanswered(uid)   # user re-engaged → clear ignored-push backoff
@@ -602,8 +784,14 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # before the threshold check — otherwise the 100th message never triggers.
     await dependency_monitor.record_message(uid)
     dep_msg = await dependency_monitor.check_dependency(uid, lang)
-    if dep_msg:
-        await message.answer(dep_msg)
+    # spec item C: dep_msg becomes a forced primary answer instead of being
+    # sent immediately — no first-turn claim, no primary LLM call for this
+    # turn, but ordinary state/stage/readiness/capacity/scenario/router-log/
+    # persistence/tracking below still run unchanged. Delivery happens once,
+    # later, through the single primary response point. Truthy check
+    # (matching the original `if dep_msg:` contract) -- an empty string is
+    # treated as "no dependency answer", not as a forced empty send.
+    forced_primary_answer = dep_msg if dep_msg else None
 
     # 5. Update state
     state = await load_state(uid) or dict(DEFAULT_STATE)
@@ -624,12 +812,15 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
                                variant, trajectory=trajectory)
     
-    # 10. Check dependency
-    dep_resp = monitor_relationship(user_text, lang)
-    if dep_resp:
-        await message.answer(dep_resp)
-        return
-    
+    # 10. Check dependency (separate monitor/flow — left unchanged, except
+    # skipped when a dependency answer is already forced above, so the same
+    # turn never sends two separate dependency-style replies).
+    if forced_primary_answer is None:
+        dep_resp = monitor_relationship(user_text, lang)
+        if dep_resp:
+            await message.answer(dep_resp)
+            return
+
     # 11. Select practice
     severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
     practice = select_practice(scenario, stage, severity, lang)
@@ -651,7 +842,71 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     for role, content in recent:
         messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_text})
-    
+
+    # 14.5 First-turn eligibility (spec item D) — computed only now that
+    # scenario/stage/capacity/risk are all known; no lexical/topic detection
+    # anywhere in this check. The claim itself is acquired at the latest safe
+    # point: after practice selection, router logging, memory/context
+    # loading, and the ordinary messages list are already built — immediately
+    # before adding the contract and calling the primary LLM.
+    is_ftm_eligible = (
+        forced_primary_answer is None
+        and scenario in FIRST_TURN_ALLOWED_SCENARIOS
+        and stage not in FIRST_TURN_EXCLUDED_STAGES
+        and capacity >= FIRST_TURN_MIN_CAPACITY
+        and risk["level"] not in FIRST_TURN_EXCLUDED_RISK_LEVELS
+    )
+    ft_claimed = False
+    claim_token = None
+    if is_ftm_eligible:
+        claim_token = secrets.token_urlsafe(16)
+        ft_claimed = await claim_first_turn(uid, FIRST_TURN_CONTRACT_VERSION, claim_token, scenario)
+
+    if forced_primary_answer is not None:
+        # spec item C: deliver only the forced dependency answer through the
+        # single primary response point — no first-turn claim, no primary
+        # LLM call, no buttons, no outcome/quality/practice follow-up.
+        # Save the user turn once, attempt exactly one send, and only save
+        # the assistant turn AFTER Telegram delivery is confirmed -- a send
+        # failure must not leave an assistant message on record for text
+        # that was never actually delivered, and must not be retried. If the
+        # user-message save itself fails, nothing downstream (send, assistant
+        # save, LLM, claim) has happened yet -- log the same redacted shape
+        # and return before any of it starts.
+        try:
+            await save_message(uid, "user", user_text, scenario, lang,
+                               risk["score"], risk["categories"])
+        except Exception as e:
+            print(f"event=dependency_user_save_failed uid={uid} exc_type={type(e).__name__}")
+            return
+        try:
+            await message.answer(forced_primary_answer)
+        except Exception:
+            return
+        # Telegram delivery is already confirmed at this point -- a save
+        # failure here must not resend, must not surface an error to the
+        # user, and must never log the delivered text, the user text, or
+        # the raw exception message (only a fixed event name, uid, and
+        # exception class name).
+        try:
+            await save_message(uid, "assistant", forced_primary_answer, scenario, lang)
+        except Exception as e:
+            print(f"event=dependency_assistant_save_failed uid={uid} exc_type={type(e).__name__}")
+        return
+
+    if ft_claimed:
+        # spec items A/E: single primary delivery lifecycle for a claimed
+        # first-turn turn. Save the ordinary user message exactly once here;
+        # generation/validation/fallback and the single send + button
+        # publication happen inside the helpers below.
+        await save_message(uid, "user", user_text, scenario, lang,
+                           risk["score"], risk["categories"])
+        await bot.send_chat_action(message.chat.id, "typing")
+        answer, buttons_allowed = await _first_turn_generate_and_validate(messages, user_text, lang)
+        await _deliver_first_turn_response(message, uid, answer, buttons_allowed, scenario, lang,
+                                           claim_token, user_revision)
+        return
+
     # 15. LLM call
     await bot.send_chat_action(message.chat.id, "typing")
     try:
@@ -960,6 +1215,55 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
               ("Спасибо за честность" if data.get("lang") == "ru" else "Thanks for honesty")
         await callback.message.answer(msg, reply_markup=ReplyKeyboardRemove())
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("ucbtn:"))
+async def cb_universal_continuation(callback: CallbackQuery):
+    """Single handler for all six DB-owned universal-continuation actions
+    (spec item G). The accepted action always comes from
+    consume_interaction_binding — never trusted from callback_data, which
+    carries only the opaque token."""
+    uid = callback.from_user.id
+    token = callback.data[len("ucbtn:"):]
+    chat_id = callback.message.chat.id
+    source_message_id = callback.message.message_id
+
+    result = await consume_interaction_binding(token, uid, chat_id, source_message_id)
+    if result is None:
+        # Stale/expired/duplicate/wrong-user/wrong-message: no assistant
+        # message, no second interaction event, no restart of any flow —
+        # just a short localized notice on the callback popup itself. No
+        # source binding was accepted here, so the stored profile language
+        # is the only option available.
+        popup_lang = await get_stored_user_language(uid) or "ru"
+        await callback.answer(
+            "Кнопка больше не активна." if popup_lang == "ru" else "This button is no longer active.")
+        return
+    await callback.answer()
+
+    # spec item C: the reply, the nested keyboard, and the persisted
+    # metadata are all source-turn-owned -- never the current stored
+    # profile language, which may have changed since the source turn.
+    lang = result.lang
+    if result.action.startswith("hardreply:"):
+        reply_text = get_hard_reply_ack(result.action.split(":", 1)[1], lang)
+    else:
+        reply_text = get_continuation_reply(result.action, lang)
+
+    try:
+        sent = await callback.message.answer(reply_text)
+    except Exception:
+        await mark_event_besteffort(result.event_id, "delivery_uncertain", SEND_EXCEPTION)
+        return
+
+    # spec: finalize_callback_reply derives scenario/lang itself from the
+    # source assistant turn — the handler passes neither.
+    fin = await finalize_callback_reply(result.event_id, uid, reply_text)
+
+    if result.action == "hard" and fin.status == "delivered":
+        # spec item G: exactly the post_consumption_revision returned by the
+        # consume transaction above — never a freshly-read revision.
+        await _publish_hard_reply_buttons(callback.message, uid, fin.assistant_turn_id,
+                                          sent.message_id, result.post_consumption_revision, lang)
 
 # ────────────────────────────────────────────────────────────────────────────
 

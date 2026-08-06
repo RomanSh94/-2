@@ -18,6 +18,7 @@ import types
 import pytest
 
 import bot
+import database
 import access_control as ac
 
 
@@ -145,6 +146,18 @@ def test_invalid_mode_still_delivers_crisis_screen(role_config, monkeypatch, pf_
 
 
 # ── item 5 / item 6: pipeline ordering + product-access gate ───────────────────
+
+# Phase 2 added unconditional real DB calls to pipeline() (bump_user_revision,
+# and -- for an eligible turn -- claim_first_turn) between the access/
+# onboarding gates and this file's mocks. Real temporary SQLite DB with the
+# current schema; never touches the repository-root x20.db.
+@pytest.fixture
+def phase2_tmp_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB", str(tmp_path / "t.db"))
+    asyncio.run(database.init_db())
+    return database.DB
+
+
 @pytest.fixture
 def pipeline_spies(monkeypatch, role_config):
     calls = {"upsert_user": 0, "log_moderation": 0, "save_message": 0, "push_alert": 0,
@@ -205,10 +218,19 @@ def test_unknown_red_still_triggers_crisis_bypassing_gate(pipeline_spies):
     assert pipeline_spies["upsert_user"] == 0   # gate never reached — RED returned first
 
 
-def test_owner_non_red_ordinary_persistence_still_works(pipeline_spies, monkeypatch):
+def test_owner_non_red_ordinary_persistence_still_works(pipeline_spies, phase2_tmp_db, monkeypatch):
     # Full pipeline for OWNER needs many more collaborators stubbed; just prove
     # the gate lets it PAST the closed-test short-circuit by checking upsert_user
     # fires (rest of the pipeline is exercised by the pre-existing test suite).
+    # Seed one real prior assistant message so this OWNER represents an
+    # ordinary EXISTING user (not their literal first turn) -- claim_first_turn's
+    # v1 legacy exemption naturally routes them past the first-turn contract
+    # branch and into the plain LLM/save/send path this test exercises, without
+    # mocking claim_first_turn/bump_user_revision or touching production
+    # eligibility logic. pipeline_spies replaces bot.save_message, so this must
+    # go through database.save_message directly.
+    asyncio.run(database.save_message(1, "assistant", "синтетический предыдущий ответ",
+                                      "open_chat", "ru"))
     user = FakeUser(1)
     msg = FakeMessage(user, "у меня был тяжёлый день на работе")
     # Stub everything downstream of the gate so this stays a narrow ordering test.
@@ -261,7 +283,12 @@ def test_tester_aggression_non_red_no_owner_alert(pipeline_spies, monkeypatch):
     assert pipeline_spies["push_alert"] == 0
 
 
-def test_owner_aggression_non_red_owner_alert_preserved(pipeline_spies, monkeypatch):
+def test_owner_aggression_non_red_owner_alert_preserved(pipeline_spies, phase2_tmp_db, monkeypatch):
+    # No legacy seed needed: monitor_relationship("stop") makes pipeline()
+    # return via the "10. Check dependency" branch, well before the
+    # first-turn eligibility/claim logic is ever reached -- the only new
+    # Phase 2 DB call on this path is the unconditional bump_user_revision,
+    # which just needs a real (temp, current-schema) DB to succeed.
     monkeypatch.setattr(bot, "get_emotional_trajectory", _async(types.SimpleNamespace(
         trend="stable", hopelessness_streak=0, yellow_plus_streak=0, messages_analyzed=0)))
     monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
