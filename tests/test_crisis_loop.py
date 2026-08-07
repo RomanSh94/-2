@@ -89,10 +89,10 @@ def _make_event(db, uid=1):
 def test_bump_is_atomic_and_monotonic(tmp_db):
     eid = _make_event(tmp_db)
     async def go():
-        first = await tmp_db.bump_crisis_stage(eid, 1)     # 0→1 changes
-        again = await tmp_db.bump_crisis_stage(eid, 1)     # stale → no-op
-        down = await tmp_db.bump_crisis_stage(eid, 0)      # never lowers
-        up = await tmp_db.bump_crisis_stage(eid, 3)        # 1→3 changes
+        first = await tmp_db.bump_crisis_stage(eid, 1, 1)     # 0→1 changes
+        again = await tmp_db.bump_crisis_stage(eid, 1, 1)     # stale → no-op
+        down = await tmp_db.bump_crisis_stage(eid, 0, 1)      # never lowers
+        up = await tmp_db.bump_crisis_stage(eid, 3, 1)        # 1→3 changes
         return first, again, down, up, await tmp_db.get_crisis_stage(eid)
     first, again, down, up, stage = asyncio.run(go())
     assert first is True and again is False and down is False and up is True
@@ -104,8 +104,8 @@ def test_stale_button_is_noop(tmp_db):
     # already-passed stage → bump to 1 is a no-op (no loop, no duplicate).
     eid = _make_event(tmp_db)
     async def go():
-        await tmp_db.bump_crisis_stage(eid, 2)
-        return await tmp_db.bump_crisis_stage(eid, 1)
+        await tmp_db.bump_crisis_stage(eid, 2, 1)
+        return await tmp_db.bump_crisis_stage(eid, 1, 1)
     assert asyncio.run(go()) is False
 
 
@@ -124,7 +124,7 @@ def test_safe_resolves_and_active_gate_releases(tmp_db):
 def test_stage_survives_restart(tmp_db):
     # Stage lives in the DB, so a fresh read (≈ after a bot restart) keeps it.
     eid = _make_event(tmp_db)
-    asyncio.run(tmp_db.bump_crisis_stage(eid, 2))
+    asyncio.run(tmp_db.bump_crisis_stage(eid, 2, 1))
     assert asyncio.run(tmp_db.get_active_crisis(1))[1] == 2
 
 

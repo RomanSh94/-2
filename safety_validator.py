@@ -281,3 +281,150 @@ def validate_first_turn_response(candidate: str, user_text: str,
     if _phrase_overlap_exceeds_bound(candidate, user_text):
         return False, "substantial literal overlap with the user's message"
     return True, None
+
+
+# ── Generic continuation contract (Phase 3): elaborate/clarify validation ─────
+# Same limitation as validate_first_turn_response above: mechanical,
+# deterministic pattern matching -- proves absence of the listed surface
+# patterns, never presence of genuine understanding.
+FORBIDDEN_DIRECT_ADVICE_CONTINUATION = [
+    "тебе нужно", "тебе стоит", "ты должен", "ты должна", "советую",
+    "попробуй сделать", "лучше всего сделать", "сделай так",
+    "you should", "you need to", "you must", "i recommend", "try doing",
+    "the best thing to do",
+]
+
+DIAGNOSTIC_CERTAINTY_PHRASES = [
+    "у тебя точно", "это точно", "однозначно", "несомненно",
+    "это классический признак", "это диагноз", "ты страдаешь от",
+    "you definitely have", "this is definitely", "you clearly have",
+    "this is a clear sign of", "that is a textbook",
+]
+
+# Per product position: these must never be the MAIN content of a
+# continuation reply -- flagged whenever present at all, since a reply this
+# short containing one of them is exactly the generic-reassurance failure
+# mode the contract exists to prevent.
+GENERIC_REASSURANCE_PHRASES_CONTINUATION = [
+    "я рядом", "я тебя понимаю", "ты не один", "ты не одна",
+    "всё будет хорошо", "не переживай", "рассказывай, как удобно",
+    "ничего объяснять не нужно",
+    "i'm here", "i understand you", "you're not alone",
+    "everything will be fine", "don't worry",
+]
+
+_LIST_MARKER_RE = re.compile(r"(^|\n)\s*(?:[-*•]|\d+[.)])\s", re.MULTILINE)
+
+# elaborate-only: the reply must work with what the user already gave it --
+# asking them to repeat everything defeats the point of "I'll tell you more".
+FORBIDDEN_REPEAT_STORY_REQUEST = [
+    "расскажи всё сначала", "расскажи всю историю", "расскажи ещё раз всё",
+    "перескажи", "опиши всё с самого начала",
+    "tell me the whole story again", "tell me everything from the start",
+    "start from the beginning", "tell me it all again",
+]
+
+# clarify-only: a cautious-hypothesis marker is mandatory (product contract --
+# clarify proposes a possibility, it never states one as settled fact).
+# EN list includes "possible"/"it's possible"/"it is possible" per product
+# approval -- the existing, unmodified CLARIFY_FALLBACK_EN ("It's possible
+# that...") is approved cautious wording, not a defect to be rewritten.
+CAUTIOUS_MARKERS_RU = ["возможно", "похоже", "может быть", "может быть связано", "вероятно"]
+CAUTIOUS_MARKERS_EN = ["perhaps", "maybe", "it seems", "may", "might", "could", "appears",
+                       "possible", "it's possible", "it is possible"]
+
+# clarify-only: certainty bolted directly onto a claim about the user's inner
+# state or another person's motive -- narrow phrase list (same limitation as
+# every other list in this module: proves absence of these specific surface
+# patterns, never presence of genuine caution elsewhere in the reply).
+FORBIDDEN_UNQUALIFIED_ASSERTION_CLARIFY = [
+    "ты точно чувствуешь", "ты определённо чувствуешь", "ты явно чувствуешь",
+    "он точно хочет", "она точно хочет", "он явно думает", "она явно думает",
+    "точно из-за того что", "именно поэтому ты",
+    "you definitely feel", "you clearly feel", "you obviously feel",
+    "he definitely wants", "she definitely wants",
+    "he clearly thinks", "she clearly thinks", "that is exactly why you",
+]
+
+# clarify-only, broader than the phrase list above: a BARE second-person
+# state claim ("ты злишься" / "you are angry") or third-person motive claim
+# ("он хочет тебя унизить" / "she wants to control you") stated as flat fact
+# -- no certainty adverb needed to be a problem; simply asserting it without
+# any hedge is itself the defect. Checked PER SENTENCE (same split as
+# check_toxic_validation above): a cautious marker earlier in the reply does
+# NOT license a later, un-hedged sentence -- each sentence making this kind
+# of claim must carry its own hedge. Same documented limitation as every
+# other pattern list here: a bounded set of common state/motive verbs, not a
+# general parse of meaning.
+_CLARIFY_SECOND_PERSON_STATE_RE_RU = re.compile(
+    r"\bты\s+(?:чувствуешь|злишься|боишься|тревожишься|переживаешь|ненавидишь|"
+    r"любишь|хочешь|думаешь|устал[ао]?|обижен[ао]?|расстроен[ао]?)\b",
+    re.IGNORECASE)
+_CLARIFY_THIRD_PERSON_MOTIVE_RE_RU = re.compile(
+    r"\b(?:он|она)\s+(?:хочет|думает|чувствует|ненавидит|любит|боится)\b",
+    re.IGNORECASE)
+_CLARIFY_SECOND_PERSON_STATE_RE_EN = re.compile(
+    r"\byou\s+(?:are|feel|feels)\s+(?:angry|sad|afraid|scared|happy|hurt|anxious|"
+    r"worried|upset)\b|\byou\s+(?:feel|want|think|hate|love)\b",
+    re.IGNORECASE)
+_CLARIFY_THIRD_PERSON_MOTIVE_RE_EN = re.compile(
+    r"\b(?:he|she)\s+(?:wants|thinks|feels|hates|loves)\b", re.IGNORECASE)
+
+
+def validate_continuation_response(candidate: str, action: str, lang: str = "ru",
+                                   source_user_text: str = "",
+                                   source_assistant_text: str = "") -> tuple[bool, str | None]:
+    """Deterministic structural checks for a continuation reply -- action-
+    specific: 'elaborate' and 'clarify' have different contracts (see
+    product spec). source_user_text/source_assistant_text are accepted for
+    interface symmetry with the generation call site; no check below reads
+    them. This function proves surface-level structure only -- it never
+    proves, and must never be reported as proving, that the reply is
+    semantically grounded in the source exchange. Returns
+    (is_valid, reason_if_invalid)."""
+    if not candidate or not candidate.strip():
+        return False, "empty response"
+    if len(candidate) > 450:
+        return False, "response too long (>450 characters)"
+    if candidate.count("?") != 1:
+        return False, "continuation response must contain exactly one question"
+    if _LIST_MARKER_RE.search(candidate):
+        return False, "response contains a bulleted or numbered list"
+    low = candidate.lower()
+    for phrase in FORBIDDEN_DIRECT_ADVICE_CONTINUATION:
+        if phrase in low:
+            return False, f"direct advice phrase: '{phrase}'"
+    for phrase in DIAGNOSTIC_CERTAINTY_PHRASES:
+        if phrase in low:
+            return False, f"diagnostic-certainty phrase: '{phrase}'"
+    for phrase in GENERIC_REASSURANCE_PHRASES_CONTINUATION:
+        if phrase in low:
+            return False, f"generic reassurance phrase: '{phrase}'"
+    before_question = candidate.split("?", 1)[0].strip()
+    if len(before_question) < 15:
+        return False, "no concrete reflection before the question"
+
+    if action == "clarify":
+        markers = CAUTIOUS_MARKERS_EN if lang == "en" else CAUTIOUS_MARKERS_RU
+        if not any(m in low for m in markers):
+            return False, "clarify response missing a cautious marker"
+        for phrase in FORBIDDEN_UNQUALIFIED_ASSERTION_CLARIFY:
+            if phrase in low:
+                return False, f"unqualified assertion: '{phrase}'"
+        state_re = _CLARIFY_SECOND_PERSON_STATE_RE_EN if lang == "en" \
+            else _CLARIFY_SECOND_PERSON_STATE_RE_RU
+        motive_re = _CLARIFY_THIRD_PERSON_MOTIVE_RE_EN if lang == "en" \
+            else _CLARIFY_THIRD_PERSON_MOTIVE_RE_RU
+        for sentence in re.split(r"[.!?\n]", candidate):
+            if any(m in sentence.lower() for m in markers):
+                continue   # this specific sentence already carries its own hedge
+            if state_re.search(sentence) or motive_re.search(sentence):
+                return False, ("unqualified internal-state or third-party-motive "
+                              "assertion outside any cautious marker")
+        return True, None
+
+    # elaborate (and any other continuation action reusing this contract)
+    for phrase in FORBIDDEN_REPEAT_STORY_REQUEST:
+        if phrase in low:
+            return False, f"asks to repeat the whole story: '{phrase}'"
+    return True, None

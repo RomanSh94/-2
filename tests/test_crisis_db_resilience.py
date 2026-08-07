@@ -188,15 +188,15 @@ def test_legacy_two_part_callback_get_active_crisis_raises_is_safe(monkeypatch):
     monkeypatch.setattr(bot, "get_active_crisis", boom)
     monkeypatch.setattr(bot, "get_user_language", _async("ru"))
 
-    calls = {"resolve_crisis": 0, "bump_crisis_stage": 0, "send_crisis": 0}
+    calls = {"set_crisis_response": 0, "bump_crisis_stage": 0, "send_crisis": 0}
 
-    async def spy_resolve(*a, **kw):
-        calls["resolve_crisis"] += 1
+    async def spy_set_response(*a, **kw):
+        calls["set_crisis_response"] += 1
     async def spy_bump(*a, **kw):
         calls["bump_crisis_stage"] += 1
     async def spy_send(*a, **kw):
         calls["send_crisis"] += 1
-    monkeypatch.setattr(bot, "resolve_crisis", spy_resolve)
+    monkeypatch.setattr(bot, "set_crisis_response", spy_set_response)
     monkeypatch.setattr(bot, "bump_crisis_stage", spy_bump)
     monkeypatch.setattr(bot, "send_crisis", spy_send)
 
@@ -207,7 +207,7 @@ def test_legacy_two_part_callback_get_active_crisis_raises_is_safe(monkeypatch):
     # Must not raise past cb_crisis.
     asyncio.run(bot.cb_crisis(cb))
 
-    assert calls["resolve_crisis"] == 0
+    assert calls["set_crisis_response"] == 0
     assert calls["bump_crisis_stage"] == 0
     assert calls["send_crisis"] == 0
 
@@ -233,16 +233,25 @@ def test_legacy_two_part_callback_no_active_crisis_is_safe_noop(monkeypatch):
 def test_normal_three_part_callback_still_works(monkeypatch):
     monkeypatch.setattr(bot, "get_user_language", _async("ru"))
     monkeypatch.setattr(bot, "log_crisis_delivery", _async(None))
-    resolved = {"n": 0}
+    calls = {"n": 0}
 
-    async def fake_resolve_crisis(eid):
-        resolved["eid"] = eid
-        resolved["n"] += 1
+    # cb_crisis now owner-verifies event_id BEFORE any action-specific work
+    # (round-6 fix) -- this test mocks every DB dependency rather than
+    # creating a real crisis_events row, so crisis_event_owner must be
+    # mocked too, to simulate "event 42 belongs to uid 1".
+    monkeypatch.setattr(bot, "crisis_event_owner", _async(1))
 
-    async def fake_set_crisis_response(uid, resp):
-        pass
+    # set_crisis_response(event_id, requester_user_id, "safe") now enforces
+    # ownership in SQL and sets both resolved=1 and user_response='safe' on
+    # the exact event in one call -- cb_crisis no longer calls resolve_crisis
+    # separately for "safe".
+    async def fake_set_crisis_response(event_id, requester_user_id, resp):
+        calls["event_id"] = event_id
+        calls["requester_user_id"] = requester_user_id
+        calls["resp"] = resp
+        calls["n"] += 1
+        return bot.CRISIS_RESPONSE_UPDATED
 
-    monkeypatch.setattr(bot, "resolve_crisis", fake_resolve_crisis)
     monkeypatch.setattr(bot, "set_crisis_response", fake_set_crisis_response)
 
     user = FakeUser(1)
@@ -250,6 +259,8 @@ def test_normal_three_part_callback_still_works(monkeypatch):
     cb = FakeCallback(user, msg, data="crisis:safe:42")   # new 3-part, carries eid
 
     asyncio.run(bot.cb_crisis(cb))
-    assert resolved["n"] == 1
-    assert resolved["eid"] == 42
+    assert calls["n"] == 1
+    assert calls["event_id"] == 42
+    assert calls["requester_user_id"] == 1
+    assert calls["resp"] == "safe"
     assert len(msg.answers) == 1

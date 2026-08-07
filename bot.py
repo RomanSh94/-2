@@ -48,8 +48,17 @@ from prompts import get_system_prompt, get_crisis_text, get_onboarding
 from prompts import (
     get_first_turn_contract_text,
     UNIVERSAL_CONTINUATION_BUTTONS_RU, UNIVERSAL_CONTINUATION_BUTTONS_EN,
-    HARD_REPLY_OPTIONS_RU, HARD_REPLY_OPTIONS_EN,
-    get_continuation_reply, get_hard_reply_ack,
+    get_elaborate_fallback, get_clarify_fallback,
+    build_continuation_system_prompt, build_continuation_user_message,
+    get_hard_menu_text, HARD_MENU_BUTTONS_RU, HARD_MENU_BUTTONS_EN,
+    get_regulate_skill_text, get_regulate_alt_text,
+    HARDREG_OUTCOME_BUTTONS_RU, HARDREG_OUTCOME_BUTTONS_EN, get_hardreg_ack,
+    HARDREG_EASIER_NEXT_RU, HARDREG_EASIER_NEXT_EN,
+    HARDREG_SAME_NEXT_RU, HARDREG_SAME_NEXT_EN,
+    HARDREG_HARDER_NEXT_RU, HARDREG_HARDER_NEXT_EN,
+    get_understand_menu_text, HARDSTATE_BUTTONS_RU, HARDSTATE_BUTTONS_EN,
+    get_hardstate_text, HARDSTATE_NEXT_RU, HARDSTATE_NEXT_EN,
+    get_quiet_text, QUIET_NEXT_RU, QUIET_NEXT_EN,
 )
 from crisis_protocol import (
     classify, crisis_keyboard, admin_alert_text, RED, ORANGE,
@@ -76,6 +85,7 @@ from safety_validator import (
     validate_response,
     validate_response_with_context, select_fallback,
     validate_first_turn_response, get_first_turn_fallback,
+    validate_continuation_response,
 )
 from traced_response import Influence, traced_response_builder, persist_influence_trace
 from prompts import get_disambiguation_message
@@ -96,7 +106,9 @@ from database import (
     get_user_language,
     set_checkin, get_checkin_users, update_last_checkin,
     log_crisis_event, set_crisis_response, set_crisis_protective_factors,
-    get_active_crisis, bump_crisis_stage, resolve_crisis, set_stage3_at, get_crisis_stage,
+    CRISIS_RESPONSE_UPDATED, CRISIS_RESPONSE_ALREADY_SAFE,
+    CRISIS_RESPONSE_NOT_ACTIONABLE, CRISIS_RESPONSE_NOT_FOUND_OR_NOT_OWNED,
+    get_active_crisis, bump_crisis_stage, set_stage3_at, get_crisis_stage, crisis_event_owner,
     get_memory_overview,
     export_all_personal_data, delete_all_personal_data, preview_delete_all_personal_data,
     set_mute, reset_unanswered,
@@ -122,10 +134,11 @@ from database import (
     complete_onboarding, set_onboarding_card_ref, get_onboarding_eligibility,
     get_stored_user_language, has_privacy_notice_ack,
     record_notice_acknowledgement,
-    bump_user_revision,
+    bump_user_revision, get_user_revision,
     claim_first_turn, transition_first_turn_claim,
     create_keyboard_batch_if_current, consume_interaction_binding,
-    finalize_callback_reply, mark_event_besteffort,
+    finalize_callback_reply, mark_event_besteffort, normalized_action_text,
+    get_last_user_message_before, count_quiet_events,
     SEND_EXCEPTION, SAVE_EXCEPTION, FINALIZE_EXCEPTION,
 )
 import onboarding
@@ -219,24 +232,23 @@ def _binding_expiry() -> str:
             + timedelta(hours=_FIRST_TURN_BINDING_LEASE_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def universal_continuation_kb(lang: str, tokens: dict) -> InlineKeyboardMarkup:
-    """tokens: {"elaborate": token, "clarify": token, "hard": token}.
-    callback_data carries only the opaque token -- action/topic/uid/turn_id/
-    scenario/lang/revision never travel in callback_data."""
-    buttons = UNIVERSAL_CONTINUATION_BUTTONS_EN if lang == "en" else UNIVERSAL_CONTINUATION_BUTTONS_RU
+def _continuation_options(lang: str, buttons_ru: list, buttons_en: list) -> list:
+    """Zips the project's (label, action) RU/EN pairs into the (label_ru,
+    label_en, action) triples _continuation_kb/_publish_continuation_options
+    expect."""
+    return [(ru_label, en_label, action)
+            for (ru_label, action), (en_label, _) in zip(buttons_ru, buttons_en)]
+
+
+def _continuation_kb(lang: str, options: list, tokens: dict) -> InlineKeyboardMarkup:
+    """Generic single-column keyboard builder for ANY continuation option
+    list. options: list of (label_ru, label_en, action). callback_data
+    carries only the opaque token -- action/topic/uid/turn_id/scenario/
+    lang/revision never travel in callback_data."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=label, callback_data=f"ucbtn:{tokens[action]}")]
-        for label, action in buttons
+        [InlineKeyboardButton(text=(en if lang == "en" else ru), callback_data=f"ucbtn:{tokens[action]}")]
+        for ru, en, action in options
     ])
-
-
-def hard_reply_kb(lang: str, tokens: dict) -> InlineKeyboardMarkup:
-    """tokens: {"easier": token, "same": token, "harder": token}."""
-    options = HARD_REPLY_OPTIONS_EN if lang == "en" else HARD_REPLY_OPTIONS_RU
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=label, callback_data=f"ucbtn:{tokens[value]}")
-        for label, value in options
-    ]])
 
 
 async def _first_turn_generate_and_validate(messages: list, user_text: str, lang: str) -> tuple[str, bool]:
@@ -261,19 +273,22 @@ async def _first_turn_generate_and_validate(messages: list, user_text: str, lang
     return get_first_turn_fallback(lang), False
 
 
-async def _publish_universal_buttons(message, uid: int, turn_id: int, source_message_id: int,
-                                     response_revision: int, lang: str) -> bool:
-    """response_revision MUST be the exact user_revision captured for this
-    turn in pipeline() -- never re-read here. A fresh read would race a
-    newer ordinary message that lands between Telegram delivery and button
+async def _publish_continuation_options(message, uid: int, turn_id: int, source_message_id: int,
+                                        response_revision: int, lang: str,
+                                        buttons_ru: list, buttons_en: list) -> bool:
+    """Generic keyboard publisher for ANY continuation option list -- binds
+    opaque tokens to turn_id for this exact (label, action) set.
+    response_revision MUST be the exact revision captured at the point this
+    turn's reply was generated -- never re-read here. A fresh read would
+    race a newer user action landing between Telegram delivery and button
     publication, incorrectly binding the buttons to a revision the user has
     already moved past."""
-    actions = ["elaborate", "clarify", "hard"]
-    tokens = {a: secrets.token_urlsafe(9) for a in actions}
+    options = _continuation_options(lang, buttons_ru, buttons_en)
+    tokens = {action: secrets.token_urlsafe(9) for _, _, action in options}
     expires_at = _binding_expiry()
-    rows = [{"token": tokens[a], "turn_id": turn_id, "chat_id": message.chat.id,
-             "source_message_id": source_message_id, "action": a, "expires_at": expires_at}
-            for a in actions]
+    rows = [{"token": tokens[action], "turn_id": turn_id, "chat_id": message.chat.id,
+             "source_message_id": source_message_id, "action": action, "expires_at": expires_at}
+            for _, _, action in options]
     try:
         batch_ok = await create_keyboard_batch_if_current(uid, response_revision, rows)
     except Exception:
@@ -282,34 +297,106 @@ async def _publish_universal_buttons(message, uid: int, turn_id: int, source_mes
         return False
     try:
         await bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=source_message_id,
-                                            reply_markup=universal_continuation_kb(lang, tokens))
+                                            reply_markup=_continuation_kb(lang, options, tokens))
     except Exception:
         return False
     return True
 
 
-async def _publish_hard_reply_buttons(message, uid: int, turn_id: int, source_message_id: int,
-                                      post_consumption_revision: int, lang: str) -> None:
-    """Uses EXACTLY the post_consumption_revision returned by the callback
-    transaction that produced turn_id -- never a freshly re-read revision."""
-    values = ["easier", "same", "harder"]
-    tokens = {v: secrets.token_urlsafe(9) for v in values}
-    expires_at = _binding_expiry()
-    rows = [{"token": tokens[v], "turn_id": turn_id, "chat_id": message.chat.id,
-             "source_message_id": source_message_id, "action": f"hardreply:{v}",
-             "expires_at": expires_at}
-            for v in values]
+async def _publish_universal_buttons(message, uid: int, turn_id: int, source_message_id: int,
+                                     response_revision: int, lang: str) -> bool:
+    """response_revision MUST be the exact user_revision captured for this
+    turn in pipeline() -- never re-read here (see _publish_continuation_options)."""
+    return await _publish_continuation_options(message, uid, turn_id, source_message_id,
+                                               response_revision, lang,
+                                               UNIVERSAL_CONTINUATION_BUTTONS_RU,
+                                               UNIVERSAL_CONTINUATION_BUTTONS_EN)
+
+
+async def _continuation_generate_and_validate(action: str, user_text: str, assistant_text: str,
+                                              scenario: str, lang: str) -> str:
+    """Single LLM call for elaborate/clarify, grounded in the actual source
+    exchange via a clearly delimited USER message -- the system message
+    carries only the immutable instruction contract and an explicit warning
+    that the source material is untrusted content, never a source of
+    instructions (see prompts.build_continuation_system_prompt /
+    build_continuation_user_message; this is the prompt-injection isolation
+    boundary). Never raises, never calls the LLM a second time: any
+    exception, a failed action-specific structural validator
+    (validate_continuation_response), or a failed production safety
+    validator (validate_response_with_context -- the same one every other
+    LLM-generated reply in this app goes through) all resolve to the
+    deterministic localized fallback. Never logs source text, generated
+    text, or the constructed messages.
+
+    The production safety validator gets the REAL risk context for
+    user_text, never a hardcoded neutral/low default: messages.risk_score/
+    risk_categories (the only stored per-message risk columns) do not carry
+    'level' or 'ambiguous_phrases' -- the fields validate_response_with_context
+    actually reads -- so there is no complete stored snapshot to prefer.
+    Re-running the SAME deterministic detect_risk the ordinary pipeline runs
+    on every message, on this exact source text, matches production
+    structure exactly and can never silently downgrade a real medium/high/
+    critical message to 'low' (including the degenerate user_text=="" case
+    from a failed prior-message lookup -- detect_risk("", lang) is the real,
+    unmodified detector's own answer for empty input, not an assumption we
+    hardcoded)."""
+    system_prompt = build_continuation_system_prompt(action, lang)
+    user_message = build_continuation_user_message(action, user_text, assistant_text, scenario, lang)
+    fallback = get_elaborate_fallback if action == "elaborate" else get_clarify_fallback
     try:
-        batch_ok = await create_keyboard_batch_if_current(uid, post_consumption_revision, rows)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": user_message}],
+            temperature=0.6, max_tokens=200,
+        )
+        candidate = response.choices[0].message.content
     except Exception:
-        return
-    if not batch_ok:
-        return
-    try:
-        await bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=source_message_id,
-                                            reply_markup=hard_reply_kb(lang, tokens))
-    except Exception:
-        pass
+        return fallback(lang)
+
+    valid, _reason = validate_continuation_response(
+        candidate, action, lang, source_user_text=user_text, source_assistant_text=assistant_text)
+    if not valid:
+        return fallback(lang)
+
+    risk = detect_risk(user_text, lang)
+    is_safe, _reason = validate_response_with_context(candidate, user_text, risk, lang)
+    if not is_safe:
+        return fallback(lang)
+    return candidate
+
+
+async def _continuation_reply_and_next(action: str, uid: int, lang: str):
+    """Deterministic (reply_text, next_buttons_ru, next_buttons_en) for every
+    non-LLM continuation action EXCEPT hardreg:unsafe -- the whole
+    hard:*/hardreg:*/hardstate:* graph minus that one action, which is
+    special-cased and returns before this function is ever called (it needs
+    the real safety-delivery path, not a plain callback.message.answer --
+    see _handle_hardreg_unsafe). next_buttons_* is None only for the
+    unreachable default at the bottom (every action in
+    ALLOWED_INTERACTION_ACTIONS is handled above it)."""
+    if action == "hard":
+        return get_hard_menu_text(lang), HARD_MENU_BUTTONS_RU, HARD_MENU_BUTTONS_EN
+    if action in ("hard:regulate", "hardreg:repeat"):
+        return get_regulate_skill_text(lang), HARDREG_OUTCOME_BUTTONS_RU, HARDREG_OUTCOME_BUTTONS_EN
+    if action == "hardreg:alt":
+        return get_regulate_alt_text(lang), HARDREG_OUTCOME_BUTTONS_RU, HARDREG_OUTCOME_BUTTONS_EN
+    if action == "hardreg:easier":
+        return get_hardreg_ack("easier", lang), HARDREG_EASIER_NEXT_RU, HARDREG_EASIER_NEXT_EN
+    if action == "hardreg:same":
+        return get_hardreg_ack("same", lang), HARDREG_SAME_NEXT_RU, HARDREG_SAME_NEXT_EN
+    if action == "hardreg:harder":
+        return get_hardreg_ack("harder", lang), HARDREG_HARDER_NEXT_RU, HARDREG_HARDER_NEXT_EN
+    if action == "hard:understand":
+        return get_understand_menu_text(lang), HARDSTATE_BUTTONS_RU, HARDSTATE_BUTTONS_EN
+    if action.startswith("hardstate:"):
+        value = action.split(":", 1)[1]
+        return get_hardstate_text(value, lang), HARDSTATE_NEXT_RU, HARDSTATE_NEXT_EN
+    if action == "hard:quiet":
+        step = max(0, await count_quiet_events(uid) - 1)
+        return get_quiet_text(step, lang), QUIET_NEXT_RU, QUIET_NEXT_EN
+    return "", None, None
 
 
 async def _deliver_first_turn_response(message, uid: int, answer: str, buttons_allowed: bool,
@@ -1046,6 +1133,12 @@ async def _show_stage(callback: CallbackQuery, stage: int, lang: str, event_id) 
                       callback.from_user.id, event_id, "screen")
 
 
+# SQLite's INTEGER storage class is a signed 64-bit int -- any bound value
+# outside this range raises OverflowError. Used to reject an out-of-range
+# 3-part crisis:*:<id> event id before any DB query is ever attempted.
+_CRISIS_EVENT_ID_MAX_SQLITE = 2**63 - 1
+
+
 @dp.callback_query(F.data.startswith("crisis:"))
 async def cb_crisis(callback: CallbackQuery):
     """Staged crisis escalation. 'still'/'cant_call' raise the monotonic stage in
@@ -1055,36 +1148,111 @@ async def cb_crisis(callback: CallbackQuery):
     username = callback.from_user.username or ""
     parts = callback.data.split(":")
     action = parts[1]
-    lang = await get_user_language(uid)
 
-    # event_id from callback (new 3-part) or resolve the active event (old 2-part
-    # legacy buttons from messages sent before this deploy → backward compatible).
-    event_id = None
-    if len(parts) >= 3 and parts[2].isdigit():
-        event_id = int(parts[2])
-    if event_id is None:
-        # checkpoint-2 round 3 item 1B: this DB-resolve is the ONLY part of
-        # cb_crisis wrapped here -- the staged (3-part) path below is left
-        # unwrapped so a real bug there still surfaces normally. A degraded-
-        # fallback screen (item 1A) sends no buttons at all, but pre-existing
-        # legacy 2-part callback_data ("crisis:safe"/"crisis:still") can still
-        # arrive from messages sent before this deploy, and the DB may still
-        # be unstable when the user taps it -- get_active_crisis must not be
-        # allowed to raise past this handler.
+    # Strict parsing contract, checked BEFORE any I/O (no get_user_language,
+    # no get_active_crisis, no crisis_event_owner, no DB call of any kind
+    # for a malformed callback):
+    #   len(parts) == 2  ("crisis:<action>")           -> legacy resolution
+    #   len(parts) == 3  ("crisis:<action>:<event_id>") -> exact numeric id
+    #   anything else                                   -> hard parse failure
+    #
+    # A malformed 3-part id (oversized, zero, negative, non-numeric) must
+    # NEVER fall through to legacy resolution: an earlier version did
+    # exactly that (treating "no valid embedded id" the same as "no id
+    # segment at all"), and if the tapping user happened to have a real
+    # active crisis, the malformed callback would silently resolve to and
+    # operate on THAT real event instead of failing closed -- not fail-
+    # closed at all. Each shape is handled in its own exclusive branch so
+    # an invalid 3-part callback can only ever reach the final "else: fail
+    # closed" branch, never the legacy path.
+    if len(parts) == 2:
         try:
             active = await get_active_crisis(uid)
         except Exception as e:
-            print(f"[crisis] cb_crisis legacy-resolve FAILED: {type(e).__name__}: {e}")
+            # Redacted: fixed event name + uid + exception CLASS only --
+            # never the raw exception message (could echo a DB path or SQL).
+            print(f"event=crisis_legacy_active_event_lookup_failed uid={uid} "
+                  f"exc_type={type(e).__name__}")
             await callback.answer()
             return
         event_id = active[0] if active else None
-    if event_id is None:
+        if event_id is None:
+            await callback.answer()
+            return
+    elif len(parts) == 3:
+        # ASCII decimal digits only -- str.isdigit() alone is NOT enough:
+        # it also accepts non-ASCII "digit" characters (e.g. superscript
+        # '²') that int() then rejects with an uncaught ValueError. isascii()
+        # rules those out before int() ever runs.
+        id_segment = parts[2]
+        if not (id_segment.isascii() and id_segment.isdigit()):
+            await callback.answer()
+            return
+        parsed_id = int(id_segment)
+        if not (1 <= parsed_id <= _CRISIS_EVENT_ID_MAX_SQLITE):
+            await callback.answer()
+            return
+        event_id = parsed_id
+    else:
+        # Zero-, one-, or four-or-more-part callback_data -- not a shape
+        # this handler ever produces itself; fail closed with no I/O.
         await callback.answer()
         return
 
+    # Owner-scope the ENTIRE crisis:* callback surface -- ONE gate, before
+    # any action-specific Telegram send, keyboard replacement, delivery-log
+    # write, database mutation, or admin/reviewer alert. Previously only
+    # "safe" enforced this (in set_crisis_response's own SQL); call/contact/
+    # safe_place/contacted/still/cant_call had none, so a forged or replayed
+    # 3-part callback_data carrying a foreign event_id could log delivery
+    # rows against someone else's event, or -- for still/cant_call --
+    # actually escalate their crisis stage and fire an admin alert. The
+    # legacy 2-part path is already owner-safe by construction
+    # (get_active_crisis(uid)'s own query is WHERE user_id=?), but is
+    # re-verified here too so both paths run through one uniform gate.
+    # Nonexistent and wrong-owner produce the IDENTICAL fail-closed result
+    # (callback.answer() only) -- neither is ever revealed to a non-owner.
+    #
+    # The lookup itself is wrapped: an exception here (a DB error, for
+    # example) must never escape cb_crisis and leave the Telegram callback
+    # unanswered -- it fails exactly like a wrong-owner/nonexistent result:
+    # answer cleanly, send nothing, mutate nothing, alert nothing.
+    try:
+        owner_id = await crisis_event_owner(event_id)
+    except Exception as e:
+        # Redacted: fixed event name + uid + exception CLASS only -- never
+        # the raw exception message, DB path, SQL, callback_data, event_id,
+        # or any content.
+        print(f"event=crisis_event_owner_lookup_failed uid={uid} exc_type={type(e).__name__}")
+        await callback.answer()
+        return
+    if owner_id != uid:
+        await callback.answer()
+        return
+
+    # Language resolution is real I/O too -- deferred until AFTER shape/id
+    # validation, event resolution, and ownership verification, so an
+    # invalid or non-owned callback never triggers it either.
+    lang = await get_user_language(uid)
+
     if action == "safe":
-        await resolve_crisis(event_id)
-        await set_crisis_response(uid, "safe")
+        # set_crisis_response(event_id, uid, "safe") enforces ownership in
+        # SQL itself (WHERE id=? AND user_id=?) and sets BOTH resolved=1 and
+        # user_response='safe' on this exact event in one UPDATE -- a
+        # separate resolve_crisis(event_id) call is no longer needed.
+        result = await set_crisis_response(event_id, uid, "safe")
+        if result not in (CRISIS_RESPONSE_UPDATED, CRISIS_RESPONSE_ALREADY_SAFE):
+            # Explicit SUCCESS allowlist, not a denylist: only these two
+            # exact values may proceed. Anything else -- including
+            # NOT_FOUND_OR_NOT_OWNED, NOT_ACTIONABLE, None, or any future/
+            # unexpected value this function might ever return -- fails
+            # closed here: no crisis row touched, no keyboard removed, no
+            # confirmation sent.
+            await callback.answer()
+            return
+        # Only UPDATED and ALREADY_SAFE reach here -- a genuine duplicate
+        # 'safe' tap by the correct owner is idempotent and still shows the
+        # same confirmation.
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -1119,18 +1287,20 @@ async def cb_crisis(callback: CallbackQuery):
         target = 1 if stage == 0 else (3 if stage == 2 else None)
         if target is None:
             await callback.answer(); return
-        changed = await bump_crisis_stage(event_id, target)   # atomic once-only
+        # Owner-scoped in the SQL mutation itself (defense in depth beyond
+        # the early gate above) -- atomic once-only.
+        changed = await bump_crisis_stage(event_id, target, uid)
         if not changed:
             await callback.answer(); return                   # stale/double tap → no-op
         if target == 3:
-            await set_stage3_at(event_id)
+            await set_stage3_at(event_id, uid)   # also owner-scoped in SQL
         await _send_admin_crisis_alert(uid, username, target, event_id)  # once
         await _show_stage(callback, target, lang, event_id)
         await callback.answer()
         return
 
     if action == "cant_call":
-        changed = await bump_crisis_stage(event_id, 2)
+        changed = await bump_crisis_stage(event_id, 2, uid)   # owner-scoped in SQL
         if changed:
             # Alert on the FIRST escalation too (pt 3) — every actual stage rise
             # notifies an admin exactly once (atomic bump guarantees once).
@@ -1216,12 +1386,81 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
         await callback.message.answer(msg, reply_markup=ReplyKeyboardRemove())
     await callback.answer()
 
+# Not RED (reserved for an actual risk_detector suicide/self_harm text
+# classification -- trigger_crisis's only other caller) and not ORANGE
+# (reserved for a risk_detector high/critical SCORE classification -- also
+# never computed here). This is an honest, distinct descriptor of the
+# SOURCE of the event: the user tapped a button, no text was scored.
+# crisis_events.level has no CHECK constraint (verified against the schema),
+# and nothing in the crisis subsystem branches on its value (crisis_screen,
+# send_crisis, cb_crisis, get_active_crisis, resolve_crisis, bump_crisis_stage
+# all key off event_id/resolved/crisis_stage -- never level) -- so this is
+# purely a truthful record-keeping label, not a classification with side
+# effects, and not a diagnosis.
+HARDREG_UNSAFE_SELF_REPORT_LEVEL = "SELF_REPORTED"
+
+
+async def _handle_hardreg_unsafe(callback: CallbackQuery, result, uid: int, lang: str) -> None:
+    """hardreg:unsafe -- the user self-reported 'Мне небезопасно' via a
+    button tap, not a risk_detector text classification.
+
+    A REAL crisis_events row is required here, not merely a bare crisis
+    message: cb_crisis's "safe"/"still" buttons only do anything when they
+    can resolve an event_id (either embedded in 3-part callback_data, or via
+    get_active_crisis(uid) for the legacy 2-part form) -- with no event at
+    all, tapping either button is a silent no-op and the user is left at a
+    dead keyboard. So this reuses the existing official event-creation API
+    (log_crisis_event) with the honest, non-RED/non-ORANGE level above, then
+    the existing staged crisis_screen(0, lang, eid) -- the SAME screen/
+    keyboard/escalation machinery trigger_crisis uses -- so "safe"/"still"/
+    "call"/"cant_call" are all genuinely functional afterward, not a second,
+    parallel safety system. Delivered through the real send_crisis ladder +
+    delivery logging + P0-alert-on-total-failure path. Sent at most once,
+    never retried after an uncertain outcome.
+
+    If log_crisis_event itself fails, degrades EXACTLY like trigger_crisis's
+    own established precedent for the same failure: plain crisis text, NO
+    buttons at all (never a stateful crisis:* button with no event behind
+    it -- the DB instability that broke event creation could still be broken
+    the moment the user taps a button).
+
+    Resolves the consumed interaction event honestly by reusing
+    finalize_callback_reply (never invents a new event status): 'delivered'
+    only when send_crisis actually confirmed delivery at some ladder level,
+    'delivery_uncertain' (the existing honest failure state) otherwise."""
+    eid = None
+    try:
+        eid = await log_crisis_event(
+            uid, HARDREG_UNSAFE_SELF_REPORT_LEVEL, 0, ["self_reported_unsafe"],
+            normalized_action_text("hardreg:unsafe", lang), lang, admin_notified=False)
+    except Exception as e:
+        # Redacted: fixed event name + uid + exception class only -- never
+        # the raw exception message (same convention as
+        # finalize_callback_reply's persistence-failure diagnostic).
+        print(f"event=hardreg_unsafe_crisis_event_create_failed uid={uid} "
+              f"exc_type={type(e).__name__}")
+        eid = None
+
+    if eid is not None:
+        text, kb = crisis_screen(0, lang, eid)
+    else:
+        text, kb = get_crisis_text(lang), None
+
+    level_delivered = await send_crisis(callback.message.answer, text, kb, lang, uid,
+                                        eid, "hardreg_unsafe")
+    if level_delivered != "none":
+        await finalize_callback_reply(result.event_id, uid, text)
+    else:
+        await mark_event_besteffort(result.event_id, "delivery_uncertain")
+
+
 @dp.callback_query(F.data.startswith("ucbtn:"))
 async def cb_universal_continuation(callback: CallbackQuery):
-    """Single handler for all six DB-owned universal-continuation actions
-    (spec item G). The accepted action always comes from
-    consume_interaction_binding — never trusted from callback_data, which
-    carries only the opaque token."""
+    """Single handler for every DB-owned universal-continuation action --
+    elaborate/clarify (LLM-generated, source-grounded) and the deterministic
+    hard:*/hardreg:*/hardstate:* graph. The accepted action always comes
+    from consume_interaction_binding — never trusted from callback_data,
+    which carries only the opaque token."""
     uid = callback.from_user.id
     token = callback.data[len("ucbtn:"):]
     chat_id = callback.message.chat.id
@@ -1240,30 +1479,56 @@ async def cb_universal_continuation(callback: CallbackQuery):
         return
     await callback.answer()
 
-    # spec item C: the reply, the nested keyboard, and the persisted
-    # metadata are all source-turn-owned -- never the current stored
-    # profile language, which may have changed since the source turn.
+    # The reply, the nested keyboard, and the persisted metadata are all
+    # source-turn-owned -- never the current stored profile language, which
+    # may have changed since the source turn.
     lang = result.lang
-    if result.action.startswith("hardreply:"):
-        reply_text = get_hard_reply_ack(result.action.split(":", 1)[1], lang)
+    scenario = result.scenario
+
+    if result.action == "hardreg:unsafe":
+        # Terminal safety-reuse leaf: its own send path (send_crisis, real
+        # keyboard, real delivery logging), never the generic single
+        # callback.message.answer(answer) + finalize_callback_reply route
+        # below -- see _handle_hardreg_unsafe.
+        await _handle_hardreg_unsafe(callback, result, uid, lang)
+        return
+
+    if result.action in ("elaborate", "clarify"):
+        user_text = await get_last_user_message_before(uid, result.turn_id)
+        answer = await _continuation_generate_and_validate(
+            result.action, user_text, result.source_text, scenario, lang)
+        # H: the binding was consumed BEFORE this (possibly slow) LLM call.
+        # Re-confirm the live revision still matches the post-consumption
+        # revision immediately before any Telegram send -- if it moved, a
+        # newer user action already superseded this one: send nothing,
+        # persist nothing, publish no keyboard, mark the event superseded,
+        # return cleanly, never retry, never log the source or generated
+        # text.
+        live_revision = await get_user_revision(uid)
+        if live_revision != result.post_consumption_revision:
+            await mark_event_besteffort(result.event_id, "no_reply_required")
+            return
+        next_ru = next_en = None
     else:
-        reply_text = get_continuation_reply(result.action, lang)
+        answer, next_ru, next_en = await _continuation_reply_and_next(result.action, uid, lang)
 
     try:
-        sent = await callback.message.answer(reply_text)
+        sent = await callback.message.answer(answer)
     except Exception:
         await mark_event_besteffort(result.event_id, "delivery_uncertain", SEND_EXCEPTION)
         return
 
-    # spec: finalize_callback_reply derives scenario/lang itself from the
-    # source assistant turn — the handler passes neither.
-    fin = await finalize_callback_reply(result.event_id, uid, reply_text)
+    # finalize_callback_reply derives scenario/lang itself from the source
+    # assistant turn — the handler passes neither — and returns the real
+    # inserted row id, never located by matching reply text.
+    fin = await finalize_callback_reply(result.event_id, uid, answer)
 
-    if result.action == "hard" and fin.status == "delivered":
-        # spec item G: exactly the post_consumption_revision returned by the
-        # consume transaction above — never a freshly-read revision.
-        await _publish_hard_reply_buttons(callback.message, uid, fin.assistant_turn_id,
-                                          sent.message_id, result.post_consumption_revision, lang)
+    if fin.status == "delivered" and next_ru is not None:
+        # Exactly the post_consumption_revision returned by the consume
+        # transaction above — never a freshly-read revision.
+        await _publish_continuation_options(callback.message, uid, fin.assistant_turn_id,
+                                            sent.message_id, result.post_consumption_revision,
+                                            lang, next_ru, next_en)
 
 # ────────────────────────────────────────────────────────────────────────────
 
