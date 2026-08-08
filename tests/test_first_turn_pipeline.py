@@ -459,6 +459,278 @@ def test_validation_rejection_uses_fallback(env, monkeypatch, bad_output):
     assert src_msg.answers[0][0] == pr.get_elaborate_fallback("ru")
 
 
+# ── Phase 3 corrective fix, item A: a punctuation- or repeated-whitespace-
+#    separated direct-advice phrase must still resolve to the deterministic
+#    fallback end-to-end through the real bot.cb_universal_continuation
+#    callback -- not just at the isolated validator layer (see
+#    test_first_turn_foundation.py for the unit-level proofs). ──────────────
+
+def test_advice_bypass_en_repeated_whitespace_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch,
+            content="You  should immediately make a decision. What part feels hardest?")
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "elaborate", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_elaborate_fallback("en")
+
+
+def test_advice_bypass_en_punctuation_separator_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch,
+            content="You.should immediately make a decision. What part feels hardest?")
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "elaborate", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_elaborate_fallback("en")
+
+
+def test_advice_bypass_ru_repeated_whitespace_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch,
+            content="Тебе  нужно сразу принять решение. Что сейчас тяжелее всего?")
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "elaborate", lang="ru", user_text="Мне тяжело после разговора на работе."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_elaborate_fallback("ru")
+
+
+def test_advice_bypass_ru_punctuation_separator_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch,
+            content="Тебе, нужно сразу принять решение. Что сейчас тяжелее всего?")
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "elaborate", lang="ru", user_text="Мне тяжело после разговора на работе."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_elaborate_fallback("ru")
+
+
+# ── Phase 3 corrective fix, item B: an unsupported direct causal attribution
+#    to the user's internal state, with a harmless/unrelated source, must
+#    still resolve to the deterministic fallback end-to-end. ───────────────
+
+def test_unsupported_causal_attribution_with_unrelated_source_falls_back_end_to_end(
+        env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "Maybe this happened because you fear abandonment. "
+        "What feels heavier right now?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_clarify_fallback("en")
+
+
+# ── positive controls: the corrective patch must not overblock legitimate
+#    Phase-3 output. ────────────────────────────────────────────────────────
+
+def test_valid_elaborate_reply_still_reaches_delivery_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=_VALID_ELABORATE_REPLY)
+    token, _ = asyncio.run(_make_bound_button(OWNER, "elaborate"))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == _VALID_ELABORATE_REPLY
+
+
+def test_valid_clarify_reply_still_reaches_delivery_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=_VALID_CLARIFY_REPLY)
+    token, _ = asyncio.run(_make_bound_button(OWNER, "clarify"))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == _VALID_CLARIFY_REPLY
+
+
+def test_cautious_source_grounded_clarify_with_causal_connective_still_reaches_delivery(
+        env, monkeypatch):
+    """A causal connective that stays within the source-grounded, product-
+    approved framing (never attributing a NEW unstated cause directly to
+    'you') must still pass -- proves the new causal-attribution rule (item
+    B) is narrow, not a blanket rejection of causal-sounding language."""
+    candidate = ("Maybe the uncertainty after that conversation is adding to the "
+                "anxiety. Does the uncertainty or the conversation itself feel heavier?")
+    _set_llm(monkeypatch, content=candidate)
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="en",
+        user_text="I feel anxious because I don't know what my manager meant."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == candidate
+
+
+def test_sanctioned_pair_connection_without_direct_attribution_still_reaches_delivery(
+        env, monkeypatch):
+    """A sanctioned-pair construction using 'связано' but never attributing
+    a cause directly to 'ты' must still pass end-to-end."""
+    candidate = "Возможно, неопределённость и тревога сейчас связаны. Что сильнее?"
+    _set_llm(monkeypatch, content=candidate)
+    token, _ = asyncio.run(_make_bound_button(OWNER, "clarify", lang="ru"))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == candidate
+
+
+# ── corrective round 2, issue 1: a real sentence boundary must not be
+#    collapsed into a disguised forbidden phrase, end-to-end. ─────────────
+
+def test_natural_sentence_not_rejected_as_disguised_advice_end_to_end(env, monkeypatch):
+    candidate = "I hear you. Should we continue?"
+    _set_llm(monkeypatch, content=candidate)
+    token, _ = asyncio.run(_make_bound_button(OWNER, "elaborate", lang="en"))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == candidate
+
+
+# ── corrective round 2, issue 2: causal-attribution obfuscation must still
+#    fall back end-to-end, and an ordinary factual "because you ..." reason
+#    must still reach delivery end-to-end. ─────────────────────────────────
+
+def test_causal_attribution_comma_bypass_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "Maybe this happened because,you fear abandonment. "
+        "What feels heavier right now?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_clarify_fallback("en")
+
+
+def test_causal_attribution_dash_bypass_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "Maybe this happened because—you fear abandonment. "
+        "What feels heavier right now?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_clarify_fallback("en")
+
+
+def test_causal_attribution_ru_comma_bypass_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "Возможно, это произошло потому что,ты боишься быть покинутым. "
+        "Что сейчас тяжелее?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="ru", user_text="Мне тяжело после разговора на работе."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_clarify_fallback("ru")
+
+
+def test_factual_because_you_construction_still_reaches_delivery_end_to_end(env, monkeypatch):
+    candidate = ("Maybe this hurts because you didn't get an answer. "
+                "What feels heavier right now?")
+    _set_llm(monkeypatch, content=candidate)
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="en",
+        user_text="I feel ignored because my manager didn't answer me."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == candidate
+
+
+def test_factual_potomu_chto_ty_construction_still_reaches_delivery_end_to_end(
+        env, monkeypatch):
+    candidate = ("Возможно, это тяжелее потому что ты не получил ответа. "
+                "Что сейчас сильнее?")
+    _set_llm(monkeypatch, content=candidate)
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="ru",
+        user_text="Мне тяжело, потому что руководитель не ответил."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == candidate
+
+
+# ── corrective round 3: causal-attribution vocabulary gap (angry/злишься
+#    etc., not just afraid/anxious/worried) must fall back end-to-end too. ──
+
+def test_causal_attribution_en_angry_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "Maybe this happened because you are angry. "
+        "What feels heavier right now?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_clarify_fallback("en")
+
+
+def test_causal_attribution_ru_zlishsya_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "Возможно, это произошло потому что ты злишься. "
+        "Что сейчас сильнее?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="ru", user_text="Мне тяжело после разговора на работе."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_clarify_fallback("ru")
+
+
+# ── corrective round 4: bounded cautious-marker matching and the phrase-
+#    boundary edge closure, proven end-to-end through the real
+#    bot.cb_universal_continuation callback. ────────────────────────────────
+
+def test_clarify_month_name_false_hedge_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content="In May, you are angry. What feels stronger?")
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_clarify_fallback("en")
+
+
+def test_period_lowercase_advice_obfuscation_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "You. should immediately make a decision. What part feels hardest?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "elaborate", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_elaborate_fallback("en")
+
+
+# ── corrective round 5, defect 1: uppercase-following-period direct advice,
+#    end-to-end. ────────────────────────────────────────────────────────────
+
+def test_uppercase_period_advice_obfuscation_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "You. Should immediately make a decision. What part feels hardest?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "elaborate", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_elaborate_fallback("en")
+
+
+def test_ru_uppercase_period_advice_obfuscation_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "Тебе. Нужно сразу принять решение. Что сейчас тяжелее?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "elaborate", lang="ru", user_text="Мне тяжело после разговора на работе."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_elaborate_fallback("ru")
+
+
+# ── corrective round 6: question-mark-terminated cross-boundary advice must
+#    fall back end-to-end too -- "?" is not a blanket exemption. ──────────
+
+def test_uppercase_question_mark_advice_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content="You. Should immediately make a decision?")
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "elaborate", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_elaborate_fallback("en")
+
+
+def test_ru_question_mark_advice_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content="Тебе. Нужно сразу принять решение?")
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "elaborate", lang="ru", user_text="Мне тяжело после разговора на работе."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_elaborate_fallback("ru")
+
+
+# ── corrective round 5, defect 2: semicolon clause hedge leak, end-to-end. ──
+
+def test_semicolon_hedge_leak_en_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content="Perhaps not; you are angry. What feels stronger?")
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="en", user_text="I feel bad after a conversation at work."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_clarify_fallback("en")
+
+
+def test_semicolon_hedge_leak_ru_falls_back_end_to_end(env, monkeypatch):
+    _set_llm(monkeypatch, content=(
+        "Возможно, это не связано с работой; ты злишься. Что сейчас сильнее?"))
+    token, _ = asyncio.run(_make_bound_button(
+        OWNER, "clarify", lang="ru", user_text="Мне тяжело после разговора на работе."))
+    src_msg, cb = _press(OWNER, token)
+    assert src_msg.answers[0][0] == pr.get_clarify_fallback("ru")
+
+
 def test_revision_race_during_generation_sends_nothing(env, monkeypatch):
     async def fake_create(*a, **kw):
         # Simulates a second user action landing WHILE the LLM call for

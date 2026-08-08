@@ -887,6 +887,327 @@ def test_elaborate_rejects_repeat_story_request():
     assert ok is False and "repeat" in reason
 
 
+# ── separator-normalized phrase matching (Phase 3 corrective fix, item A):
+#    a forbidden phrase must still be caught when punctuation or repeated
+#    whitespace is inserted between its own words, without treating a
+#    concatenated run (no separator at all) as a match, and without letting
+#    a genuine intervening word be skipped. ───────────────────────────────
+
+def test_continuation_validator_rejects_direct_advice_with_repeated_whitespace():
+    candidate = "You  should immediately make a decision. What part feels hardest?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_rejects_direct_advice_with_punctuation_separator():
+    candidate = "You.should immediately make a decision. What part feels hardest?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_rejects_ru_direct_advice_with_repeated_whitespace():
+    candidate = "Тебе  нужно сразу принять решение. Что сейчас тяжелее всего?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "ru")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_rejects_ru_direct_advice_with_punctuation_separator():
+    candidate = "Тебе, нужно сразу принять решение. Что сейчас тяжелее всего?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "ru")
+    assert ok is False and "advice" in reason
+
+
+def test_contains_phrase_matches_ordinary_separator_variants():
+    assert sv._contains_phrase("you should go now", "you should") is True
+    assert sv._contains_phrase("you  should go now", "you should") is True
+    assert sv._contains_phrase("you.should go now", "you should") is True
+    assert sv._contains_phrase("you, should go now", "you should") is True
+
+
+def test_contains_phrase_does_not_merge_concatenated_tokens():
+    """No separator at all between the two words must never be treated as
+    equivalent to a separated phrase."""
+    assert sv._contains_phrase("youshould go now", "you should") is False
+
+
+def test_contains_phrase_does_not_skip_an_intervening_word():
+    """A genuine word between the phrase's two words must never be skipped."""
+    assert sv._contains_phrase("you really should go now", "you should") is False
+
+
+# ── corrective round 2, issue 1: a REAL sentence boundary must never be
+#    collapsed into an obfuscation separator -- a forbidden phrase must
+#    never be invented by bridging two genuinely separate sentences. ───────
+
+def test_contains_phrase_does_not_cross_a_real_sentence_boundary_en():
+    assert sv._contains_phrase("I hear you. Should we continue?", "you should") is False
+
+
+def test_contains_phrase_does_not_cross_a_real_sentence_boundary_ru():
+    assert sv._contains_phrase(
+        "Я отвечаю тебе. Нужно ли продолжить?", "тебе нужно") is False
+
+
+def test_contains_phrase_does_not_cross_a_boundary_with_exclamation_and_newline():
+    assert sv._contains_phrase("You!\nShould we continue?", "you should") is False
+
+
+def test_continuation_validator_accepts_natural_sentence_not_a_disguised_advice_phrase_en():
+    """'I hear you. Should we continue?' must not be rejected as direct
+    advice merely because the sentence boundary, once collapsed, would
+    spell out 'you should'."""
+    candidate = "I hear you. Should we continue?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is True, reason
+
+
+def test_continuation_validator_accepts_natural_sentence_not_a_disguised_advice_phrase_ru():
+    candidate = "Я отвечаю тебе. Нужно ли продолжить?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "ru")
+    assert ok is True, reason
+
+
+# ── corrective round 4: phrase-boundary edge closure. A hard sentence
+#    boundary requires a terminator+whitespace run AND a non-lowercase
+#    character immediately after it -- ". " followed by a lowercase letter
+#    ("You. should decide.") is not a real sentence break and must stay
+#    inside one matching segment (case C was a confirmed DIRECT_ADVICE_BYPASS
+#    under the round-3 boundary rule). Case D (semicolon-joined clauses,
+#    "I hear you; should we continue?") is a real but ACCEPTABLE_LIMITATION:
+#    a semicolon is not a sentence terminator, the failure mode is an
+#    over-cautious fallback rather than unsafe delivery, and distinguishing
+#    it properly needs real clause/question detection, out of scope for a
+#    bounded regex parser -- documented here, not "fixed" by design. ───────
+
+def test_contains_phrase_case_a_real_sentence_boundary_unaffected():
+    assert sv._contains_phrase("I hear you. Should we continue?", "you should") is False
+
+
+def test_contains_phrase_case_b_no_space_obfuscation_still_caught():
+    assert sv._contains_phrase(
+        "You.should immediately make a decision.", "you should") is True
+
+
+def test_contains_phrase_case_c_period_space_lowercase_is_not_a_real_boundary():
+    """'You. should ...' -- terminator+space followed by a LOWERCASE word is
+    not how a real sentence starts; this must now be treated as obfuscation
+    and caught, not as a genuine sentence break."""
+    assert sv._contains_phrase(
+        "You. should immediately make a decision.", "you should") is True
+
+
+def test_contains_phrase_case_d_semicolon_is_a_documented_acceptable_limitation():
+    """Semicolons are not sentence terminators, so the two clauses stay in
+    one matching segment -- a known, accepted false-positive shape, not a
+    security-relevant bypass (see module comment for _is_hard_sentence_boundary)."""
+    assert sv._contains_phrase("I hear you; should we continue?", "you should") is True
+
+
+def test_continuation_validator_rejects_period_lowercase_advice_obfuscation():
+    candidate = "You. should immediately make a decision. What part feels hardest?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+# ── corrective round 5, defect 1: an UPPERCASE-following period can also be
+#    used to disguise direct advice as two sentences -- capitalization alone
+#    (the round-4 signal) isn't sufficient, since "You. Should decide." looks
+#    identical, by capitalization, to a genuine "I hear you. Should we
+#    continue?". The distinguishing signal is whether the second half is
+#    itself a real question (ends in "?") -- direct advice never does. ─────
+
+def test_continuation_validator_rejects_uppercase_period_advice_bypass_en():
+    candidate = "You. Should immediately make a decision. What part feels hardest?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_rejects_uppercase_period_advice_bypass_ru():
+    candidate = "Тебе. Нужно сразу принять решение. Что сейчас тяжелее?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "ru")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_still_accepts_natural_should_question_en():
+    """The exact positive control this fix must not regress."""
+    ok, reason = sv.validate_continuation_response(
+        "I hear you. Should we continue?", "elaborate", "en")
+    assert ok is True, reason
+
+
+def test_continuation_validator_still_accepts_natural_nuzhno_li_question_ru():
+    ok, reason = sv.validate_continuation_response(
+        "Я отвечаю тебе. Нужно ли продолжить?", "elaborate", "ru")
+    assert ok is True, reason
+
+
+def test_contains_cross_boundary_direct_advice_flags_declarative_continuation():
+    assert sv._contains_cross_boundary_direct_advice(
+        "You. Should immediately make a decision.") == "you should"
+
+
+def test_contains_cross_boundary_direct_advice_ignores_genuine_question():
+    assert sv._contains_cross_boundary_direct_advice(
+        "I hear you. Should we continue?") is None
+
+
+# ── corrective round 6: "?" is not, by itself, proof of a genuine question --
+#    "Should immediately make a decision?" is the same disguised advice as
+#    the "." variant with the terminator swapped. The exemption is now
+#    bounded to "should <subject pronoun>" (EN) / "нужно ли" (RU) for
+#    exactly the two forbidden-advice phrases that can plausibly continue
+#    into a real question; any other continuation after "?" is still
+#    flagged. ──────────────────────────────────────────────────────────────
+
+def test_contains_cross_boundary_direct_advice_flags_question_mark_variant():
+    assert sv._contains_cross_boundary_direct_advice(
+        "You. Should immediately make a decision?") == "you should"
+
+
+def test_continuation_validator_rejects_uppercase_question_mark_advice_immediately():
+    candidate = "You. Should immediately make a decision?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_rejects_uppercase_question_mark_advice_definitely():
+    candidate = "You. Should definitely leave?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_rejects_uppercase_question_mark_advice_just():
+    candidate = "You. Should just decide now?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_rejects_ru_question_mark_advice_srazu():
+    candidate = "Тебе. Нужно сразу принять решение?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "ru")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_rejects_ru_question_mark_advice_prosto():
+    candidate = "Тебе. Нужно просто уйти?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "ru")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_accepts_should_we_question():
+    ok, reason = sv.validate_continuation_response(
+        "I hear you. Should we continue?", "elaborate", "en")
+    assert ok is True, reason
+
+
+def test_continuation_validator_accepts_should_i_question():
+    ok, reason = sv.validate_continuation_response(
+        "I hear you. Should I say more?", "elaborate", "en")
+    assert ok is True, reason
+
+
+def test_continuation_validator_accepts_should_they_question():
+    ok, reason = sv.validate_continuation_response(
+        "I hear you. Should they continue?", "elaborate", "en")
+    assert ok is True, reason
+
+
+def test_continuation_validator_accepts_ru_nuzhno_li_question():
+    ok, reason = sv.validate_continuation_response(
+        "Я отвечаю тебе. Нужно ли продолжить?", "elaborate", "ru")
+    assert ok is True, reason
+
+
+def test_contains_cross_boundary_direct_advice_exempts_should_we():
+    assert sv._contains_cross_boundary_direct_advice(
+        "I hear you. Should we continue?") is None
+
+
+def test_contains_cross_boundary_direct_advice_exempts_should_i():
+    assert sv._contains_cross_boundary_direct_advice(
+        "I hear you. Should I say more?") is None
+
+
+def test_contains_cross_boundary_direct_advice_exempts_ru_nuzhno_li():
+    assert sv._contains_cross_boundary_direct_advice(
+        "Я отвечаю тебе. Нужно ли продолжить?") is None
+
+
+def test_contains_cross_boundary_direct_advice_still_flags_period_variant():
+    """Retained control: the non-question-mark uppercase-period bypass from
+    the previous round must still be caught."""
+    assert sv._contains_cross_boundary_direct_advice(
+        "You. Should immediately make a decision.") == "you should"
+
+
+def test_continuation_validator_still_rejects_no_space_obfuscation_en():
+    candidate = "You.should immediately make a decision. What part feels hardest?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_still_rejects_lowercase_period_obfuscation_en():
+    candidate = "You. should immediately make a decision. What part feels hardest?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_still_rejects_repeated_whitespace_obfuscation_en():
+    candidate = "You  should immediately make a decision. What part feels hardest?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "en")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_still_rejects_ru_comma_obfuscation():
+    candidate = "Тебе, нужно сразу принять решение. Что сейчас тяжелее всего?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "ru")
+    assert ok is False and "advice" in reason
+
+
+def test_continuation_validator_still_rejects_ru_repeated_whitespace_obfuscation():
+    candidate = "Тебе  нужно сразу принять решение. Что сейчас тяжелее всего?"
+    ok, reason = sv.validate_continuation_response(candidate, "elaborate", "ru")
+    assert ok is False and "advice" in reason
+
+
+# ── corrective round 5, defect 2: a cautious marker in one clause must not
+#    exempt a bare, unhedged internal-state assertion in a DIFFERENT clause
+#    separated by a semicolon -- the per-sentence hedge check now also
+#    splits on ";", scoping the hedge to its own clause only. ─────────────
+
+def test_clarify_rejects_semicolon_hedge_leak_perhaps_en():
+    candidate = "Perhaps not; you are angry. What feels stronger?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "unqualified" in reason
+
+
+def test_clarify_rejects_semicolon_hedge_leak_could_en():
+    candidate = "Could we stop; you are angry. What feels stronger?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "unqualified" in reason
+
+
+def test_clarify_rejects_semicolon_hedge_leak_ru():
+    candidate = ("Возможно, это не связано с работой; ты злишься. "
+                "Что сейчас сильнее?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "ru")
+    assert ok is False and "unqualified" in reason
+
+
+def test_clarify_accepts_same_clause_hedge_and_claim_en():
+    """The marker and the state claim are in the SAME clause here -- must
+    remain valid, proving the fix is scoped to cross-clause leakage only."""
+    ok, reason = sv.validate_continuation_response(
+        "Maybe you are angry; does that fit?", "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_same_clause_hedge_and_claim_ru():
+    ok, reason = sv.validate_continuation_response(
+        "Возможно, ты злишься; это так?", "clarify", "ru")
+    assert ok is True, reason
+
+
 # ── clarify-specific: cautious marker + unqualified-assertion rejection ──────
 
 def test_continuation_validator_accepts_well_formed_clarify_response_ru():
@@ -972,6 +1293,281 @@ def test_clarify_accepts_no_state_or_motive_claim_at_all():
     candidate = "Возможно, дело было именно в том разговоре накануне. Что случилось тогда?"
     ok, reason = sv.validate_continuation_response(candidate, "clarify", "ru")
     assert ok is True, reason
+
+
+# ── direct causal attribution to the user's internal state (Phase 3
+#    corrective fix, item B): a cautious marker does NOT exempt an invented,
+#    unstated cause attributed directly to "you"/"ты" through a causal
+#    connective -- the defect is the invented cause itself, not the absence
+#    of a hedge. The product-approved non-directed constructions (event<->
+#    meaning, uncertainty<->anxiety, boundaries<->anger, loss<->pain,
+#    overload<->control) never attribute a cause directly to "you", so they
+#    never touch this rule at all. ─────────────────────────────────────────
+
+def test_clarify_rejects_direct_causal_attribution_en():
+    candidate = ("Maybe this happened because you fear abandonment. "
+                "What feels heavier right now?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_rejects_direct_causal_attribution_ru():
+    candidate = ("Возможно, это произошло потому что ты боишься быть покинутым. "
+                "Что сейчас ощущается тяжелее?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "ru")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_accepts_sanctioned_pair_connection_without_direct_attribution():
+    """The approved event<->meaning / uncertainty<->anxiety style of
+    connection never attributes a cause directly to 'you' -- proves the new
+    rule is narrow, not a blanket ban on causal-sounding words like
+    'connected'."""
+    candidate = ("Perhaps the uncertainty and the anxiety it brought are connected. "
+                "Which one feels heavier right now?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_sanctioned_pair_connection_ru():
+    candidate = "Возможно, неопределённость и тревога сейчас связаны. Что сильнее?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "ru")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_source_grounded_cautious_hypothesis():
+    candidate = ("Maybe the uncertainty after that conversation is adding to the "
+                "anxiety. Does the uncertainty or the conversation itself feel heavier?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+# ── corrective round 2, issue 2: the causal-attribution rule must (a) still
+#    catch the confirmed unsafe class through punctuation/dash obfuscation
+#    (never just the literal string from the original report), and (b) NOT
+#    reject an ordinary factual, source-grounded "because you ..." reason --
+#    only a causal connective immediately followed by the module's own
+#    bounded internal-state/psychological predicate vocabulary is a defect.
+
+def test_clarify_rejects_direct_causal_attribution_en_comma_separator():
+    candidate = ("Maybe this happened because,you fear abandonment. "
+                "What feels heavier right now?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_rejects_direct_causal_attribution_en_dash_separator():
+    candidate = ("Maybe this happened because—you fear abandonment. "
+                "What feels heavier right now?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_rejects_direct_causal_attribution_ru_comma_separator():
+    candidate = ("Возможно, это произошло потому что,ты боишься быть покинутым. "
+                "Что сейчас тяжелее?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "ru")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_accepts_factual_because_you_construction_en():
+    """'because you didn't get an answer' names a concrete, source-grounded
+    EVENT -- not an invented internal mechanism -- and must remain allowed."""
+    candidate = ("Maybe this hurts because you didn't get an answer. "
+                "What feels heavier right now?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_factual_because_you_construction_ru():
+    candidate = ("Возможно, это тяжелее потому что ты не получил ответа. "
+                "Что сейчас сильнее?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "ru")
+    assert ok is True, reason
+
+
+# ── corrective round 3: the causal-attribution rule must cover the SAME
+#    bounded second-person internal-state vocabulary the pre-existing
+#    unqualified-claim regexes already recognize (angry/sad/scared/happy/
+#    hurt/upset/etc. in EN; злишься/устал*/обижен*/расстроен* etc. in RU) --
+#    not just the narrower afraid/anxious/worried subset round 2 shipped
+#    with, which left a real vocabulary gap. ────────────────────────────────
+
+def test_clarify_rejects_causal_attribution_en_angry():
+    candidate = ("Maybe this happened because you are angry. "
+                "What feels heavier right now?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_rejects_causal_attribution_en_scared():
+    candidate = ("Maybe this happened because you are scared. "
+                "What feels heavier right now?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_rejects_causal_attribution_en_hurt():
+    candidate = ("Maybe this happened because you feel hurt. "
+                "What feels heavier right now?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_rejects_causal_attribution_ru_anger():
+    candidate = ("Возможно, это произошло потому что ты злишься. "
+                "Что сейчас сильнее?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "ru")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_rejects_causal_attribution_ru_tired():
+    candidate = ("Возможно, это произошло потому что ты устала. "
+                "Что сейчас сильнее?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "ru")
+    assert ok is False and "causal attribution" in reason
+
+
+def test_clarify_rejects_causal_attribution_ru_hurt_feelings():
+    candidate = ("Возможно, это произошло потому что ты обижена. "
+                "Что сейчас сильнее?")
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "ru")
+    assert ok is False and "causal attribution" in reason
+
+
+# ── corrective round 4: bounded cautious-marker matching. Raw substring
+#    matching let "may" match inside "May"/"mayonnaise" and "possible"
+#    match inside "impossible", which could make an unqualified
+#    internal-state assertion look falsely hedged. _has_cautious_marker
+#    (whole-token matching, reusing _contains_phrase) closes this both at
+#    the global clarify-requirement check and the per-sentence hedge-
+#    exemption check. ───────────────────────────────────────────────────────
+
+def test_clarify_rejects_month_name_as_false_hedge():
+    candidate = "In May, you are angry. What feels stronger?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "cautious marker" in reason
+
+
+def test_clarify_rejects_mayonnaise_as_false_hedge():
+    candidate = "Mayonnaise aside, you are angry. What feels stronger?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "cautious marker" in reason
+
+
+def test_clarify_rejects_impossible_as_false_hedge():
+    candidate = "It's impossible that this is about work; you are angry. What feels stronger?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "cautious marker" in reason
+
+
+def test_clarify_accepts_maybe_hedge():
+    candidate = "Maybe the uncertainty is adding to the anxiety. Which feels heavier?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_perhaps_hedge():
+    candidate = "Perhaps the uncertainty is adding to the anxiety. Which feels heavier?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_it_seems_hedge():
+    candidate = "It seems the uncertainty is adding to the anxiety. Which feels heavier?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_may_be_modal_hedge():
+    candidate = "This may be connected to the uncertainty. Which feels heavier?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_its_possible_hedge():
+    candidate = "It's possible that the uncertainty is adding to the anxiety. Which feels heavier?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_fallback_en_still_passes_with_bounded_marker_matching():
+    fallback = prompts.get_clarify_fallback("en")
+    ok, reason = sv.validate_continuation_response(fallback, "clarify", "en")
+    assert ok is True, reason
+
+
+# ── corrective round 4 follow-up: bare "may be" alone was too narrow -- real
+#    modal "may" constructions like "may feel"/"may seem" must also count as
+#    a hedge, not just "may be", while the month name / "mayonnaise" /
+#    "impossible" false-hedge cases stay rejected. Exact six strings from
+#    the review request, run unmodified. ───────────────────────────────────
+
+def test_clarify_accepts_may_feel_modal_hedge():
+    candidate = "It may feel heavier because of the uncertainty. Which part feels strongest?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_may_seem_modal_hedge():
+    candidate = "It may seem connected to the uncertainty. Which part feels strongest?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_accepts_may_be_modal_hedge_exact_review_string():
+    candidate = "This may be connected to the uncertainty. Which part feels strongest?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is True, reason
+
+
+def test_clarify_rejects_mayonnaise_false_hedge_exact_review_string():
+    candidate = "Mayonnaise aside, you are angry. What feels stronger?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "cautious marker" in reason
+
+
+def test_clarify_rejects_month_name_false_hedge_exact_review_string():
+    candidate = "In May, you are angry. What feels stronger?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "cautious marker" in reason
+
+
+def test_clarify_rejects_impossible_false_hedge_exact_review_string():
+    candidate = "It's impossible that this is about work; you are angry. What feels stronger?"
+    ok, reason = sv.validate_continuation_response(candidate, "clarify", "en")
+    assert ok is False and "cautious marker" in reason
+
+
+def test_has_cautious_marker_accepts_may_feel():
+    assert sv._has_cautious_marker("it may feel true", sv.CAUTIOUS_MARKERS_EN) is True
+
+
+def test_has_cautious_marker_accepts_may_seem():
+    assert sv._has_cautious_marker("it may seem true", sv.CAUTIOUS_MARKERS_EN) is True
+
+
+def test_has_cautious_marker_still_rejects_bare_may():
+    """A bare 'may' with no recognized modal continuation (be/feel/seem)
+    stays unrecognized -- documented bounded-vocabulary limitation, not a
+    regression: this is what keeps the month name from counting."""
+    assert sv._has_cautious_marker("it may happen soon", sv.CAUTIOUS_MARKERS_EN) is False
+
+
+def test_has_cautious_marker_rejects_month_name():
+    assert sv._has_cautious_marker("in may you should decide", sv.CAUTIOUS_MARKERS_EN) is False
+
+
+def test_has_cautious_marker_accepts_may_be():
+    assert sv._has_cautious_marker("this may be true", sv.CAUTIOUS_MARKERS_EN) is True
+
+
+def test_has_cautious_marker_rejects_mayonnaise():
+    assert sv._has_cautious_marker("mayonnaise is tasty", sv.CAUTIOUS_MARKERS_EN) is False
+
+
+def test_has_cautious_marker_rejects_impossible():
+    assert sv._has_cautious_marker("this is impossible", sv.CAUTIOUS_MARKERS_EN) is False
 
 
 # ── elaborate/clarify fallback text (product-approved copy, unmodified) ──────
