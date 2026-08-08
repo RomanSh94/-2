@@ -637,6 +637,85 @@ def test_duplicate_finalization_returns_already_resolved(db):
     assert final_status == "delivered"  # untouched by the second attempt
 
 
+# ── ownership defense-in-depth (corrective round 7): finalize_callback_reply
+#    and mark_event_besteffort must both scope their mutations by the
+#    REQUESTING user_id directly in SQL -- never rely solely on the caller's
+#    own earlier ownership check -- so a foreign/guessed event_id can never
+#    mutate another user's row through either function. ─────────────────────
+
+def test_finalize_rejects_foreign_requester_and_does_not_mutate_owners_event(db):
+    OTHER = UID + 1
+
+    async def go():
+        token, _ = await _make_bound_button(UID, action="elaborate")
+        result = await database.consume_interaction_binding(token, UID, 100, 200)
+        async with aiosqlite.connect(database.DB) as conn:
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE role='assistant' AND user_id=?", (UID,))
+            assistant_count_before = (await cur.fetchone())[0]
+
+        fin = await database.finalize_callback_reply(result.event_id, OTHER, "foreign text")
+
+        async with aiosqlite.connect(database.DB) as conn:
+            cur = await conn.execute(
+                "SELECT reply_status, assistant_turn_id, reply_error_code "
+                "FROM user_interaction_events WHERE id=?", (result.event_id,))
+            event_row = await cur.fetchone()
+            cur2 = await conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE role='assistant' AND user_id=?", (UID,))
+            assistant_count_after = (await cur2.fetchone())[0]
+            cur3 = await conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE role='assistant' AND user_id=?", (OTHER,))
+            other_assistant_count = (await cur3.fetchone())[0]
+        return fin, event_row, assistant_count_before, assistant_count_after, other_assistant_count
+
+    fin, event_row, before, after, other_count = asyncio.run(go())
+    assert fin.status == "already_resolved"
+    assert fin.assistant_turn_id is None
+    # no assistant message inserted anywhere for this attempted finalize
+    assert after == before
+    assert other_count == 0
+    # the owned event itself is completely untouched by the foreign attempt
+    assert event_row == ("pending_before_send", None, None)
+
+
+def test_besteffort_rejects_foreign_requester_and_does_not_mutate_owners_event(db):
+    OTHER = UID + 1
+
+    async def go():
+        token, _ = await _make_bound_button(UID, action="clarify")
+        result = await database.consume_interaction_binding(token, UID, 100, 200)
+        status = await database.mark_event_besteffort(
+            result.event_id, OTHER, "delivery_uncertain", database.SEND_EXCEPTION)
+        async with aiosqlite.connect(database.DB) as conn:
+            cur = await conn.execute(
+                "SELECT reply_status, reply_error_code FROM user_interaction_events WHERE id=?",
+                (result.event_id,))
+            row = await cur.fetchone()
+        return status, row
+    status, row = asyncio.run(go())
+    assert status == "already_resolved"
+    # unchanged -- still exactly the pending state consume_interaction_binding left it in
+    assert row == ("pending_before_send", None)
+
+
+def test_besteffort_legitimate_owner_still_updates_exact_pending_event(db):
+    async def go():
+        token, _ = await _make_bound_button(UID, action="clarify")
+        result = await database.consume_interaction_binding(token, UID, 100, 200)
+        status = await database.mark_event_besteffort(
+            result.event_id, UID, "delivery_uncertain", database.SEND_EXCEPTION)
+        async with aiosqlite.connect(database.DB) as conn:
+            cur = await conn.execute(
+                "SELECT reply_status, reply_error_code FROM user_interaction_events WHERE id=?",
+                (result.event_id,))
+            row = await cur.fetchone()
+        return status, row
+    status, row = asyncio.run(go())
+    assert status == "delivery_uncertain"
+    assert row == ("delivery_uncertain", database.SEND_EXCEPTION)
+
+
 def test_besteffort_rowcount_zero_reports_already_resolved_not_success(db):
     async def go():
         token, _ = await _make_bound_button(UID, action="clarify")
@@ -644,7 +723,7 @@ def test_besteffort_rowcount_zero_reports_already_resolved_not_success(db):
         await database.finalize_callback_reply(result.event_id, UID, "ok")
         # event is now 'delivered' -- no longer pending_before_send
         return await database.mark_event_besteffort(
-            result.event_id, "delivery_uncertain", database.SEND_EXCEPTION)
+            result.event_id, UID, "delivery_uncertain", database.SEND_EXCEPTION)
     assert asyncio.run(go()) == "already_resolved"
 
 
@@ -653,7 +732,7 @@ def test_besteffort_success_path(db):
         token, _ = await _make_bound_button(UID, action="clarify")
         result = await database.consume_interaction_binding(token, UID, 100, 200)
         status = await database.mark_event_besteffort(
-            result.event_id, "delivery_uncertain", database.SEND_EXCEPTION)
+            result.event_id, UID, "delivery_uncertain", database.SEND_EXCEPTION)
         async with aiosqlite.connect(database.DB) as conn:
             cur = await conn.execute(
                 "SELECT reply_status, reply_error_code FROM user_interaction_events WHERE id=?",
@@ -670,7 +749,7 @@ def test_besteffort_rejects_unknown_target_status(db):
         token, _ = await _make_bound_button(UID, action="clarify")
         result = await database.consume_interaction_binding(token, UID, 100, 200)
         with pytest.raises(ValueError):
-            await database.mark_event_besteffort(result.event_id, "delivered")
+            await database.mark_event_besteffort(result.event_id, UID, "delivered")
     asyncio.run(go())
 
 
@@ -680,7 +759,7 @@ def test_besteffort_rejects_unknown_error_code(db):
         result = await database.consume_interaction_binding(token, UID, 100, 200)
         with pytest.raises(ValueError):
             await database.mark_event_besteffort(
-                result.event_id, "delivery_uncertain", "RAW_EXCEPTION_TEXT_LEAK")
+                result.event_id, UID, "delivery_uncertain", "RAW_EXCEPTION_TEXT_LEAK")
     asyncio.run(go())
 
 

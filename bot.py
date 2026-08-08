@@ -1451,7 +1451,7 @@ async def _handle_hardreg_unsafe(callback: CallbackQuery, result, uid: int, lang
     if level_delivered != "none":
         await finalize_callback_reply(result.event_id, uid, text)
     else:
-        await mark_event_besteffort(result.event_id, "delivery_uncertain")
+        await mark_event_besteffort(result.event_id, uid, "delivery_uncertain")
 
 
 @dp.callback_query(F.data.startswith("ucbtn:"))
@@ -1506,7 +1506,7 @@ async def cb_universal_continuation(callback: CallbackQuery):
         # text.
         live_revision = await get_user_revision(uid)
         if live_revision != result.post_consumption_revision:
-            await mark_event_besteffort(result.event_id, "no_reply_required")
+            await mark_event_besteffort(result.event_id, uid, "no_reply_required")
             return
         next_ru = next_en = None
     else:
@@ -1515,7 +1515,7 @@ async def cb_universal_continuation(callback: CallbackQuery):
     try:
         sent = await callback.message.answer(answer)
     except Exception:
-        await mark_event_besteffort(result.event_id, "delivery_uncertain", SEND_EXCEPTION)
+        await mark_event_besteffort(result.event_id, uid, "delivery_uncertain", SEND_EXCEPTION)
         return
 
     # finalize_callback_reply derives scenario/lang itself from the source

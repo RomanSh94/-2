@@ -3057,20 +3057,28 @@ async def finalize_callback_reply(event_id: int, user_id: int,
     """Call ONLY after the Telegram send is already confirmed successful.
 
     Server-owned context preservation: scenario and lang are never supplied
-    by the caller. Inside the same BEGIN IMMEDIATE transaction: verify the
-    event is still pending_before_send and belongs to user_id, then load the
-    source assistant `messages` row referenced by the event's turn_id (must
-    exist, belong to the same user, have role='assistant') and use ITS
-    scenario/lang for the inserted reply -- never a value chosen
-    independently of that source turn.
+    by the caller. Ownership is enforced in the INITIAL lookup's SQL itself
+    (WHERE id=? AND user_id=?), not by a later Python-side comparison: a
+    foreign event_id (owned by someone else) is therefore indistinguishable
+    from "no such event" / "already resolved" from this point on -- it
+    collapses into the identical already_resolved result with ZERO further
+    processing, and critically, the best-effort fallback below is NEVER
+    reached for a foreign event, so it can never mutate another user's row.
+    Inside the same BEGIN IMMEDIATE transaction: after confirming ownership
+    this way, load the source assistant `messages` row referenced by the
+    event's turn_id (must exist, belong to the same user, have
+    role='assistant') and use ITS scenario/lang for the inserted reply --
+    never a value chosen independently of that source turn.
 
-    If the event is no longer pending_before_send (already resolved by an
-    earlier/concurrent call), returns already_resolved and attempts NO
-    write -- this is not treated as a failure. If the event's user_id
-    doesn't match, or the source turn is missing/foreign/non-assistant, that
-    is a genuine integrity failure discovered AFTER the Telegram send was
-    already confirmed -- handled the same as any other exception here: it
-    falls through to the best-effort delivered_context_missing transition.
+    If the event is no longer pending_before_send, doesn't exist, or belongs
+    to a different user (already resolved by an earlier/concurrent call, or
+    a foreign/guessed id), returns already_resolved and attempts NO write --
+    this is not treated as a failure and never reveals which case occurred.
+    If the event genuinely belongs to user_id but its source turn is
+    missing/foreign/non-assistant, that is a real persistence integrity
+    failure discovered AFTER the Telegram send was already confirmed -- by
+    this point ownership is already established, so the best-effort
+    delivered_context_missing transition below is owner-scoped correctly.
 
     Returns FinalizationResult(status, assistant_turn_id) -- assistant_turn_id
     is non-None only when status == 'delivered'."""
@@ -3078,26 +3086,26 @@ async def finalize_callback_reply(event_id: int, user_id: int,
         async with aiosqlite.connect(DB) as db:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
-                "SELECT reply_status, turn_id, user_id FROM user_interaction_events WHERE id=?",
-                (event_id,))
+                "SELECT reply_status, turn_id FROM user_interaction_events "
+                "WHERE id=? AND user_id=?",
+                (event_id, user_id))
             row = await cur.fetchone()
             if row is None or row[0] != "pending_before_send":
                 await db.rollback()
                 return FinalizationResult(status="already_resolved", assistant_turn_id=None)
-            _, turn_id, event_user_id = row
+            _, turn_id = row
 
             source_ok = False
             scenario = lang = None
-            if event_user_id == user_id:
-                cur = await db.execute(
-                    "SELECT user_id, role, scenario, lang FROM messages WHERE id=?", (turn_id,))
-                turn_row = await cur.fetchone()
-                if turn_row is not None:
-                    turn_user_id, turn_role, turn_scenario, turn_lang = turn_row
-                    if turn_role == "assistant" and turn_user_id == user_id:
-                        source_ok = True
-                        scenario = turn_scenario or "open_chat"
-                        lang = turn_lang or "ru"
+            cur = await db.execute(
+                "SELECT user_id, role, scenario, lang FROM messages WHERE id=?", (turn_id,))
+            turn_row = await cur.fetchone()
+            if turn_row is not None:
+                turn_user_id, turn_role, turn_scenario, turn_lang = turn_row
+                if turn_role == "assistant" and turn_user_id == user_id:
+                    source_ok = True
+                    scenario = turn_scenario or "open_chat"
+                    lang = turn_lang or "ru"
 
             if not source_ok:
                 await db.rollback()
@@ -3111,8 +3119,8 @@ async def finalize_callback_reply(event_id: int, user_id: int,
             cur2 = await db.execute(
                 "UPDATE user_interaction_events SET reply_status='delivered', "
                 "assistant_turn_id=?, reply_updated_at=datetime('now') "
-                "WHERE id=? AND reply_status='pending_before_send'",
-                (assistant_turn_id, event_id))
+                "WHERE id=? AND user_id=? AND reply_status='pending_before_send'",
+                (assistant_turn_id, event_id, user_id))
             if cur2.rowcount != 1:
                 await db.rollback()
                 return FinalizationResult(status="already_resolved", assistant_turn_id=None)
@@ -3124,7 +3132,10 @@ async def finalize_callback_reply(event_id: int, user_id: int,
         # a DB path, or SQL), never source/generated text, never a token.
         print(f"event=callback_reply_persistence_failed uid={user_id} "
               f"exc_type={type(e).__name__}")
-        besteffort_status = await mark_event_besteffort(event_id, "delivered_context_missing",
+        # user_id is the confirmed owner by this point (the initial SELECT's
+        # own WHERE clause already scoped it) -- never a foreign uid, since a
+        # foreign event_id can never reach this except block at all.
+        besteffort_status = await mark_event_besteffort(event_id, user_id, "delivered_context_missing",
                                                          FINALIZE_EXCEPTION)
         return FinalizationResult(status=besteffort_status, assistant_turn_id=None)
 
@@ -3134,20 +3145,28 @@ _EVENT_BESTEFFORT_ALLOWED_STATUSES = {
 }
 
 
-async def mark_event_besteffort(event_id: int, status: str, error_code: str | None = None) -> str:
+async def mark_event_besteffort(event_id: int, requester_user_id: int, status: str,
+                                error_code: str | None = None) -> str:
     """Best-effort transition for user_interaction_events, restricted to the
     three honest fallback targets (delivery_uncertain, delivered_context_missing,
     no_reply_required -- the last used when the revision moved during an
     in-flight LLM generation, so the reply is deliberately never sent).
 
+    Owner-scoped directly in the SQL itself (WHERE id=? AND user_id=?), not
+    reliant solely on an earlier ownership check by the caller -- a foreign
+    or guessed event_id can never mutate another user's row through this
+    function, no matter what status/error_code is requested.
+
     Validates status and error_code BEFORE executing any SQL (raises
     ValueError for either being invalid). Checks cursor.rowcount and returns
-    the requested status only when exactly one pending event was updated. If
-    the event was no longer pending_before_send (already resolved by
-    something else), returns 'already_resolved' -- never reports a status
-    that was not actually persisted. On a genuine exception (including a
-    complete DB outage) returns 'pending_before_send' honestly -- never
-    resends, never force-writes."""
+    the requested status only when exactly one pending event, owned by
+    requester_user_id, was updated. If the event was no longer
+    pending_before_send, doesn't exist, or belongs to someone else, returns
+    'already_resolved' -- never reports a status that was not actually
+    persisted, and never distinguishes "foreign owner" from "already
+    resolved" to the caller. On a genuine exception (including a complete DB
+    outage) returns 'pending_before_send' honestly -- never resends, never
+    force-writes."""
     if status not in _EVENT_BESTEFFORT_ALLOWED_STATUSES:
         raise ValueError(f"mark_event_besteffort: invalid target status {status!r}")
     if error_code is not None and error_code not in INTERACTION_ERROR_CODES:
@@ -3157,8 +3176,8 @@ async def mark_event_besteffort(event_id: int, status: str, error_code: str | No
             cur = await db.execute(
                 "UPDATE user_interaction_events "
                 "SET reply_status=?, reply_updated_at=datetime('now'), reply_error_code=? "
-                "WHERE id=? AND reply_status='pending_before_send'",
-                (status, error_code, event_id))
+                "WHERE id=? AND user_id=? AND reply_status='pending_before_send'",
+                (status, error_code, event_id, requester_user_id))
             await db.commit()
             if cur.rowcount != 1:
                 return "already_resolved"
