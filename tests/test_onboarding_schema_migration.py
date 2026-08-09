@@ -182,6 +182,57 @@ def test_migrated_table_has_partial_unique_active_index(old_db):
     assert "idx_onboarding_one_active_per_user" in names
 
 
+def test_migration_index_ownership_has_no_collision_with_old_schema(old_db):
+    """Investigation record (onboarding-index-preservation task): a real
+    index-name-collision bug was found and fixed in the core_practice_
+    proposals migration -- SQLite does not rename a table's indexes when
+    the table itself is renamed, so an OLD index sharing a name with the
+    fresh schema's index can silently block `CREATE INDEX IF NOT EXISTS`
+    from ever creating the new one (the old, renamed-aside table keeps
+    "owning" that name).
+
+    Verified here that this does NOT apply to the onboarding migration.
+    Checked directly against sqlite_master, not just an application-level
+    read: the OLD schema (bare `user_id INTEGER PRIMARY KEY`, no composite
+    key, no versioning) has ZERO indexes of any name before migration --
+    `idx_onboarding_one_active_per_user` is a NEW index, introduced
+    alongside the composite (user_id, onboarding_version) primary key that
+    makes the "one active version per user" invariant meaningful in the
+    first place (the old bare PK already made user_id unique by itself, so
+    no such index could have existed under the old shape). There is
+    nothing for `CREATE INDEX IF NOT EXISTS` to collide with, so no
+    defensive DROP INDEX was added to _rename_old_onboarding_state_if_needed
+    here (unlike its practice-proposals counterpart, where the collision is
+    real and the fix is warranted)."""
+    import sqlite3
+    con = sqlite3.connect(old_db)
+    before = con.execute(
+        "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index' "
+        "AND tbl_name='user_onboarding_state'").fetchall()
+    con.close()
+    assert before == [], \
+        "the old schema must have no indexes at all -- confirms there is nothing to collide with"
+
+    _insert_old_row(old_db, 1012, "v1", "active", 1)
+    run(database.init_db())
+
+    con = sqlite3.connect(old_db)
+    after = con.execute(
+        "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_onboarding_one_active_per_user'").fetchall()
+    count = con.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
+        "AND name='idx_onboarding_one_active_per_user'").fetchone()[0]
+    integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+    con.close()
+
+    assert count == 1, "exactly one index by this name, never zero (missed) or two (orphan duplicate)"
+    name, tbl_name, sql = after[0]
+    assert tbl_name == "user_onboarding_state", "the index must belong to the LIVE table"
+    assert "status='active'" in sql
+    assert integrity == "ok"
+
+
 # ── second init_db() is a no-op ───────────────────────────────────────────────
 def test_second_init_db_is_a_noop(old_db):
     _insert_old_row(old_db, 1007, "v1", "active", 4,

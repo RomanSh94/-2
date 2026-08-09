@@ -156,3 +156,114 @@ def _validate_rollout_policy(raw: str) -> str:
 
 ONBOARDING_ROLLOUT_POLICY = _validate_rollout_policy(
     os.getenv("ONBOARDING_ROLLOUT_POLICY", "NEW_USERS_ONLY"))
+
+# Therapeutic Core Foundation — default OFF. Gates ONLY the new explicit
+# baseline-skip control on the existing before-score prompt (cb_before_skip /
+# before_score_kb); flag false reproduces the prior score_kb keyboard
+# byte-for-byte. Does NOT gate the dependency-monitor consolidation (an
+# always-on safety correction, never a product feature) or the canonical
+# production-practice allowlist (a safety/reachability enforcement, not new
+# user-visible behavior — the 7 production ids were already the only ones
+# ever actually selected).
+THERAPEUTIC_CORE_FOUNDATION_ENABLED = (
+    os.getenv("THERAPEUTIC_CORE_FOUNDATION_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+# Master-prompt §24's off/owner/invited/all rollout contract for the NEW
+# governed Therapeutic Core (session/hypothesis/intervention/outcome/memory —
+# therapeutic_domain.py + database.py's core_* tables, Phase 1 onward). This is
+# the ONE canonical rollout switch for that surface, going forward.
+#
+# Legacy-flag relationship (no two competing sources of truth): the boolean
+# THERAPEUTIC_CORE_FOUNDATION_ENABLED above is scoped, permanently, to the
+# narrow pre-existing fixes documented in its own comment (baseline-skip
+# button, dependency-monitor consolidation, practice-registry reachability) —
+# it predates this rollout model and MUST NOT be read by any Phase-1-forward
+# Core code. Nothing in the new core_* storage or therapeutic_domain.py checks
+# it, and this flag will never be repurposed to mean something new; it is
+# simply a different, already-shipped feature that happens to share the
+# "Therapeutic Core" name from the original handoff document.
+# THERAPEUTIC_CORE_ROLLOUT_MODE is independent and starts at "off", so
+# introducing it changes no runtime behavior (flag-off compatibility is
+# preserved for both flags simultaneously). "invited" and "all" have no
+# effect yet because no Phase 3+ user-facing Core behavior exists to gate —
+# access_control.core_rollout_allowed() is the single check future phases
+# must call before running any Core turn.
+_THERAPEUTIC_CORE_ROLLOUT_MODES = ("off", "owner", "invited", "all")
+
+
+def _validate_core_rollout_mode(raw: str) -> str:
+    value = (raw or "off").strip().lower()
+    if value not in _THERAPEUTIC_CORE_ROLLOUT_MODES:
+        raise ValueError(
+            f"Unsupported THERAPEUTIC_CORE_ROLLOUT_MODE={value!r}; "
+            f"supported values: {_THERAPEUTIC_CORE_ROLLOUT_MODES}")
+    return value
+
+
+THERAPEUTIC_CORE_ROLLOUT_MODE = _validate_core_rollout_mode(
+    os.getenv("THERAPEUTIC_CORE_ROLLOUT_MODE", "off"))
+
+# Depression Disclosure Gate (Phase 2, master prompt §13) — default OFF, own
+# flag rather than THERAPEUTIC_CORE_ROLLOUT_MODE: this gate is a standalone
+# deterministic safety feature that runs independently of the Core session/
+# hypothesis/intervention surface, not part of that Core rollout contract.
+# Flag false => pipeline() behaves byte-for-byte as before this phase; no
+# first-person depression disclosure is intercepted, no new DB row is ever
+# created. Deploys dormant; do not flip true for owner/all except through an
+# explicit later canary phase.
+DEPRESSION_DISCLOSURE_GATE_ENABLED = (
+    os.getenv("DEPRESSION_DISCLOSURE_GATE_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+# ── Voice and Adaptive Response UX — both default OFF ───────────────────────
+# VOICE_REPLIES_ENABLED gates: the /format selector, the "🔊 Прослушать"
+# listen button, natural-language format/voice meta-commands, and the
+# response-preferences-driven delivery (deliver_response in bot.py). Flag
+# false => deliver_response always sends plain text, byte-for-byte the prior
+# `await message.answer(answer)` behavior, and /format replies as if it were
+# an unknown command (no selector shown, nothing saved).
+VOICE_REPLIES_ENABLED = (
+    os.getenv("VOICE_REPLIES_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+# EMOTIONAL_REACTIONS_ENABLED gates ONLY the best-effort Telegram message
+# reaction (reaction_selector.py + bot.py's _maybe_react). Independent of
+# VOICE_REPLIES_ENABLED -- a deployment can enable one without the other.
+EMOTIONAL_REACTIONS_ENABLED = (
+    os.getenv("EMOTIONAL_REACTIONS_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+# TTS configuration (not rollout flags -- inert while VOICE_REPLIES_ENABLED
+# is false). tts-1 is OpenAI's low-latency TTS model; opus is the format
+# Telegram voice messages actually want (see tts.py).
+TTS_MODEL              = os.getenv("TTS_MODEL", "tts-1")
+TTS_VOICE_RU           = os.getenv("TTS_VOICE_RU", "alloy")
+TTS_VOICE_EN           = os.getenv("TTS_VOICE_EN", "alloy")
+TTS_RESPONSE_FORMAT    = os.getenv("TTS_RESPONSE_FORMAT", "opus")
+TTS_TIMEOUT_SECONDS    = int(os.getenv("TTS_TIMEOUT_SECONDS", "20"))
+TTS_MAX_INPUT_CHARS    = int(os.getenv("TTS_MAX_INPUT_CHARS", "600"))
+TTS_MAX_AUDIO_SECONDS  = int(os.getenv("TTS_MAX_AUDIO_SECONDS", "90"))
+
+# Reaction configuration (not rollout flags -- inert while
+# EMOTIONAL_REACTIONS_ENABLED is false).
+EMOTIONAL_REACTION_COOLDOWN_SECONDS = int(
+    os.getenv("EMOTIONAL_REACTION_COOLDOWN_SECONDS", "120"))
+EMOTIONAL_REACTION_MIN_CONFIDENCE = float(
+    os.getenv("EMOTIONAL_REACTION_MIN_CONFIDENCE", "0.6"))
+
+# Bounded TTLs for the two pieces of ephemeral FSM-scoped state used by
+# format-command replay (not rollout flags -- inert while
+# VOICE_REPLIES_ENABLED is false). Both are plain configuration values, not
+# feature flags: no default or migration path ever changes their meaning.
+# ONE_SHOT_OVERRIDE: how long a "voice the next reply" armed-but-unconsumed
+# override (from "лень читать" with nothing yet to voice-ify) remains valid.
+# LAST_RESPONSE: how long a successfully delivered final ordinary answer
+# stays eligible to be replayed by a later "лень читать"/"много текста".
+VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS = int(
+    os.getenv("VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS", "300"))
+VOICE_LAST_RESPONSE_TTL_SECONDS = int(
+    os.getenv("VOICE_LAST_RESPONSE_TTL_SECONDS", "21600"))

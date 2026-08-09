@@ -54,3 +54,42 @@ jobs:
 
       - name: "Unit tests (детерминированная логика: risk, safety, dependency)"
         run: python -m pytest -q
+
+  # Narrow, permanent exact-head compatibility gate for the ACTUAL production
+  # interpreter (3.10.12) -- separate from "smoke" (3.12) above so it never
+  # affects that job's required-check name. Does not import bot.py: bot.py
+  # constructs Bot()/AsyncOpenAI() at module scope, which "smoke" only gets
+  # away with via dummy-secret env vars; here we only need py_compile
+  # coverage for bot.py, not a live import.
+  python-310-compatibility-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10.12"
+
+      - name: Install dependencies (runtime + dev/test)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Confirm exact interpreter version
+        run: |
+          python --version
+          python -c "import sys; assert sys.version_info[:3] == (3, 10, 12), sys.version_info"
+
+      - name: Syntax check (py_compile every production file changed by PR #75)
+        run: |
+          python -m py_compile bot.py database.py therapeutic_domain.py
+
+      - name: Safe import smoke (no Telegram/OpenAI clients, no secrets, no DB mutation)
+        run: |
+          python -c "import database, therapeutic_domain; print('safe import smoke: OK')"
+
+      - name: Focused database contract tests under 3.10.12
+        run: python -m pytest -q tests/test_practice_proposal_transition_contract.py

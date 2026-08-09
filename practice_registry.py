@@ -510,8 +510,44 @@ CATEGORY_MAP = {
     "somatic": "somatic", "open_chat": "reflective",
 }
 
+# ── Canonical production practice catalog (Therapeutic Core Foundation) ────
+# Every scenario in CATEGORY_MAP already had exactly one safe, evidence-
+# ranked practice reachable through select_practice() -- an empirically
+# verified, emergent property of the evidence-rank/id tie-break in _best().
+# These 7 ids are that exact reachable set, now made an EXPLICIT, enforced
+# allowlist instead of an emergent property: select_practice() filters to
+# this set before ranking, and get_production_practice_by_id() is the only
+# lookup a Telegram callback (untrusted input) may use -- a forged, stale,
+# or catalog-only id fails closed (returns None) rather than being served.
+# The remaining 36 REGISTRY entries are real, safe, approved-school
+# definitions (CATALOG_ONLY status) -- kept for deliberate future wiring,
+# never silently selectable. No entry in REGISTRY uses a prohibited modality
+# (psychoanalysis/EMDR/IFS/schema therapy/trauma excavation/dream
+# interpretation/diagnosis/medical treatment) -- verified directly against
+# every entry's `approach`/name fields, not merely assumed.
+PRODUCTION_PRACTICE_IDS = frozenset({
+    "breathing_box_v1", "dbt_stop_v1", "cbt_thought_record_v1",
+    "cbt_behavioral_activation_v1", "act_acceptance_v1",
+    "reflective_listen_v1", "breathing_478_v1",
+})
+
 _SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 _EVIDENCE_RANK = {"strong": 0, "moderate": 1, "weak": 2}
+
+
+def is_production_practice(practice_id: str) -> bool:
+    return practice_id in PRODUCTION_PRACTICE_IDS
+
+
+def practice_status(practice_id: str) -> str:
+    """PRODUCTION | CATALOG_ONLY | UNKNOWN (id not in REGISTRY at all).
+    No entry is currently OBSOLETE or PROHIBITED -- see PRODUCTION_PRACTICE_IDS
+    docstring."""
+    if practice_id in PRODUCTION_PRACTICE_IDS:
+        return "PRODUCTION"
+    if any(p["id"] == practice_id for p in REGISTRY):
+        return "CATALOG_ONLY"
+    return "UNKNOWN"
 
 
 def _fits(p: Dict, stage: str, user_sev: int) -> bool:
@@ -538,13 +574,29 @@ def select_practice(scenario: str, stage: str = "OPEN",
     """Legacy scenario-based selection (kept for the current pipeline).
 
     Respects contraindications and severity limits; among valid candidates picks
-    the strongest-evidence one deterministically. Falls back to grounding."""
+    the strongest-evidence one deterministically. Falls back to grounding.
+    ENFORCED (not just emergent): candidates are filtered to
+    PRODUCTION_PRACTICE_IDS before ranking, so a future CATALOG_ONLY addition
+    with stronger evidence can never become silently selectable."""
     category = CATEGORY_MAP.get(scenario, "grounding")
     user_sev = _SEVERITY_ORDER.get(severity, 1)
-    candidates = [p for p in REGISTRY if p["category"] == category and _fits(p, stage, user_sev)]
+    candidates = [p for p in REGISTRY if p["category"] == category
+                  and p["id"] in PRODUCTION_PRACTICE_IDS and _fits(p, stage, user_sev)]
     if not candidates:
-        candidates = [p for p in REGISTRY if p["category"] == "grounding"]
+        candidates = [p for p in REGISTRY if p["category"] == "grounding"
+                      and p["id"] in PRODUCTION_PRACTICE_IDS]
     return _localize(_best(candidates), lang)
+
+
+def get_production_practice_by_id(practice_id: str, lang: str = "ru") -> Optional[Dict]:
+    """The ONLY practice lookup a Telegram callback (untrusted input) may
+    use. Fails closed (returns None) for any non-production id -- forged,
+    stale-version, catalog-only, or simply nonexistent -- rather than
+    serving it. get_practice_by_id (below) has no such guard and must never
+    be called directly with callback-supplied data."""
+    if practice_id not in PRODUCTION_PRACTICE_IDS:
+        return None
+    return get_practice_by_id(practice_id, lang)
 
 
 def select_practice_by_need(user_need: str, stage: str = "OPEN",

@@ -8,7 +8,7 @@ Tables:
   moderation_logs, checkins, validator_blocks, response_quality (👍/👎),
   ab_assignments
 """
-import aiosqlite, sqlite3, json
+import aiosqlite, sqlite3, json, uuid
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -135,6 +135,14 @@ CREATE TABLE IF NOT EXISTS intervention_results (
     engagement_metrics_json TEXT,
     feedback_rating         INTEGER,
     self_reported_behavior  INTEGER DEFAULT 0,
+    -- Therapeutic Core Foundation: the Telegram card identity (chat + message
+    -- id of the before-score offer), used ONLY as the atomic idempotency key
+    -- below -- see idx_intervention_one_baseline_per_card, created after
+    -- _apply_migrations (mirrors _migrate_questionnaire_response_uniqueness's
+    -- own after-migrations placement, since an upgraded DB only gains these
+    -- two columns via _MIGRATIONS, not via this CREATE TABLE).
+    source_chat_id          INTEGER,
+    source_message_id       INTEGER,
     created_at              TEXT DEFAULT (datetime('now'))
 );
 
@@ -625,6 +633,218 @@ CREATE TABLE IF NOT EXISTS first_turn_claims (
 -- bounded internal label (see database.INTERACTION_ERROR_CODES) -- never a
 -- raw exception message or user content.
 {_INTERACTION_EVENTS_TABLE_DDL};
+
+-- Voice and Adaptive Response UX — neutral response-delivery UI preference,
+-- nothing more. Stores ONLY the three closed-set choices below, never a raw
+-- format-command message, never an inferred psychological trait ("lazy",
+-- "dislikes reading", depression status, etc.). One row per user
+-- (PRIMARY KEY user_id) since this is a single current preference, not a
+-- history. CHECK constraints keep the value space closed at the engine
+-- level, matching this repo's convention for every other closed-vocabulary
+-- column (e.g. user_onboarding_state.status above).
+CREATE TABLE IF NOT EXISTS user_response_preferences (
+    user_id         INTEGER PRIMARY KEY REFERENCES users(id),
+    response_format TEXT NOT NULL DEFAULT 'text',
+    response_length TEXT NOT NULL DEFAULT 'normal',
+    voice_language  TEXT NOT NULL DEFAULT 'auto',
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK(response_format IN ('text', 'voice', 'voice_and_concise_text')),
+    CHECK(response_length IN ('concise', 'normal')),
+    CHECK(voice_language IN ('ru', 'en', 'auto'))
+);
+
+-- Therapeutic Core domain foundation (Phase 1, master prompt SS15). Inert
+-- storage: nothing in bot.pipeline() reads or writes these tables yet -- see
+-- therapeutic_domain.py for the validated Python models each *_json column
+-- serializes. Top-level columns duplicate the filterable fields already
+-- inside the JSON (same pattern as router_decision_logs.state_snapshot) so
+-- callers can query/index without deserializing every row; the JSON blob
+-- remains the single source of truth for full reconstruction.
+CREATE TABLE IF NOT EXISTS core_sessions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id          INTEGER NOT NULL REFERENCES users(id),
+    intent           TEXT NOT NULL DEFAULT 'UNKNOWN',
+    phase            TEXT NOT NULL DEFAULT 'OPENING',
+    lifecycle_status TEXT NOT NULL DEFAULT 'OPEN',
+    state_json       TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_sessions_user ON core_sessions(user_id);
+-- At most one OPEN/PAUSED (resumable) session per user, enforced at the
+-- engine level -- same technique as idx_onboarding_one_active_per_user
+-- above. Concurrent create_core_session() calls for the same user race on
+-- this index: the second INSERT fails with IntegrityError instead of
+-- silently forking two active sessions.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_core_one_open_session_per_user
+    ON core_sessions(user_id) WHERE lifecycle_status IN ('OPEN','PAUSED');
+
+CREATE TABLE IF NOT EXISTS core_formulations (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       INTEGER NOT NULL REFERENCES core_sessions(id),
+    user_id          INTEGER NOT NULL REFERENCES users(id),
+    confirmation     TEXT NOT NULL DEFAULT 'UNCONFIRMED',
+    formulation_json TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_formulations_user ON core_formulations(user_id);
+CREATE INDEX IF NOT EXISTS idx_core_formulations_session ON core_formulations(session_id);
+
+-- capability_level/method_id/consent are columns (not just JSON) because the
+-- Phase 5 Method Registry and the Phase 6 Outcome Engine need to filter/join
+-- on them without deserializing intervention_json on every row.
+CREATE TABLE IF NOT EXISTS core_interventions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        INTEGER NOT NULL REFERENCES core_sessions(id),
+    user_id           INTEGER NOT NULL REFERENCES users(id),
+    method_id         TEXT NOT NULL,
+    capability_level  TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'PROPOSED',
+    consent           TEXT NOT NULL DEFAULT 'ABSENT',
+    intervention_json TEXT NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_interventions_user ON core_interventions(user_id);
+-- Engine-level proof of SS15.6 ("at most one active intervention per
+-- session"): a second ACCEPTED/STARTED row for the same session is an
+-- IntegrityError, not a hopeful application-level check. Same technique as
+-- idx_onboarding_one_active_per_user above.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_core_one_active_intervention_per_session
+    ON core_interventions(session_id) WHERE status IN ('ACCEPTED','STARTED');
+
+CREATE TABLE IF NOT EXISTS core_outcomes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    intervention_id INTEGER NOT NULL REFERENCES core_interventions(id),
+    user_id         INTEGER NOT NULL REFERENCES users(id),
+    metric_kind     TEXT NOT NULL,
+    outcome_json    TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_outcomes_user ON core_outcomes(user_id);
+
+-- Confirmable memory (SS14). lifecycle starts at CANDIDATE; only CONFIRMED/
+-- CORRECTED rows may influence a response (MemoryLifecycle.influences_responses
+-- in therapeutic_domain.py) -- REJECTED/EXPIRED rows stay in the table for audit/
+-- export but a future Core reader must filter them out, never delete-and-forget.
+CREATE TABLE IF NOT EXISTS core_memory_items (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    category    TEXT NOT NULL,
+    lifecycle   TEXT NOT NULL DEFAULT 'CANDIDATE',
+    memory_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_memory_items_user ON core_memory_items(user_id);
+
+-- Depression Disclosure Gate (Phase 2, master prompt SS13). Restart-safe,
+-- DB-backed multi-step flow -- NOT aiogram FSM/MemoryStorage, which does not
+-- survive a process restart. At most one ACTIVE flow per user; a callback's
+-- ownership/step/duplicate/staleness checks are all encoded in the single
+-- conditional UPDATE database.advance_disclosure_flow() issues (WHERE
+-- id=? AND user_id=? AND step=? AND status='active') -- a repeated or
+-- out-of-order callback tap matches zero rows and is rejected deterministically,
+-- no separate "consumed" bookkeeping needed.
+CREATE TABLE IF NOT EXISTS depression_disclosure_flows (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id            INTEGER NOT NULL REFERENCES users(id),
+    status             TEXT NOT NULL DEFAULT 'active',
+    step               TEXT NOT NULL DEFAULT 'SAFETY_CHECK',
+    diagnosis_source   TEXT,
+    answers_json       TEXT NOT NULL DEFAULT '{{}}',
+    lang               TEXT NOT NULL DEFAULT 'ru',
+    origin_message_id  INTEGER,
+    prompt_message_id  INTEGER,
+    handoff_status     TEXT,
+    superseded_reason  TEXT,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at         TEXT NOT NULL DEFAULT (datetime('now', '+24 hours')),
+    completed_at       TEXT,
+    CHECK(status IN ('active','completed','cancelled','superseded_by_crisis','expired')),
+    CHECK(step IN ('SAFETY_CHECK','DIAGNOSIS_SOURCE','DURATION','FUNCTIONING',
+                   'BASIC_ACTIVITIES','SUPPORT','PURPOSE','HANDOFF_READY')),
+    CHECK(handoff_status IS NULL OR handoff_status IN ('ready','claimed')),
+    CHECK(length(answers_json) <= 2000)
+);
+CREATE INDEX IF NOT EXISTS idx_dd_flows_user ON depression_disclosure_flows(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dd_one_active_flow_per_user
+    ON depression_disclosure_flows(user_id) WHERE status='active';
+
+-- Phase 3 hardening SS3: a PRACTICE proposal is its own persisted, versioned
+-- entity -- consent applies to THIS exact proposal, never to "whatever
+-- practice the session happens to be about". The partial unique index makes
+-- "supersede the old proposal before creating a new one" a hard DB
+-- invariant, not a convention callers might forget.
+CREATE TABLE IF NOT EXISTS core_practice_proposals (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id             INTEGER NOT NULL REFERENCES users(id),
+    session_id          INTEGER NOT NULL REFERENCES core_sessions(id),
+    practice_id         TEXT NOT NULL,
+    practice_version    TEXT NOT NULL,
+    purpose             TEXT NOT NULL DEFAULT '',
+    expected_duration   TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'PROPOSED',
+    proposal_message_id INTEGER,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at          TEXT NOT NULL,
+    delivered_at        TEXT,
+    superseded_reason   TEXT,
+    outcome             TEXT,
+    outcome_recorded_at TEXT,
+    -- PR #73 request-changes §6: restart-safe delivery tracking for the two
+    -- post-practice follow-up UI prompts (distinct from proposal_message_id/
+    -- delivered_at above, which track the PRACTICE STEPS message only).
+    -- NULL = never attempted; 'FAILED' = attempted, Telegram rejected it,
+    -- eligible for one idempotent retry; 'DELIVERED' = terminal, never
+    -- retried or overwritten again.
+    outcome_prompt_message_id   INTEGER,
+    outcome_prompt_delivered_at TEXT,
+    outcome_prompt_status       TEXT,
+    outcome_prompt_claimed_at   TEXT,
+    -- PR #73 ATOMIC CLOSURE §2: RETRYING is a status, not an owner identity
+    -- -- a persisted claim_id makes claim_prompt_send's win unforgeable by a
+    -- stale prior claimant (e.g. one that crashed, got reclaimed by a
+    -- second caller, then resumed and tried to finalize the SECOND
+    -- caller's claim as if it were its own).
+    outcome_prompt_claim_id     TEXT,
+    helped_prompt_message_id    INTEGER,
+    helped_prompt_delivered_at  TEXT,
+    helped_prompt_status        TEXT,
+    helped_prompt_claimed_at    TEXT,
+    helped_prompt_claim_id      TEXT,
+    -- PR #73 ATOMIC CLOSURE §4: true when this proposal is an explicit,
+    -- informed repeat of a practice whose latest recorded outcome was
+    -- WORSE -- created fresh (never reusing the old WORSE proposal) the
+    -- moment the guard fires, so its consent buttons carry a REAL,
+    -- persisted proposal_id through the ordinary cb_cc_consent contract
+    -- instead of an unpersisted callback payload.
+    is_worse_override           INTEGER NOT NULL DEFAULT 0,
+    -- PR #73 FINAL REQUEST CHANGES §1: a callback/reporting-window lifecycle
+    -- SEPARATE from `status`/`outcome` above -- those stay a truthful,
+    -- never-rewritten historical record (STARTED/COMPLETED/WITHDRAWN mean
+    -- exactly what they always meant). reporting_window_status instead
+    -- tracks whether the cc:outcome/cc:helped BUTTONS for this proposal are
+    -- still actionable right now: NULL until STARTED opens it, 'ACTIVE'
+    -- while a report is still expected, 'INVALIDATED' once a topic change/
+    -- new disclosure/​start/close/crisis makes a stale button non-actionable,
+    -- 'CLOSED' once the reporting flow finished normally (withdrawn, or a
+    -- final outcome recorded).
+    reporting_window_status     TEXT,
+    CHECK(status IN ('PROPOSED','PENDING','GRANTED','DELIVERING','DECLINED','STARTED',
+                     'COMPLETED','WITHDRAWN','EXPIRED','SUPERSEDED','DELIVERY_FAILED')),
+    CHECK(outcome IS NULL OR outcome IN ('HELPED','PARTLY_HELPED','NO_CHANGE','WORSE')),
+    CHECK(outcome_prompt_status IS NULL OR outcome_prompt_status IN ('FAILED','DELIVERED','RETRYING')),
+    CHECK(helped_prompt_status IS NULL OR helped_prompt_status IN ('FAILED','DELIVERED','RETRYING')),
+    CHECK(reporting_window_status IS NULL OR reporting_window_status IN ('ACTIVE','INVALIDATED','CLOSED'))
+);
+CREATE INDEX IF NOT EXISTS idx_core_practice_proposals_user ON core_practice_proposals(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_core_one_actionable_proposal_per_session
+    ON core_practice_proposals(session_id)
+    WHERE status IN ('PROPOSED','PENDING','GRANTED','DELIVERING');
 """
 
 # Additive column migrations (no migration system in this repo; ADD COLUMN is
@@ -653,6 +873,25 @@ _MIGRATIONS = [
     # user_onboarding_state a given database has (fresh CREATE TABLE already
     # includes it; the pre-versioning-schema migration backfills it as NULL).
     ("user_onboarding_state", "privacy_notice_version", "TEXT"),
+    # Therapeutic Core Foundation: atomic baseline-claim key (see
+    # _migrate_intervention_baseline_uniqueness below for the actual
+    # constraint -- these columns must exist first on an upgraded DB).
+    ("intervention_results", "source_chat_id", "INTEGER"),
+    ("intervention_results", "source_message_id", "INTEGER"),
+    # Phase 2 correction §3/§13: truthful crisis-source metadata. NULL for
+    # every pre-existing row (this column didn't exist yet). Every current
+    # trigger_crisis() call defaults to "EXPLICIT_MESSAGE" (self-documenting,
+    # strictly additive, no behavior change at any call site); the
+    # Depression Disclosure Gate's callbacks pass "DIRECT_SAFETY_YES" /
+    # "DIRECT_SAFETY_UNSURE" instead, so the audit trail never has to guess
+    # whether a RED event came from pattern-matched text or a direct button
+    # answer.
+    ("crisis_events", "source", "TEXT"),
+    # core_practice_proposals.outcome/outcome_recorded_at are handled by the
+    # dedicated _rename_old_practice_proposals_if_needed/_finish_practice_
+    # proposals_migration rebuild below (a plain ADD COLUMN cannot also fix
+    # that table's CHECK constraint and partial-index WHERE clause, so a
+    # full rebuild is needed anyway -- no separate ADD COLUMN entry required).
 ]
 
 
@@ -695,6 +934,68 @@ async def _migrate_questionnaire_response_uniqueness(db) -> None:
     await db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_qresponses_session_item "
         "ON questionnaire_responses(session_id, item_id)")
+
+
+async def _migrate_intervention_baseline_uniqueness(db) -> None:
+    """Therapeutic Core Foundation P1 fix -- cb_before's prior guard (an
+    in-memory FSMContext check-then-act) is NOT atomic: two genuinely
+    concurrent callback_query deliveries for the SAME offer (the Telegram
+    card identified by chat_id+message_id) can both read the FSM state
+    before either writes it, both pass, and both call start_intervention,
+    creating two baseline rows. This partial UNIQUE index is the real,
+    engine-enforced invariant -- one baseline per (user, card), same
+    "safe on every boot, run after _apply_migrations" convention as
+    _migrate_questionnaire_response_uniqueness above (these two columns
+    only exist on an upgraded DB once _apply_migrations has run). NULL
+    values (rows predating this migration) are excluded from the
+    constraint -- SQLite treats NULL as distinct in a UNIQUE index, so
+    historical rows never collide with each other or with new rows.
+    start_intervention's narrow ON CONFLICT(...) DO NOTHING target relies
+    on this exact index; a rowcount of 0 there means "lost the atomic
+    claim", not an error -- see start_intervention's docstring.
+
+    Defensive dedupe before creating the index: this exact duplicate shape
+    -- two existing rows already sharing a non-NULL (user_id, source_chat_id,
+    source_message_id) -- is structurally impossible via any real app code
+    path today, since these two columns are introduced by THIS migration and
+    no prior release ever wrote a non-NULL value into them. It is kept
+    anyway so CREATE UNIQUE INDEX cannot crash init_db() on a hand-edited or
+    otherwise corrupted DB.
+
+    Deliberately does NOT reuse _migrate_questionnaire_response_uniqueness's
+    "keep MAX(id)" rule: that rule is correct there because a later
+    questionnaire_responses row is a legitimate Back->revise correction and
+    should win. Here the duplicated column is before_score -- the whole
+    point of this migration is that the FIRST accepted baseline must never
+    be silently replaced by a second write for the same card (see
+    start_intervention's ON CONFLICT ... DO NOTHING below, and
+    cb_before's "duplicate tap" contract). So this keeps MIN(id) -- the
+    earliest-inserted, first-accepted row -- and discards later duplicates,
+    matching that same semantics during a one-time migration cleanup. Only
+    non-NULL-identity groups are touched; historical NULL-identity rows are
+    never considered for dedupe."""
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM intervention_results WHERE source_chat_id IS NOT NULL "
+        "AND source_message_id IS NOT NULL AND id NOT IN ("
+        "  SELECT MIN(id) FROM intervention_results "
+        "  WHERE source_chat_id IS NOT NULL AND source_message_id IS NOT NULL "
+        "  GROUP BY user_id, source_chat_id, source_message_id)")
+    stale = (await cur.fetchone())[0]
+    if stale:
+        await db.execute(
+            "DELETE FROM intervention_results WHERE source_chat_id IS NOT NULL "
+            "AND source_message_id IS NOT NULL AND id NOT IN ("
+            "  SELECT MIN(id) FROM intervention_results "
+            "  WHERE source_chat_id IS NOT NULL AND source_message_id IS NOT NULL "
+            "  GROUP BY user_id, source_chat_id, source_message_id)")
+        logging.info(
+            "intervention_results dedupe: removed %d duplicate-card row(s) "
+            "(should be structurally unreachable via app code -- defensive only)",
+            stale)
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_intervention_one_baseline_per_card "
+        "ON intervention_results(user_id, source_chat_id, source_message_id) "
+        "WHERE source_chat_id IS NOT NULL AND source_message_id IS NOT NULL")
 
 
 # ── Onboarding real-versioning migration (spec item E) ──────────────────────
@@ -960,6 +1261,131 @@ async def _migrate_interaction_tables_atomically(db) -> None:
         raise
 
 
+# PR #73 request-changes §9: a fresh-schema CHECK constraint (status now
+# allows DELIVERING; outcome has its own CHECK) is NOT the same invariant as
+# what a plain ADD-COLUMN migration gives an already-deployed table -- SQLite
+# CHECK constraints are baked into the table definition at CREATE time and
+# cannot be altered in place. Rebuilt the same way _rename_old_onboarding_
+# state_if_needed/_finish_onboarding_state_migration already do: rename the
+# old-shape table aside BEFORE executescript (whose CREATE TABLE IF NOT
+# EXISTS then makes a fresh, correctly-constrained one), copy every row
+# across AFTER, then drop the renamed table. Both steps are idempotent/
+# crash-safe to rerun. This also naturally fixes the partial UNIQUE index's
+# WHERE clause (GRANTED/DELIVERING now also block a second actionable
+# proposal per session) -- CREATE INDEX IF NOT EXISTS alone would never have
+# updated an already-existing index's definition, but dropping the table
+# drops its indexes too, and the fresh CREATE TABLE recreates the correct one.
+_OLD_PRACTICE_PROPOSALS_TABLE = "_core_practice_proposals_pre_delivering"
+
+
+async def _rename_old_practice_proposals_if_needed(db) -> None:
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='core_practice_proposals'")
+    row = await cur.fetchone()
+    if row is None:
+        return  # no table yet -- executescript's CREATE TABLE IF NOT EXISTS makes a fresh one
+    sql = row[0] or ""
+    if ("DELIVERING" in sql and "outcome" in sql and "outcome_prompt_status" in sql
+            and "reporting_window_status" in sql and "outcome_prompt_claim_id" in sql
+            and "is_worse_override" in sql):
+        return  # already on the current shape -- nothing to migrate
+    await db.execute(
+        f"ALTER TABLE core_practice_proposals RENAME TO {_OLD_PRACTICE_PROPOSALS_TABLE}")
+    # PR #73 MIGRATION COMPATIBILITY GATE: SQLite does NOT rename a table's
+    # indexes when the table itself is renamed -- they keep their original
+    # names, still attached to the now-renamed-aside table. The fresh
+    # schema's executescript() below creates indexes with the SAME names
+    # (CREATE ... INDEX IF NOT EXISTS idx_core_practice_proposals_user /
+    # idx_core_one_actionable_proposal_per_session), so leaving the old
+    # ones in place would silently block the NEW ones from ever being
+    # created -- IF NOT EXISTS treats the name as already taken, even
+    # though it is the OLD (narrower) index definition still doing the
+    # work. This was a real, previously-undetected latent bug: it made the
+    # new partial unique index a no-op on every migrated (non-fresh)
+    # database, never actually enforced by SQLite after an upgrade.
+    # Dropping the index (not the table) leaves the renamed-aside table's
+    # rows fully intact for the later copy step.
+    await db.execute("DROP INDEX IF EXISTS idx_core_practice_proposals_user")
+    await db.execute("DROP INDEX IF EXISTS idx_core_one_actionable_proposal_per_session")
+    logging.info("core_practice_proposals: old schema detected, renamed for migration")
+
+
+async def _finish_practice_proposals_migration(db) -> None:
+    cur = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name="
+        f"'{_OLD_PRACTICE_PROPOSALS_TABLE}'")
+    if not await cur.fetchone():
+        return  # nothing was renamed in step 1 -- no old-schema table existed
+    cur = await db.execute(f"PRAGMA table_info({_OLD_PRACTICE_PROPOSALS_TABLE})")
+    old_cols = {r[1] for r in await cur.fetchall()}
+
+    def col_or_null(name: str) -> str:
+        return name if name in old_cols else "NULL"
+
+    def col_or_default(name: str, default_sql: str) -> str:
+        return name if name in old_cols else default_sql
+
+    cur = await db.execute(f"SELECT COUNT(*) FROM {_OLD_PRACTICE_PROPOSALS_TABLE}")
+    total = (await cur.fetchone())[0]
+
+    # PR #73 MIGRATION COMPATIBILITY GATE: the OLD partial unique index (and
+    # the OLD create_practice_proposal) only ever enforced "one actionable
+    # proposal per session" across PROPOSED/PENDING -- GRANTED (and later
+    # DELIVERING) were never covered by either. Real old-schema data can
+    # therefore legally contain MORE THAN ONE actionable row for the same
+    # (user_id, session_id) -- e.g. two GRANTED rows, or a GRANTED plus a
+    # newer PENDING. Copying such rows verbatim into the NEW schema's wider
+    # partial unique index (PROPOSED/PENDING/GRANTED/DELIVERING) would raise
+    # IntegrityError and crash init_db(). Every row is still copied here
+    # (row-count preserving, no history deleted) -- only the LOSING
+    # duplicate's status/superseded_reason are normalized. The winner is
+    # deterministic (newest created_at, ties broken by highest id), computed
+    # with a correlated subquery rather than a window function so this works
+    # on any SQLite version. COMPLETED/WITHDRAWN/DECLINED/EXPIRED/
+    # DELIVERY_FAILED/already-SUPERSEDED rows are untouched -- the CASE only
+    # ever fires for a row whose OWN status is still in the actionable set.
+    is_duplicate_loser = (
+        "T.status IN ('PROPOSED','PENDING','GRANTED','DELIVERING') AND EXISTS ("
+        f"SELECT 1 FROM {_OLD_PRACTICE_PROPOSALS_TABLE} R2 "
+        "WHERE R2.user_id=T.user_id AND R2.session_id=T.session_id "
+        "AND R2.status IN ('PROPOSED','PENDING','GRANTED','DELIVERING') "
+        "AND (R2.created_at > T.created_at OR (R2.created_at = T.created_at AND R2.id > T.id)))"
+    )
+    status_expr = f"CASE WHEN {is_duplicate_loser} THEN 'SUPERSEDED' ELSE T.status END"
+    reason_expr = (f"CASE WHEN {is_duplicate_loser} THEN 'migration_duplicate_actionable' "
+                   f"ELSE {col_or_null('superseded_reason')} END")
+
+    await db.execute(
+        "INSERT INTO core_practice_proposals "
+        "(id, user_id, session_id, practice_id, practice_version, purpose, "
+        " expected_duration, status, proposal_message_id, created_at, "
+        " expires_at, delivered_at, superseded_reason, outcome, outcome_recorded_at, "
+        " outcome_prompt_message_id, outcome_prompt_delivered_at, outcome_prompt_status, "
+        " outcome_prompt_claimed_at, outcome_prompt_claim_id, "
+        " helped_prompt_message_id, helped_prompt_delivered_at, helped_prompt_status, "
+        " helped_prompt_claimed_at, helped_prompt_claim_id, reporting_window_status, "
+        " is_worse_override) "
+        "SELECT T.id, T.user_id, T.session_id, T.practice_id, T.practice_version, T.purpose, "
+        f"T.expected_duration, {status_expr}, T.proposal_message_id, T.created_at, "
+        f"T.expires_at, T.delivered_at, {reason_expr}, {col_or_null('outcome')}, "
+        f"{col_or_null('outcome_recorded_at')}, "
+        f"{col_or_null('outcome_prompt_message_id')}, {col_or_null('outcome_prompt_delivered_at')}, "
+        f"{col_or_null('outcome_prompt_status')}, {col_or_null('outcome_prompt_claimed_at')}, "
+        f"{col_or_null('outcome_prompt_claim_id')}, "
+        f"{col_or_null('helped_prompt_message_id')}, "
+        f"{col_or_null('helped_prompt_delivered_at')}, {col_or_null('helped_prompt_status')}, "
+        f"{col_or_null('helped_prompt_claimed_at')}, {col_or_null('helped_prompt_claim_id')}, "
+        f"{col_or_null('reporting_window_status')}, "
+        f"{col_or_default('is_worse_override', '0')} "
+        f"FROM {_OLD_PRACTICE_PROPOSALS_TABLE} AS T")
+    cur = await db.execute("SELECT changes()")
+    inserted = (await cur.fetchone())[0]
+    await db.execute(f"DROP TABLE {_OLD_PRACTICE_PROPOSALS_TABLE}")
+    logging.info(
+        "core_practice_proposals migration: %d/%d row(s) copied to the new schema",
+        inserted, total)
+
+
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         # Must run FIRST, on a connection with no transaction open yet --
@@ -968,10 +1394,13 @@ async def init_db():
         # transaction of its own before it (see the note above it).
         await _migrate_interaction_tables_atomically(db)
         await _rename_old_onboarding_state_if_needed(db)
+        await _rename_old_practice_proposals_if_needed(db)
         await db.executescript(SCHEMA)
         await _finish_onboarding_state_migration(db)
+        await _finish_practice_proposals_migration(db)
         await _apply_migrations(db)
         await _migrate_questionnaire_response_uniqueness(db)
+        await _migrate_intervention_baseline_uniqueness(db)
         await _backfill_notice_acknowledgements(db)
         await db.commit()
 
@@ -1060,6 +1489,50 @@ async def mark_summarized(ids: list):
         await db.execute(f"UPDATE messages SET summarized=1 WHERE id IN ({ph})", ids)
         await db.commit()
 
+# ── Response Preferences (Voice and Adaptive Response UX) ────────────────────
+_DEFAULT_RESPONSE_PREFERENCES = {
+    "response_format": "text", "response_length": "normal", "voice_language": "auto",
+}
+
+async def get_response_preferences(uid: int) -> dict:
+    """Always returns a full dict with the three closed-set fields, even for
+    a user with no row yet (the schema defaults, not a DB round-trip write)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT response_format, response_length, voice_language"
+            " FROM user_response_preferences WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+    if not row:
+        return dict(_DEFAULT_RESPONSE_PREFERENCES)
+    return {"response_format": row[0], "response_length": row[1], "voice_language": row[2]}
+
+async def set_response_preference(uid: int, **fields) -> None:
+    """Upserts ONLY the neutral UI fields named in `fields` (a subset of
+    response_format/response_length/voice_language) -- never a raw message,
+    never an inferred trait. The CHECK constraints in the schema reject an
+    out-of-vocabulary value at the engine level regardless of caller intent."""
+    allowed = {"response_format", "response_length", "voice_language"}
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"unknown response preference field(s): {unknown}")
+    if not fields:
+        return
+    current = await get_response_preferences(uid)
+    current.update(fields)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            """INSERT INTO user_response_preferences
+               (user_id, response_format, response_length, voice_language, updated_at)
+               VALUES (?,?,?,?,datetime('now'))
+               ON CONFLICT(user_id) DO UPDATE SET
+                   response_format=excluded.response_format,
+                   response_length=excluded.response_length,
+                   voice_language=excluded.voice_language,
+                   updated_at=excluded.updated_at""",
+            (uid, current["response_format"], current["response_length"],
+             current["voice_language"]))
+        await db.commit()
+
 # ── Summaries ─────────────────────────────────────────────────────────────────
 
 async def save_summary(uid: int, content: str):
@@ -1139,18 +1612,43 @@ async def start_intervention(uid: int, objective: str, scenario: str,
                               selection_reason: dict, before_score: int,
                               stage: str = "OPEN", readiness: str = "MEDIUM",
                               capacity: float = 1.0, ab_variant: str = "control",
-                              router_version: str = "2.0") -> int:
+                              router_version: str = "2.0",
+                              source_chat_id: int | None = None,
+                              source_message_id: int | None = None) -> int | None:
+    """Returns the new row's id, or None if source_chat_id/source_message_id
+    were given and idx_intervention_one_baseline_per_card (see
+    _migrate_intervention_baseline_uniqueness) rejected this as a duplicate
+    claim on the same card -- i.e. this call LOST a genuine concurrent race
+    against another callback for the same (user, chat, message). Callers that
+    omit both (None, None) never hit the constraint and always get a row, as
+    before -- this is additive, not a behavior change for existing callers.
+
+    Uses a NARROW ON CONFLICT(...) target naming the exact partial index,
+    not a blanket INSERT OR IGNORE: SQLite's conflict-resolution algorithm
+    for OR IGNORE would silently absorb ANY constraint violation on this
+    table (e.g. the before_score CHECK(BETWEEN 1 AND 10) -- reachable if a
+    forged callback ever supplied an out-of-range score), which would
+    misclassify a real data-integrity bug as an ordinary "lost the race"
+    outcome. Naming the conflict target means only a violation of THIS
+    index is swallowed (rowcount 0 => lost the claim); any other integrity
+    violation still raises a genuine IntegrityError, matching the existing
+    "fails loud, not fake-success" contract used elsewhere in this module."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             """INSERT INTO intervention_results
                (user_id,session_objective,scenario,practice_id,practice_version,
                 router_version,ab_variant,selection_reason_json,stage,readiness,
-                capacity,before_score)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                capacity,before_score,source_chat_id,source_message_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(user_id,source_chat_id,source_message_id)
+               WHERE source_chat_id IS NOT NULL AND source_message_id IS NOT NULL
+               DO NOTHING""",
             (uid, objective, scenario, practice_id, practice_version,
              router_version, ab_variant, json.dumps(selection_reason),
-             stage, readiness, capacity, before_score))
-        await db.commit(); return cur.lastrowid
+             stage, readiness, capacity, before_score,
+             source_chat_id, source_message_id))
+        await db.commit()
+        return cur.lastrowid if cur.rowcount else None
 
 async def finish_intervention(record_id: int, after_score: int,
                                feedback_rating: int, confidence_score: float,
@@ -1407,17 +1905,174 @@ async def get_memory_overview(uid: int) -> dict:
 
 # ── Crisis Events (Epic 1) ────────────────────────────────────────────────────
 
+CRISIS_SOURCE_KINDS = {"EXPLICIT_MESSAGE", "DIRECT_SAFETY_YES", "DIRECT_SAFETY_UNSURE"}
+
+
 async def log_crisis_event(uid: int, level: str, risk_score: int,
                             categories: list, message_excerpt: str,
-                            lang: str = "ru", admin_notified: bool = False) -> int:
+                            lang: str = "ru", admin_notified: bool = False,
+                            source: str | None = None) -> int:
+    """`source` is optional, truthful provenance metadata -- closed-set
+    (CRISIS_SOURCE_KINDS), never an arbitrary caller-supplied string; None is
+    also accepted (legacy call sites/rows predating this column). This
+    function is audit logging ONLY -- Phase 2 correction §2 explicitly moved
+    disclosure-flow supersession OUT of here and into trigger_crisis (before
+    this is even called), because logging is a side effect that can fail or
+    be skipped and must never be the sole mechanism enforcing a safety
+    invariant. Do not put supersession logic back here."""
+    if source is not None and source not in CRISIS_SOURCE_KINDS:
+        raise ValueError(f"log_crisis_event: unknown source {source!r}; "
+                         f"allowed={sorted(CRISIS_SOURCE_KINDS)}")
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             """INSERT INTO crisis_events
-               (user_id,level,risk_score,categories,message_excerpt,lang,admin_notified)
-               VALUES (?,?,?,?,?,?,?)""",
+               (user_id,level,risk_score,categories,message_excerpt,lang,admin_notified,source)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (uid, level, risk_score, ",".join(categories), message_excerpt,
-             lang, int(admin_notified)))
-        await db.commit(); return cur.lastrowid
+             lang, int(admin_notified), source))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def supersede_active_disclosure_flows_for_crisis(uid: int) -> int:
+    """The ONE canonical, logging-independent safety hook (Phase 2 correction
+    §2): atomically makes every active depression-disclosure flow for this
+    user non-actionable. Called from the TOP of trigger_crisis -- the single
+    shared crisis-entry function every route in this codebase funnels
+    through -- BEFORE the crisis screen is delivered and BEFORE
+    log_crisis_event is even attempted, so it holds regardless of whether
+    audit logging succeeds, fails, or is skipped.
+
+    Phase 3 correction: also invalidates a COMPLETED-but-unclaimed handoff
+    (status='completed' AND handoff_status='ready') the same way -- a crisis
+    beginning between "assessment completed" and "Conversation Controller
+    claims it" must not leave a stale pre-crisis handoff claimable once the
+    crisis is resolved. No schema change needed: the row's `status` moves to
+    'superseded_by_crisis' (already in the CHECK constraint), which is
+    exactly what get_unclaimed_handoff's own WHERE clause (status='completed')
+    already requires to no longer match.
+
+    Returns the number of rows superseded (0, 1, or -- only in the
+    vanishingly rare case both an active flow AND a completed-unclaimed one
+    exist for the same user -- 2)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows
+               SET status='superseded_by_crisis', superseded_reason='crisis_activated',
+                   updated_at=datetime('now')
+               WHERE user_id=? AND (status='active'
+                                    OR (status='completed' AND handoff_status='ready'))""",
+            (uid,))
+        await db.commit()
+        return cur.rowcount
+
+
+async def supersede_active_core_sessions_for_crisis(uid: int) -> int:
+    """Phase 3 correction §6: crisis must supersede ALL ordinary Core work,
+    not just the Depression Disclosure Gate. Called from the same canonical,
+    logging-independent crisis-entry point (top of trigger_crisis) as
+    supersede_active_disclosure_flows_for_crisis, in its own try/except.
+
+    Every OPEN core_session for this user is PAUSED (resumable later, same
+    semantics as /start -- a crisis interruption is not a permanent
+    cancellation of ordinary conversational work). Any PENDING or GRANTED
+    consent (e.g. an unanswered PRACTICE proposal) is WITHDRAWN, so a stale
+    consent callback becomes non-actionable the same way a stale disclosure-
+    gate callback does: the callback's own ownership+status check (§4) reads
+    this already-updated state, not a second explicit crisis check.
+
+    Goes through the existing list_core_sessions/update_core_session
+    accessors (not raw SQL) so state_json and its denormalized columns never
+    drift out of sync -- the same discipline as Phase 1's create_core_session.
+
+    Hardening §4: also supersedes every actionable PRACTICE proposal for
+    this user (the proposal's own `status` is now the real consent gate --
+    session.consent is kept in sync too, best-effort, for older readers)."""
+    sessions = await list_core_sessions(uid, active_only=True)
+    count = 0
+    for s in sessions:
+        if s.lifecycle_status is not _core.LifecycleStatus.OPEN:
+            continue
+        s.lifecycle_status = _core.LifecycleStatus.PAUSED
+        if s.consent in (_core.ConsentState.PENDING, _core.ConsentState.GRANTED):
+            s.consent = _core.ConsentState.WITHDRAWN
+        if await update_core_session(s):
+            count += 1
+    await supersede_active_practice_proposals(uid, "crisis_activated")
+    return count
+
+
+async def claim_handoff_and_get_or_create_session(
+        uid: int) -> tuple[dict | None, "_core.SessionState | None"]:
+    """Phase 3 correction §5 -- ONE atomic transaction: claim the user's
+    single valid unclaimed Depression Disclosure Gate handoff (if any) and
+    link it to their existing OPEN/PAUSED session or a newly-created one, in
+    the SAME connection/commit as the claim itself.
+
+    Two concurrent calls for the same user can never both succeed: the
+    claim's own conditional UPDATE (handoff_status 'ready' -> 'claimed') is
+    the race guard, evaluated by SQLite's own transaction serialization on
+    this one connection/file -- the loser's rowcount is 0 and it returns
+    (None, None) immediately, touching no session row at all.
+
+    Correction round 2 (§2/§3): this function DOES NOT set or persist the
+    session's `intent`, deliberately. Claiming the handoff and linking it to
+    a session is INTERPRETATION-INDEPENDENT (the same regardless of what
+    this turn's text says) and safe to do unconditionally, before any
+    staleness check. Which Intent the session ends up with depends on THIS
+    turn's classification (repair signal > handoff purpose > plain text) and
+    on this turn still being authoritative when it finishes -- so the caller
+    (bot.py) sets `session.intent` itself and persists it ONLY via its own
+    already generation-guarded update_core_session() call, after its stale-
+    response check. A superseded turn therefore claims/links (harmless,
+    idempotent bookkeeping) but never gets to write an intent, a repair
+    constraint, or a consent change -- those all live in the one
+    update_core_session() call this function deliberately does not make.
+
+    Returns (None, None) when there is nothing to claim -- the caller falls
+    back to plain-text intent classification for this turn."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"""SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows
+               WHERE user_id=? AND status='completed' AND handoff_status='ready'
+               ORDER BY id DESC LIMIT 1""", (uid,))).fetchone()
+        if row is None:
+            return None, None
+        handoff = _dd_row_to_dict(row)
+
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows SET handoff_status='claimed',
+               updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND status='completed' AND handoff_status='ready'""",
+            (handoff["id"], uid))
+        if cur.rowcount == 0:
+            await db.commit()
+            return None, None  # lost the race to a concurrent claim
+
+        srow = await (await db.execute(
+            """SELECT id, state_json FROM core_sessions
+               WHERE user_id=? AND lifecycle_status IN ('OPEN','PAUSED')
+               ORDER BY id DESC LIMIT 1""", (uid,))).fetchone()
+        if srow is not None:
+            state = _load_session(srow[0], srow[1])
+            state.handoff_flow_id = str(handoff["id"])
+            await db.execute(
+                "UPDATE core_sessions SET state_json=?, updated_at=datetime('now') WHERE id=? AND user_id=?",
+                (_dump_session_json(state), state.session_id, uid))
+        else:
+            state = _core.SessionState(session_id="unassigned", user_id=uid)  # intent defaults UNKNOWN
+            cur2 = await db.execute(
+                """INSERT INTO core_sessions (user_id, intent, phase, lifecycle_status, state_json)
+                   VALUES (?,?,?,?,?)""",
+                (uid, state.intent.value, state.phase.value,
+                 state.lifecycle_status.value, _dump_session_json(state)))
+            state.session_id = str(cur2.lastrowid)
+            state.handoff_flow_id = str(handoff["id"])
+            await db.execute(
+                "UPDATE core_sessions SET state_json=? WHERE id=?",
+                (_dump_session_json(state), state.session_id))
+        await db.commit()
+    return handoff, state
 
 
 async def log_crisis_delivery(event_id, user_id: int, kind: str,
@@ -3336,3 +3991,880 @@ def sync_export_query_safe(table: str) -> tuple:
     rows = cur.fetchall()
     conn.close()
     return cols, rows
+
+
+# ── Therapeutic Core Foundation (Phase 1) ───────────────────────────────────
+# Restart-safe storage for therapeutic_domain.py's validated models. The DB row
+# is the canonical source of state -- never a process-local dict (SS15.3).
+# Every read/update filters by user_id (never trusts a bare row id as proof
+# of ownership -- SS21), so a stale/forged id from one user can never touch
+# another user's row: it simply matches zero rows.
+#
+# Nothing in bot.pipeline() calls into this section yet -- it ships inert,
+# behind THERAPEUTIC_CORE_FOUNDATION_ENABLED staying false, exactly like the
+# rest of the flag-off surface in this file.
+
+import therapeutic_domain as _core
+
+
+def _dump_session_json(state: _core.SessionState) -> str:
+    """The DB row id is the ONLY canonical session_id (§ "one source of
+    truth" -- see the Phase 1 PR description). state_json never embeds it, so
+    there is no second copy that could ever diverge from the row id, and no
+    caller can observe a placeholder/unassigned id even transiently: the row
+    doesn't exist in a queryable state until INSERT returns, at which point
+    the id is already final."""
+    d = state.to_dict()
+    d.pop("session_id", None)
+    return json.dumps(d)
+
+
+def _load_session(row_id, raw_json: str) -> _core.SessionState:
+    """Inverse of `_dump_session_json`: session_id is always hydrated from the
+    relational row id, never read out of the JSON blob."""
+    d = json.loads(raw_json)
+    d["session_id"] = str(row_id)
+    return _core.SessionState.from_dict(d)
+
+
+def session_json_snapshot(state: _core.SessionState) -> str:
+    """Public wrapper around _dump_session_json -- hardening §2: bot.py calls
+    this to capture the EXACT `expected_prior_json` a Controller turn's
+    mutations were computed from, for update_core_session_authoritative's
+    CAS. Public (not underscore-prefixed) because it is a cross-module
+    contract now, not an internal helper."""
+    return _dump_session_json(state)
+
+
+async def create_core_session(user_id: int, intent=_core.Intent.UNKNOWN) -> _core.SessionState:
+    """Single INSERT, single commit. Raises sqlite3.IntegrityError if `user_id`
+    already has an OPEN/PAUSED session (idx_core_one_open_session_per_user) --
+    concurrent creation for the same user fails deterministically rather than
+    silently forking two active sessions; a rolled-back INSERT leaves no row,
+    so there is nothing for a reader to observe mid-failure."""
+    state = _core.SessionState(session_id="unassigned", user_id=user_id, intent=intent)
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_sessions (user_id, intent, phase, lifecycle_status, state_json)
+               VALUES (?,?,?,?,?)""",
+            (user_id, state.intent.value, state.phase.value,
+             state.lifecycle_status.value, _dump_session_json(state)))
+        await db.commit()
+        state.session_id = str(cur.lastrowid)
+    return state
+
+
+async def get_core_session(session_id: str, user_id: int) -> _core.SessionState | None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id, state_json FROM core_sessions WHERE id=? AND user_id=?",
+            (session_id, user_id))
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return _load_session(row[0], row[1])
+
+
+async def list_core_sessions(user_id: int, active_only: bool = False) -> list[_core.SessionState]:
+    query = "SELECT id, state_json FROM core_sessions WHERE user_id=?"
+    if active_only:
+        query += " AND lifecycle_status IN ('OPEN','PAUSED')"
+    query += " ORDER BY id DESC"
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(query, (user_id,))).fetchall()
+    return [_load_session(r[0], r[1]) for r in rows]
+
+
+async def update_core_session(state: _core.SessionState) -> bool:
+    """Persists `state` back to its own row. Returns False (no-op) if
+    session_id/user_id no longer match any row -- callers must not assume the
+    write happened without checking this. Never trusts state.session_id as
+    proof of ownership by itself: the WHERE clause also requires user_id to
+    match, so a caller holding another user's session_id updates zero rows."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_sessions SET intent=?, phase=?, lifecycle_status=?,
+               state_json=?, updated_at=datetime('now') WHERE id=? AND user_id=?""",
+            (state.intent.value, state.phase.value, state.lifecycle_status.value,
+             _dump_session_json(state), state.session_id, state.user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def update_core_session_authoritative(state: _core.SessionState,
+                                            expected_prior_json: str) -> bool:
+    """Hardening §2: the TOCTOU-safe replacement for plain update_core_session
+    on the Controller's delivery path. `expected_prior_json` is the exact
+    state_json this turn's mutations were computed FROM (captured in
+    bot._controller_claim_turn, before any in-memory mutation) -- the write
+    only lands if nothing else touched the row since then (optimistic
+    concurrency, same CAS pattern as transition_core_session_consent).
+
+    This closes the gap the in-process generation counter alone cannot: a
+    DIFFERENT writer (a /start pause, a crisis supersession, another process)
+    mutating the SAME row between this turn's claim and its final write. Both
+    of those call sites do a plain unconditional UPDATE (they are meant to
+    always win over a stale Controller turn) -- so if either ran in the gap,
+    this CAS's WHERE clause no longer matches and the stale turn's write is
+    correctly rejected, exactly like a superseded generation."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_sessions SET intent=?, phase=?, lifecycle_status=?,
+               state_json=?, updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND state_json=?""",
+            (state.intent.value, state.phase.value, state.lifecycle_status.value,
+             _dump_session_json(state), state.session_id, state.user_id,
+             expected_prior_json))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+_PP_COLUMNS = ("id", "user_id", "session_id", "practice_id", "practice_version",
+              "purpose", "expected_duration", "status", "proposal_message_id",
+              "created_at", "expires_at", "delivered_at", "superseded_reason",
+              "outcome", "outcome_recorded_at",
+              "outcome_prompt_message_id", "outcome_prompt_delivered_at",
+              "outcome_prompt_status", "outcome_prompt_claimed_at", "outcome_prompt_claim_id",
+              "helped_prompt_message_id",
+              "helped_prompt_delivered_at", "helped_prompt_status",
+              "helped_prompt_claimed_at", "helped_prompt_claim_id",
+              "reporting_window_status", "is_worse_override")
+
+
+def _pp_row_to_obj(row) -> "_core.PracticeProposal":
+    d = dict(zip(_PP_COLUMNS, row))
+    pid = d.pop("id")
+    return _core.PracticeProposal(proposal_id=str(pid), **d)
+
+
+async def create_practice_proposal(uid: int, session_id, practice_id: str,
+                                   practice_version: str, purpose: str,
+                                   expected_duration: str,
+                                   ttl_seconds: int = 1800,
+                                   is_worse_override: bool = False,
+                                   block_if_refinement_pending=None
+                                   ) -> "_core.PracticeProposal | None":
+    """Hardening §3/§4: supersedes any still-actionable proposal for this
+    SESSION in the same transaction before inserting the new one -- the
+    partial unique index (one actionable proposal per session) turns a
+    forgotten supersession into a hard DB error, never a silent duplicate.
+
+    PR #73 ATOMIC CLOSURE §4: `is_worse_override=True` persists that THIS
+    exact proposal is an explicit, informed repeat of a practice whose
+    latest recorded outcome was WORSE -- always a brand-new row (this
+    function never reuses an existing one), never touching the old
+    WORSE-outcome proposal's own history.
+
+    Progressive practice UX atomicity fix (external review F2 follow-up):
+    `block_if_refinement_pending`, if given a non-empty sequence of internal
+    pending-marker strings (caller-supplied, never hardcoded here -- mirrors
+    transition_practice_proposal/record_practice_outcome's own convention),
+    makes the row creation itself conditional via a single `INSERT ...
+    SELECT ... WHERE NOT EXISTS (...) RETURNING ...` statement on this SAME
+    connection/transaction. The refinement check and the insert are ONE
+    atomic SQL statement -- there is no separate pre-read SELECT and no
+    window for another connection's concurrent write (e.g. a callback
+    establishing the marker) to land between a check and an insert, because
+    there is no gap between them to land in. Returns None if blocked (the
+    row is never created). Default (None/empty) preserves the prior
+    unconditional-insert behavior exactly.
+
+    External review correction (transaction side-effects): a block must
+    leave ZERO persisted side effects, including the supersession UPDATE
+    above. That UPDATE and the guarded INSERT share one transaction on one
+    connection; when the INSERT is blocked (RETURNING yields no row), the
+    transaction is explicitly rolled back instead of committed, so a
+    pre-existing still-actionable proposal is never flipped to SUPERSEDED
+    without a replacement ever being created."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            """UPDATE core_practice_proposals SET status='SUPERSEDED',
+               superseded_reason='newer_proposal'
+               WHERE session_id=? AND user_id=?
+                 AND status IN ('PROPOSED','PENDING','GRANTED','DELIVERING')""",
+            (session_id, uid))
+        where_clause = ""
+        guard_params = ()
+        if block_if_refinement_pending:
+            placeholders = ",".join("?" for _ in block_if_refinement_pending)
+            where_clause = (
+                " WHERE NOT EXISTS (SELECT 1 FROM core_practice_proposals "
+                "WHERE user_id=? AND session_id=? AND reporting_window_status='ACTIVE' "
+                f"AND superseded_reason IN ({placeholders}))")
+            guard_params = (uid, session_id, *block_if_refinement_pending)
+        cur = await db.execute(
+            f"""INSERT INTO core_practice_proposals
+               (user_id, session_id, practice_id, practice_version, purpose,
+                expected_duration, status, expires_at, is_worse_override)
+               SELECT ?, ?, ?, ?, ?, ?, 'PROPOSED', datetime('now', ?), ?{where_clause}
+               RETURNING {','.join(_PP_COLUMNS)}""",
+            (uid, session_id, practice_id, practice_version, purpose,
+             expected_duration, f"+{int(ttl_seconds)} seconds", int(is_worse_override),
+             *guard_params))
+        row = await cur.fetchone()
+        if row is None:
+            await db.rollback()
+            return None
+        await db.commit()
+        return _pp_row_to_obj(row)
+
+
+async def get_latest_proposal_for_session(session_id, user_id: int) -> "_core.PracticeProposal | None":
+    """Most recent proposal (any status) for this session -- used where a
+    caller has a session but not yet a proposal_id (e.g. building the
+    callback for a just-delivered PENDING proposal)."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals "
+            "WHERE session_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
+            (session_id, user_id))).fetchone()
+        return _pp_row_to_obj(row) if row else None
+
+
+async def get_latest_outcome_for_practice(user_id: int, practice_id: str) -> str | None:
+    """PR #73 request-changes §7: the minimum adverse-history guard --
+    the user's most recently RECORDED outcome for this exact practice_id
+    (across ALL of their sessions, any status), or None if they have never
+    reported one. Callers use this to refuse automatically re-proposing a
+    practice whose latest outcome was WORSE -- HELPED/PARTLY_HELPED/
+    NO_CHANGE/never-reported all permit reuse."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            "SELECT outcome FROM core_practice_proposals "
+            "WHERE user_id=? AND practice_id=? AND outcome IS NOT NULL "
+            "ORDER BY outcome_recorded_at DESC, id DESC LIMIT 1",
+            (user_id, practice_id))).fetchone()
+        return row[0] if row else None
+
+
+async def get_practice_proposal(proposal_id, user_id: int) -> "_core.PracticeProposal | None":
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals "
+            "WHERE id=? AND user_id=?", (proposal_id, user_id))).fetchone()
+        return _pp_row_to_obj(row) if row else None
+
+
+async def transition_practice_proposal(proposal_id, user_id: int, *, from_status: str,
+                                       to_status: str, reason: str | None = None,
+                                       require_unexpired: bool = False,
+                                       open_reporting_window: bool = False,
+                                       close_reporting_window: bool = False,
+                                       require_active_reporting_window: bool = False,
+                                       require_prior_reason: str | None = None,
+                                       require_prior_reason_null: bool = False) -> bool:
+    """Atomic status CAS (hardening §4/§5) -- mirrors
+    transition_core_session_consent's pattern. `require_unexpired=True`
+    (used for the GRANTED/DECLINED consent transitions) makes expiry
+    enforcement itself atomic: an expired PENDING proposal fails this CAS
+    exactly like a wrong-owner or wrong-status one, no separate read-then-
+    decide race.
+
+    PR #73 FINAL REQUEST CHANGES §1: `open_reporting_window`/
+    `close_reporting_window` fold the reporting-window lifecycle write into
+    this SAME atomic UPDATE as the status transition (DELIVERING->STARTED
+    opens it; STARTED->WITHDRAWN closes it) -- never a second, separately-
+    racing write. `status`/`outcome` -- the truthful historical record --
+    are never touched by this window bookkeeping.
+
+    PR #73 ATOMIC CLOSURE §1: `require_active_reporting_window=True` closes
+    the TOCTOU gap between a caller's own earlier (non-atomic) read of
+    `reporting_window_status` and this write -- the WHERE clause itself,
+    not just a Python-level check beforehand, is what actually enforces it.
+    Used for STARTED->COMPLETED and STARTED->WITHDRAWN.
+
+    Progressive practice UX: `require_prior_reason`/`require_prior_reason_null`
+    let a caller CAS on `superseded_reason` too, not just `status` -- this is
+    what makes a same-status "refinement" write (from_status == to_status,
+    e.g. WITHDRAWN -> WITHDRAWN or COMPLETED -> COMPLETED) exactly-once. A
+    plain status-only CAS can't protect a refinement step, since `status`
+    never changes across it; gating on the CURRENT `superseded_reason` too
+    is what makes a duplicate/racing tap lose. `superseded_reason` remains a
+    plain descriptive TEXT column (no CHECK enum) -- reusing it here for a
+    COMPLETED-status row's "which follow-up question is this" marker does
+    not touch or reinterpret its meaning for SUPERSEDED/WITHDRAWN rows.
+
+    `require_prior_reason` and `require_prior_reason_null` are mutually
+    exclusive: passing both would generate a deterministically-unsatisfiable
+    `AND superseded_reason=? AND superseded_reason IS NULL` predicate (no row
+    can match both), which would silently make every call with this
+    combination a no-op CAS failure rather than surface the caller's bug."""
+    if require_prior_reason is not None and require_prior_reason_null:
+        raise ValueError(
+            "transition_practice_proposal: require_prior_reason and "
+            "require_prior_reason_null are mutually exclusive")
+    window_set = ""
+    if open_reporting_window:
+        window_set = ", reporting_window_status='ACTIVE'"
+    elif close_reporting_window:
+        window_set = ", reporting_window_status='CLOSED'"
+    query = (f"""UPDATE core_practice_proposals SET status=?,
+                 superseded_reason=COALESCE(?, superseded_reason){window_set}
+                 WHERE id=? AND user_id=? AND status=?""")
+    params = [to_status, reason, proposal_id, user_id, from_status]
+    if require_unexpired:
+        query += " AND expires_at > datetime('now')"
+    if require_active_reporting_window:
+        query += " AND reporting_window_status='ACTIVE'"
+    if require_prior_reason is not None:
+        query += " AND superseded_reason=?"
+        params.append(require_prior_reason)
+    if require_prior_reason_null:
+        query += " AND superseded_reason IS NULL"
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(query, params)
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def mark_proposal_delivered(proposal_id, user_id: int, message_id: int) -> bool:
+    """Info-only update (not a status transition) -- records the Telegram
+    message id a successfully-sent proposal landed as, so a later delivery-
+    failure/edit path can find it. Only meaningful while still PENDING."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_practice_proposals SET proposal_message_id=?,
+               delivered_at=datetime('now') WHERE id=? AND user_id=? AND status='PENDING'""",
+            (message_id, proposal_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def record_practice_outcome(proposal_id, user_id: int, outcome: str,
+                                  require_active_reporting_window: bool = False,
+                                  require_prior_reason: str | None = None,
+                                  require_prior_reason_null: bool = False,
+                                  clear_superseded_reason: bool = False) -> bool:
+    """Phase 3 final closure §5: records a purely qualitative, explicit
+    self-reported outcome on an ALREADY-COMPLETED proposal (status is not
+    touched -- this is an info-only update, same pattern as
+    mark_proposal_delivered). Only meaningful once (WHERE outcome IS NULL),
+    so a duplicate/replayed outcome callback cannot silently overwrite the
+    user's first answer. PR #73 FINAL REQUEST CHANGES §1: a successful
+    outcome report is the normal end of the reporting window -- closed in
+    the same atomic write.
+
+    PR #73 ATOMIC CLOSURE §1: `require_active_reporting_window=True` makes
+    the WHERE clause itself the authority on window freshness, closing the
+    TOCTOU gap between a caller's earlier read and this write.
+
+    Progressive practice UX atomic outcome-finalization contract:
+    `require_prior_reason`/`require_prior_reason_null` mirror
+    transition_practice_proposal's same-named parameters, CASing on
+    `superseded_reason` so a direct outcome write and a pending-detail
+    refinement can never both succeed against the same row.
+    `clear_superseded_reason=True` removes a pending UX marker in the SAME
+    atomic UPDATE that commits the terminal outcome -- never a separate
+    SELECT-then-UPDATE, never a second write. It is only permitted alongside
+    an exact `require_prior_reason` value: a caller must never clear an
+    arbitrary lifecycle reason without proving the row contains exactly the
+    expected internal pending marker it is finalizing."""
+    if require_prior_reason is not None and require_prior_reason_null:
+        raise ValueError(
+            "record_practice_outcome: require_prior_reason and "
+            "require_prior_reason_null are mutually exclusive")
+    if clear_superseded_reason and require_prior_reason is None:
+        raise ValueError(
+            "record_practice_outcome: clear_superseded_reason=True requires "
+            "an exact require_prior_reason value")
+    reason_set = ", superseded_reason=NULL" if clear_superseded_reason else ""
+    query = (f"""UPDATE core_practice_proposals SET outcome=?, outcome_recorded_at=datetime('now'),
+               reporting_window_status='CLOSED'{reason_set}
+               WHERE id=? AND user_id=? AND status='COMPLETED' AND outcome IS NULL""")
+    params = [outcome, proposal_id, user_id]
+    if require_active_reporting_window:
+        query += " AND reporting_window_status='ACTIVE'"
+    if require_prior_reason is not None:
+        query += " AND superseded_reason=?"
+        params.append(require_prior_reason)
+    if require_prior_reason_null:
+        query += " AND superseded_reason IS NULL"
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(query, params)
+        await db.commit()
+        return cur.rowcount > 0
+
+
+# PR #73 request-changes §6 -- restart-safe delivery tracking for the two
+# post-practice follow-up UI prompts. Both prompt_kind values below map 1:1
+# onto the outcome_prompt_*/helped_prompt_* column pairs; a single
+# parametrized set of functions avoids duplicating the same CAS logic twice.
+#
+# PR #73 FINAL REQUEST CHANGES §2: a two-step SELECT-then-send-then-mark
+# flow lets two concurrent inbound turns both pass the SELECT and both send
+# before either write lands -- a post-send CAS only prevents the second DB
+# write, not the second Telegram message. claim_prompt_send is a THIRD,
+# atomic pre-send state (RETRYING) that only one caller can ever win; the
+# send is only attempted by whichever caller wins the claim.
+_PROMPT_COLUMNS = {
+    "outcome": ("outcome_prompt_status", "outcome_prompt_message_id",
+               "outcome_prompt_delivered_at", "outcome_prompt_claimed_at",
+               "outcome_prompt_claim_id"),
+    "helped": ("helped_prompt_status", "helped_prompt_message_id",
+              "helped_prompt_delivered_at", "helped_prompt_claimed_at",
+              "helped_prompt_claim_id"),
+}
+# A claim older than this is treated as abandoned (the claiming process
+# crashed or restarted between the claim and the send/mark) and becomes
+# eligible for a fresh claim -- the bounded-timeout half of "stale RETRYING
+# is recoverable after a bounded timeout or restart".
+_PROMPT_RETRY_CLAIM_TIMEOUT_SECONDS = 120
+
+
+async def claim_prompt_send(proposal_id, user_id: int, prompt_kind: str,
+                            expected_status: str) -> str | None:
+    """PR #73 ATOMIC CLOSURE §2: atomic pre-send claim: NULL/FAILED (or a
+    stale, timed-out RETRYING) -> RETRYING, stamped with a fresh, unforgeable
+    claim_id (not just the RETRYING status value, which a stale prior
+    claimant could otherwise mistake for its own win after a second caller
+    legitimately reclaimed it). Only the caller that wins this CAS may
+    attempt the Telegram send for this prompt_kind. `expected_status`
+    additionally requires the PROPOSAL's own status (STARTED for the
+    outcome prompt, COMPLETED for the helped prompt) to still hold, and the
+    reporting window to still be ACTIVE -- both in the SAME atomic WHERE
+    clause, not a separate read beforehand.
+
+    Returns the winning claim_id, or None if the claim was not won."""
+    status_col, _, _, claimed_col, claimid_col = _PROMPT_COLUMNS[prompt_kind]
+    claim_id = uuid.uuid4().hex
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"""UPDATE core_practice_proposals SET {status_col}='RETRYING',
+               {claimid_col}=?, {claimed_col}=datetime('now')
+               WHERE id=? AND user_id=? AND status=? AND reporting_window_status='ACTIVE'
+                 AND ({status_col} IS NULL OR {status_col}='FAILED'
+                      OR ({status_col}='RETRYING' AND {claimed_col} < datetime(
+                          'now', '-{_PROMPT_RETRY_CLAIM_TIMEOUT_SECONDS} seconds')))""",
+            (claim_id, proposal_id, user_id, expected_status))
+        await db.commit()
+        return claim_id if cur.rowcount > 0 else None
+
+
+async def mark_prompt_delivered(proposal_id, user_id: int, prompt_kind: str, message_id: int,
+                                claim_id: str) -> bool:
+    """Only the EXACT claim owner may mark DELIVERED: requires the row to
+    still be RETRYING under THIS claim_id, not merely RETRYING under
+    whatever claim currently holds it. A stale prior claimant that resumed
+    after a second caller reclaimed the same prompt can never finalize the
+    NEWER claim as if it were its own."""
+    status_col, msgid_col, at_col, _, claimid_col = _PROMPT_COLUMNS[prompt_kind]
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"""UPDATE core_practice_proposals SET {status_col}='DELIVERED',
+               {msgid_col}=?, {at_col}=datetime('now')
+               WHERE id=? AND user_id=? AND {status_col}='RETRYING' AND {claimid_col}=?""",
+            (message_id, proposal_id, user_id, claim_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def mark_prompt_failed(proposal_id, user_id: int, prompt_kind: str, claim_id: str) -> bool:
+    """Only the EXACT claim owner may revert to FAILED -- same claim_id
+    discipline as mark_prompt_delivered. Never overwrites an already-
+    DELIVERED prompt or a claim some OTHER (including a newer) caller
+    currently owns."""
+    status_col, _, _, _, claimid_col = _PROMPT_COLUMNS[prompt_kind]
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"""UPDATE core_practice_proposals SET {status_col}='FAILED'
+               WHERE id=? AND user_id=? AND {status_col}='RETRYING' AND {claimid_col}=?""",
+            (proposal_id, user_id, claim_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def get_proposals_with_failed_prompts(user_id: int) -> list:
+    """Restart-safe recovery query: every proposal for this user whose
+    outcome-stage or helped-stage follow-up prompt either failed to deliver,
+    or is stuck in a timed-out RETRYING claim (a prior attempt crashed
+    between claiming and sending/marking) -- both are eligible for exactly
+    one idempotent retry via claim_prompt_send. STARTED/COMPLETED are the
+    ONLY states where that specific prompt is still meaningful to resend."""
+    cutoff = f"datetime('now', '-{_PROMPT_RETRY_CLAIM_TIMEOUT_SECONDS} seconds')"
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            f"SELECT {','.join(_PP_COLUMNS)} FROM core_practice_proposals "
+            "WHERE user_id=? AND ("
+            "  (status='STARTED' AND ("
+            "     outcome_prompt_status='FAILED'"
+            f"    OR (outcome_prompt_status='RETRYING' AND outcome_prompt_claimed_at < {cutoff})))"
+            "  OR (status='COMPLETED' AND ("
+            "     helped_prompt_status='FAILED'"
+            f"    OR (helped_prompt_status='RETRYING' AND helped_prompt_claimed_at < {cutoff})))"
+            ")",
+            (user_id,))).fetchall()
+        return [_pp_row_to_obj(r) for r in rows]
+
+
+async def supersede_active_practice_proposals(uid: int, reason: str) -> int:
+    """Hardening §4; PR #73 request-changes §3: invalidate every actionable
+    OR in-flight-delivery proposal for this user in one call -- used on
+    crisis, /start, a new Depression Disclosure flow, rollout-off, and any
+    other event that makes standing consent (or an in-progress delivery
+    claim) stale. GRANTED/DELIVERING are included, not just PROPOSED/
+    PENDING: a crisis beginning after consent was granted but before the
+    practice steps were actually sent must still stop that send.
+
+    PR #73 FINAL REQUEST CHANGES §1: the SAME call sites (topic change, new
+    disclosure, /start, conversation close, crisis) also invalidate any
+    still-ACTIVE reporting window -- but as a SEPARATE update that only
+    touches reporting_window_status, never `status`/`outcome`. This is what
+    makes a stale cc:outcome/cc:helped button on an already-STARTED or
+    -COMPLETED proposal non-actionable WITHOUT rewriting that proposal's
+    truthful historical status."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_practice_proposals SET status='SUPERSEDED', superseded_reason=?
+               WHERE user_id=? AND status IN ('PROPOSED','PENDING','GRANTED','DELIVERING')""",
+            (reason, uid))
+        await db.execute(
+            """UPDATE core_practice_proposals SET reporting_window_status='INVALIDATED'
+               WHERE user_id=? AND reporting_window_status='ACTIVE'""",
+            (uid,))
+        await db.commit()
+        return cur.rowcount
+
+
+async def transition_core_session_consent(session_id, user_id: int, *,
+                                          from_consent: str, to_consent: str) -> bool:
+    """Phase 3 hardening §4: atomic compare-and-set on `consent` (embedded in
+    state_json, not a top-level column). Reads the row, verifies consent==
+    from_consent AND lifecycle_status=='OPEN' in Python, then writes back
+    conditioned on state_json being EXACTLY the value just read (optimistic
+    concurrency) -- a second concurrent caller reading the same pre-write
+    state_json has its own conditional UPDATE match zero rows once the first
+    caller's write lands, because the JSON blob has changed underneath it.
+    This is what makes 'two concurrent yes taps deliver exactly once' a
+    database-enforced guarantee, not a lucky ordering of awaits. Returns
+    False uniformly for every failure reason (wrong owner, wrong consent
+    state, session not OPEN, or lost the race) -- callers treat all of these
+    identically: reject, no delivery, no state change."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            "SELECT id, state_json FROM core_sessions WHERE id=? AND user_id=?",
+            (session_id, user_id))).fetchone()
+        if row is None:
+            return False
+        state = _load_session(row[0], row[1])
+        if state.consent.value != from_consent or state.lifecycle_status is not _core.LifecycleStatus.OPEN:
+            return False
+        state.consent = _core.as_enum(_core.ConsentState, to_consent)
+        cur = await db.execute(
+            """UPDATE core_sessions SET state_json=?, updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND state_json=?""",
+            (_dump_session_json(state), session_id, user_id, row[1]))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def add_core_formulation(session_id: str, user_id: int,
+                                formulation: _core.Formulation) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_formulations (session_id, user_id, confirmation, formulation_json)
+               VALUES (?,?,?,?)""",
+            (session_id, user_id, formulation.confirmation.value,
+             json.dumps(formulation.to_dict())))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_core_formulations(session_id: str, user_id: int) -> list[_core.Formulation]:
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            """SELECT formulation_json FROM core_formulations
+               WHERE session_id=? AND user_id=? ORDER BY id""",
+            (session_id, user_id))).fetchall()
+    return [_core.Formulation.from_dict(json.loads(r[0])) for r in rows]
+
+
+async def add_core_intervention(session_id: str, user_id: int,
+                                 intervention: _core.Intervention) -> int:
+    """Raises sqlite3.IntegrityError if `intervention` starts ACCEPTED/STARTED
+    and the session already has another active intervention (SS15.6 -- enforced
+    by idx_core_one_active_intervention_per_session, not just by convention)."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_interventions
+               (session_id, user_id, method_id, capability_level, status, consent, intervention_json)
+               VALUES (?,?,?,?,?,?,?)""",
+            (session_id, user_id, intervention.method_id,
+             intervention.capability_level.value, intervention.status.value,
+             intervention.consent.value, json.dumps(intervention.to_dict())))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_core_intervention(intervention_id: str, user_id: int) -> _core.Intervention | None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT intervention_json FROM core_interventions WHERE id=? AND user_id=?",
+            (intervention_id, user_id))
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return _core.Intervention.from_dict(json.loads(row[0]))
+
+
+async def get_active_core_intervention(session_id: str, user_id: int) -> _core.Intervention | None:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """SELECT intervention_json FROM core_interventions
+               WHERE session_id=? AND user_id=? AND status IN ('ACCEPTED','STARTED')""",
+            (session_id, user_id))
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return _core.Intervention.from_dict(json.loads(row[0]))
+
+
+async def update_core_intervention(intervention_id: str, user_id: int,
+                                    intervention: _core.Intervention) -> bool:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_interventions SET status=?, consent=?, intervention_json=?,
+               updated_at=datetime('now') WHERE id=? AND user_id=?""",
+            (intervention.status.value, intervention.consent.value,
+             json.dumps(intervention.to_dict()), intervention_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def add_core_outcome(intervention_id: str, user_id: int,
+                            outcome: _core.OutcomeMeasurement) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_outcomes (intervention_id, user_id, metric_kind, outcome_json)
+               VALUES (?,?,?,?)""",
+            (intervention_id, user_id, outcome.metric_kind.value,
+             json.dumps(outcome.to_dict())))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_core_outcomes(intervention_id: str, user_id: int) -> list[_core.OutcomeMeasurement]:
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            """SELECT outcome_json FROM core_outcomes
+               WHERE intervention_id=? AND user_id=? ORDER BY id""",
+            (intervention_id, user_id))).fetchall()
+    return [_core.OutcomeMeasurement.from_dict(json.loads(r[0])) for r in rows]
+
+
+async def add_core_memory_item(user_id: int, item: _core.MemoryItem) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO core_memory_items (user_id, category, lifecycle, memory_json)
+               VALUES (?,?,?,?)""",
+            (user_id, item.category.value, item.lifecycle.value, json.dumps(item.to_dict())))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_core_memory_items(user_id: int, *, influencing_only: bool = False
+                                  ) -> list[_core.MemoryItem]:
+    """influencing_only=True returns only CONFIRMED/CORRECTED items (SS14.12 --
+    REJECTED/EXPIRED items must never influence a response)."""
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            "SELECT memory_json FROM core_memory_items WHERE user_id=? ORDER BY id",
+            (user_id,))).fetchall()
+    items = [_core.MemoryItem.from_dict(json.loads(r[0])) for r in rows]
+    if influencing_only:
+        items = [i for i in items if i.influences_responses]
+    return items
+
+
+async def update_core_memory_item_lifecycle(item_id: str, user_id: int,
+                                             lifecycle: _core.MemoryLifecycle) -> bool:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE core_memory_items SET lifecycle=?, updated_at=datetime('now')
+               WHERE id=? AND user_id=?""",
+            (lifecycle.value, item_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+# ── Depression Disclosure Gate (Phase 2) ────────────────────────────────────
+_DD_COLUMNS = ("id", "user_id", "status", "step", "diagnosis_source", "answers_json",
+              "lang", "origin_message_id", "prompt_message_id", "handoff_status",
+              "superseded_reason", "created_at", "updated_at", "expires_at", "completed_at")
+
+
+def _dd_row_to_dict(row) -> dict:
+    return dict(zip(_DD_COLUMNS, row))
+
+
+def safe_load_answers(raw: str | None) -> dict:
+    """Malformed/corrupted answers_json fails closed to an empty dict rather
+    than raising -- a hand-corrupted or truncated row must never crash a
+    callback handler (Phase 2 correction §10)."""
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+async def create_disclosure_flow(user_id: int, lang: str = "ru",
+                                 origin_message_id: int | None = None) -> dict:
+    """Raises sqlite3.IntegrityError if the user already has an ACTIVE flow
+    (idx_dd_one_active_flow_per_user) -- callers must supersede/close any
+    existing active flow first (see bot.py's gate) rather than relying on
+    this to fail; the index is defense-in-depth against a race, not the
+    primary control."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """INSERT INTO depression_disclosure_flows (user_id, lang, origin_message_id)
+               VALUES (?,?,?)""",
+            (user_id, lang, origin_message_id))
+        await db.commit()
+        row = await (await db.execute(
+            f"SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows WHERE id=?",
+            (cur.lastrowid,))).fetchone()
+    return _dd_row_to_dict(row)
+
+
+async def set_disclosure_prompt_message_id(flow_id, user_id: int, message_id: int) -> bool:
+    """Best-effort metadata write (the bot's own safety-prompt message id) --
+    never gates correctness, only enriches audit/debugging."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows SET prompt_message_id=?,
+               updated_at=datetime('now') WHERE id=? AND user_id=?""",
+            (message_id, flow_id, user_id))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def get_active_disclosure_flow(user_id: int) -> dict | None:
+    """Only a non-expired ACTIVE flow counts -- an expired one is treated as
+    absent here (lazy expiry, no background sweep needed for Phase 2)."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"""SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows
+               WHERE user_id=? AND status='active' AND expires_at > datetime('now')""",
+            (user_id,))).fetchone()
+    return _dd_row_to_dict(row) if row else None
+
+
+async def get_disclosure_flow(flow_id, user_id: int) -> dict | None:
+    """Ownership-checked read of a flow in ANY status/expiry state -- callers
+    use this (not get_active_disclosure_flow) to decide whether a callback
+    references an expired/superseded/already-completed flow and must be
+    rejected with a specific reason rather than silently ignored."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"""SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows
+               WHERE id=? AND user_id=?""",
+            (flow_id, user_id))).fetchone()
+    return _dd_row_to_dict(row) if row else None
+
+
+def disclosure_flow_is_live(flow: dict) -> bool:
+    """True only for a flow a callback may still legitimately act on: ACTIVE
+    status and not past its expiry. Checked in Python against the already-
+    fetched row (not a second query) so callers get one consistent snapshot."""
+    from datetime import datetime, timezone
+    if flow["status"] != "active":
+        return False
+    expires = datetime.fromisoformat(flow["expires_at"]).replace(tzinfo=timezone.utc)
+    return expires > datetime.now(timezone.utc)
+
+
+async def advance_disclosure_flow(flow_id, user_id: int, *, from_step: str, to_step: str,
+                                  diagnosis_source: str | None = None,
+                                  answers_json: str | None = None) -> bool:
+    """Atomic conditional UPDATE -- WHERE also requires step=from_step AND
+    status='active' AND not expired. A duplicate tap (step already advanced
+    past from_step), a stale tap (flow superseded/expired/completed), or a
+    wrong-user tap (no row at id+user_id) all match zero rows and return
+    False identically -- the caller never needs a separate branch per failure
+    reason. Also doubles as the §7 race guard: if log_crisis_event superseded
+    this flow between the caller's read and this call, status is no longer
+    'active' and this UPDATE is a deterministic no-op -- the caller must not
+    send the next question when this returns False."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows
+               SET step=?, diagnosis_source=COALESCE(?, diagnosis_source),
+                   answers_json=COALESCE(?, answers_json), updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND step=? AND status='active'
+                     AND expires_at > datetime('now')""",
+            (to_step, diagnosis_source, answers_json, flow_id, user_id, from_step))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def close_disclosure_flow(flow_id, user_id: int, *, from_step: str, status: str,
+                                answers_json: str | None = None,
+                                superseded_reason: str | None = None) -> bool:
+    """Same atomic from_step/status guard as advance_disclosure_flow -- used
+    for terminal transitions (completed / cancelled / superseded_by_crisis).
+    One statement: a terminal answer (the PURPOSE step) is recorded and the
+    flow closed in the same atomic UPDATE, never a separate advance-then-close
+    pair. status='completed' is the ONLY status that produces a HANDOFF_READY
+    step + handoff_status='ready' -- every other terminal status (cancelled/
+    superseded_by_crisis) leaves `step` exactly where the flow was interrupted,
+    which is more informative for audit than a generic 'DONE'."""
+    is_completed = status == "completed"
+    new_step = "HANDOFF_READY" if is_completed else from_step
+    handoff_status = "ready" if is_completed else None
+    completed_at_expr = "datetime('now')" if is_completed else "completed_at"
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"""UPDATE depression_disclosure_flows
+               SET status=?, step=?, handoff_status=COALESCE(?, handoff_status),
+                   superseded_reason=COALESCE(?, superseded_reason),
+                   answers_json=COALESCE(?, answers_json),
+                   completed_at={completed_at_expr}, updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND step=? AND status='active'""",
+            (status, new_step, handoff_status, superseded_reason, answers_json,
+             flow_id, user_id, from_step))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def claim_disclosure_handoff(flow_id, user_id: int) -> dict | None:
+    """The Conversation Controller's (Phase 3) consumption point. Atomically
+    transitions handoff_status 'ready' -> 'claimed'; a repeated claim finds
+    handoff_status already 'claimed' and matches zero rows, so it fails
+    deterministically (returns None) rather than silently succeeding twice or
+    raising -- this is what makes it safe to call from a turn that might be
+    reprocessed (e.g. after a restart) without ever creating two controller
+    sessions from the same handoff. Ownership-checked like every other
+    accessor here -- a wrong user_id also matches zero rows."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            """UPDATE depression_disclosure_flows SET handoff_status='claimed',
+               updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND status='completed' AND handoff_status='ready'""",
+            (flow_id, user_id))
+        await db.commit()
+        if cur.rowcount == 0:
+            return None
+        row = await (await db.execute(
+            f"SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows WHERE id=?",
+            (flow_id,))).fetchone()
+    return _dd_row_to_dict(row)
+
+
+async def get_unclaimed_handoff(user_id: int) -> dict | None:
+    """The most recent completed, not-yet-claimed disclosure flow for this
+    user (status='completed' AND handoff_status='ready') -- used by the
+    Conversation Controller to find a handoff to claim without already
+    knowing its flow_id. At most one such row can realistically exist at a
+    time (only one flow is ever 'active' -> 'completed' per user before the
+    next one either supersedes it or is itself claimed), but ORDER BY id DESC
+    LIMIT 1 is still explicit about which one wins if history ever contains
+    more than one for any reason."""
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            f"""SELECT {','.join(_DD_COLUMNS)} FROM depression_disclosure_flows
+               WHERE user_id=? AND status='completed' AND handoff_status='ready'
+               ORDER BY id DESC LIMIT 1""",
+            (user_id,))).fetchone()
+    return _dd_row_to_dict(row) if row else None

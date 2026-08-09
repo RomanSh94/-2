@@ -92,7 +92,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "ensure_full_access_or_closed_test", _async(True))
     monkeypatch.setattr(bot, "_onboarding_blocks_ordinary_entry", _async(False))
     monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(None))
     monkeypatch.setattr(bot.bot, "send_chat_action", _async(None))
 
     edit_calls = []
@@ -276,10 +276,16 @@ def test_ineligible_turn_gets_no_claim(env, monkeypatch):
 
 
 # ── 5: forced dependency answer — exactly one reply, no claim, no LLM call ────
+# Post-merge (origin/main dependency semantics, Architecture Decision 3): a
+# dependency answer returns immediately from pipeline() with a single
+# message.answer(dep_msg) -- no router-decision logging, no message
+# persistence, no first-turn claim. This replaces the feature branch's old
+# forced_primary_answer bookkeeping path, which main's dependency_monitor
+# (record_message/assess) does not have.
 
 def test_forced_dependency_answer_single_reply_no_claim_no_llm_call(env, monkeypatch):
     dep_text = "Похоже, ты общаешься очень часто. Помни, что я не замена живому человеку."
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(dep_text))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(dep_text))
     calls = _set_llm(monkeypatch, content="should never be used")
     msg = FakeMessage(FakeUser(OWNER), ELIGIBLE_TEXT)
     _run(msg)
@@ -288,8 +294,8 @@ def test_forced_dependency_answer_single_reply_no_claim_no_llm_call(env, monkeyp
     assert len(msg.answers) == 1
     assert msg.answers[0][0] == dep_text
     assert _row("SELECT COUNT(*) FROM first_turn_claims WHERE user_id=?", (OWNER,))[0] == 0
-    assert _row("SELECT COUNT(*) FROM router_decision_logs WHERE user_id=?", (OWNER,))[0] == 1
-    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=?", (OWNER,))[0] == 2
+    assert _row("SELECT COUNT(*) FROM router_decision_logs WHERE user_id=?", (OWNER,))[0] == 0
+    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=?", (OWNER,))[0] == 0
 
 
 # ── 12: new ordinary text bumps revision and invalidates an older binding ─────
@@ -2341,106 +2347,8 @@ def test_race_revision_moves_between_capture_and_publish_no_buttons(env, monkeyp
                (OWNER,))[0] == "delivered_without_buttons"
 
 
-# ── B: forced-dependency send/save ordering and the truthy contract ───────────
-
-def test_forced_dependency_success_one_user_one_assistant_one_send(env, monkeypatch):
-    dep_text = "Похоже, ты общаешься очень часто. Помни, что я не замена живому человеку."
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(dep_text))
-    msg = FakeMessage(FakeUser(OWNER), ELIGIBLE_TEXT)
-    _run(msg)
-
-    assert msg.send_attempts == 1
-    assert len(msg.answers) == 1
-    assert msg.answers[0][0] == dep_text
-    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=? AND role='user'", (OWNER,))[0] == 1
-    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=? AND role='assistant'",
-               (OWNER,))[0] == 1
-
-
-def test_forced_dependency_send_failure_no_assistant_row_one_attempt(env, monkeypatch):
-    dep_text = "Похоже, ты общаешься очень часто. Помни, что я не замена живому человеку."
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(dep_text))
-    msg = FakeMessage(FakeUser(OWNER), ELIGIBLE_TEXT)
-    msg.fail_answer = True
-    _run(msg)
-
-    assert msg.send_attempts == 1   # no retry after the failed send
-    assert len(msg.answers) == 0
-    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=? AND role='user'", (OWNER,))[0] == 1
-    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=? AND role='assistant'",
-               (OWNER,))[0] == 0
-
-
-def test_forced_dependency_send_success_assistant_save_failure_no_raise_no_resend(
-        env, monkeypatch, capsys):
-    dep_text = "Похоже, ты общаешься очень часто. Помни, что я не замена живому человеку."
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(dep_text))
-
-    real_save_message = bot.save_message
-
-    async def flaky_save_message(uid, role, content, *a, **kw):
-        if role == "assistant":
-            raise RuntimeError("disk full: secret-token-xyz")
-        return await real_save_message(uid, role, content, *a, **kw)
-    monkeypatch.setattr(bot, "save_message", flaky_save_message)
-
-    msg = FakeMessage(FakeUser(OWNER), ELIGIBLE_TEXT)
-    _run(msg)   # must not raise -- pipeline() returns cleanly
-
-    assert msg.send_attempts == 1   # delivery already confirmed before the save failed
-    assert len(msg.answers) == 1
-    assert msg.answers[0][0] == dep_text
-    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=? AND role='user'", (OWNER,))[0] == 1
-    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=? AND role='assistant'",
-               (OWNER,))[0] == 0
-
-    out = capsys.readouterr().out
-    assert "event=dependency_assistant_save_failed" in out
-    assert f"uid={OWNER}" in out
-    assert "exc_type=RuntimeError" in out
-    # redacted: no dependency reply text, no user text, no raw exception message
-    assert dep_text not in out
-    assert ELIGIBLE_TEXT not in out
-    assert "disk full" not in out
-    assert "secret-token-xyz" not in out
-
-
-def test_forced_dependency_user_save_failure_no_send_no_raise(env, monkeypatch, capsys):
-    dep_text = "Похоже, ты общаешься очень часто. Помни, что я не замена живому человеку."
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(dep_text))
-    calls = _set_llm(monkeypatch, content="should never be used")
-
-    save_attempts = {"user": 0, "assistant": 0}
-
-    async def flaky_save_message(uid, role, content, *a, **kw):
-        save_attempts[role] = save_attempts.get(role, 0) + 1
-        if role == "user":
-            raise RuntimeError("disk full: secret-token-xyz")
-        return 1
-    monkeypatch.setattr(bot, "save_message", flaky_save_message)
-
-    msg = FakeMessage(FakeUser(OWNER), ELIGIBLE_TEXT)
-    _run(msg)   # must not raise -- pipeline() returns cleanly
-
-    assert save_attempts["user"] == 1     # attempted exactly once
-    assert save_attempts["assistant"] == 0   # never reached
-    assert msg.send_attempts == 0         # no Telegram send attempted
-    assert len(calls) == 0                # no LLM call
-    assert _row("SELECT COUNT(*) FROM first_turn_claims WHERE user_id=?", (OWNER,))[0] == 0
-
-    out = capsys.readouterr().out
-    assert "event=dependency_user_save_failed" in out
-    assert f"uid={OWNER}" in out
-    assert "exc_type=RuntimeError" in out
-    # redacted: no user input, no dependency reply, no raw exception message
-    assert ELIGIBLE_TEXT not in out
-    assert dep_text not in out
-    assert "disk full" not in out
-    assert "secret-token-xyz" not in out
-
-
 def test_empty_string_dependency_result_follows_ordinary_first_turn_path(env, monkeypatch):
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(""))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(""))
     calls = _set_llm(monkeypatch, content=sv.get_first_turn_fallback("ru"))
     msg = FakeMessage(FakeUser(OWNER), ELIGIBLE_TEXT)
     _run(msg)
@@ -2751,3 +2659,231 @@ def test_legacy_hardreply_actions_schema_valid_but_not_in_runtime_allowlist(env)
 def test_no_test_touches_repository_root_db(env):
     assert database.DB != "x20.db"
     assert "x20.db" not in database.DB
+
+
+# ── Merge integration: first-turn vs Conversation Controller precedence,
+#    reaction skip/preserve, dependency non-consumption, and single-user-turn
+#    context, per the explicit merge architecture decisions. Controller's own
+#    internal claim logic (classify_intent/sessions/handoffs) is exercised by
+#    tests/test_conversation_controller.py -- these tests isolate pipeline()'s
+#    OWN orchestration/precedence contract by stubbing _controller_claim_turn/
+#    _controller_generate_and_deliver directly. ────────────────────────────────
+
+def _controller_spy(monkeypatch, claim_result):
+    """Stubs the Controller's fast claim + slow generate/deliver halves so
+    these tests exercise only pipeline()'s precedence/gating logic, not
+    conversation_controller.py's own intent/session internals."""
+    claim_calls = []
+    deliver_calls = []
+
+    async def fake_claim_turn(uid, user_text, lang, risk):
+        claim_calls.append((uid, user_text, lang))
+        return claim_result
+
+    async def fake_generate_and_deliver(message, uid, claim, turn_gen, risk):
+        deliver_calls.append((uid, claim))
+        await message.answer("controller-owned-reply")
+
+    monkeypatch.setattr(bot, "_controller_claim_turn", fake_claim_turn)
+    monkeypatch.setattr(bot, "_controller_generate_and_deliver", fake_generate_and_deliver)
+    return claim_calls, deliver_calls
+
+
+def test_eligible_first_turn_wins_over_controller_claim(env, monkeypatch):
+    """Architecture decision 1: a successfully claimed first-turn owns the
+    turn outright -- the Controller claim must never even be attempted."""
+    monkeypatch.setattr(bot.access_control, "core_rollout_allowed", _async(True))
+    claim_calls, deliver_calls = _controller_spy(monkeypatch, {"sentinel": "would-have-claimed"})
+    _set_llm(monkeypatch, content=sv.get_first_turn_fallback("ru"))
+
+    msg = FakeMessage(FakeUser(OWNER), ELIGIBLE_TEXT)
+    _run(msg)
+
+    assert len(claim_calls) == 0    # Controller claim never attempted
+    assert len(deliver_calls) == 0  # Controller delivery never invoked
+    assert msg.answers[0][0] == sv.get_first_turn_fallback("ru")
+    assert _row("SELECT status FROM first_turn_claims WHERE user_id=?",
+               (OWNER,))[0] == "delivered"
+
+
+def test_controller_claims_turn_after_first_turn_already_consumed(env, monkeypatch):
+    """Architecture decision 1: once claim_first_turn has already been
+    consumed by an earlier turn, the (now guaranteed-to-fail) claim attempt
+    must not interfere with Controller routing on a later turn."""
+    _set_llm(monkeypatch, content=sv.get_first_turn_fallback("ru"))
+    user = FakeUser(OWNER)
+    first_msg = FakeMessage(user, ELIGIBLE_TEXT)
+    _run(first_msg)   # consumes the one-time first-turn claim
+    assert _row("SELECT COUNT(*) FROM first_turn_claims WHERE user_id=?", (OWNER,))[0] == 1
+
+    monkeypatch.setattr(bot.access_control, "core_rollout_allowed", _async(True))
+    claim_calls, deliver_calls = _controller_spy(monkeypatch, {"sentinel": "controller-owns-this"})
+
+    second_msg = FakeMessage(user, ELIGIBLE_TEXT)
+    _run(second_msg)
+
+    assert len(claim_calls) == 1     # Controller claim WAS attempted this time
+    assert len(deliver_calls) == 1   # and its delivery WAS invoked
+    assert second_msg.answers[0][0] == "controller-owned-reply"
+    # still exactly one claim row -- the second attempt failed the PK conflict
+    # and was never allowed to interfere with Controller ownership.
+    assert _row("SELECT COUNT(*) FROM first_turn_claims WHERE user_id=?", (OWNER,))[0] == 1
+
+
+def test_first_turn_claimed_turn_sends_no_reaction(env, monkeypatch):
+    """Architecture decision 2: ft_claimed skips _maybe_react entirely,
+    matching the Controller's own existing reaction bypass."""
+    react_calls = []
+
+    async def fake_maybe_react(message, uid, cat, conf):
+        react_calls.append((uid, cat, conf))
+    monkeypatch.setattr(bot, "_maybe_react", fake_maybe_react)
+    _set_llm(monkeypatch, content=sv.get_first_turn_fallback("ru"))
+
+    msg = FakeMessage(FakeUser(OWNER), ELIGIBLE_TEXT)
+    _run(msg)
+
+    assert _row("SELECT status FROM first_turn_claims WHERE user_id=?",
+               (OWNER,))[0] == "delivered"
+    assert len(react_calls) == 0
+
+
+def test_ordinary_non_first_turn_path_still_calls_reaction(env, monkeypatch):
+    """Architecture decision 2: only the ft_claimed/Controller-owned paths
+    skip reaction -- the plain ordinary LLM path must still call
+    _maybe_react exactly like origin/main did before this merge."""
+    react_calls = []
+
+    async def fake_maybe_react(message, uid, cat, conf):
+        react_calls.append((uid, cat, conf))
+    monkeypatch.setattr(bot, "_maybe_react", fake_maybe_react)
+    _set_llm(monkeypatch, content="Расскажи, что произошло? Что было самым тяжёлым?")
+
+    # INELIGIBLE_TEXT routes to ACUTE_DISTRESS/stabilization -- excluded from
+    # first-turn eligibility by construction, so this always reaches the
+    # plain ordinary LLM path on a fresh user.
+    msg = FakeMessage(FakeUser(OWNER), INELIGIBLE_TEXT)
+    _run(msg)
+
+    assert len(react_calls) == 1
+
+
+def test_dependency_deflection_preserves_first_turn_claim_for_a_later_turn(env, monkeypatch):
+    """Architecture decision 3: a dependency-deflected turn must not consume
+    claim_first_turn -- extends the existing single-turn proof
+    (test_forced_dependency_answer_single_reply_no_claim_no_llm_call) by
+    showing the SAME user's next ordinary turn can still successfully claim
+    it, i.e. the opportunity was genuinely preserved, not merely untouched
+    on that one turn."""
+    dep_text = "Похоже, ты общаешься очень часто. Помни, что я не замена живому человеку."
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(dep_text))
+    user = FakeUser(OWNER)
+    first_msg = FakeMessage(user, ELIGIBLE_TEXT)
+    _run(first_msg)
+    assert _row("SELECT COUNT(*) FROM first_turn_claims WHERE user_id=?", (OWNER,))[0] == 0
+
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(None))
+    _set_llm(monkeypatch, content=sv.get_first_turn_fallback("ru"))
+    second_msg = FakeMessage(user, ELIGIBLE_TEXT)
+    _run(second_msg)
+
+    assert second_msg.answers[0][0] == sv.get_first_turn_fallback("ru")
+    assert _row("SELECT status FROM first_turn_claims WHERE user_id=?",
+               (OWNER,))[0] == "delivered"
+
+
+def test_first_turn_llm_context_contains_current_user_turn_exactly_once(env, monkeypatch):
+    """Architecture decision 4: the user message is persisted before
+    build_context() inside the ingestion lock, and no explicit
+    messages.append(user_text) remains -- the current turn must appear in
+    the first-turn LLM call's messages exactly once."""
+    calls = _set_llm(monkeypatch, content=sv.get_first_turn_fallback("ru"))
+    msg = FakeMessage(FakeUser(OWNER), ELIGIBLE_TEXT)
+    _run(msg)
+
+    assert len(calls) == 1
+    occurrences = sum(1 for m in calls[0]["messages"] if m.get("content") == ELIGIBLE_TEXT)
+    assert occurrences == 1
+
+
+def test_ordinary_llm_context_contains_current_user_turn_exactly_once(env, monkeypatch):
+    """Architecture decision 4: same invariant as above, for the plain
+    ordinary (non-first-turn, non-Controller) LLM path."""
+    calls = _set_llm(monkeypatch, content="Расскажи, что произошло? Что было самым тяжёлым?")
+    msg = FakeMessage(FakeUser(OWNER), INELIGIBLE_TEXT)
+    _run(msg)
+
+    assert len(calls) == 1
+    occurrences = sum(1 for m in calls[0]["messages"] if m.get("content") == INELIGIBLE_TEXT)
+    assert occurrences == 1
+
+
+def test_bot_module_does_not_reimport_bare_resolve_crisis(env):
+    """Architecture decision 5: the merged owner-scoped cb_crisis uses
+    crisis_event_owner/CRISIS_RESPONSE_* exclusively (already exercised
+    end-to-end by the existing bot.cb_crisis tests in this file and in
+    tests/test_crisis_db_resilience.py) -- this locks in, at the import
+    level, that the old bare resolve_crisis(event_id) ownership bypass is
+    not reintroduced: bot.py does not import that name at all."""
+    assert not hasattr(bot, "resolve_crisis")
+
+
+def _gated_llm_first_turn_race(monkeypatch, *, first_content, rest_content):
+    """Same technique as tests/test_stale_response_race.py's _gated_llm: the
+    FIRST completion blocks on an Event (the slow, first-turn-claiming turn);
+    every later completion returns immediately (the fast, ordinary turn)."""
+    gate = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fake_create(*a, **kw):
+        idx = calls["n"]
+        calls["n"] += 1
+        if idx == 0:
+            await gate.wait()
+        content = first_content if idx == 0 else rest_content
+        msg_obj = types.SimpleNamespace(content=content)
+        choice = types.SimpleNamespace(message=msg_obj)
+        return types.SimpleNamespace(choices=[choice])
+    monkeypatch.setattr(bot.client.chat.completions, "create", fake_create)
+    return gate
+
+
+def test_slow_first_turn_A_then_fast_ordinary_B_suppresses_stale_first_turn_delivery(
+        env, monkeypatch):
+    """Production-gap regression: a genuinely first-turn-eligible turn A
+    claims the one-time first-turn contract and blocks in generation. Before
+    it resumes, a newer turn B for the SAME user completes and delivers
+    through the ordinary path (B's own claim_first_turn attempt fails the
+    PRIMARY KEY conflict, since A already claimed -- ft_claimed=False for B,
+    matching the documented one-time claim contract). When A is finally
+    released, its now-stale first-turn response must be suppressed exactly
+    like an ordinary stale turn already is (tests/test_stale_response_race.py)
+    -- neither delivered to the user nor persisted as an assistant row.
+
+    This test does NOT pre-consume the first-turn claim -- it exercises the
+    real ft_claimed delivery path end-to-end."""
+    gate = _gated_llm_first_turn_race(
+        monkeypatch,
+        first_content=sv.get_first_turn_fallback("ru"),
+        rest_content="Расскажи, что произошло? Что было самым тяжёлым?")
+    user = FakeUser(OWNER)
+    mA = FakeMessage(user, ELIGIBLE_TEXT)
+    mB = FakeMessage(user, ELIGIBLE_TEXT)
+
+    async def scenario():
+        tA = asyncio.create_task(bot.pipeline(mA, ELIGIBLE_TEXT, None, tg_user=user))
+        await asyncio.sleep(0.02)              # A claims first-turn, blocks in the LLM call
+        tB = asyncio.create_task(bot.pipeline(mB, ELIGIBLE_TEXT, None, tg_user=user))
+        await tB                                # B's own claim fails (A already claimed); ordinary path delivers
+        gate.set()                              # release the stale A
+        await tA
+    asyncio.run(scenario())
+
+    assert mB.answers[0][0] == "Расскажи, что произошло? Что было самым тяжёлым?"
+    assert mA.answers == []                                          # stale first-turn turn suppressed
+    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=? AND role='user'",
+               (OWNER,))[0] == 2                                     # both turns' user rows saved
+    assert _row("SELECT COUNT(*) FROM messages WHERE user_id=? AND role='assistant'",
+               (OWNER,))[0] == 1                                     # only B's assistant row persisted
+    assert _row("SELECT status FROM first_turn_claims WHERE user_id=?",
+               (OWNER,))[0] != "delivered"      # A's stale claim never reached the delivered state

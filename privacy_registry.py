@@ -185,6 +185,14 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
         retention_policy="Until user-requested delete-all.",
         log_policy="No raw field in logs/alerts."),
 
+    "user_response_preferences": _e(
+        table="user_response_preferences", user_id_column="user_id", category="ENGAGEMENT",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="No raw field in logs/alerts. Only the three closed-set "
+                    "values (response_format/response_length/voice_language) -- "
+                    "never a raw format-command message or an inferred trait."),
+
     # ── Crisis safety/audit records — retained, NOT silently deleted ────────────
     "crisis_events": _e(
         table="crisis_events", user_id_column="user_id", category="CRISIS_SAFETY",
@@ -349,6 +357,78 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
                   "content; `reply_error_code` is a bounded internal code, never a "
                   "raw exception message — neither is ever emitted in logs/alerts "
                   "beyond internal DB read."),
+
+    # Therapeutic Core Foundation (Phase 1, master prompt SS15) — same
+    # PSYCH_PROFILE treatment as user_psychology_profile/psychology_profile_history:
+    # structured therapeutic working state, not a safety-audit record, so it does
+    # NOT get CRISIS_SAFETY RETAIN treatment. Ships inert (flag off, nothing in
+    # bot.pipeline() reads/writes these tables yet) but is registered from its
+    # first commit, same discipline as influence_trace above.
+    "core_sessions": _e(
+        table="core_sessions", user_id_column="user_id", category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`state_json` is structured session state (phase/intent/goal), "
+                  "not raw message text — still never in logs/alerts."),
+
+    "core_formulations": _e(
+        table="core_formulations", user_id_column="user_id", category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`formulation_json` is a user-confirmable working hypothesis — "
+                  "never in logs/alerts."),
+
+    "core_interventions": _e(
+        table="core_interventions", user_id_column="user_id", category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`intervention_json` is method/consent/status metadata only — "
+                  "never in logs/alerts."),
+
+    "core_outcomes": _e(
+        table="core_outcomes", user_id_column="user_id", category="RESEARCH_LOG",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="Scores/metadata only — same treatment as intervention_results."),
+
+    "core_memory_items": _e(
+        table="core_memory_items", user_id_column="user_id", category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`memory_json` is confirmable psychological memory content — "
+                  "never in logs/alerts. REJECTED/EXPIRED rows are exported like "
+                  "any other row (export is not filtered by lifecycle) but must "
+                  "never be read back into a live response (see "
+                  "MemoryLifecycle.influences_responses in therapeutic_domain.py)."),
+
+    # PRACTICE proposal entity (Phase 3 hardening SS3). Same PSYCH_PROFILE
+    # treatment as core_sessions -- a proposal is structured consent-flow
+    # state (which practice, purpose, duration, status), not raw message
+    # text or a safety-audit record.
+    "core_practice_proposals": _e(
+        table="core_practice_proposals", user_id_column="user_id",
+        category="PSYCH_PROFILE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`purpose`/`expected_duration` are short catalog strings "
+                  "describing the proposed practice, never raw user text — "
+                  "never in logs/alerts."),
+
+    # Depression Disclosure Gate (Phase 2, master prompt SS13). CRISIS_SAFETY
+    # category (like crisis_events) because a flow record proves the safety
+    # question was asked and answered -- but CASCADE_DELETE, not RETAIN: unlike
+    # crisis_events this is a routing/assessment record, not the audit trail of
+    # an actual crisis response being delivered, so a delete-all request removes
+    # it in full.
+    "depression_disclosure_flows": _e(
+        table="depression_disclosure_flows", user_id_column="user_id",
+        category="CRISIS_SAFETY",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`answers_json` holds only the closed-set button values from "
+                  "DURATION_OPTIONS/FUNCTIONING_OPTIONS/SUPPORT_OPTIONS/"
+                  "PURPOSE_OPTIONS (depression_disclosure.py) -- never raw user "
+                  "text; never in logs/alerts."),
 }
 
 

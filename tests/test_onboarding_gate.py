@@ -303,10 +303,9 @@ def test_text_reaches_ordinary_pipeline_after_onboarding_completed(monkeypatch, 
     monkeypatch.setattr(bot, "get_emotional_trajectory", _async(types.SimpleNamespace(
         trend="stable", hopelessness_streak=0, yellow_plus_streak=0, messages_analyzed=0)))
     monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
-    monkeypatch.setattr(bot.dependency_monitor, "check_dependency", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(None))
     monkeypatch.setattr(bot, "load_state", _async(None))
     monkeypatch.setattr(bot, "save_state", _async(None))
-    monkeypatch.setattr(bot, "monitor_relationship", lambda *a, **kw: None)
     monkeypatch.setattr(bot, "log_router_decision", _async(None))
     monkeypatch.setattr(bot, "maybe_summarize", _async(None))
     monkeypatch.setattr(bot, "build_context", _async(("", [])))

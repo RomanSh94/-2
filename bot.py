@@ -8,10 +8,14 @@ X20 Bot — Основной файл
 """
 import asyncio
 import hmac
+import json
 import logging
+import os
 import pathlib
+import re
 import secrets
 import sys
+import time
 
 # Windows consoles default to a legacy codepage (e.g. cp1251) that cannot encode
 # the emoji used in our log/print statements, which crashes startup with
@@ -24,8 +28,12 @@ for _stream in (sys.stdout, sys.stderr):
 
 from html import escape as _he
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, FSInputFile, ReactionTypeEmoji,
+)
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from collections import OrderedDict
 from aiogram.filters import Command
 from aiogram.exceptions import (
     TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter,
@@ -79,8 +87,7 @@ from state_engine import (
 from psychology_profile import maybe_update_profile, format_profile_for_user
 from readiness_engine import assess_readiness
 from cognitive_capacity import get_capacity
-from relationship_monitor import monitor_relationship
-from practice_registry import select_practice, get_practice_by_id
+from practice_registry import select_practice, get_production_practice_by_id
 from safety_validator import (
     validate_response,
     validate_response_with_context, select_fallback,
@@ -98,6 +105,9 @@ from scheduler import setup_scheduler
 from dashboard import start_dashboard
 from ab_testing import get_variant
 from dependency_monitor import DependencyMonitor
+from format_commands import parse_format_command, is_pure_format_command
+from reaction_selector import ReactionCategory, select_reaction_category, pick_supported_emoji
+from tts import synthesize_speech, TTSError
 from database import (
     init_db, upsert_user, save_message, load_state, save_state,
     log_moderation, log_validator_block, log_router_decision,
@@ -140,6 +150,34 @@ from database import (
     finalize_callback_reply, mark_event_besteffort, normalized_action_text,
     get_last_user_message_before, count_quiet_events,
     SEND_EXCEPTION, SAVE_EXCEPTION, FINALIZE_EXCEPTION,
+    get_response_preferences, set_response_preference,
+    create_disclosure_flow, get_active_disclosure_flow, get_disclosure_flow,
+    advance_disclosure_flow, close_disclosure_flow, disclosure_flow_is_live,
+    claim_disclosure_handoff, safe_load_answers, set_disclosure_prompt_message_id,
+    supersede_active_disclosure_flows_for_crisis,
+)
+from depression_disclosure import (
+    classify_disclosure, safety_check_text, diagnosis_source_text, duration_text,
+    functioning_text, basic_activities_text, support_text, purpose_text, closing_text,
+    DURATION_OPTIONS, FUNCTIONING_OPTIONS, BASIC_ACTIVITIES_OPTIONS, SUPPORT_OPTIONS,
+    PURPOSE_OPTIONS, DIAGNOSIS_SOURCE_OPTIONS, SAFETY_CHECK_OPTIONS,
+    STEP_ALLOWED_VALUES, STEP_TAG_TO_DB_STEP, STEP_ANSWER_KEY,
+)
+from database import (
+    create_core_session, get_core_session, list_core_sessions, update_core_session,
+    claim_handoff_and_get_or_create_session, supersede_active_core_sessions_for_crisis,
+    update_core_session_authoritative,
+    session_json_snapshot, create_practice_proposal, get_practice_proposal,
+    transition_practice_proposal, mark_proposal_delivered,
+    supersede_active_practice_proposals, record_practice_outcome,
+    get_latest_outcome_for_practice,
+    mark_prompt_delivered, mark_prompt_failed,
+    get_proposals_with_failed_prompts, claim_prompt_send,
+)
+import conversation_controller as controller
+from therapeutic_domain import (
+    Intent, RepairConstraint, LifecycleStatus, ConsentState, PracticeProposalStatus,
+    PracticeOutcome, UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL,
 )
 import onboarding
 import onboarding_content
@@ -207,6 +245,21 @@ def score_kb(prefix: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=str(i), callback_data=f"{prefix}:{i}") for i in range(1, 6)],
         [InlineKeyboardButton(text=str(i), callback_data=f"{prefix}:{i}") for i in range(6, 11)],
     ])
+
+
+def before_score_kb(practice_id: str, scenario: str, lang: str) -> InlineKeyboardMarkup:
+    """Same 1-10 buttons as score_kb, plus an explicit "skip rating" action
+    when Therapeutic Core Foundation is enabled -- lets the user proceed
+    straight to the practice content without fabricating a baseline (see
+    cb_before_skip). Flag OFF reproduces score_kb's exact prior keyboard,
+    byte-for-byte -- no user-visible change."""
+    base = score_kb(f"before:{practice_id}:{scenario}:{lang}")
+    if not config.THERAPEUTIC_CORE_FOUNDATION_ENABLED:
+        return base
+    rows = list(base.inline_keyboard) + [[InlineKeyboardButton(
+        text=("Пропустить оценку" if lang == "ru" else "Skip rating"),
+        callback_data=f"before_skip:{practice_id}:{scenario}:{lang}")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def quality_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -450,6 +503,401 @@ async def _deliver_first_turn_response(message, uid: int, answer: str, buttons_a
         await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
                                           "reply_delivered", "delivered_without_buttons")
 
+# ── Depression Disclosure Gate (Phase 2) ────────────────────────────────────
+# callback_data namespace "dd:<step>:<flow_id>:<value>" -- flow_id alone is
+# NEVER treated as proof of ownership; every handler re-fetches the row by
+# (flow_id, callback.from_user.id) and lets the DB's ownership/step/status/
+# expiry filter (database.advance_disclosure_flow's WHERE clause) be the
+# actual authority, exactly like the rest of this file's callback handlers.
+
+def _dd_options_kb(step: str, flow_id, options, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"dd:{step}:{flow_id}:{val}")]
+        for val, ru, en in options])
+
+
+def _dd_safety_check_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    # Single row (not one-per-row like the other steps) -- exact approved
+    # copy/order lives ONLY in depression_disclosure.SAFETY_CHECK_OPTIONS.
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=(ru if lang != "en" else en),
+                             callback_data=f"dd:safety:{flow_id}:{val}")
+        for val, ru, en in SAFETY_CHECK_OPTIONS]])
+
+
+def _dd_diagnosis_source_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("src", flow_id, DIAGNOSIS_SOURCE_OPTIONS, lang)
+
+
+def _dd_duration_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("dur", flow_id, DURATION_OPTIONS, lang)
+
+
+def _dd_functioning_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("func", flow_id, FUNCTIONING_OPTIONS, lang)
+
+
+def _dd_basic_activities_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("basic", flow_id, BASIC_ACTIVITIES_OPTIONS, lang)
+
+
+def _dd_support_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("supp", flow_id, SUPPORT_OPTIONS, lang)
+
+
+def _dd_purpose_kb(flow_id, lang: str) -> InlineKeyboardMarkup:
+    return _dd_options_kb("purp", flow_id, PURPOSE_OPTIONS, lang)
+
+
+async def _dd_reject_stale_callback(callback: CallbackQuery, lang: str) -> None:
+    await callback.answer(
+        "Этот вопрос уже неактуален." if lang != "en" else "This question is no longer active.",
+        show_alert=False)
+
+
+async def _dd_validate_callback(callback: CallbackQuery, expected_step: str):
+    """The full 7-point validation chain (Phase 2 correction §1): parse exact
+    namespace/step tag -> validate step tag -> validate ownership -> validate
+    current DB step -> validate status+expiry -> validate value against the
+    step's closed allowlist -> [caller performs the atomic transition]. Any
+    failure answers the callback (no state change, no next question) and
+    returns None -- ownership failures, duplicate/stale/expired/superseded
+    taps, and unsupported values are ALL rejected the same safe way, never
+    coerced into a different meaning (e.g. an unknown SAFETY_CHECK value is
+    never treated as "no").
+
+    Crisis supersession is NOT re-checked here separately: trigger_crisis
+    (the one canonical crisis-entry point) supersedes every active flow for
+    the user UNCONDITIONALLY, before it even attempts audit logging (Phase 2
+    correction §2 -- logging must never be the sole mechanism enforcing this
+    invariant), so a flow's own `status` is already truthful the instant ANY
+    crisis route runs -- disclosure_flow_is_live() below already returns
+    False for it. Duplicating a second get_active_crisis() lookup here would
+    be exactly the kind of per-handler duplication the correction asked NOT
+    to have."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4 or parts[0] != "dd":
+        await callback.answer()
+        return None
+    _, tag, flow_id, value = parts
+    if STEP_TAG_TO_DB_STEP.get(tag) != expected_step:
+        await callback.answer()
+        return None
+    flow = await get_disclosure_flow(flow_id, uid)
+    if flow is None:
+        await callback.answer()
+        return None
+    lang = flow["lang"]
+    if not await access_control.depression_disclosure_allowed_for(uid):
+        await _dd_reject_stale_callback(callback, lang)
+        return None
+    if flow["step"] != expected_step or not disclosure_flow_is_live(flow):
+        await _dd_reject_stale_callback(callback, lang)
+        return None
+    if value not in STEP_ALLOWED_VALUES[expected_step]:
+        await _dd_reject_stale_callback(callback, lang)
+        return None
+    return flow, value
+
+# ── Voice and Adaptive Response UX ──────────────────────────────────────────
+# Everything below is inert while VOICE_REPLIES_ENABLED / EMOTIONAL_REACTIONS_
+# ENABLED are false (the default). deliver_response is the ONE shared point
+# where a final, Safety-Validator-approved ordinary response is actually
+# delivered -- text, voice, or voice+concise-text -- reused by the listen
+# button and the "much text/lazy to read" meta-command path below.
+#
+# Owner-only canary gate: both flags remain global rollout switches (default
+# false), but even once true, the two helpers below additionally require an
+# exact match against the EXISTING access_control.OWNER_USER_ID (a single
+# immutable Telegram numeric id, already fail-closed to None on a missing/
+# invalid environment value -- see access_control.py). No new allowlist, no
+# new role system, no new DB table: reuses the same mechanism this codebase
+# already trusts elsewhere (e.g. dass21_access.authorize_dass21_user). If
+# OWNER_USER_ID is unset/invalid, these always return False for everyone,
+# including whoever happens to hold that uid in a misconfigured deployment.
+
+_FMT_KB_VERSION = "fmt1"
+_LISTEN_KB_VERSION = "listen1"
+_LISTEN_TAP_COOLDOWN_SECONDS = 5
+_reaction_last_sent: dict[int, float] = {}
+_listen_last_tap: dict[int, float] = {}
+
+
+# Legacy reply-keyboard eviction (UX defect found during the owner canary).
+#
+# Before commit 214ba15 the mood entry was a ReplyKeyboardMarkup(6 rows,
+# one_time_keyboard=True); it is now an InlineKeyboardMarkup. But a Telegram
+# reply keyboard lives CLIENT-SIDE and survives indefinitely -- switching the
+# bot to inline does not retract it, and one_time_keyboard only collapses it
+# (the user can re-open it from the input field, and several clients re-expand
+# it on their own). So every account that used the bot before that commit
+# still carries the old 6-row keyboard, which covers a large part of the
+# screen and makes ordinary typing awkward. Only two rarely-reached call
+# sites (/help, the post-practice rating) ever sent ReplyKeyboardRemove, so
+# an ordinary "/start -> talk" session never cleared it.
+#
+# Fix: piggy-back a ReplyKeyboardRemove on the FIRST ordinary reply we send
+# each user, then never again. deliver_response is the single shared delivery
+# point, so one insertion covers all three required triggers -- choosing an
+# emotion (cb_mood -> pipeline), typing free text, and sending a voice
+# message (handle_voice -> pipeline). No extra message is sent, no visible
+# change for users who never had the legacy keyboard, and no DB schema.
+#
+# In-memory set (same convention as _reaction_last_sent/_listen_last_tap): a
+# restart simply re-sends one harmless no-op removal per user. Nothing in the
+# current codebase constructs a ReplyKeyboardMarkup at all (it is not even
+# imported), so this can never retract a keyboard some other live flow needs
+# -- and ReplyKeyboardRemove does not touch inline keyboards.
+#
+# BOUNDED, and deliberately so: one int per distinct user would otherwise grow
+# for the process lifetime. At the cap the whole set is dropped rather than
+# evicting an arbitrary member -- the only consequence of forgetting a user is
+# one extra no-op removal on their next reply, so a cheap full reset is
+# preferable to maintaining insertion order for a value this inconsequential.
+_LEGACY_KB_MAX_TRACKED = 10_000
+_legacy_kb_cleared: set[int] = set()
+
+
+async def _answer_evicting_legacy_kb(message: Message, uid: int, text: str) -> Message:
+    """Send one ordinary reply, evicting the legacy reply keyboard the first
+    time we successfully reply to this user.
+
+    Eviction is strictly best-effort and must never cost the user their
+    answer: if the send carrying the removal fails, the answer is retried
+    plain and the uid stays UNMARKED so the next reply tries again. The uid
+    is marked only AFTER a confirmed successful send -- marking first would
+    make a failed eviction permanent for that user."""
+    if uid in _legacy_kb_cleared:
+        return await message.answer(text)
+    try:
+        sent = await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        # The removal never got through, so nothing was delivered either --
+        # retry the plain answer (not a duplicate) and leave uid unmarked.
+        return await message.answer(text)
+    if len(_legacy_kb_cleared) >= _LEGACY_KB_MAX_TRACKED:
+        _legacy_kb_cleared.clear()
+    _legacy_kb_cleared.add(uid)
+    return sent
+
+
+def _voice_ux_enabled_for(uid: int) -> bool:
+    return (
+        config.VOICE_REPLIES_ENABLED
+        and access_control.OWNER_USER_ID is not None
+        and uid == access_control.OWNER_USER_ID
+    )
+
+
+def _reactions_enabled_for(uid: int) -> bool:
+    return (
+        config.EMOTIONAL_REACTIONS_ENABLED
+        and access_control.OWNER_USER_ID is not None
+        and uid == access_control.OWNER_USER_ID
+    )
+
+
+def format_selector_kb(lang: str) -> InlineKeyboardMarkup:
+    ru = [
+        [InlineKeyboardButton(text="📝 Текстом", callback_data=f"{_FMT_KB_VERSION}:format:text")],
+        [InlineKeyboardButton(text="🎙 Голосом", callback_data=f"{_FMT_KB_VERSION}:format:voice")],
+        [InlineKeyboardButton(text="🎙 Голосом + короткий текст",
+                              callback_data=f"{_FMT_KB_VERSION}:format:voice_and_concise_text")],
+        [InlineKeyboardButton(text="Кратко", callback_data=f"{_FMT_KB_VERSION}:length:concise")],
+        [InlineKeyboardButton(text="Обычно", callback_data=f"{_FMT_KB_VERSION}:length:normal")],
+    ]
+    en = [
+        [InlineKeyboardButton(text="📝 Text", callback_data=f"{_FMT_KB_VERSION}:format:text")],
+        [InlineKeyboardButton(text="🎙 Voice", callback_data=f"{_FMT_KB_VERSION}:format:voice")],
+        [InlineKeyboardButton(text="🎙 Voice + short text",
+                              callback_data=f"{_FMT_KB_VERSION}:format:voice_and_concise_text")],
+        [InlineKeyboardButton(text="Brief", callback_data=f"{_FMT_KB_VERSION}:length:concise")],
+        [InlineKeyboardButton(text="Normal", callback_data=f"{_FMT_KB_VERSION}:length:normal")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=(ru if lang == "ru" else en))
+
+
+def _listen_kb(uid: int, lang: str) -> InlineKeyboardMarkup:
+    label = "🔊 Прослушать" if lang == "ru" else "🔊 Listen"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=label, callback_data=f"{_LISTEN_KB_VERSION}:{uid}")]])
+
+
+def _format_ack_text(cmd, lang: str) -> str:
+    ru = {
+        "voice_persistent": "Хорошо, буду отвечать голосом.",
+        "text_persistent": "Хорошо, буду отвечать текстом.",
+        "concise_persistent": "Хорошо, буду отвечать короче.",
+        "concise_oneshot": "Постараюсь короче в следующий раз.",
+        "detailed_oneshot": "Хорошо, в следующий раз отвечу подробнее.",
+    }
+    en = {
+        "voice_persistent": "Got it — I'll reply with voice from now on.",
+        "text_persistent": "Got it — I'll reply with text from now on.",
+        "concise_persistent": "Got it — I'll keep replies shorter.",
+        "concise_oneshot": "I'll keep the next reply shorter.",
+        "detailed_oneshot": "Got it — I'll go into more detail next time.",
+    }
+    table = ru if lang == "ru" else en
+    return table.get(cmd.kind, "Хорошо." if lang == "ru" else "Got it.")
+
+
+def _concise_version(text: str, max_chars: int = 220) -> str:
+    """Deterministic, bounded shortening -- NOT a second LLM interpretation.
+    Takes leading sentences up to a char budget; never fabricates content."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    out = ""
+    for s in sentences:
+        if out and len(out) + len(s) + 1 > max_chars:
+            break
+        out = (out + " " + s).strip()
+    return out or (text[:max_chars].rstrip() + "…")
+
+
+def _safe_concise_version(text: str, lang: str) -> str:
+    """The concise text is re-validated through Safety Validator (§9):
+    truncation cannot introduce a new claim, but it COULD cut off a
+    qualifying safety caveat, so the shortened text is checked again before
+    ever reaching TTS. Falls back to the full (already-approved) text if
+    the shortened version fails validation."""
+    candidate = _concise_version(text)
+    if candidate == text.strip():
+        return text
+    is_safe, _ = validate_response(candidate, lang)
+    return candidate if is_safe else text
+
+
+async def _synthesize_and_send_voice(target, uid: int, text: str, lang: str) -> bool:
+    """Synthesizes `text` (already Safety-Validator-approved) and sends ONE
+    voice message via `target` (a Message, exposing .answer_voice). Returns
+    True on success, False on ANY failure (TTS or Telegram send) -- never
+    raises, and the temporary audio file is always removed."""
+    if not _voice_ux_enabled_for(uid):
+        return False
+    path = None
+    try:
+        path = await synthesize_speech(client, text, lang)
+        await target.answer_voice(FSInputFile(path))
+        return True
+    except Exception as e:
+        print(f"[tts] uid={uid}: {type(e).__name__}")
+        return False
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+async def deliver_response(message: Message, uid: int, answer: str, lang: str,
+                            *, one_shot_voice: bool = False,
+                            one_shot_concise: bool = False,
+                            reply_markup=None) -> Message | None:
+    """The SINGLE shared point where a final, Safety-Validator-approved
+    response is delivered — text / voice / voice_and_concise_text, from the
+    user's stored preference or a one-shot meta-command override. Flag OFF
+    => always plain text, byte-for-byte the prior
+    `await message.answer(answer)` behavior. Also private-chat-only (§4):
+    even if a preference were somehow set, delivery from a non-private chat
+    always falls back to plain text with no listen button -- defense in
+    depth alongside the pipeline()-level guard that never lets a group
+    message reach the format-command/override code at all.
+
+    Hardening §12: `reply_markup` (used for the Conversation Controller's
+    PRACTICE consent buttons) always forces plain text -- a consent prompt
+    is never voiced or condensed, matching its existing dedicated contract
+    exactly, byte-for-byte. Returns the sent Telegram Message (or None when
+    voice delivery consumed it) so a caller needing the message id (e.g. to
+    record a PracticeProposal's delivered message) can read it -- every
+    other existing caller already ignored the previous None return, so this
+    is additive, not a breaking change."""
+    is_private = getattr(message.chat, "type", "private") == "private"
+    if reply_markup is not None:
+        return await message.answer(answer, reply_markup=reply_markup)
+    if not _voice_ux_enabled_for(uid) or not is_private:
+        return await _answer_evicting_legacy_kb(message, uid, answer)
+
+    prefs = await get_response_preferences(uid)
+    fmt = "voice" if one_shot_voice else prefs["response_format"]
+    concise = one_shot_concise or prefs["response_length"] == "concise"
+
+    if fmt == "text":
+        return await message.answer(answer, reply_markup=_listen_kb(uid, lang))
+
+    if fmt == "voice_and_concise_text":
+        visible = _safe_concise_version(answer, lang)
+        voice_text = visible if concise else answer
+        sent = await message.answer(visible)
+        await _synthesize_and_send_voice(message, uid, voice_text, lang)
+        return sent
+
+    # fmt == "voice"
+    voice_text = _safe_concise_version(answer, lang) if concise else answer
+    ok = await _synthesize_and_send_voice(message, uid, voice_text, lang)
+    if not ok:
+        return await message.answer(answer)  # TTS failed -- never silent; full text stands in
+    return None  # delivered as a voice message -- no text Message object to return
+
+
+async def _maybe_react(message: Message, uid: int, category: ReactionCategory,
+                        confidence: float) -> None:
+    """Best-effort Telegram message reaction -- never blocks or delays the
+    actual response, never raises, never persists `category` anywhere.
+
+    Emits a privacy-safe decision line so a canary is diagnosable without
+    reading anyone's chat: category, confidence and a fixed skip-reason
+    token only. Never the message text, the response, the transcript, the
+    username or the Telegram user id -- during the owner canary the silent
+    outcome was indistinguishable from a broken flag, which is exactly what
+    this makes visible. _log is deliberately exception-proof: observability
+    must never be able to affect text delivery."""
+    def _log(decision: str, reason: str = "-") -> None:
+        try:
+            print(f"[reaction] decision={decision} reason={reason} "
+                  f"category={category.value} confidence={confidence:.2f}")
+        except Exception:
+            pass
+
+    if not _reactions_enabled_for(uid):
+        _log("skipped", "not_authorized")
+        return
+    if category == ReactionCategory.NONE:
+        _log("skipped", "no_match")
+        return
+    if confidence < config.EMOTIONAL_REACTION_MIN_CONFIDENCE:
+        _log("skipped", "low_confidence")
+        return
+    # NOTE: deliberately no chat-type gate here. Reactions have never been
+    # private-chat-only (unlike Voice UX), and narrowing that now would be an
+    # unrequested behavior change -- see
+    # test_owner_gate_reactions_owner_in_group_unaffected.
+    now = time.time()
+    if now - _reaction_last_sent.get(uid, 0) < config.EMOTIONAL_REACTION_COOLDOWN_SECONDS:
+        _log("skipped", "cooldown")
+        return
+    try:
+        chat = await bot.get_chat(message.chat.id)
+        available = None
+        if chat.available_reactions is not None:
+            available = [r.emoji for r in chat.available_reactions if hasattr(r, "emoji")]
+        emoji = pick_supported_emoji(category, available)
+        if not emoji:
+            _log("skipped", "unsupported_in_chat")
+            return
+        await bot.set_message_reaction(
+            chat_id=message.chat.id, message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)])
+        _reaction_last_sent[uid] = now
+        _log("selected", "sent")
+    except Exception as e:
+        _log("failed", type(e).__name__)
+
 # ────────────────────────────────────────────────────────────────────────────
 
 def _minimal_reviewer_payload(uid: int, eid, note: str) -> str:
@@ -582,7 +1030,8 @@ async def send_crisis(send, text, kb, lang, uid, eid, kind) -> str:
 
 
 async def trigger_crisis(message: Message, uid: int, username: str,
-                         user_text: str, risk: dict, lang: str) -> None:
+                         user_text: str, risk: dict, lang: str, *,
+                         source: str = "EXPLICIT_MESSAGE") -> None:
     """Deterministic Crisis Protocol (LLM is NEVER called here). Extracted from
     pipeline so other entry points (e.g. the journals risk-gate) can REUSE the
     exact same flow instead of duplicating it.
@@ -608,12 +1057,41 @@ async def trigger_crisis(message: Message, uid: int, username: str,
     when the user taps a button a moment later (cb_crisis's own DB reads can
     then raise — see cb_crisis's own try/except around that resolve, item 1B).
     get_crisis_text already contains the hotline/plain emergency guidance in
-    the message body itself, so no button is needed to deliver the number."""
+    the message body itself, so no button is needed to deliver the number.
+
+    `source` (Phase 2 correction §3): truthful provenance for the audit trail.
+    EXPLICIT_MESSAGE (default, unchanged) means risk/categories came from
+    risk_detector pattern-matching real message text. DIRECT_SAFETY_YES/
+    DIRECT_SAFETY_UNSURE (Depression Disclosure Gate) mean a direct button
+    answer -- `risk["score"]` is None (never a fabricated number) and
+    `user_text` is "" (never invented placeholder text) for those.
+
+    Phase 2 correction §2 -- disclosure-flow supersession is NOT a side
+    effect of logging: THIS function is the one canonical crisis-entry point
+    every route in the codebase funnels through (pipeline()'s RED branch,
+    journal_guard's RED branch, the Depression Disclosure Gate's own
+    "yes"/"unsure" callback), so it supersedes any active disclosure flow
+    FIRST -- unconditionally, in its own try/except, BEFORE even attempting
+    log_crisis_event -- so the invariant holds even if audit logging raises,
+    times out, or is skipped entirely."""
+    try:
+        await supersede_active_disclosure_flows_for_crisis(uid)
+    except Exception as e:
+        print(f"[crisis] disclosure-flow supersession FAILED uid={uid}: {type(e).__name__}: {e}")
+    # Phase 3 correction §6: crisis supersedes ALL ordinary Core work, not
+    # just the Depression Disclosure Gate -- same unconditional, logging-
+    # independent placement, its own try/except.
+    try:
+        await supersede_active_core_sessions_for_crisis(uid)
+    except Exception as e:
+        print(f"[crisis] core-session supersession FAILED uid={uid}: {type(e).__name__}: {e}")
+
     eid = None
     try:
         # Create the event first — its id is baked into the crisis screen buttons.
         eid = await log_crisis_event(uid, RED, risk["score"], risk["categories"],
-                                     user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS))
+                                     user_text[:300], lang, admin_notified=bool(ADMIN_USER_IDS),
+                                     source=source)
     except Exception as e:
         # Sanitized: no raw user_text/username in this log line.
         print(f"[crisis] log_crisis_event FAILED: {type(e).__name__}: {e}")
@@ -648,7 +1126,13 @@ async def trigger_crisis(message: Message, uid: int, username: str,
         # (§5 trigger #2) so crisis_risk/themes reflect this turn immediately.
         # UNKNOWN (uninvited, not onboarded) does NOT get ordinary memory/profile
         # building — only the deterministic crisis_events audit row above exists.
-        if role != access_control.UNKNOWN:
+        # `and user_text` (Phase 2 correction §3): a direct-safety-answer
+        # trigger has NO original message text (user_text == "") -- saving an
+        # empty "user" message would fabricate a phantom entry in the
+        # conversation history, so it is skipped. Every EXPLICIT_MESSAGE call
+        # site always has non-empty user_text (risk_detector only matches
+        # non-empty text), so this is unchanged behavior for them.
+        if role != access_control.UNKNOWN and user_text:
             await save_message(uid, "user", user_text, "crisis", lang,
                                risk["score"], risk["categories"])
             await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
@@ -734,6 +1218,417 @@ async def journal_guard(message: Message, uid: int, lang: str,
     return "ok", risk
 
 
+# Hardening §3: MUST be a member of practice_registry.PRODUCTION_PRACTICE_IDS
+# -- "grounding_5senses_v1" (the pre-hardening constant here) is CATALOG_ONLY,
+# not production-approved, so get_production_practice_by_id() for it always
+# returned None; every Controller-issued PRACTICE consent silently fell back
+# to generic filler text instead of real steps.
+#
+# Final closure §6: box breathing is NOT claimed here as universal, suitable
+# for every user, or contraindication-free -- it is a temporary, production-
+# approved, low-complexity practice used to validate the consent/lifecycle
+# infrastructure itself (proposal -> consent -> delivery -> outcome) for an
+# explicit PRACTICE request, pending the real Method Registry/selection logic
+# a later phase builds. Trains a specific, named skill (slowing attention,
+# observing breathing rhythm, practising deliberate regulation) -- it is not
+# framed as treating the user's underlying problem.
+_PRACTICE_ID = "breathing_box_v1"
+
+
+def _practice_consent_kb(session_id, proposal_id, lang: str) -> InlineKeyboardMarkup:
+    # Hardening §3: callback data carries the exact PROPOSAL identity, not
+    # just the session -- a stale/superseded proposal's buttons can never be
+    # mistaken for a newer one's, even within the same session.
+    labels = [("yes", "Да", "Yes"), ("no", "Нет", "No")]
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=(ru if lang != "en" else en),
+                             callback_data=f"cc:consent:{session_id}:{proposal_id}:{val}")
+        for val, ru, en in labels]])
+
+
+def _known_facts_from_handoff(flow: dict) -> list[str]:
+    facts = []
+    if flow.get("diagnosis_source"):
+        facts.append(f"diagnosis_source={flow['diagnosis_source']}")
+    answers = safe_load_answers(flow.get("answers_json"))
+    for key in ("duration", "functioning", "basic_activities", "support"):
+        if answers.get(key):
+            facts.append(f"{key}={answers[key]}")
+    return facts
+
+
+def _linked_handoff_is_valid(flow: dict | None) -> bool:
+    """Hardening §13: handoff_flow_id existing on a session is NOT enough on
+    its own -- re-verified on EVERY turn (a link claimed while healthy can
+    go stale later, e.g. a crisis superseding the flow after the fact).
+    Only a still-completed, still-claimed, well-formed flow may feed known
+    facts into the Controller's prompt."""
+    if flow is None:
+        return False
+    if flow.get("status") != "completed" or flow.get("handoff_status") != "claimed":
+        return False
+    try:
+        answers = safe_load_answers(flow.get("answers_json"))
+    except Exception:
+        return False
+    return isinstance(answers, dict)
+
+
+async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict) -> dict | None:
+    """Phase 3 hardening §5: the FAST, DB-only half of a controller turn --
+    called from INSIDE the per-user ingestion lock, exactly where the
+    ordinary path does its own inbound persistence, and containing no LLM
+    call whatsoever. Returns None when the controller does not own this
+    turn (no repair signal, no explicit intent, no active session to
+    continue, no handoff) -- the caller falls through to the legacy
+    scenario pipeline unchanged. Otherwise returns a bundle for the second,
+    slow half (_controller_generate_and_deliver, called AFTER the lock is
+    released) to consume.
+
+    Handoff consumption (§5 of round 2): claim_handoff_and_get_or_create_
+    session is ONE atomic transaction (claim + session link only --
+    interpretation-independent, safe to do unconditionally). The purpose->
+    intent mapping happens HERE and is not persisted by that call.
+
+    Continuity (§7 of round 3): an explicit repair signal or a freshly
+    classified explicit intent always overrides, in that priority order,
+    the handoff-derived intent, which in turn overrides plain continuation
+    of an already-OPEN session's existing intent. Only when NONE of those
+    apply -- no signal at all, no active session with a real base intent --
+    does the controller decline the turn.
+
+    Hardening §6: REPAIR never becomes the persisted base intent (`intent`
+    on SessionState) -- it is an overlay, computed fresh into `turn_intent`
+    for THIS turn's ResponsePlan only. `base_intent` is what gets written to
+    the session."""
+    from datetime import datetime, timezone
+    handoff, handoff_session = await claim_handoff_and_get_or_create_session(uid)
+    known_facts: list[str] = []
+    handoff_intent = None
+    if handoff is not None and handoff_session is not None:
+        known_facts = _known_facts_from_handoff(handoff)
+        purpose = safe_load_answers(handoff["answers_json"]).get("purpose")
+        handoff_intent = controller.HANDOFF_PURPOSE_TO_INTENT.get(purpose, Intent.UNKNOWN)
+
+    repair_now = controller.classify_repair_signals(user_text)
+    overrides = controller.classify_repair_overrides(user_text)
+    text_intent = controller.classify_intent(user_text, lang)
+
+    existing_session = handoff_session
+    if existing_session is None:
+        active_sessions = await list_core_sessions(uid, active_only=True)
+        existing_session = active_sessions[0] if active_sessions else None
+
+    has_base = existing_session is not None and existing_session.intent is not Intent.UNKNOWN
+    if repair_now:
+        turn_intent = Intent.REPAIR
+    elif text_intent is not Intent.UNKNOWN:
+        turn_intent = text_intent
+    elif handoff_intent is not None and handoff_intent is not Intent.UNKNOWN:
+        turn_intent = handoff_intent
+    elif existing_session is not None and existing_session.lifecycle_status is LifecycleStatus.OPEN and has_base:
+        turn_intent = existing_session.intent  # continuation: no new signal, keep governing
+    else:
+        return None
+
+    base_intent = (existing_session.intent if (repair_now and has_base)
+                   else Intent.UNKNOWN if repair_now else turn_intent)
+    is_topic_change = (not repair_now and text_intent is not Intent.UNKNOWN
+                       and has_base and existing_session.intent is not turn_intent)
+
+    session = existing_session
+    if session is None:
+        # §2: never an interpretation-dependent intent at creation -- stays
+        # UNKNOWN until the SAME authoritative, CAS-protected write this
+        # turn's mutations go through in _controller_generate_and_deliver.
+        session = await create_core_session(uid)
+
+    # §2: snapshot BEFORE ANY of this turn's own mutations (including the
+    # PAUSED->OPEN resume just below) -- must be the exact value still on
+    # the DB row right now, or update_core_session_authoritative's CAS would
+    # reject this turn's own write as if it were already stale.
+    base_state_json = session_json_snapshot(session)
+
+    if session.lifecycle_status is LifecycleStatus.PAUSED:
+        # §17: a new explicit-intent message (or a continuation decision,
+        # which by construction only fires for an OPEN session) resumes a
+        # /start-paused session -- engaging IS the continuation signal.
+        session.lifecycle_status = LifecycleStatus.OPEN
+
+    session.intent = base_intent
+    if handoff is not None:
+        session.handoff_flow_id = str(handoff["id"])
+
+    if not known_facts and session.handoff_flow_id:
+        linked = await get_disclosure_flow(session.handoff_flow_id, uid)
+        if _linked_handoff_is_valid(linked):
+            known_facts = _known_facts_from_handoff(linked)
+
+    # §7: per-constraint repair lifecycle -- decay every currently-active
+    # record ONE turn FIRST, then apply this turn's fresh signal (refreshes
+    # ONLY the constraints it names) and any explicit override (clears ONLY
+    # the constraint it names). An unrelated already-active constraint's own
+    # countdown is never touched by either.
+    session.decay_repair_turns()
+    if repair_now:
+        session.add_repair_signal(repair_now, source_turn_id=None,
+                                  created_at=datetime.now(timezone.utc).isoformat(),
+                                  window_turns=controller.REPAIR_WINDOW_TURNS)
+    for cleared in overrides:
+        session.clear_repair_constraint(cleared, "explicit_override")
+    if turn_intent is Intent.PRACTICE:
+        session.clear_repair_constraint(RepairConstraint.EXERCISE_REJECTED, "explicit_practice_request")
+
+    plan = controller.build_response_plan(turn_intent, session.active_repair_constraints)
+
+    # §8: an explicit topic change invalidates a standing PRACTICE proposal
+    # -- old consent must not survive a real subject change.
+    if is_topic_change:
+        await supersede_active_practice_proposals(uid, "topic_change")
+
+    # §3: the exact practice is selected deterministically NOW, before any
+    # LLM call, as a persisted proposal -- this turn's prompt AND the
+    # eventual consent buttons both reference it by proposal_id, so the LLM
+    # can never describe one practice while the callback delivers another.
+    #
+    # PR #73 request-changes §7: the minimum adverse-history guard -- if the
+    # user's LATEST recorded outcome for this exact practice was WORSE,
+    # never automatically re-propose it. No alternative-selection logic
+    # exists at this layer (that is Phase 5's Method Registry, deliberately
+    # out of scope here), so the honest response is to say so and offer
+    # nothing else automatically -- never silently repeat what already made
+    # things worse, never invent a substitute.
+    #
+    # External review F2 follow-up: PRACTICE-intent continuation must never
+    # automatically propose ANOTHER practice while a progressive refinement
+    # is still pending (superseded_reason is a UX_PENDING_* marker and the
+    # reporting window is still ACTIVE) -- the user hasn't finished answering
+    # the current one yet. `block_if_refinement_pending` below makes this
+    # atomic AT THE INSERT ITSELF (create_practice_proposal's own same-
+    # connection INSERT...WHERE NOT EXISTS...RETURNING) -- there is no
+    # separate pre-read SELECT and therefore no TOCTOU gap for a concurrent
+    # callback to establish the marker in between a check and an insert.
+    # This does not touch the pending proposal itself (no write, no marker
+    # clear, no window change) and does not suppress crisis/disclosure/
+    # rollout/topic-change handling, all of which already ran (or already
+    # invalidated this session's window) before this point.
+    proposal = None
+    adverse_guard = False
+    if turn_intent is Intent.PRACTICE:
+        practice = get_production_practice_by_id(_PRACTICE_ID, lang)
+        if practice:
+            latest_outcome = await get_latest_outcome_for_practice(uid, practice["id"])
+            adverse_guard = latest_outcome == PracticeOutcome.WORSE.value
+            # PR #73 ATOMIC CLOSURE §4: still no AUTOMATIC re-proposal text
+            # (a generic "дай упражнение" always lands here and the LLM is
+            # never called) -- but a REAL, brand-new PENDING proposal is
+            # created either way now, so the warning message's consent
+            # buttons carry an ordinary, persisted proposal_id through the
+            # SAME cb_cc_consent contract every other PRACTICE proposal
+            # uses, instead of an unpersisted "cc:worseover" callback
+            # payload. is_worse_override records that this exact proposal is
+            # an informed repeat, never reusing the old WORSE-outcome row.
+            proposal = await create_practice_proposal(
+                uid, session.session_id, practice["id"], practice.get("version", "v1"),
+                purpose=practice.get("name", _PRACTICE_ID),
+                expected_duration=f"{practice.get('duration_min', 5)} минут",
+                is_worse_override=adverse_guard,
+                block_if_refinement_pending=(
+                    UX_PENDING_NOT_COMPLETED_REASON, UX_PENDING_OUTCOME_DETAIL))
+
+    # §7/§8/§9: bounded recent context -- this user's own last few turns (any
+    # scenario, not just prior controller ones), fetched BEFORE this turn's
+    # own message is saved below so it reflects PRIOR turns only. Small,
+    # bounded (get_recent_messages already caps at `limit`), never the full
+    # unrestricted history, never treated as instructions (see
+    # conversation_controller.build_system_prompt's injection guard).
+    recent_rows = await get_recent_messages(uid, limit=6)
+    recent_context = [c for r, c in recent_rows if r == "user"]
+
+    # §1: the ACTUAL risk score/categories for this turn, not a hardcoded
+    # placeholder -- a Controller-owned turn is still a real inbound message
+    # for research/audit purposes.
+    await save_message(uid, "user", user_text, "controller", lang,
+                       risk.get("score", 0), risk.get("categories", []))
+    return {"session": session, "plan": plan, "known_facts": known_facts,
+           "recent_context": recent_context, "user_text": user_text, "lang": lang,
+           "base_state_json": base_state_json, "proposal": proposal,
+           "adverse_guard": adverse_guard}
+
+
+async def _controller_generate_and_deliver(message: Message, uid: int, claim: dict,
+                                            turn_gen: int, risk: dict) -> None:
+    """Phase 3 hardening §5: the SLOW half of a controller turn -- called
+    strictly AFTER the per-user ingestion lock has been released (never
+    holds it across the LLM call, matching PR#67's contract exactly)."""
+    session, plan, known_facts = claim["session"], claim["plan"], claim["known_facts"]
+    recent_context = claim.get("recent_context")
+    user_text, lang = claim["user_text"], claim["lang"]
+
+    proposal = claim.get("proposal")
+
+    # PR #73 request-changes §7 / ATOMIC CLOSURE §4: adverse-history guard
+    # fired during claim -- skip the LLM entirely and answer with a fixed,
+    # honest, non-inviting warning naming the exact practice, the user's
+    # own prior WORSE report (never claiming the practice caused it), its
+    # purpose, and its approximate duration. A brand-new PENDING proposal
+    # (claim["proposal"], is_worse_override=True, never the old WORSE-
+    # outcome row) carries the consent buttons through the ORDINARY
+    # cb_cc_consent contract -- same ownership/expiry/session/supersession
+    # rules as any other PRACTICE proposal, no parallel callback contract.
+    if claim.get("adverse_guard") and proposal is not None:
+        name, duration = proposal.purpose, proposal.expected_duration
+        text = (f"В прошлый раз ты сообщил(а), что практика «{name}» ({duration}) "
+                f"— судя по твоему отклику — не помогла, стало хуже. Это не значит, "
+                f"что дело точно в ней. Хочешь всё равно попробовать ещё раз?"
+                if lang != "en" else
+                f"Last time you reported that the practice \"{name}\" ({duration}) "
+                f"made things worse, based on what you told me. That doesn't "
+                f"necessarily mean it was the cause. Do you still want to try it again?")
+        if _user_generation_superseded(uid, turn_gen):
+            return
+        session.consent = ConsentState.PENDING
+        if not await update_core_session_authoritative(session, claim["base_state_json"]):
+            return
+        if not await transition_practice_proposal(
+                proposal.proposal_id, uid, from_status="PROPOSED", to_status="PENDING"):
+            return
+        reply_markup = _practice_consent_kb(session.session_id, proposal.proposal_id, lang)
+        try:
+            sent = await deliver_response(message, uid, text, lang, reply_markup=reply_markup)
+        except Exception as e:
+            print(f"[controller] adverse-guard delivery failed uid={uid}: {type(e).__name__}: {e}")
+            await transition_practice_proposal(
+                proposal.proposal_id, uid, from_status="PENDING",
+                to_status="DELIVERY_FAILED", reason="send_exception")
+            return
+        await mark_proposal_delivered(proposal.proposal_id, uid, sent.message_id)
+        await save_message(uid, "assistant", text, "controller", lang)
+        return
+    practice_name = proposal.purpose if proposal is not None else None
+    expected_duration = proposal.expected_duration if proposal is not None else None
+    system_prompt = controller.build_system_prompt(plan, lang, known_facts, recent_context)
+    if proposal is not None:
+        # §3: tell the model the EXACT proposal it must describe -- the
+        # consent buttons below reference this SAME proposal_id, so a
+        # mismatch between "what the model described" and "what gets
+        # delivered on GRANTED" is structurally impossible, not just unlikely.
+        system_prompt += (
+            f" Точная практика для описания (назови именно её, не другую): "
+            f"{practice_name} ({expected_duration})." if lang != "en" else
+            f" Exact practice to describe (name it exactly, not a different "
+            f"one): {practice_name} ({expected_duration}).")
+
+    async def _generate() -> str:
+        try:
+            completion = await client.chat.completions.create(
+                model="gpt-4o-mini", temperature=0.65, max_tokens=300,
+                messages=[{"role": "system", "content": system_prompt},
+                         {"role": "user", "content": user_text}])
+            out = (completion.choices[0].message.content or "").strip()
+            return out or controller.fallback_text(
+                lang, plan.intent, known_facts=known_facts,
+                practice_name=practice_name, expected_duration=expected_duration)
+        except Exception as e:
+            print(f"[controller] LLM call failed uid={uid}: {type(e).__name__}: {e}")
+            return controller.fallback_text(
+                lang, plan.intent, known_facts=known_facts,
+                practice_name=practice_name, expected_duration=expected_duration)
+
+    def _valid(candidate: str) -> bool:
+        ok, _ = controller.validate_controller_response(
+            candidate, plan, known_facts=known_facts, practice_name=practice_name)
+        if not ok:
+            return False
+        # §12: the STRONGER context-aware validator, not the plain one --
+        # never a weaker safety path than the ordinary pipeline uses.
+        ok, _ = validate_response_with_context(candidate, user_text, risk, lang)
+        return ok
+
+    text = await _generate()
+    if not _valid(text):
+        text = controller.fallback_text(
+            lang, plan.intent, known_facts=known_facts,
+            practice_name=practice_name, expected_duration=expected_duration)
+        if not _valid(text):
+            # §11: fall back to the STATIC per-intent table entry -- no
+            # dynamic known_facts/practice_name substitution that could
+            # itself be what made the previous attempt fail. Proven to pass
+            # validate_controller_response for EVERY Intent, in both
+            # languages, by test_static_per_intent_fallbacks_pass_validation.
+            text = controller.fallback_text(lang, plan.intent)
+            if not _valid(text):
+                # Absolute last resort -- kept as a real (validated, not
+                # assumed) fourth tier rather than delivering unvalidated
+                # text; unreachable in practice given the tier above is
+                # proven to always pass, but never trusted blindly either.
+                text = controller.fallback_text(lang)
+
+    # Stale-response guard (§3 of round 2): the SAME suppression the
+    # ordinary LLM path uses (PR#67) -- a newer turn for this user
+    # superseded this one while the LLM call above was in flight. No state
+    # mutation, no persistence, no delivery.
+    if _user_generation_superseded(uid, turn_gen):
+        return
+
+    # PRACTICE requires explicit consent (§3/§10) -- deterministic Да/Нет
+    # buttons tied to the exact proposal, never LLM-parsed free text. The
+    # ENTIRE session write (including the best-effort consent=PENDING
+    # mirror) happens in ONE authoritative, CAS-protected write BEFORE the
+    # buttons are ever shown, closing the fast-tap race: a callback arriving
+    # the instant the buttons render always finds a durably PENDING row.
+    reply_markup = None
+    if plan.intent is Intent.PRACTICE and proposal is not None:
+        # session.consent mirrors the proposal's status for older readers;
+        # the proposal's OWN status (see below) is the real gate now (§3).
+        session.consent = ConsentState.PENDING
+        reply_markup = _practice_consent_kb(session.session_id, proposal.proposal_id, lang)
+    elif plan.intent is Intent.CLOSE_CONVERSATION:
+        # §8: an explicit close is a deliberate, user-initiated end -- a
+        # terminal status, distinct from PAUSED (which is for /start/crisis
+        # interruptions the user did not ask to end).
+        session.lifecycle_status = LifecycleStatus.COMPLETED
+
+    # §2: authoritative CAS write -- rejects this turn if ANYTHING else
+    # (a newer turn's own write, /start's pause, a crisis supersession)
+    # touched this row since claim time, closing the TOCTOU gap between the
+    # generation check above and this write reaching the database.
+    if not await update_core_session_authoritative(session, claim["base_state_json"]):
+        return  # superseded -- do not persist assistant output, do not deliver
+
+    if plan.intent is Intent.PRACTICE and proposal is not None:
+        # §4: the proposal itself may have been superseded/invalidated
+        # between claim time and now (e.g. a concurrent topic-change turn's
+        # claim ran and superseded it) -- its own CAS is the authority.
+        if not await transition_practice_proposal(
+                proposal.proposal_id, uid, from_status="PROPOSED", to_status="PENDING"):
+            return
+    elif plan.intent is Intent.CLOSE_CONVERSATION:
+        # §8: closing the conversation invalidates any standing proposal too.
+        await supersede_active_practice_proposals(uid, "conversation_closed")
+
+    # §5/§12: persist PENDING before the send attempt (already done above),
+    # then handle a real Telegram delivery failure explicitly -- never leave
+    # a proposal PENDING forever with no way for the user to act on it.
+    # Delivery goes through the ONE shared delivery contract (deliver_response)
+    # -- reply_markup forces plain text there, matching this flow's existing
+    # "consent is never voiced" contract byte-for-byte, while still keeping
+    # stale-suppression (already checked above, before any write) and future
+    # voice/reaction compatibility for the non-PRACTICE case.
+    try:
+        sent = await deliver_response(message, uid, text, lang, reply_markup=reply_markup)
+    except Exception as e:
+        print(f"[controller] delivery failed uid={uid}: {type(e).__name__}: {e}")
+        if plan.intent is Intent.PRACTICE and proposal is not None:
+            await transition_practice_proposal(
+                proposal.proposal_id, uid, from_status="PENDING",
+                to_status="DELIVERY_FAILED", reason="send_exception")
+        return
+    if plan.intent is Intent.PRACTICE and proposal is not None:
+        await mark_proposal_delivered(proposal.proposal_id, uid, sent.message_id)
+    await save_message(uid, "assistant", text, "controller", lang)
+
+
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
                    tg_user=None) -> None:
     """Complete X20 pipeline.
@@ -742,6 +1637,16 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     поэтому реальный пользователь передаётся явно (callback.from_user)."""
     u = tg_user or message.from_user
     uid, username, first_name = u.id, u.username or "", u.first_name or ""
+    # New user turn: bump the generation (also done for crisis, which returns
+    # earlier) so any older ordinary answer still in flight is superseded, and
+    # capture this turn's generation to check just before ordinary delivery.
+    _turn_gen = _bump_user_generation(uid)
+    _cid = _new_correlation_id()
+    # Voice and Adaptive Response UX is private-chat-only in V1 (§4): this
+    # bot has no ChatType filtering anywhere else either, so this is a new,
+    # narrow, explicit boundary for just this feature, not a bot-wide policy
+    # change. `chat.type` is a standard field on every real aiogram Message.
+    is_private_chat = getattr(message.chat, "type", "private") == "private"
 
     # 1. Detect language (pure, no I/O — safe to run before any access check)
     lang = detect_language(user_text)
@@ -755,245 +1660,461 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # recency window in get_active_crisis bounds this so nobody is stuck forever.
     # Crisis-adjacent like the RED branch below — runs regardless of role/access,
     # structurally BEFORE the product-access gate.
-    active = await get_active_crisis(uid)
-    if active and not (tg_user is not None):
-        event_id, stage, alang = active
-        lvl = classify(risk)
-        # Default to the crisis screen. Only EXPLICITLY reassuring text (and not
-        # RED/ORANGE) gets the gentle "I'm safe" offer — anything with distress
-        # ("мне плохо, я не в безопасности") or anything unclear keeps the crisis
-        # screen. Never assume safety.
-        if lvl not in (RED, ORANGE) and is_reassuring(user_text):
-            await message.answer(
-                "Я рядом. Если ты сейчас в большей безопасности — нажми ниже, "
-                "и мы спокойно продолжим." if lang == "ru" else
-                "I'm here. If you're safer now, tap below and we'll continue gently.",
-                reply_markup=safe_only_keyboard(event_id, lang))
-        else:
-            # PR 1B-1: same role-gated bookkeeping as trigger_crisis — an UNKNOWN
-            # (uninvited) uid does not get ordinary message/profile persistence.
-            if access_control.resolve_role_safe(uid) != access_control.UNKNOWN:
-                await save_message(uid, "user", user_text, "crisis", lang,
+    # Ingestion lock: acquired here (only pure language/risk detection
+    # runs before this point, so acquire order == entry order). Held
+    # through the user-row save only; released before summarization,
+    # the answer LLM, reaction sending, TTS and delivery.
+    _ingest = await _ingest_enter(uid)
+    try:
+        active = await get_active_crisis(uid)
+        if active and not (tg_user is not None):
+            event_id, stage, alang = active
+            lvl = classify(risk)
+            # Default to the crisis screen. Only EXPLICITLY reassuring text (and not
+            # RED/ORANGE) gets the gentle "I'm safe" offer — anything with distress
+            # ("мне плохо, я не в безопасности") or anything unclear keeps the crisis
+            # screen. Never assume safety.
+            if lvl not in (RED, ORANGE) and is_reassuring(user_text):
+                await message.answer(
+                    "Я рядом. Если ты сейчас в большей безопасности — нажми ниже, "
+                    "и мы спокойно продолжим." if lang == "ru" else
+                    "I'm here. If you're safer now, tap below and we'll continue gently.",
+                    reply_markup=safe_only_keyboard(event_id, lang))
+            else:
+                # PR 1B-1: same role-gated bookkeeping as trigger_crisis — an UNKNOWN
+                # (uninvited) uid does not get ordinary message/profile persistence.
+                if access_control.resolve_role_safe(uid) != access_control.UNKNOWN:
+                    await save_message(uid, "user", user_text, "crisis", lang,
+                                       risk["score"], risk["categories"])
+                text, kb = crisis_screen(stage, lang, event_id)
+                await send_crisis(message.answer, text, kb, lang, uid, event_id, "screen")
+            return
+
+        # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here).
+        # RED bypasses the product-access gate below entirely, for ANY role — the
+        # crisis path must never be gated by access control.
+        if classify(risk) == RED:
+            await trigger_crisis(message, uid, username, user_text, risk, lang)
+            return
+
+        # 4.1 Product access gate — strictly AFTER both crisis paths above, and
+        # BEFORE any ordinary product persistence (upsert_user/log_moderation/state/
+        # profile/memory/LLM). UNKNOWN, CLINICIAN_REVIEWER, an unacknowledged
+        # CLINICIAN_TESTER, or an acknowledged tester with no reviewer mapping all
+        # get the closed-test/tester-acknowledgment screen instead, and NOTHING
+        # ordinary is written about them.
+        if not await ensure_full_access_or_closed_test(message, uid):
+            return
+
+        # 4.2 Mandatory onboarding gate (spec item A) — strictly AFTER both crisis
+        # paths AND the access gate, and BEFORE any ordinary product persistence.
+        # A user with an ACTIVE first-user onboarding must not reach ordinary text/
+        # voice conversation by typing through it — this re-shows their current
+        # onboarding card (editing it in place, never flooding the chat) instead of
+        # silently dropping the message or letting it fall into the pipeline.
+        # Unconditional (not skipped when called from cb_mood, which already runs
+        # this same check before ever calling pipeline()) -- a second read of the
+        # same DB state here is a harmless no-op when already blocked/cleared
+        # upstream, and this way pipeline() is safe to call from ANY entrypoint
+        # without relying on a caller-specific signal to know whether the gate was
+        # already checked.
+        if await _onboarding_blocks_ordinary_entry(uid):
+            await _resume_onboarding_card(message.chat.id, uid)
+            return
+
+        # 4.3 Per-user monotonic revision (spec item B) -- bumped exactly once
+        # per ordinary turn, strictly after the crisis/access/onboarding gates
+        # above (a gate-rejected request never reaches here) and before any
+        # long pipeline work. Used as response_revision for the first-turn
+        # continuation-button binding below.
+        user_revision = await bump_user_revision(uid)
+
+        # 5. Ordinary persistence — only now that access is confirmed.
+        await upsert_user(uid, username, first_name, lang)
+        await reset_unanswered(uid)   # user re-engaged → clear ignored-push backoff
+
+        # 3. Log if medium+
+        if risk["level"] in ("medium", "high", "critical"):
+            await log_moderation(uid, username, first_name, risk["level"], risk["score"],
+                                  risk["categories"], user_text, "pending", risk["implicit"])
+
+        # Aggression signal — checkpoint-2 item 2: routed through access_control
+        # instead of an unconditional push_alert. By construction we only reach here
+        # for a role that already has full product access (OWNER, or an
+        # acknowledged+mapped CLINICIAN_TESTER); should_alert_owner is False for a
+        # tester, so no owner alert and no raw-text leak happens for them. RED+
+        # aggression never reaches here (RED already returned above), so there is
+        # never a duplicate owner alert.
+        if "aggression" in risk["categories"] and access_control.should_alert_owner(uid):
+            await push_alert("Aggression Detected", uid, username, risk["level"],
+                             risk["score"], risk["categories"], user_text)
+
+        # 4.3 Depression Disclosure Gate (Phase 2, master prompt §13). Deterministic
+        # only -- no LLM call. Runs strictly AFTER the RED crisis check near the top
+        # of this function, so explicit suicide/self-harm language always wins: a
+        # message containing BOTH crisis language AND a depression disclosure never
+        # reaches this line at all (RED already returned). classify_disclosure()
+        # itself excludes negation/third-person/meta-question/quoted-or-hypothetical
+        # -- only a genuinely eligible first-person disclosure reaches here.
+        # Gated by the ONE centralized rollout helper (Phase 2 correction §4) --
+        # gate flag AND core_rollout_allowed -- entirely inert while either is off
+        # (byte-for-byte prior behavior, nothing created).
+        if await access_control.depression_disclosure_allowed_for(uid):
+            active_flow = await get_active_disclosure_flow(uid)
+            if classify_disclosure(user_text, lang) == "POSITIVE":
+                # §8: a new eligible disclosure supersedes an older pending flow
+                # (rather than being silently skipped) before creating the new one.
+                if active_flow is not None:
+                    await close_disclosure_flow(active_flow["id"], uid,
+                                                from_step=active_flow["step"],
+                                                status="cancelled",
+                                                superseded_reason="new_disclosure")
+                # Hardening §4: a new Depression Disclosure flow (a fresh
+                # safety re-assessment) also invalidates any standing
+                # PRACTICE proposal for this user.
+                await supersede_active_practice_proposals(uid, "new_disclosure_flow")
+                flow = await create_disclosure_flow(uid, lang, origin_message_id=message.message_id)
+                await save_message(uid, "user", user_text, "depression_disclosure", lang,
                                    risk["score"], risk["categories"])
-            text, kb = crisis_screen(stage, lang, event_id)
-            await send_crisis(message.answer, text, kb, lang, uid, event_id, "screen")
-        return
+                text = safety_check_text(lang)
+                sent = await message.answer(text, reply_markup=_dd_safety_check_kb(flow["id"], lang))
+                prompt_mid = getattr(sent, "message_id", None)
+                if prompt_mid is not None:
+                    await set_disclosure_prompt_message_id(flow["id"], uid, prompt_mid)
+                await save_message(uid, "assistant", text, "depression_disclosure", lang)
+                return
+            if active_flow is not None:
+                # §8: an unrelated ordinary message while a flow is pending is a
+                # topic change -- the old flow's buttons become inert (silently;
+                # the ordinary message below still gets its normal reply, the
+                # user is never forced back to the old topic).
+                await close_disclosure_flow(active_flow["id"], uid,
+                                            from_step=active_flow["step"],
+                                            status="cancelled", superseded_reason="new_topic")
 
-    # 4. Crisis override (Epic 1 — Crisis Protocol; LLM is NEVER called here).
-    # RED bypasses the product-access gate below entirely, for ANY role — the
-    # crisis path must never be gated by access control.
-    if classify(risk) == RED:
-        await trigger_crisis(message, uid, username, user_text, risk, lang)
-        return
+        # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
+        # (current one not saved yet). Used to amplify ambiguity and bias routing.
+        trajectory = await get_emotional_trajectory(uid, window_hours=24)
 
-    # 4.1 Product access gate — strictly AFTER both crisis paths above, and
-    # BEFORE any ordinary product persistence (upsert_user/log_moderation/state/
-    # profile/memory/LLM). UNKNOWN, CLINICIAN_REVIEWER, an unacknowledged
-    # CLINICIAN_TESTER, or an acknowledged tester with no reviewer mapping all
-    # get the closed-test/tester-acknowledgment screen instead, and NOTHING
-    # ordinary is written about them.
-    if not await ensure_full_access_or_closed_test(message, uid):
-        return
+        # 4.5 Ambiguity check (v3 hotfix) — runs BEFORE any LLM call.
+        # A double-meaning phrase ("выйти в окно") must trigger a deterministic
+        # clarifying question, never an LLM guess. With recent risk history we also
+        # surface the hotline. This is the direct fix for the endorsement incident.
+        if risk.get("ambiguous_phrases"):
+            recent = await get_recent_messages(uid, limit=10)
+            signal = amplify_ambiguity_by_context(risk["ambiguous_phrases"], recent)
+            # §4: trajectory upgrades a soft "force_disambiguation" to "force_crisis"
+            # when aggregated dynamics show deterioration or a chronic risk streak —
+            # closing the gap where raw last-message scanning would miss it.
+            if signal and (trajectory.trend == "deteriorating"
+                           or trajectory.hopelessness_streak >= 3
+                           or trajectory.yellow_plus_streak >= 5):
+                signal = "force_crisis"
+            if signal:
+                phrase = risk["ambiguous_phrases"][0]
+                disambig = get_disambiguation_message(
+                    phrase, lang, with_hotline=(signal == "force_crisis"))
+                await save_message(uid, "user", user_text, "disambiguation", lang,
+                                   risk["score"], risk["categories"])
+                await save_message(uid, "assistant", disambig, "disambiguation", lang)
+                await message.answer(disambig)
+                await log_disambiguation(uid, user_text, phrase, signal)
+                return
 
-    # 4.2 Mandatory onboarding gate (spec item A) — strictly AFTER both crisis
-    # paths AND the access gate, and BEFORE any ordinary product persistence.
-    # A user with an ACTIVE first-user onboarding must not reach ordinary text/
-    # voice conversation by typing through it — this re-shows their current
-    # onboarding card (editing it in place, never flooding the chat) instead of
-    # silently dropping the message or letting it fall into the pipeline.
-    # Unconditional (not skipped when called from cb_mood, which already runs
-    # this same check before ever calling pipeline()) -- a second read of the
-    # same DB state here is a harmless no-op when already blocked/cleared
-    # upstream, and this way pipeline() is safe to call from ANY entrypoint
-    # without relying on a caller-specific signal to know whether the gate was
-    # already checked.
-    if await _onboarding_blocks_ordinary_entry(uid):
-        await _resume_onboarding_card(message.chat.id, uid)
-        return
+        # 3.5 Dependency monitor -- the ONE deterministic authority (Therapeutic
+        # Core Foundation): consolidates the behavioural-pattern signals (this
+        # module) and the explicit-phrase signal (relationship_monitor) behind a
+        # single shared cooldown gate. record_message MUST come first so the
+        # current message is counted before the threshold check -- otherwise the
+        # 100th message never triggers. A non-None result is a soft, narrow
+        # redirect that REPLACES the ordinary reply for this turn (never both),
+        # matching CLINICAL_BOUNDARY.md §2.3 -- it is never crisis protocol, and
+        # this check always runs strictly after the crisis/RED checks above.
+        await dependency_monitor.record_message(uid)
+        dep_msg = await dependency_monitor.assess(uid, user_text, lang)
+        if dep_msg:
+            await message.answer(dep_msg)
+            return
 
-    # 4.3 Per-user monotonic revision (spec item B) — bumped exactly once per
-    # ordinary turn, strictly after the crisis/access/onboarding gates above
-    # (a gate-rejected request never reaches here) and before any long
-    # pipeline work. Retained for possible first-turn button binding later.
-    user_revision = await bump_user_revision(uid)
+        # 4.3 Format meta-command detection (Voice and Adaptive Response UX) --
+        # AFTER crisis/dependency handling, BEFORE ordinary therapeutic routing.
+        # Private-chat-only in V1 (§4): a group/supergroup message never even
+        # enters this block, so nothing here can be armed, consumed, or replayed
+        # from a non-private chat -- ordinary text handling for a group message
+        # is completely unaffected (not a bot-wide policy change).
+        # A MIXED message ("Мне тревожно, и ответь голосом") falls through to
+        # the ordinary pipeline below unchanged -- only delivery of the eventual
+        # answer is affected. A PURE command never enters therapeutic routing.
+        one_shot_voice = False
+        one_shot_concise = False
+        voice_ux_active = _voice_ux_enabled_for(uid) and is_private_chat
 
-    # 5. Ordinary persistence — only now that access is confirmed.
-    await upsert_user(uid, username, first_name, lang)
-    await reset_unanswered(uid)   # user re-engaged → clear ignored-push backoff
+        # Consume a one-shot voice override armed by a PRIOR Telegram update (see
+        # the "no previous response yet" branch below) -- a plain local variable
+        # cannot survive past the end of THIS function call, so the override is
+        # persisted in FSM state. aiogram's default FSMStrategy is USER_IN_CHAT
+        # (confirmed: bot.py's Dispatcher(storage=MemoryStorage()) never
+        # overrides fsm_strategy), so `fsm_state` is ALREADY scoped per (chat,
+        # user) -- the same user in a different chat gets a completely separate
+        # FSM entry. Cleared the instant it is read (whether still within TTL or
+        # already expired): it can apply to at most ONE subsequent ordinary
+        # reply, is never written to the DB, and is never a permanent
+        # preference. Crisis and dependency both return earlier in pipeline()
+        # than this point, so an intervening crisis/dependency message leaves an
+        # armed override untouched -- PRESERVED for the next ordinary message,
+        # the chosen deterministic rule (not silently dropped, not consumed by
+        # a non-ordinary reply).
+        if voice_ux_active and fsm_state is not None:
+            pending = await fsm_state.get_data()
+            if pending.get("one_shot_voice_pending"):
+                armed_at = pending.get("one_shot_voice_pending_at") or 0
+                if time.time() - armed_at <= config.VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS:
+                    one_shot_voice = True
+                await fsm_state.update_data(one_shot_voice_pending=False,
+                                            one_shot_voice_pending_at=None)
 
-    # 3. Log if medium+
-    if risk["level"] in ("medium", "high", "critical"):
-        await log_moderation(uid, username, first_name, risk["level"], risk["score"],
-                              risk["categories"], user_text, "pending", risk["implicit"])
+        # Detection itself is flag-gated ONLY (cheap, stateless, no I/O) -- but
+        # every ACTION (persistence, replay, override arming, voice delivery)
+        # below remains private-chat-only. This matters specifically for a PURE
+        # command outside a private chat: it must be recognized and short-
+        # circuited with a neutral notice, never silently sent to the
+        # therapeutic LLM just because chat.type != "private" made detection
+        # itself unavailable (the earlier, narrower gate did exactly that).
+        fmt_cmd = parse_format_command(user_text, lang) if config.VOICE_REPLIES_ENABLED else None
+        if fmt_cmd:
+            pure = is_pure_format_command(user_text, lang)
+            if pure and not voice_ux_active:
+                # §5 (private-chat boundary) + owner-only canary gate: a pure
+                # meta-command from a non-private chat OR a non-owner user (even
+                # in their own private chat) must never replay, never arm an
+                # override, never touch a preference, and never enter
+                # therapeutic routing -- a short neutral notice, then stop.
+                # voice_ux_active already folds in flag + owner + private-chat.
+                await message.answer(
+                    "Настройки формата и озвучивание доступны в личном чате с ботом." if lang == "ru"
+                    else "Format settings and voice replies are only available in a private chat with me.")
+                return
 
-    # Aggression signal — checkpoint-2 item 2: routed through access_control
-    # instead of an unconditional push_alert. By construction we only reach here
-    # for a role that already has full product access (OWNER, or an
-    # acknowledged+mapped CLINICIAN_TESTER); should_alert_owner is False for a
-    # tester, so no owner alert and no raw-text leak happens for them. RED+
-    # aggression never reaches here (RED already returned above), so there is
-    # never a duplicate owner alert.
-    if "aggression" in risk["categories"] and access_control.should_alert_owner(uid):
-        await push_alert("Aggression Detected", uid, username, risk["level"],
-                         risk["score"], risk["categories"], user_text)
+            if voice_ux_active:
+                if fmt_cmd.kind == "voice_persistent":
+                    await set_response_preference(uid, response_format="voice")
+                elif fmt_cmd.kind == "text_persistent":
+                    await set_response_preference(uid, response_format="text")
+                elif fmt_cmd.kind == "concise_persistent":
+                    await set_response_preference(uid, response_length="concise")
+                elif fmt_cmd.kind == "voice_oneshot":
+                    one_shot_voice = True
+                elif fmt_cmd.kind == "concise_oneshot":
+                    one_shot_concise = True
 
-    # 4.4 Emotional trajectory (§4) — deterministic aggregate of PRIOR messages
-    # (current one not saved yet). Used to amplify ambiguity and bias routing.
-    trajectory = await get_emotional_trajectory(uid, window_hours=24)
+                if pure and fmt_cmd.persistent:
+                    await message.answer(_format_ack_text(fmt_cmd, lang))
+                    return
+                if pure and fmt_cmd.kind == "voice_oneshot":
+                    # §8: "много текста"/"лень читать" etc. -- voice-ify the LAST
+                    # SUCCESSFULLY DELIVERED ordinary response instead of
+                    # generating a new therapeutic interpretation, when one is
+                    # still available. Sourced from FSM state
+                    # (last_delivered_response), NOT the database -- FSM is
+                    # scoped per (chat, user) by aiogram itself, so a
+                    # private-chat reply can never be replayed from a different
+                    # chat the same Telegram user happens to also be in.
+                    fdata = await fsm_state.get_data() if fsm_state is not None else {}
+                    last = fdata.get("last_delivered_response")
+                    last_at = fdata.get("last_delivered_response_at") or 0
+                    if last and (time.time() - last_at <= config.VOICE_LAST_RESPONSE_TTL_SECONDS):
+                        spoken = _safe_concise_version(last, lang)
+                        ok = await _synthesize_and_send_voice(message, uid, spoken, lang)
+                        if not ok:
+                            await message.answer(last)
+                        return
+                    # No usable previous response (none stored, or past its
+                    # TTL): this message itself must NEVER be treated as
+                    # therapeutic content. Clear any stale value, arm the
+                    # override for the NEXT ordinary reply (consumed above, on
+                    # that future update), and stop here.
+                    if fsm_state is not None:
+                        await fsm_state.update_data(
+                            last_delivered_response=None, last_delivered_response_at=None,
+                            one_shot_voice_pending=True, one_shot_voice_pending_at=time.time())
+                    await message.answer(
+                        "Хорошо, следующий ответ озвучу." if lang == "ru"
+                        else "Okay, I'll voice the next reply.")
+                    return
+                elif pure and fmt_cmd.kind in ("concise_oneshot", "detailed_oneshot"):
+                    await message.answer(_format_ack_text(fmt_cmd, lang))
+                    return
+            # else: a MIXED message. When voice_ux_active (owner, private chat,
+            # flag on), falls through with the one-shot flags armed above.
+            # Otherwise -- non-private chat OR non-owner -- voice_ux_active was
+            # False so the `if voice_ux_active:` block never ran -- the format
+            # fragment is silently ignored (no preference write, no override
+            # armed) and ordinary routing proceeds UNCHANGED for the emotional
+            # content, exactly as it did before this feature existed.
 
-    # 4.5 Ambiguity check (v3 hotfix) — runs BEFORE any LLM call.
-    # A double-meaning phrase ("выйти в окно") must trigger a deterministic
-    # clarifying question, never an LLM guess. With recent risk history we also
-    # surface the hotline. This is the direct fix for the endorsement incident.
-    if risk.get("ambiguous_phrases"):
-        recent = await get_recent_messages(uid, limit=10)
-        signal = amplify_ambiguity_by_context(risk["ambiguous_phrases"], recent)
-        # §4: trajectory upgrades a soft "force_disambiguation" to "force_crisis"
-        # when aggregated dynamics show deterioration or a chronic risk streak —
-        # closing the gap where raw last-message scanning would miss it.
-        if signal and (trajectory.trend == "deteriorating"
-                       or trajectory.hopelessness_streak >= 3
-                       or trajectory.yellow_plus_streak >= 5):
-            signal = "force_crisis"
-        if signal:
-            phrase = risk["ambiguous_phrases"][0]
-            disambig = get_disambiguation_message(
-                phrase, lang, with_hotline=(signal == "force_crisis"))
-            await save_message(uid, "user", user_text, "disambiguation", lang,
+        # 5. Update state
+        state = await load_state(uid) or dict(DEFAULT_STATE)
+        state = update_state(state, user_text)
+        await save_state(uid, state)
+
+        # 6. Detect stage
+        stage = detect_stage(user_text, lang)
+
+        # 7. Assess readiness
+        readiness = assess_readiness(user_text, lang)
+
+        # 8. Cognitive capacity
+        capacity = get_capacity(state)
+
+        # 9. Select scenario
+        variant = get_variant(uid)
+        scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
+                                   variant, trajectory=trajectory)
+
+        # 9.4 First-turn eligibility (spec item D) -- computed only now that
+        # scenario/stage/capacity/risk are all known; no lexical/topic
+        # detection anywhere in this check. claim_first_turn succeeds AT MOST
+        # ONCE per (user_id, contract_version) ever (PRIMARY KEY-enforced), so
+        # a successfully claimed first-turn owns this turn's entire response
+        # lifecycle and takes precedence over the Conversation Controller
+        # below -- and costs nothing on any later turn, since the claim
+        # attempt then fails instantly and falls through to the Controller
+        # unaffected.
+        is_ftm_eligible = (
+            scenario in FIRST_TURN_ALLOWED_SCENARIOS
+            and stage not in FIRST_TURN_EXCLUDED_STAGES
+            and capacity >= FIRST_TURN_MIN_CAPACITY
+            and risk["level"] not in FIRST_TURN_EXCLUDED_RISK_LEVELS
+        )
+        ft_claimed = False
+        claim_token = None
+        if is_ftm_eligible:
+            claim_token = secrets.token_urlsafe(16)
+            ft_claimed = await claim_first_turn(uid, FIRST_TURN_CONTRACT_VERSION, claim_token, scenario)
+
+        # 5.5 Conversation Controller (Phase 3, master prompt §10/§15) -- FAST
+        # claim only, still inside the ingestion lock (matches the ordinary
+        # path's own inbound-persistence timing exactly). Runs strictly AFTER
+        # the RED crisis check, the Depression Disclosure Gate, the ambiguity
+        # check, and the dependency boundary above -- all already returned for
+        # this turn if triggered, so none of those deterministic safety/
+        # boundary routes can ever be bypassed by an explicit Controller
+        # intent (hardening §4). Attempted ONLY when first-turn did not
+        # already claim this turn above (see 9.4) -- a successfully claimed
+        # first-turn owns the turn outright. The LLM call itself happens
+        # later, OUTSIDE this lock (hardening §5) -- see
+        # _controller_generate_and_deliver, invoked right after the `finally`
+        # below releases it.
+        controller_claim = None
+        if not ft_claimed and await access_control.core_rollout_allowed(uid):
+            controller_claim = await _controller_claim_turn(uid, user_text, lang, risk)
+
+        # 9.5 Emotional reaction (Voice and Adaptive Response UX) -- best-effort,
+        # deterministic, fires only for genuine (non-format-only) messages: a
+        # PURE format command already returned above and never reaches here.
+        cat, conf = select_reaction_category(user_text, risk["categories"], stage, lang,
+                                             is_meta_command=False, is_dependency_redirect=False)
+
+        # 11. Select practice
+        severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
+        practice = select_practice(scenario, stage, severity, lang)
+
+        # 12. Log router decision -- and 12.5's inbound persistence -- SKIPPED
+        # for a Controller-owned turn: _controller_claim_turn already persisted
+        # the inbound user message itself (tagged "controller", not a legacy
+        # scenario), and logging a legacy routing decision for a turn the
+        # Controller actually owns would misrepresent research/analytics data
+        # (hardening §6 -- the legacy router must not act as if it decided
+        # this turn). stage/readiness/capacity/scenario/practice above still
+        # ran (pure computation, no side effects, nothing delivered) -- a
+        # deliberate, documented minor inefficiency traded for not reindenting
+        # this entire legacy block, rather than a correctness gap: nothing
+        # computed here is used, persisted, or delivered for a Controller turn.
+        if controller_claim is None:
+            await log_router_decision(uid, state, risk["score"], risk["categories"],
+                                       stage, readiness, capacity, scenario,
+                                       practice["id"], variant, ROUTER_VERSION)
+
+            # 12.5 Persist the USER message HERE -- before BOTH long LLM awaits
+            # (maybe_summarize below AND the answer call). Memory loads recent messages
+            # by autoincrement id (get_recent_messages ORDER BY id DESC), so a row's
+            # arrival ORDER is its id order. Every await before this point is a fast
+            # local/DB op; the two multi-second awaits (summarization, answer) come
+            # after. So a slow turn can no longer pause on an LLM call while a newer,
+            # faster turn's user row lands first and makes the slow turn look like the
+            # newest active context (P1 EARLY PERSISTENCE ORDER RACE -- previously this
+            # save sat after both LLM awaits). The assistant row is still saved later,
+            # and only if this turn was not superseded. A duplicate Telegram update
+            # never reaches here (DuplicateUpdateGuard drops it), so no duplicate row.
+            await save_message(uid, "user", user_text, scenario, lang,
                                risk["score"], risk["categories"])
-            await save_message(uid, "assistant", disambig, "disambiguation", lang)
-            await message.answer(disambig)
-            await log_disambiguation(uid, user_text, phrase, signal)
+    finally:
+        _ingest_leave(uid, _ingest)
+
+    # PR #73 request-changes §6: best-effort, restart-safe recovery for any
+    # post-practice follow-up prompt that previously failed to deliver --
+    # runs on every real inbound turn (independent of whether THIS turn is
+    # Controller-claimed), never holds the ingestion lock, and is fully
+    # idempotent (mark_prompt_delivered's own CAS prevents a duplicate
+    # active prompt even if this fires more than once).
+    if await access_control.core_rollout_allowed(uid):
+        await _retry_failed_practice_prompts(message, uid)
+
+    # Conversation Controller: the SLOW half (LLM call, validation, delivery)
+    # -- strictly AFTER the ingestion lock above is released (hardening §5),
+    # and authoritative for this turn: none of the ordinary reaction/memory/
+    # LLM/delivery code below ever runs for a Controller-owned turn
+    # (hardening §6 -- no second ordinary-response pipeline running alongside).
+    if controller_claim is not None:
+        await _controller_generate_and_deliver(message, uid, controller_claim, _turn_gen, risk)
+        return
+
+    # 9.4b First-turn: the single primary delivery lifecycle for a claimed
+    # first-turn turn (spec items A/E) -- authoritative for this turn, same
+    # as the Controller lifecycle above: no reaction is sent (see
+    # _maybe_react below, skipped entirely on this path), and none of the
+    # ordinary memory/LLM/delivery code below ever runs for it. The user
+    # message was already persisted inside the ingestion lock above, so
+    # build_context's `recent` already contains it -- no explicit append.
+    if ft_claimed:
+        await maybe_summarize(uid, client)
+        summary, recent = await build_context(uid)
+        system_prompt = get_system_prompt(scenario, lang)
+        messages = [{"role": "system", "content": system_prompt}]
+        if summary:
+            messages.append({"role": "system", "content": f"Context:\n{summary}"})
+        for role, content in recent:
+            messages.append({"role": role, "content": content})
+        await bot.send_chat_action(message.chat.id, "typing")
+        answer, buttons_allowed = await _first_turn_generate_and_validate(messages, user_text, lang)
+        # Stale-response guard: the SAME suppression the Controller/ordinary
+        # paths use (_user_generation_superseded) -- a newer turn for this
+        # user superseded this one while the LLM call above was in flight.
+        # No delivery, no persistence; the claim is left in its last
+        # confirmed state, never compensated with a follow-up transition
+        # (see transition_first_turn_claim's own contract).
+        if _user_generation_superseded(uid, _turn_gen):
             return
+        await _deliver_first_turn_response(message, uid, answer, buttons_allowed, scenario, lang,
+                                           claim_token, user_revision)
+        return
 
-    # 3.5 Dependency monitor
-    # record_message MUST come first so the current message is counted
-    # before the threshold check — otherwise the 100th message never triggers.
-    await dependency_monitor.record_message(uid)
-    dep_msg = await dependency_monitor.check_dependency(uid, lang)
-    # spec item C: dep_msg becomes a forced primary answer instead of being
-    # sent immediately — no first-turn claim, no primary LLM call for this
-    # turn, but ordinary state/stage/readiness/capacity/scenario/router-log/
-    # persistence/tracking below still run unchanged. Delivery happens once,
-    # later, through the single primary response point. Truthy check
-    # (matching the original `if dep_msg:` contract) -- an empty string is
-    # treated as "no dependency answer", not as a forced empty send.
-    forced_primary_answer = dep_msg if dep_msg else None
+    # 9.5 reaction: moved OUT of the ingestion lock (never hold the
+    # lock across reaction sending). cat/conf were computed above.
+    await _maybe_react(message, uid, cat, conf)
 
-    # 5. Update state
-    state = await load_state(uid) or dict(DEFAULT_STATE)
-    state = update_state(state, user_text)
-    await save_state(uid, state)
-    
-    # 6. Detect stage
-    stage = detect_stage(user_text, lang)
-    
-    # 7. Assess readiness
-    readiness = assess_readiness(user_text, lang)
-    
-    # 8. Cognitive capacity
-    capacity = get_capacity(state)
-    
-    # 9. Select scenario
-    variant = get_variant(uid)
-    scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
-                               variant, trajectory=trajectory)
-    
-    # 10. Check dependency (separate monitor/flow — left unchanged, except
-    # skipped when a dependency answer is already forced above, so the same
-    # turn never sends two separate dependency-style replies).
-    if forced_primary_answer is None:
-        dep_resp = monitor_relationship(user_text, lang)
-        if dep_resp:
-            await message.answer(dep_resp)
-            return
-
-    # 11. Select practice
-    severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
-    practice = select_practice(scenario, stage, severity, lang)
-    
-    # 12. Log router decision
-    await log_router_decision(uid, state, risk["score"], risk["categories"],
-                               stage, readiness, capacity, scenario,
-                               practice["id"], variant, ROUTER_VERSION)
-    
-    # 13. Memory
+    # 13. Memory. build_context now returns the just-saved current user message
+    # as the newest item in `recent`, so it is NOT appended again below.
     await maybe_summarize(uid, client)
     summary, recent = await build_context(uid)
-    
-    # 14. Build messages
+
+    # 14. Build messages (recent already ends with the current user message)
     system_prompt = get_system_prompt(scenario, lang)
     messages = [{"role": "system", "content": system_prompt}]
     if summary:
         messages.append({"role": "system", "content": f"Context:\n{summary}"})
     for role, content in recent:
         messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": user_text})
-
-    # 14.5 First-turn eligibility (spec item D) — computed only now that
-    # scenario/stage/capacity/risk are all known; no lexical/topic detection
-    # anywhere in this check. The claim itself is acquired at the latest safe
-    # point: after practice selection, router logging, memory/context
-    # loading, and the ordinary messages list are already built — immediately
-    # before adding the contract and calling the primary LLM.
-    is_ftm_eligible = (
-        forced_primary_answer is None
-        and scenario in FIRST_TURN_ALLOWED_SCENARIOS
-        and stage not in FIRST_TURN_EXCLUDED_STAGES
-        and capacity >= FIRST_TURN_MIN_CAPACITY
-        and risk["level"] not in FIRST_TURN_EXCLUDED_RISK_LEVELS
-    )
-    ft_claimed = False
-    claim_token = None
-    if is_ftm_eligible:
-        claim_token = secrets.token_urlsafe(16)
-        ft_claimed = await claim_first_turn(uid, FIRST_TURN_CONTRACT_VERSION, claim_token, scenario)
-
-    if forced_primary_answer is not None:
-        # spec item C: deliver only the forced dependency answer through the
-        # single primary response point — no first-turn claim, no primary
-        # LLM call, no buttons, no outcome/quality/practice follow-up.
-        # Save the user turn once, attempt exactly one send, and only save
-        # the assistant turn AFTER Telegram delivery is confirmed -- a send
-        # failure must not leave an assistant message on record for text
-        # that was never actually delivered, and must not be retried. If the
-        # user-message save itself fails, nothing downstream (send, assistant
-        # save, LLM, claim) has happened yet -- log the same redacted shape
-        # and return before any of it starts.
-        try:
-            await save_message(uid, "user", user_text, scenario, lang,
-                               risk["score"], risk["categories"])
-        except Exception as e:
-            print(f"event=dependency_user_save_failed uid={uid} exc_type={type(e).__name__}")
-            return
-        try:
-            await message.answer(forced_primary_answer)
-        except Exception:
-            return
-        # Telegram delivery is already confirmed at this point -- a save
-        # failure here must not resend, must not surface an error to the
-        # user, and must never log the delivered text, the user text, or
-        # the raw exception message (only a fixed event name, uid, and
-        # exception class name).
-        try:
-            await save_message(uid, "assistant", forced_primary_answer, scenario, lang)
-        except Exception as e:
-            print(f"event=dependency_assistant_save_failed uid={uid} exc_type={type(e).__name__}")
-        return
-
-    if ft_claimed:
-        # spec items A/E: single primary delivery lifecycle for a claimed
-        # first-turn turn. Save the ordinary user message exactly once here;
-        # generation/validation/fallback and the single send + button
-        # publication happen inside the helpers below.
-        await save_message(uid, "user", user_text, scenario, lang,
-                           risk["score"], risk["categories"])
-        await bot.send_chat_action(message.chat.id, "typing")
-        answer, buttons_allowed = await _first_turn_generate_and_validate(messages, user_text, lang)
-        await _deliver_first_turn_response(message, uid, answer, buttons_allowed, scenario, lang,
-                                           claim_token, user_revision)
-        return
-
     # 15. LLM call
     await bot.send_chat_action(message.chat.id, "typing")
     try:
@@ -1059,13 +2180,34 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # NEVER re-prompt the LLM here.
         answer = select_fallback(risk, lang)
 
-    # 17. Save & send (with a human-feeling typing pause, §7.2). The user
-    # message carries its risk snapshot — the deterministic source for §4/§5.
-    await save_message(uid, "user", user_text, scenario, lang,
-                       risk["score"], risk["categories"])
-    await save_message(uid, "assistant", answer, scenario, lang)
+    # 17. Send (with a human-feeling typing pause, §7.2). The user message was
+    # already persisted before the LLM call (step 14.5) to preserve arrival
+    # order; only the assistant row + delivery remain, and both are gated on
+    # this turn not having been superseded.
     await asyncio.sleep(typing_delay(answer))
-    await message.answer(answer)
+    # Stale-response guard: if a NEWER turn for this user started while this
+    # ordinary answer was being generated (aiogram runs updates as concurrent
+    # tasks), this answer is stale -- skip persisting the assistant row AND
+    # delivering it, so an older reply can never arrive after a newer one, and
+    # a stale assistant answer never enters memory. Checked as late as possible
+    # (after the typing pause) to catch a turn that arrived during it.
+    # Deterministic safety replies (crisis/dependency/disambiguation) returned
+    # earlier and are never subject to this guard.
+    if _user_generation_superseded(uid, _turn_gen):
+        _dispatch_log(f"cid={_cid} stage=skipped_stale source=normal")
+        return
+    await save_message(uid, "assistant", answer, scenario, lang)
+    await deliver_response(message, uid, answer, lang,
+                           one_shot_voice=one_shot_voice, one_shot_concise=one_shot_concise)
+    # Only reached if deliver_response did not raise -- an exception during
+    # actual Telegram delivery leaves NO last_delivered_response write, so a
+    # failed send is never later replayed as if it had succeeded. Stored in
+    # FSM state (chat+user scoped, never the DB) -- never crisis/dependency
+    # text, since both of those paths already returned earlier in pipeline()
+    # and never reach this line at all.
+    if voice_ux_active and fsm_state is not None:
+        await fsm_state.update_data(last_delivered_response=answer,
+                                    last_delivered_response_at=time.time())
 
     # 17.5 Profile refresh (§5) — deterministic, every 5th user message.
     await maybe_update_profile(uid, await get_user_message_count(uid))
@@ -1098,7 +2240,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             await fsm_state.update_data(stage=stage, readiness=readiness, capacity=capacity)
         await message.answer(f"Как ты себя чувствуешь прямо сейчас? (1=плохо, 10=хорошо)" if lang == "ru"
                              else "How do you feel right now? (1=bad, 10=good)",
-                             reply_markup=score_kb(f"before:{practice['id']}:{scenario}:{lang}"))
+                             reply_markup=before_score_kb(practice['id'], scenario, lang))
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -1315,11 +2457,34 @@ async def cb_crisis(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("before:"))
 async def cb_before(callback: CallbackQuery, fsm_state: FSMContext):
     uid = callback.from_user.id
-    parts = callback.data.split(":")
-    practice_id, scenario, lang, score = parts[1], parts[2], parts[3], int(parts[4])
+    try:
+        parts = callback.data.split(":")
+        practice_id, scenario, lang, score = parts[1], parts[2], parts[3], int(parts[4])
+    except (IndexError, ValueError):
+        # Malformed callback data (forged/truncated) -- fail closed, no DB write.
+        await callback.answer()
+        return
+
+    # Fail closed BEFORE any DB write: a forged, stale-version, or
+    # catalog-only practice_id must never create an intervention_results row,
+    # let alone display content. This is the ONLY lookup used with
+    # callback-supplied (untrusted) data -- get_practice_by_id itself has no
+    # such guard.
+    practice = get_production_practice_by_id(practice_id, lang)
+    if not practice:
+        await callback.answer()
+        return
+
+    # Idempotency: a duplicate tap of the SAME offer (double-tap, or the
+    # button remaining clickable after the first tap) must create exactly
+    # one baseline row, never a second one, and never let a later tap
+    # overwrite the first score.
+    fdata = await fsm_state.get_data()
+    if fdata.get("practice_id") == practice_id and fdata.get("intervention_id") is not None:
+        await callback.answer()
+        return
 
     state = await load_state(uid) or dict(DEFAULT_STATE)
-    fdata = await fsm_state.get_data()
     intervention_id = await start_intervention(
         uid, scenario, scenario, practice_id, PRACTICE_VERSION,
         {"state": state}, score,
@@ -1327,7 +2492,17 @@ async def cb_before(callback: CallbackQuery, fsm_state: FSMContext):
         fdata.get("readiness", "MEDIUM"),
         fdata.get("capacity", get_capacity(state)),
         get_variant(uid), ROUTER_VERSION,
+        source_chat_id=callback.message.chat.id,
+        source_message_id=callback.message.message_id,
     )
+    if intervention_id is None:
+        # Lost the atomic claim: a genuinely concurrent (or duplicate) tap on
+        # this EXACT card already won -- idx_intervention_one_baseline_per_card
+        # rejected this insert. The in-memory fdata check above is only a
+        # cheap fast path for the common sequential case; this is the real,
+        # engine-enforced guarantee. No second row, no overwrite, no content.
+        await callback.answer()
+        return
     await fsm_state.update_data(
         intervention_id=intervention_id,
         practice_id=practice_id,
@@ -1337,15 +2512,1099 @@ async def cb_before(callback: CallbackQuery, fsm_state: FSMContext):
     )
     await fsm_state.set_state(InterventionStates.awaiting_after)
 
-    practice = get_practice_by_id(practice_id, lang)
-    if practice:
-        steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
-        await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}", parse_mode="HTML")
-        await asyncio.sleep(1)
-        await callback.message.answer(
-            ("Как теперь?" if lang == "ru" else "How now?"),
-            reply_markup=score_kb("after"))
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
+    await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}", parse_mode="HTML")
+    await asyncio.sleep(1)
+    await callback.message.answer(
+        ("Как теперь?" if lang == "ru" else "How now?"),
+        reply_markup=score_kb("after"))
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("before_skip:"))
+async def cb_before_skip(callback: CallbackQuery, fsm_state: FSMContext):
+    """Explicit baseline-skip (Therapeutic Core Foundation, flag-gated): the
+    user proceeds straight to the practice content WITHOUT providing a
+    before-score. Deliberately does NOT call start_intervention (no baseline
+    is fabricated, no row is created -- non-evaluable by absence, the same
+    convention the existing schema already uses for any offer the user never
+    engages with) and does NOT enter the after/quality rating loop (nothing
+    exists to compare a later value against, so no improvement claim is
+    ever possible for this episode)."""
+    if not config.THERAPEUTIC_CORE_FOUNDATION_ENABLED:
+        await callback.answer()
+        return
+    try:
+        parts = callback.data.split(":")
+        practice_id, scenario, lang = parts[1], parts[2], parts[3]
+    except IndexError:
+        await callback.answer()
+        return
+    practice = get_production_practice_by_id(practice_id, lang)
+    if not practice:
+        await callback.answer()
+        return
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
+    await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}", parse_mode="HTML")
+    await callback.answer()
+
+# ── Depression Disclosure Gate callbacks (Phase 2) ──────────────────────────
+# Every handler: parse+validate via _dd_validate_callback (§1's 7-point chain)
+# -> perform ONE atomic transition -> answer -> send the next question. A
+# transition returning False (lost the race -- e.g. superseded by a crisis
+# event logged between validation and this call) means "do not send the next
+# question", which is exactly what §7's TOCTOU requirement asks for; it falls
+# out of the atomic UPDATE's own WHERE clause, not a second explicit check.
+
+async def _dd_record_answer_and_advance(flow: dict, uid: int, key: str, value: str,
+                                        from_step: str, to_step: str) -> bool:
+    answers = safe_load_answers(flow["answers_json"])
+    answers[key] = value
+    return await advance_disclosure_flow(flow["id"], uid, from_step=from_step,
+                                         to_step=to_step, answers_json=json.dumps(answers))
+
+
+@dp.callback_query(F.data.startswith("dd:safety:"))
+async def cb_dd_safety(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "SAFETY_CHECK")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+
+    if value in ("yes", "unsure"):
+        # §2/§6: "Да" is a direct, truthful positive answer to the explicit
+        # safety question -> routes to the SAME deterministic crisis system
+        # ("EXPLICIT_MESSAGE"'s sibling, not a parallel one) with truthful
+        # source metadata: DIRECT_SAFETY_YES, risk_score=None (never a
+        # fabricated 100), categories=["suicide"] (truthful -- this genuinely
+        # IS a direct confirmed report). "Не уверен" gets the SAME crisis-
+        # support UI/priority (this codebase's existing, documented
+        # philosophy: "anything unclear keeps the crisis screen, never assume
+        # safety" -- see the active-crisis reassurance gate near the top of
+        # pipeline()) but source=DIRECT_SAFETY_UNSURE and categories=[] --
+        # uncertainty is never recorded as a confirmed suicide statement.
+        # user_text="" (not the fabricated bracket placeholder): there is no
+        # original message for a button tap, and trigger_crisis/log_crisis_
+        # event now handle an empty user_text truthfully (no fabricated
+        # "user" message is saved -- see trigger_crisis's own comment).
+        if not await close_disclosure_flow(flow["id"], uid, from_step=flow["step"],
+                                           status="superseded_by_crisis",
+                                           superseded_reason=f"direct_safety_{value}"):
+            await _dd_reject_stale_callback(callback, lang)
+            return
+        await callback.answer()
+        source = "DIRECT_SAFETY_YES" if value == "yes" else "DIRECT_SAFETY_UNSURE"
+        categories = ["suicide"] if value == "yes" else []
+        risk = {"score": None, "level": "critical", "categories": categories,
+               "implicit": False, "ambiguous_phrases": []}
+        await trigger_crisis(callback.message, uid, callback.from_user.username or "",
+                             "", risk, lang, source=source)
+        return
+
+    # value == "no"
+    if not await advance_disclosure_flow(flow["id"], uid, from_step="SAFETY_CHECK",
+                                         to_step="DIAGNOSIS_SOURCE"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(diagnosis_source_text(lang),
+                                  reply_markup=_dd_diagnosis_source_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:src:"))
+async def cb_dd_source(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "DIAGNOSIS_SOURCE")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    # value in {"specialist","self","unknown"} -- never used to confirm OR deny
+    # a diagnosis (§13.3/§8), only stored as reported provenance.
+    if not await advance_disclosure_flow(flow["id"], uid, from_step="DIAGNOSIS_SOURCE",
+                                         to_step="DURATION", diagnosis_source=value):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(duration_text(lang),
+                                  reply_markup=_dd_duration_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:dur:"))
+async def cb_dd_duration(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "DURATION")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    if not await _dd_record_answer_and_advance(flow, uid, "duration", value,
+                                               "DURATION", "FUNCTIONING"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(functioning_text(lang),
+                                  reply_markup=_dd_functioning_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:func:"))
+async def cb_dd_functioning(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "FUNCTIONING")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    if not await _dd_record_answer_and_advance(flow, uid, "functioning", value,
+                                               "FUNCTIONING", "BASIC_ACTIVITIES"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(basic_activities_text(lang),
+                                  reply_markup=_dd_basic_activities_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:basic:"))
+async def cb_dd_basic_activities(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "BASIC_ACTIVITIES")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    if not await _dd_record_answer_and_advance(flow, uid, "basic_activities", value,
+                                               "BASIC_ACTIVITIES", "SUPPORT"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(support_text(lang),
+                                  reply_markup=_dd_support_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:supp:"))
+async def cb_dd_support(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "SUPPORT")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    if not await _dd_record_answer_and_advance(flow, uid, "support", value,
+                                               "SUPPORT", "PURPOSE"):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(purpose_text(lang),
+                                  reply_markup=_dd_purpose_kb(flow["id"], lang))
+
+
+@dp.callback_query(F.data.startswith("dd:purp:"))
+async def cb_dd_purpose(callback: CallbackQuery):
+    result = await _dd_validate_callback(callback, "PURPOSE")
+    if result is None:
+        return
+    flow, value = result
+    uid, lang = callback.from_user.id, flow["lang"]
+    answers = safe_load_answers(flow["answers_json"])
+    answers["purpose"] = value
+    # §9: PURPOSE is the last question, not a discard point -- close_disclosure_
+    # flow(status="completed") is what actually produces the typed HANDOFF_READY
+    # step + handoff_status='ready' for Phase 3 to later claim_disclosure_handoff().
+    if not await close_disclosure_flow(flow["id"], uid, from_step="PURPOSE", status="completed",
+                                       answers_json=json.dumps(answers)):
+        await _dd_reject_stale_callback(callback, lang)
+        return
+    await callback.answer()
+    await callback.message.answer(closing_text(lang))
+
+
+# ── Conversation Controller: PRACTICE consent (Phase 3 §12, hardening §3/§4) ─
+# callback_data "cc:consent:<session_id>:<proposal_id>:<yes|no>" -- carries
+# the exact PROPOSAL identity, not just the session, so consent applies to
+# one exact practice proposal. Deterministic Да/Нет, never LLM-parsed free
+# text. Every check below is independent and additive -- a callback that
+# fails any one of them is rejected the same way (non-actionable, no delivery).
+
+@dp.callback_query(F.data.startswith("cc:consent:"))
+async def cb_cc_consent(callback: CallbackQuery):
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 4)
+    if len(parts) != 5:
+        await callback.answer()
+        return
+    _, _tag, session_id, proposal_id, value = parts
+    if value not in ("yes", "no"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    # Hardening §4: defense-in-depth. supersede_active_core_sessions_for_crisis
+    # (called from trigger_crisis) already PAUSES the session and supersedes
+    # any actionable proposal, which the atomic transition below independently
+    # rejects -- this direct get_active_crisis check is a SECOND, independent
+    # guard so a crisis is caught even if that supersession step itself failed.
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    # §4: a new Depression Disclosure flow (a fresh safety re-assessment)
+    # also makes a standing PRACTICE proposal non-actionable, independent of
+    # the proposal's own status.
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    session = await get_core_session(session_id, uid)
+    if session is None or session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    # §4: exact proposal AND session identity must both match -- ownership is
+    # already enforced by get_practice_proposal's own WHERE, this additionally
+    # rejects a forged/mismatched session_id paired with a real proposal_id.
+    if proposal is None or str(proposal.session_id) != str(session_id):
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+    to_status = (PracticeProposalStatus.DECLINED if value == "no"
+                else PracticeProposalStatus.GRANTED).value
+
+    # Atomic CAS (database.transition_practice_proposal): PENDING -> to_status,
+    # with expiry enforced INSIDE the same conditional UPDATE (require_
+    # unexpired=True). Ownership, current status, and freshness are all
+    # verified in the ONE atomic write -- a duplicate tap, a stale tap, an
+    # expired proposal, or two concurrent taps racing each other all resolve
+    # to exactly one winner, never a lost-update or a double delivery.
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.PENDING.value,
+            to_status=to_status, require_unexpired=True):
+        await callback.answer()
+        return
+    # Best-effort mirror on the session for older readers -- the proposal's
+    # own status (just transitioned above) is the real, authoritative gate.
+    prior_json = session_json_snapshot(session)
+    session.consent = ConsentState.DECLINED if value == "no" else ConsentState.GRANTED
+    await update_core_session_authoritative(session, prior_json)
+    await callback.answer()
+
+    if value == "no":
+        await callback.message.answer(
+            "Хорошо, не будем. Если захочешь попробовать позже — просто скажи." if lang != "en"
+            else "Okay, we won't. Just say the word if you want to try later.")
+        return
+
+    await _deliver_granted_practice(callback, uid, session_id, proposal_id, proposal.practice_id, lang)
+
+
+async def _deliver_granted_practice(callback: CallbackQuery, uid: int, session_id, proposal_id,
+                                    practice_id: str, lang: str) -> None:
+    """Shared GRANTED->...->STARTED delivery pipeline for cb_cc_consent's
+    "yes" tap. PR #73 ATOMIC CLOSURE §4: an informed repeat of a WORSE-
+    outcome practice now flows through this SAME ordinary consent contract
+    too (a real, brand-new is_worse_override proposal, ordinary Да/Нет
+    buttons) -- there is no separate callback contract or delivery path to
+    drift apart from anymore. The caller is responsible for the PENDING ->
+    GRANTED transition itself; this function owns everything from GRANTED
+    onward."""
+    practice = get_production_practice_by_id(practice_id, lang)
+    if not practice:  # pragma: no cover -- defensive, practice_id is always a real production id
+        await callback.message.answer(controller.fallback_text(lang, Intent.PRACTICE))
+        return
+
+    # PR #73 request-changes §3: a real delivery-claim state machine closes
+    # the consent-to-delivery crisis race. GRANTED alone was not enough --
+    # a crisis/​start beginning between GRANTED and the actual Telegram send
+    # could not be caught (supersede_active_practice_proposals now DOES
+    # cover GRANTED/DELIVERING too, but only a fresh safety recheck right
+    # here, immediately before claiming delivery, closes the narrow window
+    # between "the crisis write landed" and "this callback re-reads it").
+    if (await get_active_crisis(uid) is not None
+            or await get_active_disclosure_flow(uid) is not None
+            or not await access_control.core_rollout_allowed(uid)):
+        return
+    resession = await get_core_session(session_id, uid)
+    if resession is None or resession.lifecycle_status is not LifecycleStatus.OPEN:
+        return
+    # Atomic delivery claim: GRANTED -> DELIVERING. Only ONE callback
+    # invocation can ever win this (the CAS's own ownership+status+expiry
+    # checks), so a duplicate/racing tap here is rejected the same way a
+    # duplicate PENDING->GRANTED tap already is.
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.GRANTED.value,
+            to_status=PracticeProposalStatus.DELIVERING.value, require_unexpired=True):
+        return
+    # Recheck safety ONE more time, immediately before the actual external
+    # (unsendable-boundary) Telegram call -- the narrowest possible window
+    # is between this check and the send itself, which cannot be closed
+    # further without controlling Telegram's own delivery latency. Honest
+    # guarantee: crisis/​start beginning BEFORE this line is always caught;
+    # crisis/​start beginning strictly AFTER this line and DURING the network
+    # call itself is not (no system can close an external I/O boundary).
+    if await get_active_crisis(uid) is not None:
+        await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
+            to_status=PracticeProposalStatus.SUPERSEDED.value, reason="crisis_before_send")
+        return
+    # PR #73 FINAL REQUEST CHANGES §3: the crisis-only recheck above was not
+    # enough -- a new disclosure flow or rollout turning off between the
+    # DELIVERING claim and the send need the exact same guarantee.
+    if (await get_active_disclosure_flow(uid) is not None
+            or not await access_control.core_rollout_allowed(uid)):
+        await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
+            to_status=PracticeProposalStatus.SUPERSEDED.value, reason="unsafe_before_send")
+        return
+    # Owning session no longer OPEN (e.g. /start paused it between the claim
+    # and here) -- /start's own supersede_active_practice_proposals call
+    # already flipped this proposal away from DELIVERING, so no further
+    # write is needed, just stop.
+    resession2 = await get_core_session(session_id, uid)
+    if resession2 is None or resession2.lifecycle_status is not LifecycleStatus.OPEN:
+        return
+    # The proposal itself may already be superseded (by /start, a topic
+    # change, a new disclosure flow, or a racing duplicate claim) even if
+    # none of the checks above caught it directly -- this is the final,
+    # authoritative recheck immediately before the external Telegram call.
+    reproposal = await get_practice_proposal(proposal_id, uid)
+    if reproposal is None or reproposal.status is not PracticeProposalStatus.DELIVERING:
+        return
+
+    # §3 final closure: STARTED means the exact steps were SUCCESSFULLY
+    # delivered -- the send is attempted FIRST, and DELIVERING->STARTED only
+    # happens once it actually succeeded. A send failure records
+    # DELIVERY_FAILED (never leaves the proposal stuck in DELIVERING, never
+    # falsely STARTED, never shows outcome buttons for content the user
+    # never received).
+    steps = "\n".join(f"{i}. {s}" for i, s in enumerate(practice["steps"], 1))
+    try:
+        await callback.message.answer(f"<b>{_he(practice['name'])}</b>\n\n{_he(steps)}",
+                                      parse_mode="HTML")
+    except Exception as e:
+        print(f"[controller] practice steps delivery failed uid={uid}: {type(e).__name__}: {e}")
+        await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
+            to_status=PracticeProposalStatus.DELIVERY_FAILED.value, reason="send_exception")
+        return
+    # Only the delivery owner (this exact callback invocation, having won
+    # the GRANTED->DELIVERING CAS above) may mark STARTED. PR #73 FINAL
+    # REQUEST CHANGES §1: the reporting window opens in this SAME atomic
+    # write -- the cc:outcome buttons about to be shown become actionable
+    # exactly when STARTED becomes true, never before.
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.DELIVERING.value,
+            to_status=PracticeProposalStatus.STARTED.value, open_reporting_window=True):
+        return  # superseded between the send and this write -- steps went out, but
+                # were also invalidated moments later; the outcome UI stays silent
+    # PR #73 request-changes §6 / FINAL REQUEST CHANGES §2 / ATOMIC CLOSURE
+    # §2/§3: restart-safe, claim-first delivery tracking with a persisted,
+    # unforgeable claim_id -- claim_prompt_send's atomic CAS to RETRYING is
+    # what makes this idempotent under concurrency (a post-send CAS alone
+    # only dedupes the DB write, not a second Telegram message), and the
+    # claim_id is what stops a stale prior claimant from finalizing a claim
+    # a second caller legitimately reclaimed. A lost claim (another caller
+    # already owns this send, or it is already terminal) means this call
+    # must not attempt to send at all.
+    outcome_claim_id = await claim_prompt_send(proposal_id, uid, "outcome", "STARTED")
+    if outcome_claim_id:
+        # §3: re-verify EVERYTHING immediately before the send -- winning
+        # the claim does not guarantee crisis/disclosure/rollout/session/
+        # window state hasn't changed in the interim.
+        if await _prompt_claim_still_safe(uid, proposal_id, "outcome", outcome_claim_id, "STARTED"):
+            try:
+                sent = await callback.message.answer(
+                    ("Получилось выполнить практику?\n\n"
+                     "Можно выбрать вариант или ответить своими словами.") if lang != "en" else
+                    ("Were you able to do the practice?\n\n"
+                     "You can choose an option or reply in your own words."),
+                    reply_markup=_practice_did_kb(proposal_id, lang))
+                await mark_prompt_delivered(proposal_id, uid, "outcome", sent.message_id, outcome_claim_id)
+            except Exception as e:
+                print(f"[controller] outcome-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+                await mark_prompt_failed(proposal_id, uid, "outcome", outcome_claim_id)
+        else:
+            # Release the claim immediately rather than block it for the
+            # full stale-claim timeout -- whatever invalidated the world
+            # (crisis/start/disclosure/rollout/topic-change/close) already
+            # makes this prompt permanently uninteresting to resurrect.
+            await mark_prompt_failed(proposal_id, uid, "outcome", outcome_claim_id)
+
+
+async def _prompt_claim_still_safe(uid: int, proposal_id, prompt_kind: str,
+                                   claim_id: str, expected_status: str) -> bool:
+    """PR #73 ATOMIC CLOSURE §3: revalidate everything AFTER claim_prompt_
+    send wins the claim but BEFORE the actual Telegram call -- winning the
+    claim only proves nobody else currently owns this send; it does not
+    prove the world hasn't changed since (a /start, topic change, new
+    disclosure, crisis, or conversation close could all land in the
+    interval). Shared by every prompt-send site so they cannot drift apart
+    on which checks matter."""
+    if (await get_active_crisis(uid) is not None
+            or await get_active_disclosure_flow(uid) is not None
+            or not await access_control.core_rollout_allowed(uid)):
+        return False
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None or proposal.status.value != expected_status:
+        return False
+    if proposal.reporting_window_status != "ACTIVE":
+        return False
+    current_claim = (proposal.outcome_prompt_claim_id if prompt_kind == "outcome"
+                     else proposal.helped_prompt_claim_id)
+    if current_claim != claim_id:
+        return False
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        return False
+    return True
+
+
+def _practice_outcome_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [
+        ("done", "✅ Выполнил(а)", "✅ Done"),
+        ("stopped", "⏸ Остановился(ась)", "⏸ Stopped"),
+        ("refused", "❌ Не хочу продолжать", "❌ Don't want to continue"),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:outcome:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+def _practice_helped_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [
+        ("helped", "Помогло", "Helped"),
+        ("partly", "Помогло отчасти", "Partly helped"),
+        ("none", "Не изменилось", "No change"),
+        ("worse", "Стало хуже", "Became worse"),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:helped:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+# ── Progressive two-button practice UX (replaces the 3-then-4-button legacy
+# flow above for every NEWLY delivered proposal). The legacy cc:outcome/
+# cc:helped handlers and keyboards above are kept completely unchanged --
+# any proposal already carrying an old-style keyboard (a message sent
+# before this change) continues through that exact same, already-tested
+# path end to end, never switched mid-flow to the new one. Product
+# principle: never more than two buttons per message; free text always
+# remains a valid answer at every step (it flows through the ordinary
+# conversation pipeline, unchanged); an unfinished practice is never framed
+# as failure or met with pressure to continue.
+
+def _practice_did_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [("yes", "Получилось", "I did it"), ("no", "Не получилось", "I couldn't")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:practdone:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+def _practice_notdone_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [("stopped", "Начал, но остановился", "I started but stopped"),
+             ("never", "Не начал", "I didn't start")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:practwhy:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+def _practice_help_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [("yes", "Помогло", "It helped"), ("no", "Не помогло", "It didn't help")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:practhelp:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+def _practice_helpwhy_kb(proposal_id, lang: str) -> InlineKeyboardMarkup:
+    labels = [("same", "Без изменений", "No change"), ("worse", "Стало хуже", "I feel worse")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=(ru if lang != "en" else en),
+                              callback_data=f"cc:practhelpwhy:{proposal_id}:{val}")]
+        for val, ru, en in labels])
+
+
+async def _retry_failed_practice_prompts(message: Message, uid: int) -> None:
+    """PR #73 request-changes §6 / FINAL REQUEST CHANGES §2/§4: restart-safe
+    recovery, called on every real inbound turn. Resends whichever post-
+    practice follow-up prompt previously failed (or is stuck in a timed-out
+    RETRYING claim -- a prior attempt crashed between claiming and sending),
+    exactly once each -- claim_prompt_send's atomic CAS is what makes this
+    idempotent under concurrency, including two overlapping inbound turns
+    both running this sweep for the same user.
+
+    Never retried unless every one of the stale-prompt guards holds: rollout
+    allowed, no active crisis, no active disclosure flow, the owning session
+    still exists and is OPEN, and -- critically -- the reporting window is
+    still ACTIVE. That last check is what stops a failed prompt from an old
+    topic reappearing in a new conversation: a topic change, /start, a new
+    disclosure flow, a conversation close, or a crisis all invalidate the
+    window (database.supersede_active_practice_proposals), so a proposal
+    whose prompt failed before one of those events simply drops out of this
+    sweep for good, exactly once it becomes stale."""
+    if await get_active_crisis(uid) is not None:
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        return
+    try:
+        pending = await get_proposals_with_failed_prompts(uid)
+    except Exception:
+        return
+    if not pending:
+        return
+    lang = await get_user_language(uid) or "ru"
+    for p in pending:
+        if p.reporting_window_status != "ACTIVE":
+            continue  # stale -- invalidated since the send failed, never resurrect it
+        owning_session = await get_core_session(p.session_id, uid)
+        if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+            continue
+        if (p.status is PracticeProposalStatus.STARTED
+                and p.outcome_prompt_status in ("FAILED", "RETRYING")):
+            claim_id = await claim_prompt_send(p.proposal_id, uid, "outcome", "STARTED")
+            if not claim_id:
+                continue
+            if not await _prompt_claim_still_safe(uid, p.proposal_id, "outcome", claim_id, "STARTED"):
+                await mark_prompt_failed(p.proposal_id, uid, "outcome", claim_id)
+                continue
+            try:
+                sent = await message.answer(
+                    ("Получилось выполнить практику?\n\n"
+                     "Можно выбрать вариант или ответить своими словами.") if lang != "en" else
+                    ("Were you able to do the practice?\n\n"
+                     "You can choose an option or reply in your own words."),
+                    reply_markup=_practice_did_kb(p.proposal_id, lang))
+                await mark_prompt_delivered(p.proposal_id, uid, "outcome", sent.message_id, claim_id)
+            except Exception as e:
+                print(f"[controller] outcome-prompt retry failed uid={uid}: {type(e).__name__}: {e}")
+                await mark_prompt_failed(p.proposal_id, uid, "outcome", claim_id)
+        elif (p.status is PracticeProposalStatus.COMPLETED
+              and p.helped_prompt_status in ("FAILED", "RETRYING")):
+            claim_id = await claim_prompt_send(p.proposal_id, uid, "helped", "COMPLETED")
+            if not claim_id:
+                continue
+            if not await _prompt_claim_still_safe(uid, p.proposal_id, "helped", claim_id, "COMPLETED"):
+                await mark_prompt_failed(p.proposal_id, uid, "helped", claim_id)
+                continue
+            try:
+                sent = await message.answer(
+                    "Помогла ли практика хотя бы немного?" if lang != "en" else
+                    "Did the practice help at least a little?",
+                    reply_markup=_practice_help_kb(p.proposal_id, lang))
+                await mark_prompt_delivered(p.proposal_id, uid, "helped", sent.message_id, claim_id)
+            except Exception as e:
+                print(f"[controller] helped-prompt retry failed uid={uid}: {type(e).__name__}: {e}")
+                await mark_prompt_failed(p.proposal_id, uid, "helped", claim_id)
+
+
+# ── Conversation Controller: post-practice outcome (Phase 3 final closure §3
+# /§4/§5) -- callback_data "cc:outcome:<proposal_id>:<done|stopped|refused>".
+# STARTED is the only actionable prior state; every check below is
+# independent and additive, matching cb_cc_consent's discipline exactly.
+
+@dp.callback_query(F.data.startswith("cc:outcome:"))
+async def cb_cc_outcome(callback: CallbackQuery):
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    if value not in ("done", "stopped", "refused"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None:
+        await callback.answer()
+        return
+    # PR #73 FINAL REQUEST CHANGES §1 / ATOMIC CLOSURE §5: a stale callback
+    # (topic change, new disclosure, /start, close, or crisis already
+    # invalidated the reporting window) must not mutate the proposal and
+    # must not show any user-visible message -- but it MUST still answer
+    # the callback (silently, no text) so the Telegram client's loading
+    # spinner clears. `status` itself (STARTED etc.) stays a truthful,
+    # untouched historical record; only the window governs whether the
+    # BUTTON is still actionable right now. This non-atomic read is a fast
+    # path only -- ATOMIC CLOSURE §1's require_active_reporting_window on
+    # the actual CAS below is the real, race-proof authority.
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    # Final closure §7 boundary: a /start (or any other) reset that PAUSED
+    # the owning session makes a dangling outcome-report button inert too --
+    # same discipline as cb_cc_consent, reusing the existing session-pause
+    # mechanism rather than adding a second, competing invalidation path.
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+
+    if value == "done":
+        # §3: COMPLETED means the user explicitly reported completion --
+        # never inferred from delivery. Atomic CAS: STARTED -> COMPLETED.
+        # The reporting window STAYS ACTIVE here -- the helped-prompt report
+        # is still pending, closed only once THAT is answered or withdrawn.
+        if not await transition_practice_proposal(
+                proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
+                to_status=PracticeProposalStatus.COMPLETED.value,
+                require_active_reporting_window=True):
+            await callback.answer()
+            return
+        await callback.answer()
+        # PR #73 FINAL REQUEST CHANGES §2 / ATOMIC CLOSURE §2/§3: claim-first
+        # send with a persisted claim_id, revalidated immediately before the
+        # send -- see cb_cc_consent's outcome-prompt send for the full
+        # rationale (shared via _prompt_claim_still_safe).
+        helped_claim_id = await claim_prompt_send(proposal_id, uid, "helped", "COMPLETED")
+        if helped_claim_id:
+            if await _prompt_claim_still_safe(uid, proposal_id, "helped", helped_claim_id, "COMPLETED"):
+                try:
+                    sent = await callback.message.answer(
+                        "Хорошо. Как это подействовало?" if lang != "en" else "Good. How did that go?",
+                        reply_markup=_practice_helped_kb(proposal_id, lang))
+                    await mark_prompt_delivered(proposal_id, uid, "helped", sent.message_id, helped_claim_id)
+                except Exception as e:
+                    print(f"[controller] helped-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+                    await mark_prompt_failed(proposal_id, uid, "helped", helped_claim_id)
+            else:
+                await mark_prompt_failed(proposal_id, uid, "helped", helped_claim_id)
+        return
+
+    # "stopped" (paused, no pressure to retry) and "refused" (explicit
+    # decline to continue) both WITHDRAW -- §3: withdrawal is never treated
+    # as resistance or failure, only distinguished by whether
+    # EXERCISE_REJECTED gets persisted (§4's "refusal prevents automatic
+    # re-proposal" -- there is no automatic re-proposal path at all, but a
+    # LATER unprompted LLM offer is additionally blocked by this constraint).
+    # No further report is expected after a withdrawal, so the reporting
+    # window closes in the same atomic write (§1).
+    reason = "user_stopped" if value == "stopped" else "user_refused"
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
+            to_status=PracticeProposalStatus.WITHDRAWN.value, reason=reason,
+            close_reporting_window=True, require_active_reporting_window=True):
+        await callback.answer()
+        return
+    await callback.answer()
+    if value == "refused":
+        # PR #73 request-changes §8: check the CAS result -- never claim a
+        # write persisted when it did not, and never overwrite a NEWER
+        # turn's session state with a stale snapshot. One bounded retry from
+        # a fresh snapshot covers the common case (no other write landed in
+        # between); if that also loses, the truthful copy below reflects
+        # what actually happened instead of promising something moot.
+        persisted = False
+        for _ in range(2):
+            session = await get_core_session(proposal.session_id, uid)
+            if session is None or session.lifecycle_status is not LifecycleStatus.OPEN:
+                break
+            from datetime import datetime, timezone
+            prior_json = session_json_snapshot(session)
+            session.add_repair_signal(
+                {RepairConstraint.EXERCISE_REJECTED}, source_turn_id=None,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                window_turns=controller.REPAIR_WINDOW_TURNS)
+            if await update_core_session_authoritative(session, prior_json):
+                persisted = True
+                break
+        # Truthful, scope-accurate copy either way: EXERCISE_REJECTED is a
+        # bounded-turn-window constraint, explicitly overrideable by a later
+        # explicit request (conversation_controller.classify_repair_
+        # overrides) -- never "never again", and never claimed as recorded
+        # if the write actually did not land.
+        if persisted:
+            text = ("Понял. Не буду предлагать упражнения без твоего явного "
+                    "запроса в ближайшем продолжении разговора." if lang != "en" else
+                    "Got it. I won't suggest exercises without your explicit "
+                    "request for the next while.")
+        else:
+            text = ("Понял, что не хочешь продолжать сейчас." if lang != "en" else
+                    "Got it, you don't want to continue right now.")
+    else:
+        text = ("Хорошо, останавливаемся. Ты не обязан(а) продолжать." if lang != "en"
+               else "Okay, let's stop. You don't have to continue.")
+    await callback.message.answer(text)
+
+
+_HELPED_TO_OUTCOME = {
+    "helped": PracticeOutcome.HELPED.value,
+    "partly": PracticeOutcome.PARTLY_HELPED.value,
+    "none": PracticeOutcome.NO_CHANGE.value,
+    "worse": PracticeOutcome.WORSE.value,
+}
+
+
+@dp.callback_query(F.data.startswith("cc:helped:"))
+async def cb_cc_outcome_detail(callback: CallbackQuery):
+    """§5: purely qualitative, explicit, self-reported outcome -- no before
+    score, none estimated. Recorded once (the DB write is a no-op past the
+    first answer); worsening is recorded truthfully with no causality claim
+    and no repeat-practice/crisis side effect (crisis detection stays fully
+    independent, driven only by message-text risk scoring, never by this
+    button)."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    outcome = _HELPED_TO_OUTCOME.get(value)
+    if outcome is None:
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    # PR #73 request-changes §4: cc:helped must independently verify
+    # ownership/existence/status/session-lifecycle exactly like cc:outcome
+    # does -- not rely on record_practice_outcome's own CAS alone (that CAS
+    # already enforces ownership+COMPLETED+not-yet-recorded atomically, but
+    # the session-lifecycle check below is a SEPARATE axis it cannot see).
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None or proposal.status is not PracticeProposalStatus.COMPLETED:
+        await callback.answer()
+        return
+    # PR #73 FINAL REQUEST CHANGES §1 / ATOMIC CLOSURE §5: same stale-window
+    # discipline as cb_cc_outcome -- no mutation, no user-visible message,
+    # but the callback IS still answered (silently) so the client's loading
+    # spinner clears. `status`/`outcome` left untouched. Fast-path only --
+    # require_active_reporting_window on the write below is the real
+    # authority.
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    # Legacy handler predates the progressive refinement flow -- it must fail
+    # closed (not silently overwrite) once a pending UX_PENDING_OUTCOME_DETAIL
+    # marker exists, so an untouched old Telegram message can never race past
+    # a refinement already in progress.
+    ok = await record_practice_outcome(proposal_id, uid, outcome,
+                                       require_active_reporting_window=True,
+                                       require_prior_reason_null=True)
+    await callback.answer()
+    if not ok:
+        return
+    lang = await get_user_language(uid) or "ru"
+    if outcome == PracticeOutcome.WORSE.value:
+        text = ("Спасибо, что сказал(а) честно — я это записал(а). Если станет тяжелее, "
+                "напиши мне об этом." if lang != "en" else
+                "Thanks for being honest — I've noted that. If things get harder, tell me.")
+    else:
+        text = "Спасибо, что рассказал(а)." if lang != "en" else "Thanks for telling me."
+    await callback.message.answer(text)
+
+
+# ── Progressive two-button practice UX callbacks ────────────────────────────
+# Every handler below follows the exact same independent/additive safety
+# discipline as cb_cc_outcome/cb_cc_outcome_detail above: rollout, crisis,
+# disclosure, proposal existence+ownership, reporting-window ACTIVE (fast
+# path; the atomic CAS below is the real authority), owning-session OPEN.
+# A stale callback never mutates anything and never sends a visible
+# message, but is still answered (silently) so the Telegram client's
+# loading spinner clears.
+
+@dp.callback_query(F.data.startswith("cc:practdone:"))
+async def cb_cc_practdone(callback: CallbackQuery):
+    """Step A: 'Получилось' / 'Не получилось' -- replaces the legacy
+    3-button 'Как прошло?' prompt. 'Получилось' is exactly the old 'done'
+    transition (STARTED->COMPLETED), just relabeled. 'Не получилось' is
+    NOT yet a terminal answer -- it withdraws truthfully (reason=
+    UX_PENDING_NOT_COMPLETED_REASON, an internal marker, never a real
+    withdrawal cause) but keeps the reporting window ACTIVE, then asks one
+    more question to distinguish an attempt from never starting."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    if value not in ("yes", "no"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None:
+        await callback.answer()
+        return
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+
+    if value == "yes":
+        if not await transition_practice_proposal(
+                proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
+                to_status=PracticeProposalStatus.COMPLETED.value,
+                require_active_reporting_window=True):
+            await callback.answer()
+            return
+        await callback.answer()
+        helped_claim_id = await claim_prompt_send(proposal_id, uid, "helped", "COMPLETED")
+        if helped_claim_id:
+            if await _prompt_claim_still_safe(uid, proposal_id, "helped", helped_claim_id, "COMPLETED"):
+                try:
+                    sent = await callback.message.answer(
+                        "Помогла ли практика хотя бы немного?" if lang != "en" else
+                        "Did the practice help at least a little?",
+                        reply_markup=_practice_help_kb(proposal_id, lang))
+                    await mark_prompt_delivered(proposal_id, uid, "helped", sent.message_id, helped_claim_id)
+                except Exception as e:
+                    print(f"[controller] help-prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+                    await mark_prompt_failed(proposal_id, uid, "helped", helped_claim_id)
+            else:
+                await mark_prompt_failed(proposal_id, uid, "helped", helped_claim_id)
+        return
+
+    # "no": not terminal yet. Reporting window stays ACTIVE (no
+    # close_reporting_window) -- one more answer is still expected.
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.STARTED.value,
+            to_status=PracticeProposalStatus.WITHDRAWN.value, reason=UX_PENDING_NOT_COMPLETED_REASON,
+            require_active_reporting_window=True):
+        await callback.answer()
+        return
+    await callback.answer()
+    try:
+        await callback.message.answer(
+            ("Понял. Что произошло ближе всего?\n\n"
+             "Можно выбрать вариант или написать своими словами.") if lang != "en" else
+            ("Understood. What happened most closely?\n\n"
+             "You can choose an option or reply in your own words."),
+            reply_markup=_practice_notdone_kb(proposal_id, lang))
+    except Exception as e:
+        print(f"[controller] practwhy prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+
+
+@dp.callback_query(F.data.startswith("cc:practwhy:"))
+async def cb_cc_practwhy(callback: CallbackQuery):
+    """Step A2: 'Начал, но остановился' / 'Не начал'. Refines an already-
+    WITHDRAWN(reason=UX_PENDING_NOT_COMPLETED_REASON) proposal into its truthful specific
+    reason via a SAME-STATUS CAS additionally gated on the CURRENT reason
+    (require_prior_reason) -- this is what makes a duplicate/racing tap
+    lose, since `status` alone never changes across this step. Neither
+    answer persists EXERCISE_REJECTED: an attempt-then-stop and a never-
+    started are both truthful non-completions, not proof of refusal or
+    dislike."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    if value not in ("stopped", "never"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None:
+        await callback.answer()
+        return
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    reason = "user_stopped" if value == "stopped" else "user_did_not_start"
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.WITHDRAWN.value,
+            to_status=PracticeProposalStatus.WITHDRAWN.value,
+            require_prior_reason=UX_PENDING_NOT_COMPLETED_REASON, reason=reason,
+            close_reporting_window=True, require_active_reporting_window=True):
+        await callback.answer()
+        return
+    await callback.answer()
+    lang = await get_user_language(uid) or "ru"
+    try:
+        # Open question, no keyboard -- free text (or a topic change) is
+        # always the next valid move, not another forced choice.
+        await callback.message.answer(
+            "Что помешало больше всего?" if lang != "en" else "What got in the way most?")
+    except Exception as e:
+        print(f"[controller] practwhy followup delivery failed uid={uid}: {type(e).__name__}: {e}")
+
+
+@dp.callback_query(F.data.startswith("cc:practhelp:"))
+async def cb_cc_practhelp(callback: CallbackQuery):
+    """Step B: 'Помогло' / 'Не помогло' -- replaces the legacy 4-button
+    'Как это подействовало?' prompt. 'Помогло' records HELPED exactly like
+    the legacy 'helped' answer. 'Не помогло' is NOT recorded as NO_CHANGE
+    yet (the state may have worsened) -- a same-status CAS additionally
+    gated on superseded_reason being NULL (require_prior_reason_null) makes
+    this refinement step exactly-once without ever touching `outcome`
+    (whose CHECK constraint has no 'pending' value)."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    if value not in ("yes", "no"):
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None or proposal.status is not PracticeProposalStatus.COMPLETED:
+        await callback.answer()
+        return
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    lang = await get_user_language(uid) or "ru"
+
+    if value == "yes":
+        # Mutually exclusive with the "no" refinement branch below:
+        # both paths require an ACTIVE reporting window and
+        # superseded_reason still NULL.
+        # If "yes" commits first, record_practice_outcome records HELPED and
+        # closes the reporting window, so the later "no" CAS fails.
+        # If "no" commits first, transition_practice_proposal atomically sets
+        # UX_PENDING_OUTCOME_DETAIL while keeping the proposal COMPLETED and
+        # the reporting window ACTIVE, so a later "yes" fails
+        # require_prior_reason_null.
+        ok = await record_practice_outcome(proposal_id, uid, PracticeOutcome.HELPED.value,
+                                           require_active_reporting_window=True,
+                                           require_prior_reason_null=True)
+        await callback.answer()
+        if not ok:
+            return
+        await callback.message.answer(
+            "Понял. Отмечу, что в этот раз практика оказалась полезной." if lang != "en" else
+            "Understood. I'll record that this practice was useful this time.")
+        return
+
+    # "no": not terminal yet -- never write NO_CHANGE prematurely.
+    if not await transition_practice_proposal(
+            proposal_id, uid, from_status=PracticeProposalStatus.COMPLETED.value,
+            to_status=PracticeProposalStatus.COMPLETED.value,
+            require_prior_reason_null=True, reason=UX_PENDING_OUTCOME_DETAIL,
+            require_active_reporting_window=True):
+        await callback.answer()
+        return
+    await callback.answer()
+    try:
+        await callback.message.answer(
+            "Что ближе к твоему состоянию сейчас?" if lang != "en" else
+            "Which is closer to how you feel now?",
+            reply_markup=_practice_helpwhy_kb(proposal_id, lang))
+    except Exception as e:
+        print(f"[controller] practhelpwhy prompt delivery failed uid={uid}: {type(e).__name__}: {e}")
+
+
+@dp.callback_query(F.data.startswith("cc:practhelpwhy:"))
+async def cb_cc_practhelpwhy(callback: CallbackQuery):
+    """Step C: 'Без изменений' / 'Стало хуже'. record_practice_outcome's
+    own `outcome IS NULL` CAS is what makes this exactly-once (unaffected
+    by superseded_reason). WORSE still writes to the same `outcome` column
+    the informed-repeat guard (_controller_claim_turn's get_latest_outcome_
+    for_practice check) already reads -- that guard is completely
+    unaffected by which callback wrote the value."""
+    uid = callback.from_user.id
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, _tag, proposal_id, value = parts
+    outcome = {"same": PracticeOutcome.NO_CHANGE.value, "worse": PracticeOutcome.WORSE.value}.get(value)
+    if outcome is None:
+        await callback.answer()
+        return
+    if not await access_control.core_rollout_allowed(uid):
+        await callback.answer()
+        return
+    if await get_active_crisis(uid) is not None:
+        await callback.answer()
+        return
+    if await get_active_disclosure_flow(uid) is not None:
+        await callback.answer()
+        return
+    proposal = await get_practice_proposal(proposal_id, uid)
+    if proposal is None or proposal.status is not PracticeProposalStatus.COMPLETED:
+        await callback.answer()
+        return
+    if proposal.reporting_window_status != "ACTIVE":
+        await callback.answer()
+        return
+    owning_session = await get_core_session(proposal.session_id, uid)
+    if owning_session is None or owning_session.lifecycle_status is not LifecycleStatus.OPEN:
+        await callback.answer()
+        return
+    # Finalizes the pending refinement -- the terminal outcome write and the
+    # removal of UX_PENDING_OUTCOME_DETAIL happen in the SAME atomic UPDATE
+    # (clear_superseded_reason=True), never a separate clearing write. The
+    # require_prior_reason CAS also means this can only ever finalize a row
+    # that genuinely went through "Не помогло" -- a stray/duplicate tap
+    # after the marker is already cleared loses cleanly.
+    ok = await record_practice_outcome(proposal_id, uid, outcome,
+                                       require_active_reporting_window=True,
+                                       require_prior_reason=UX_PENDING_OUTCOME_DETAIL,
+                                       clear_superseded_reason=True)
+    await callback.answer()
+    if not ok:
+        return
+    lang = await get_user_language(uid) or "ru"
+    if outcome == PracticeOutcome.WORSE.value:
+        # No causality claim -- the user's own report is noted, not
+        # attributed to the practice.
+        text = ("Ты отметил(а), что после практики стало хуже. Я не буду автоматически "
+                "предлагать её снова." if lang != "en" else
+                "You noted that you felt worse after the practice. I won't automatically "
+                "suggest it again.")
+    else:
+        text = "Понял, спасибо, что рассказал(а)." if lang != "en" else "Understood, thanks for telling me."
+    await callback.message.answer(text)
+
 
 @dp.callback_query(F.data.startswith("after:"))
 async def cb_after(callback: CallbackQuery, fsm_state: FSMContext):
@@ -1384,6 +3643,7 @@ async def cb_quality(callback: CallbackQuery, fsm_state: FSMContext):
         msg = ("Рад помочь 🙂" if data.get("lang") == "ru" else "Glad to help 🙂") if rating >= 0 else \
               ("Спасибо за честность" if data.get("lang") == "ru" else "Thanks for honesty")
         await callback.message.answer(msg, reply_markup=ReplyKeyboardRemove())
+        await _maybe_react(callback.message, uid, ReactionCategory.PRACTICE_COMPLETED, 1.0)
     await callback.answer()
 
 # Not RED (reserved for an actual risk_detector suicide/self_harm text
@@ -1529,6 +3789,114 @@ async def cb_universal_continuation(callback: CallbackQuery):
         await _publish_continuation_options(callback.message, uid, fin.assistant_turn_id,
                                             sent.message_id, result.post_consumption_revision,
                                             lang, next_ru, next_en)
+
+# ── /format — response-delivery preference selector ─────────────────────────
+
+@dp.message(Command("format"))
+async def cmd_format(message: Message):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    if not _voice_ux_enabled_for(uid):
+        # Flag off, OR flag on but not the owner: behave as if this command
+        # does not exist -- no selector, nothing saved, previous behavior
+        # preserved exactly for everyone but the owner during canary.
+        return
+    if getattr(message.chat, "type", "private") != "private":
+        # §4: private-chat-only in V1 -- a short neutral notice, never the
+        # selector itself (never repeats/exposes anything private).
+        await message.answer(
+            "Эта настройка доступна только в личном чате со мной." if lang == "ru"
+            else "This setting is only available in a private chat with me.")
+        return
+    await message.answer(
+        "Как тебе удобнее получать ответы?" if lang == "ru"
+        else "How would you like to receive replies?",
+        reply_markup=format_selector_kb(lang))
+
+
+@dp.callback_query(F.data.startswith(f"{_FMT_KB_VERSION}:"))
+async def cb_format_select(callback: CallbackQuery):
+    uid = callback.from_user.id
+    if not _voice_ux_enabled_for(uid):
+        # Flag off, OR flag on but not the owner: fail closed -- a stale
+        # button from before rollback, or a non-owner during canary, must
+        # never silently save anything.
+        await callback.answer()
+        return
+    if getattr(callback.message.chat, "type", "private") != "private":
+        # §4: a group callback must never modify a persistent preference.
+        await callback.answer()
+        return
+    try:
+        _, kind, value = callback.data.split(":")
+    except ValueError:
+        await callback.answer()
+        return
+    if kind == "format" and value in ("text", "voice", "voice_and_concise_text"):
+        await set_response_preference(uid, response_format=value)
+    elif kind == "length" and value in ("concise", "normal"):
+        await set_response_preference(uid, response_length=value)
+    else:
+        # Malformed/forged value outside the closed vocabulary -- fail closed.
+        await callback.answer()
+        return
+    lang = await get_user_language(uid)
+    await callback.message.answer(
+        "Сохранено ✅" if lang == "ru" else "Saved ✅")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{_LISTEN_KB_VERSION}:"))
+async def cb_listen(callback: CallbackQuery):
+    """"🔊 Прослушать" — synthesizes the EXACT visible text of the message
+    the button is attached to. No new LLM call, no deeper memory lookup, no
+    DB row created. Ownership is checked because the owning uid is encoded
+    in callback_data (a stateless action, unlike cb_before's FSM-scoped
+    flow) -- a forged/cross-user/malformed callback all fail closed."""
+    uid = callback.from_user.id
+    if not _voice_ux_enabled_for(uid):
+        # Flag off, OR flag on but not the owner -- defense in depth: the
+        # listen button is only ever attached by deliver_response for an
+        # eligible owner turn, but a forged/replayed callback_data must
+        # still fail closed here regardless.
+        await callback.answer()
+        return
+    if getattr(callback.message.chat, "type", "private") != "private":
+        # §4: the listen button is never attached outside a private chat
+        # (deliver_response only attaches it when is_private) -- this is a
+        # defense-in-depth fail-closed for a forged/replayed callback_data.
+        await callback.answer()
+        return
+    try:
+        owner_uid = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+    if owner_uid != uid:
+        await callback.answer()
+        return
+    text = callback.message.text
+    if not text:
+        await callback.answer()
+        return
+    now = time.time()
+    if now - _listen_last_tap.get(uid, 0) < _LISTEN_TAP_COOLDOWN_SECONDS:
+        await callback.answer()
+        return
+    _listen_last_tap[uid] = now
+    lang = await get_user_language(uid)
+    # Re-validate before TTS even though this text was already sent once --
+    # defense in depth, same "only Safety-Validator-approved text may enter
+    # TTS" contract as deliver_response, applied consistently at every TTS
+    # call site rather than assumed safe because it was validated once.
+    is_safe, _ = validate_response(text, lang)
+    if not is_safe:
+        await callback.answer(
+            "Не получилось озвучить" if lang == "ru" else "Couldn't create voice")
+        return
+    ok = await _synthesize_and_send_voice(callback.message, uid, text, lang)
+    await callback.answer(
+        None if ok else ("Не получилось озвучить" if lang == "ru" else "Couldn't create voice"))
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -1739,10 +4107,205 @@ dp.callback_query.outer_middleware(
     OnboardingGateMiddleware(_callback_is_onboarding_exempt, kind="callback"))
 
 
+# ── Duplicate-update guard + privacy-safe dispatch trace ───────────────────
+# Investigation of a "one message -> a second, stale-context answer ~1 min
+# later" report could not be closed because (a) the bot logged NOTHING per
+# update, so the two sends could not be correlated after the fact, and (b)
+# start_polling ran with neither drop_pending_updates NOR any update_id
+# deduplication -- so a redelivered/replayed update (restart backlog, a
+# reconnect) reprocesses as a fresh answer that leans on now-stale memory,
+# exactly the observed shape. The exact trigger of that specific event was
+# NOT proven; this closes the diagnosability gap and the one real latent
+# duplicate vector, without changing any normal behavior.
+#
+# Telegram update_ids are unique and monotonic under normal operation, so
+# this guard NEVER drops a legitimate update -- it fires only on an exact
+# duplicate id. Bounded FIFO; a restart simply starts with an empty window.
+# LIMITATION: this is IN-MEMORY -- it does NOT survive a process restart and
+# is not durable idempotency; it only defends a single continuous run against
+# a redelivered/replayed identical update. The trace logs the update_id (a
+# Telegram-internal sequence number) and the decision only -- never message
+# text, user id, username or any content.
+_SEEN_UPDATE_IDS_MAX = 4096
+_seen_update_ids: "OrderedDict[int, None]" = OrderedDict()
+
+
+def _dispatch_log(msg: str) -> None:
+    """Privacy-safe dispatch trace. Exception-proof by contract: observability
+    must never be able to break message delivery (§9)."""
+    try:
+        print(f"[dispatch] {msg}")
+    except Exception:
+        pass
+
+
+class DuplicateUpdateGuard(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        update_id = getattr(event, "update_id", None)
+        if update_id is not None:
+            # check-and-add is a read-modify-write with no await between, so it
+            # is atomic under asyncio's single thread (concurrent duplicate ->
+            # exactly one passes).
+            if update_id in _seen_update_ids:
+                _dispatch_log(f"update_id={update_id} decision=duplicate_dropped")
+                return None
+            _seen_update_ids[update_id] = None
+            if len(_seen_update_ids) > _SEEN_UPDATE_IDS_MAX:
+                _seen_update_ids.popitem(last=False)
+            _dispatch_log(f"update_id={update_id} decision=accepted")
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(DuplicateUpdateGuard())
+
+
+# ── Stale-response guard: suppress an ordinary answer superseded mid-flight ─
+# Reproduced race (see tests): aiogram runs updates as concurrent tasks
+# (handle_as_tasks=True), so two turns from the SAME user can run pipeline()
+# at once. If an earlier turn's LLM call is slow and a later turn finishes
+# first, the earlier turn then delivers its now-stale answer AFTER the newer
+# one -- "two answers, the second referencing older context". This is the
+# actual mechanism behind the owner report; the DB timestamps are pipeline-
+# COMPLETION times, not arrival times, so they never proved two user sends.
+#
+# Fix: a per-user monotonic "generation". Every new user turn (ordinary
+# pipeline entry, crisis pipeline entry, and /start) bumps it. An ordinary
+# answer captures the generation at entry and, immediately before delivery,
+# skips if a newer turn has since bumped it. Deterministic safety responses
+# (crisis / dependency / disambiguation) return earlier and are never guarded
+# -- they are always delivered. The bump is a read-modify-write with no await
+# between, so it is atomic under asyncio's single thread; no lock needed.
+# Bounded FIFO; an evicted user fails OPEN (delivers), the pre-existing
+# behavior. In-memory only -- it does not, and need not, survive a restart.
+_USER_GEN_MAX = 4096
+_user_generation: "OrderedDict[int, int]" = OrderedDict()
+
+
+def _bump_user_generation(uid: int) -> int:
+    g = _user_generation.get(uid, 0) + 1
+    _user_generation[uid] = g
+    if len(_user_generation) > _USER_GEN_MAX:
+        _user_generation.popitem(last=False)
+    return g
+
+
+def _user_generation_superseded(uid: int, captured: int) -> bool:
+    """True iff a newer turn for uid started after `captured` was taken."""
+    return _user_generation.get(uid, captured) > captured
+
+
+def _new_correlation_id() -> str:
+    """Random per-turn id for privacy-safe log correlation. NOT derived from
+    any user identifier -- it exists only to stitch one turn's log lines
+    together, never to identify a person."""
+    return secrets.token_hex(4)
+
+
+# ── Per-user ingestion lock: preserve arrival order of user-row persistence ──
+# Generation suppression already stops a stale ANSWER from being delivered or
+# persisted. This closes the remaining pre-persistence race: two turns from the
+# same user run pipeline() as concurrent aiogram tasks, and the older one can
+# pause on a fast pre-save DB await while the newer one saves its user row
+# first -- and memory loads by autoincrement id (get_recent_messages ORDER BY
+# id DESC), so the older row would then look like the newest active context.
+#
+# Fix: each turn acquires this user's lock at entry (the only code before the
+# acquire is pure/sync -- language + risk detection -- so acquire order equals
+# entry order, and asyncio.Lock grants FIFO). It is held ONLY through the
+# pre-persistence work and the user-row save, then released BEFORE the two
+# multi-second awaits (summarization, answer) and before reaction sending /
+# TTS / delivery. So it orders persistence without serializing conversations.
+#
+# Registry: per-user, bounded LRU. A holder is evicted ONLY when refs == 0
+# (no acquirer and no waiter) -- never one that is held or awaited. In-memory;
+# a restart terminates all in-flight coroutines, so no cross-process claim is
+# needed. No user id is ever logged.
+class _IngestHolder:
+    __slots__ = ("lock", "refs", "seq")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refs = 0    # acquirers + current waiters referencing this holder
+        self.seq = 0     # last-used monotonic sequence (LRU tiebreak)
+
+
+_INGEST_MAX = 4096
+_ingest_registry: "OrderedDict[int, _IngestHolder]" = OrderedDict()
+_ingest_seq = 0
+
+
+def _ingest_get_or_create(uid: int) -> _IngestHolder:
+    """Sync (no await): bump refs and LRU, evicting only unheld/unwaited
+    holders. Atomic under asyncio's single thread."""
+    global _ingest_seq
+    holder = _ingest_registry.get(uid)
+    if holder is None:
+        holder = _IngestHolder()
+        _ingest_registry[uid] = holder
+    _ingest_seq += 1
+    holder.seq = _ingest_seq
+    holder.refs += 1
+    _ingest_registry.move_to_end(uid)
+    if len(_ingest_registry) > _INGEST_MAX:
+        for k in list(_ingest_registry):
+            if k != uid and _ingest_registry[k].refs == 0:
+                del _ingest_registry[k]
+                if len(_ingest_registry) <= _INGEST_MAX:
+                    break
+    return holder
+
+
+async def _ingest_enter(uid: int) -> _IngestHolder:
+    holder = _ingest_get_or_create(uid)
+    try:
+        await holder.lock.acquire()
+    except BaseException:
+        _ingest_leave(uid, holder, acquired=False)
+        raise
+    return holder
+
+
+def _ingest_leave(uid: int, holder: _IngestHolder, acquired: bool = True) -> None:
+    if acquired:
+        holder.lock.release()
+    holder.refs -= 1
+    if holder.refs <= 0 and _ingest_registry.get(uid) is holder:
+        del _ingest_registry[uid]
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     from datetime import datetime, timezone
     uid = message.from_user.id
+    # /start is a new turn: bump the generation so any ordinary answer still
+    # being generated for this user is superseded and not delivered afterward.
+    _bump_user_generation(uid)
+    # Phase 2 correction §8: /start supersedes any pending Depression
+    # Disclosure Gate flow -- old buttons become inert, the new /start menu
+    # is never blocked by it. Best-effort (never blocks /start itself).
+    try:
+        active_dd_flow = await get_active_disclosure_flow(uid)
+        if active_dd_flow is not None:
+            await close_disclosure_flow(active_dd_flow["id"], uid,
+                                        from_step=active_dd_flow["step"],
+                                        status="cancelled", superseded_reason="start_command")
+    except Exception as e:
+        print(f"[depression-disclosure] /start supersession failed uid={uid}: {e}")
+    # Phase 3 §17: /start PAUSES (not cancels) any active Conversation
+    # Controller session -- unlike a Phase 2 safety flow, ordinary
+    # conversational work is resumable, so lifecycle_status becomes PAUSED,
+    # not a terminal status. Best-effort (never blocks /start itself).
+    try:
+        active_sessions = await list_core_sessions(uid, active_only=True)
+        for s in active_sessions:
+            if s.lifecycle_status is LifecycleStatus.OPEN:
+                s.lifecycle_status = LifecycleStatus.PAUSED
+                await update_core_session(s)
+        # Hardening §4: /start also invalidates any standing PRACTICE
+        # proposal -- old consent must not survive a /start reset.
+        await supersede_active_practice_proposals(uid, "start_command")
+    except Exception as e:
+        print(f"[controller] /start session pause failed uid={uid}: {e}")
     # PR C3a.1 -- parse a /start deep-link payload BEFORE the access gate.
     # This is the critical ordering: a temp-invite-code holder has no prior
     # access, so if we ran ensure_full_access_or_closed_test first they'd be
@@ -4739,10 +7302,22 @@ async def cb_emotion_map(callback: CallbackQuery):
 
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):
-    lang = await get_user_language(message.from_user.id)   # needed for Whisper lang hint
+    uid = message.from_user.id
+    lang = await get_user_language(uid)   # needed for Whisper lang hint
+    # Voice and Adaptive Response UX: an explicitly SAVED voice_language
+    # preference (only ever settable via the now owner-gated /format, so
+    # unreachable for anyone else) overrides the stored UI language hint;
+    # "auto" (the untouched default) preserves the exact prior behavior.
+    # Gated the same way as every other Voice UX action -- defense in depth
+    # in case a preference row ever existed for a non-owner uid.
+    stt_lang = lang
+    if _voice_ux_enabled_for(uid):
+        prefs = await get_response_preferences(uid)
+        if prefs["voice_language"] in ("ru", "en"):
+            stt_lang = prefs["voice_language"]
     await bot.send_chat_action(message.chat.id, "typing")
     try:
-        text = await transcribe_voice(message.voice, bot, client, lang)
+        text = await transcribe_voice(message.voice, bot, client, stt_lang)
         await message.answer(f"🎤 <i>{_he(text)}</i>", parse_mode="HTML")
         await pipeline(message, text, state)
     except Exception as e:
@@ -4761,6 +7336,14 @@ async def main():
     scheduler = setup_scheduler(bot)
     scheduler.start()
     print("✅ X20 Bot started")
+    # NOTE: no drop_pending_updates here. In aiogram 3.7 it is NOT a
+    # start_polling parameter -- it would fall into **kwargs and be injected
+    # as workflow_data (a misleading no-op that drops nothing), and the only
+    # real way to drop the backlog is bot.delete_webhook(drop_pending_updates
+    # =True), which silently discards messages users sent during a restart.
+    # That message loss is deliberately NOT wanted: a normal restart must
+    # never drop a user's message. The stale-answer defence lives in the
+    # per-turn generation guard (see _bump_user_generation) instead.
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
