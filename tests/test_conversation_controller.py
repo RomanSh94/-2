@@ -113,6 +113,14 @@ def _full_pipeline_stub_set(monkeypatch, *, llm_reply="ok, noted", llm_calls=Non
 
 async def _seed_user(uid: int):
     await database.upsert_user(uid, f"u{uid}", f"U{uid}")
+    # This suite exercises the Conversation Controller (a steady-state,
+    # already-onboarded user), not first-turn onboarding -- pre-consume the
+    # one-time first-turn claim via the real, tested API (same pattern
+    # already validated in tests/test_stale_response_race.py) so a fresh
+    # pipeline() call for this uid is definitively past first-turn
+    # eligibility and reaches the Controller/ordinary path under test.
+    await database.claim_first_turn(uid, config.FIRST_TURN_CONTRACT_VERSION,
+                                    f"test-preconsumed-{uid}", "test_setup")
 
 
 # ── A. Intent routing: every required explicit phrase ───────────────────────

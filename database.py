@@ -10,11 +10,68 @@ Tables:
 """
 import aiosqlite, sqlite3, json, uuid
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 DB = "x20.db"
 
-SCHEMA = """
+# Single source of truth for the interaction-tables shape, used BOTH inside
+# the main SCHEMA string (fresh-database / already-current-shape path) AND
+# directly by the atomic migration below (which cannot use executescript --
+# see _migrate_interaction_tables_atomically). Keeping one definition avoids
+# any risk of the two paths drifting apart.
+_INTERACTION_BINDINGS_TABLE_DDL = """CREATE TABLE IF NOT EXISTS interaction_button_bindings (
+    token              TEXT PRIMARY KEY,
+    turn_id            INTEGER NOT NULL,
+    user_id            INTEGER NOT NULL,
+    chat_id            INTEGER NOT NULL,
+    source_message_id  INTEGER NOT NULL,
+    action             TEXT NOT NULL
+                       CHECK (action IN ('elaborate','clarify','hard',
+                                          'hard:regulate','hard:understand','hard:quiet',
+                                          'hardreg:easier','hardreg:same','hardreg:harder',
+                                          'hardreg:unsafe','hardreg:repeat','hardreg:alt',
+                                          'hardstate:anxiety','hardstate:anger',
+                                          'hardstate:hurt','hardstate:numb',
+                                          'hardreply:easier','hardreply:same','hardreply:harder')),
+    binding_revision   INTEGER NOT NULL,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at         TEXT NOT NULL,
+    consumed_at        TEXT
+)"""
+
+_INTERACTION_BINDINGS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_interaction_bindings_open\n"
+    "    ON interaction_button_bindings(user_id, consumed_at, expires_at)"
+)
+
+_INTERACTION_EVENTS_TABLE_DDL = """CREATE TABLE IF NOT EXISTS user_interaction_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id           INTEGER NOT NULL,
+    turn_id           INTEGER NOT NULL,
+    event_type        TEXT NOT NULL,
+    action            TEXT NOT NULL
+                      CHECK (action IN ('elaborate','clarify','hard',
+                                         'hard:regulate','hard:understand','hard:quiet',
+                                         'hardreg:easier','hardreg:same','hardreg:harder',
+                                         'hardreg:unsafe','hardreg:repeat','hardreg:alt',
+                                         'hardstate:anxiety','hardstate:anger',
+                                         'hardstate:hurt','hardstate:numb',
+                                         'hardreply:easier','hardreply:same','hardreply:harder')),
+    normalized_text   TEXT NOT NULL,
+    reply_status      TEXT NOT NULL DEFAULT 'pending_before_send'
+                      CHECK (reply_status IN ('pending_before_send','delivery_uncertain',
+                                                'delivered','delivered_context_missing',
+                                                'no_reply_required')),
+    assistant_turn_id INTEGER,
+    reply_updated_at  TEXT,
+    reply_error_code  TEXT
+                      CHECK (reply_error_code IS NULL OR reply_error_code IN
+                             ('SEND_EXCEPTION','SAVE_EXCEPTION','FINALIZE_EXCEPTION')),
+    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+)"""
+
+SCHEMA = f"""
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS users (
@@ -525,6 +582,58 @@ CREATE TABLE IF NOT EXISTS user_notice_acknowledgements (
     PRIMARY KEY (user_id, notice_id, notice_version)
 );
 
+-- ── Generic first-turn contract: persistence/concurrency foundation ────────
+-- Phase 1 only -- not yet wired into bot.py:pipeline, no keyboard is exposed
+-- to Telegram yet. See CLAUDE.md-adjacent design notes for the full
+-- architecture; this schema implements exactly the approved primitives.
+
+-- Per-user monotonic revision. Bumped atomically at the start of every
+-- ordinary user turn and on every accepted callback action. A keyboard
+-- binding records the revision it was created at (below); any newer
+-- revision invalidates it.
+CREATE TABLE IF NOT EXISTS user_interaction_revision (
+    user_id  INTEGER PRIMARY KEY,
+    revision INTEGER NOT NULL DEFAULT 0
+);
+
+-- Version-scoped, immutable-token claim on "who gets to deliver the
+-- first-turn contract to this user for this contract_version". PRIMARY KEY
+-- (user_id, contract_version) means a later contract_version is a fully
+-- independent claim -- never blocked or auto-exempted by an earlier
+-- version's history. No reclaim path exists for any status: a claim that
+-- gets stuck (process crash) stays stuck, by design (fail-closed over risk
+-- of duplicate delivery).
+CREATE TABLE IF NOT EXISTS first_turn_claims (
+    user_id          INTEGER NOT NULL,
+    contract_version TEXT NOT NULL,
+    claim_token      TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending_before_llm'
+                     CHECK (status IN (
+                         'pending_before_llm','generated','send_started',
+                         'reply_delivered','delivered','delivered_without_buttons',
+                         'delivered_context_missing','failed_before_send',
+                         'delivery_uncertain','legacy_exempt')),
+    turn_id          INTEGER,
+    scenario         TEXT,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, contract_version)
+);
+
+-- One row per individual button (never per keyboard). callback_data carries
+-- only the opaque token; `action` is the sole source of truth for what a
+-- button does, loaded from this row, never trusted from callback_data.
+-- binding_revision is the user_interaction_revision value at creation time;
+-- consumption requires it to still equal the live revision.
+{_INTERACTION_BINDINGS_TABLE_DDL};
+{_INTERACTION_BINDINGS_INDEX_DDL};
+
+-- Audit trail of consumed button actions AND the honest delivery status of
+-- the deterministic assistant reply sent in response. reply_error_code is a
+-- bounded internal label (see database.INTERACTION_ERROR_CODES) -- never a
+-- raw exception message or user content.
+{_INTERACTION_EVENTS_TABLE_DDL};
+
 -- Voice and Adaptive Response UX — neutral response-delivery UI preference,
 -- nothing more. Stores ONLY the three closed-set choices below, never a raw
 -- format-command message, never an inferred psychological trait ("lazy",
@@ -645,7 +754,7 @@ CREATE TABLE IF NOT EXISTS depression_disclosure_flows (
     status             TEXT NOT NULL DEFAULT 'active',
     step               TEXT NOT NULL DEFAULT 'SAFETY_CHECK',
     diagnosis_source   TEXT,
-    answers_json       TEXT NOT NULL DEFAULT '{}',
+    answers_json       TEXT NOT NULL DEFAULT '{{}}',
     lang               TEXT NOT NULL DEFAULT 'ru',
     origin_message_id  INTEGER,
     prompt_message_id  INTEGER,
@@ -992,6 +1101,166 @@ async def _backfill_notice_acknowledgements(db) -> None:
         "AND privacy_notice_acknowledged_at IS NOT NULL")
 
 
+# ── Phase 3 continuation-actions migration ───────────────────────────────────
+# Phase 2 shipped interaction_button_bindings/user_interaction_events with
+# CHECK(action IN ('elaborate','clarify','hard','hardreply:easier',
+# 'hardreply:same','hardreply:harder')). Phase 3 widened the action set to 16
+# values (hardreg:*/hardstate:* replacing hardreply:easier/same/harder) and the
+# SCHEMA string's CHECK now lists both the current 16 and the 3 legacy values
+# (so old rows always satisfy the constraint) -- but SQLite cannot ALTER a
+# CHECK constraint in place, and CREATE TABLE IF NOT EXISTS is a silent no-op
+# against an already-existing table. An old-shape production DB would keep
+# its OLD (6-value) CHECK forever and reject every new Phase 3 action at
+# insert time unless it is rebuilt.
+#
+# The two Phase 2/Phase 3 shapes have IDENTICAL columns -- only the CHECK
+# constraint text differs -- so PRAGMA table_info (used by the onboarding
+# migration above, which has real column differences) cannot tell them apart.
+# Detection instead reads the table's own stored CREATE statement from
+# sqlite_master and checks for an action value that only exists in the
+# current CHECK ('hardreg:unsafe').
+#
+# THIS MUST BE ATOMIC, unlike the onboarding migration above: an earlier
+# version of this code did rename -> db.executescript(SCHEMA) -> copy+drop,
+# relying on init_db()'s single trailing db.commit() for atomicity. That is
+# WRONG -- sqlite3/aiosqlite's executescript() issues an implicit COMMIT of
+# any pending transaction before running the script, so the rename step was
+# actually already committed by the time executescript ran, regardless of
+# what happens afterward. This version instead runs entirely inside one
+# explicit BEGIN IMMEDIATE / COMMIT (or ROLLBACK on any exception) block,
+# using individual db.execute() calls for the rebuild -- never executescript
+# -- so nothing can commit early. It runs as the very FIRST thing init_db()
+# does on a freshly-opened connection (before anything else can open an
+# implicit transaction of its own).
+_OLD_INTERACTION_BINDINGS_TABLE = "_interaction_button_bindings_pre_phase3"
+_OLD_INTERACTION_EVENTS_TABLE = "_user_interaction_events_pre_phase3"
+
+
+async def _interaction_table_needs_migration(db, table: str) -> bool:
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,))
+    row = await cur.fetchone()
+    if row is None:
+        return False   # no table yet -- executescript's CREATE TABLE IF NOT EXISTS makes a fresh one
+    return not (row[0] and "hardreg:unsafe" in row[0])   # old (6-value) CHECK detected
+
+
+async def _migration_checkpoint(name: str) -> None:
+    """No-op in production. Tests monkeypatch this to inject a REAL exception
+    at an exact, named point inside the atomic migration transaction, to
+    prove the rollback restores the complete original Phase 2 state (both
+    table names, both schemas, all rows, the original index) no matter where
+    the failure happens. Named checkpoints: 'before_index_recreation',
+    'mid_copy:<new_table_name>', 'after_first_table_copied',
+    'before_old_tables_dropped', 'before_commit'."""
+    return None
+
+
+async def _copy_and_verify_interaction_table(db, *, old_name: str, new_name: str,
+                                             pk_column: str, columns: str) -> None:
+    """Copies every row from the renamed old table into the freshly-created
+    new one by NAMED column (never SELECT *), then verifies BOTH the row
+    count AND that every single source primary key exists in the
+    destination (a stronger check than count alone -- count matching cannot,
+    by itself, rule out one row being dropped while an unrelated duplicate
+    happens to balance the total). A plain INSERT (never INSERT OR IGNORE)
+    is used: the destination is guaranteed empty/fresh at this point, so any
+    real conflict is a genuine integrity problem that must raise and roll
+    back the whole transaction, never be silently swallowed."""
+    cur = await db.execute(f"SELECT COUNT(*) FROM {old_name}")
+    source_count = (await cur.fetchone())[0]
+
+    await db.execute(
+        f"INSERT INTO {new_name} ({columns}) "
+        f"SELECT {columns} FROM {old_name}")
+    await _migration_checkpoint(f"mid_copy:{new_name}")
+
+    cur = await db.execute(f"SELECT COUNT(*) FROM {new_name}")
+    dest_count = (await cur.fetchone())[0]
+    if dest_count != source_count:
+        raise RuntimeError(
+            f"{new_name} migration row-count mismatch: "
+            f"source={source_count} dest={dest_count}")
+
+    cur = await db.execute(
+        f"SELECT {pk_column} FROM {old_name} "
+        f"EXCEPT SELECT {pk_column} FROM {new_name}")
+    missing = await cur.fetchall()
+    if missing:
+        raise RuntimeError(
+            f"{new_name} migration lost {len(missing)} primary key(s) during copy")
+
+    logging.info("%s migration: %d row(s) copied and verified", new_name, dest_count)
+
+
+async def _migrate_interaction_tables_atomically(db) -> None:
+    needs_bindings = await _interaction_table_needs_migration(db, "interaction_button_bindings")
+    needs_events = await _interaction_table_needs_migration(db, "user_interaction_events")
+    if not needs_bindings and not needs_events:
+        return   # already current shape (or neither table exists yet) -- nothing to do
+
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        if needs_bindings:
+            # ALTER TABLE RENAME carries the table's own indexes along under
+            # their ORIGINAL names (they now point at the renamed old
+            # table). The CREATE INDEX IF NOT EXISTS below would then
+            # silently no-op against the NEW table (an index with that
+            # exact name already exists, just on the wrong table) -- so the
+            # new table would commit with NO index at all, only regaining
+            # one later when the separate, non-atomic executescript(SCHEMA)
+            # call happens to patch it back in. Drop the carried-over
+            # index(es) now, by their real current name(s), so the
+            # in-transaction CREATE INDEX actually lands on the real table
+            # before THIS transaction commits.
+            cur = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='interaction_button_bindings' AND sql IS NOT NULL")
+            for (index_name,) in await cur.fetchall():
+                await db.execute(f"DROP INDEX IF EXISTS {index_name}")
+            await db.execute(
+                "ALTER TABLE interaction_button_bindings RENAME TO "
+                f"{_OLD_INTERACTION_BINDINGS_TABLE}")
+        if needs_events:
+            await db.execute(
+                f"ALTER TABLE user_interaction_events RENAME TO {_OLD_INTERACTION_EVENTS_TABLE}")
+
+        await _migration_checkpoint("before_index_recreation")
+        # Rebuild both tables (+ index) under their REAL names, inside this
+        # SAME transaction -- individual statements only, never
+        # executescript (see the module-level note above).
+        await db.execute(_INTERACTION_BINDINGS_TABLE_DDL)
+        await db.execute(_INTERACTION_BINDINGS_INDEX_DDL)
+        await db.execute(_INTERACTION_EVENTS_TABLE_DDL)
+
+        if needs_bindings:
+            await _copy_and_verify_interaction_table(
+                db, old_name=_OLD_INTERACTION_BINDINGS_TABLE,
+                new_name="interaction_button_bindings", pk_column="token",
+                columns="token, turn_id, user_id, chat_id, source_message_id, action, "
+                       "binding_revision, created_at, expires_at, consumed_at")
+        await _migration_checkpoint("after_first_table_copied")
+        if needs_events:
+            await _copy_and_verify_interaction_table(
+                db, old_name=_OLD_INTERACTION_EVENTS_TABLE,
+                new_name="user_interaction_events", pk_column="id",
+                columns="id, user_id, turn_id, event_type, action, normalized_text, "
+                       "reply_status, assistant_turn_id, reply_updated_at, "
+                       "reply_error_code, created_at")
+
+        await _migration_checkpoint("before_old_tables_dropped")
+        if needs_bindings:
+            await db.execute(f"DROP TABLE {_OLD_INTERACTION_BINDINGS_TABLE}")
+        if needs_events:
+            await db.execute(f"DROP TABLE {_OLD_INTERACTION_EVENTS_TABLE}")
+
+        await _migration_checkpoint("before_commit")
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+
 # PR #73 request-changes §9: a fresh-schema CHECK constraint (status now
 # allows DELIVERING; outcome has its own CHECK) is NOT the same invariant as
 # what a plain ADD-COLUMN migration gives an already-deployed table -- SQLite
@@ -1119,6 +1388,11 @@ async def _finish_practice_proposals_migration(db) -> None:
 
 async def init_db():
     async with aiosqlite.connect(DB) as db:
+        # Must run FIRST, on a connection with no transaction open yet --
+        # it owns its own complete BEGIN IMMEDIATE/COMMIT and must not be
+        # interleaved with anything else that could start an implicit
+        # transaction of its own before it (see the note above it).
+        await _migrate_interaction_tables_atomically(db)
         await _rename_old_onboarding_state_if_needed(db)
         await _rename_old_practice_proposals_if_needed(db)
         await db.executescript(SCHEMA)
@@ -1164,14 +1438,18 @@ async def get_stored_user_language(uid: int) -> str | None:
 
 async def save_message(uid: int, role: str, content: str,
                         scenario: str = "open_chat", lang: str = "ru",
-                        risk_score: int = 0, risk_categories=None):
+                        risk_score: int = 0, risk_categories=None) -> int:
+    """Returns the new row's id (cursor.lastrowid). Every existing call site
+    calls this bare (return value ignored), so adding this return is
+    backward-compatible."""
     cats = ",".join(risk_categories) if risk_categories else ""
     async with aiosqlite.connect(DB) as db:
-        await db.execute(
+        cur = await db.execute(
             "INSERT INTO messages (user_id,role,content,scenario,lang,risk_score,risk_categories)"
             " VALUES (?,?,?,?,?,?,?)",
             (uid, role, content, scenario, lang, int(risk_score), cats))
         await db.commit()
+        return cur.lastrowid
 
 async def get_user_messages_with_risk(uid: int, window_hours: int = 24) -> list:
     """User messages in the last N hours WITH their per-message risk snapshot.
@@ -2504,23 +2782,90 @@ async def set_crisis_protective_factors(event_id: int, factors: list) -> None:
         await db.commit()
 
 
-async def set_crisis_response(uid: int, response: str) -> None:
-    """Record the user's self-report on their most recent unresolved event.
+# Bounded return values for set_crisis_response -- named constants (matching
+# this module's existing convention for status enums, e.g. INTERACTION_ERROR_CODES,
+# _EVENT_BESTEFFORT_ALLOWED_STATUSES) rather than magic strings at call sites.
+CRISIS_RESPONSE_UPDATED = "updated"
+CRISIS_RESPONSE_ALREADY_SAFE = "already_safe"
+CRISIS_RESPONSE_NOT_ACTIONABLE = "not_actionable"
+CRISIS_RESPONSE_NOT_FOUND_OR_NOT_OWNED = "not_found_or_not_owned"
 
-    'safe'  → resolved (stop follow-ups). 'still' → stays open (keep following up).
+
+async def set_crisis_response(event_id: int, requester_user_id: int, response: str) -> str:
+    """Record the user's self-report on THIS EXACT crisis event -- keyed
+    precisely by event_id, AND ownership-checked in the SQL itself
+    (WHERE id=? AND user_id=?) so a cross-user callback_data value (guessed,
+    forwarded, or replayed) can never mutate another user's crisis event.
+
+    Returns one of four bounded results (see the constants above):
+      CRISIS_RESPONSE_UPDATED                -- the exact owned, still-open
+                                                 event was updated just now.
+      CRISIS_RESPONSE_ALREADY_SAFE            -- the exact owned event is
+                                                 ALREADY resolved with this
+                                                 SAME response (resolved=1
+                                                 AND user_response==response)
+                                                 -- a genuine idempotent
+                                                 duplicate tap, safe to
+                                                 confirm again.
+      CRISIS_RESPONSE_NOT_ACTIONABLE          -- the exact owned event
+                                                 exists but is resolved in
+                                                 some OTHER terminal state:
+                                                 resolved=1 with user_response
+                                                 NULL, or resolved=1 with a
+                                                 DIFFERENT response. This can
+                                                 happen via a different code
+                                                 path (e.g. the standalone
+                                                 resolve_crisis helper, a
+                                                 follow-up job, an admin
+                                                 action) -- it is NOT the
+                                                 same as a genuine duplicate
+                                                 'safe' tap and must never be
+                                                 confirmed as one.
+      CRISIS_RESPONSE_NOT_FOUND_OR_NOT_OWNED  -- no event with this id
+                                                 belongs to requester_user_id.
+                                                 Covers BOTH "doesn't exist"
+                                                 and "exists but owned by
+                                                 someone else" with the
+                                                 IDENTICAL result -- a caller
+                                                 can never tell the two
+                                                 apart, which is deliberate:
+                                                 existence must never be
+                                                 revealed to a non-owner.
+
+    The single UPDATE sets BOTH resolved and user_response atomically, so
+    callers no longer need a separate resolve_crisis call for 'safe'.
+    'safe' → resolved (stop follow-ups). 'still' → stays open (keep following up).
     """
     resolved = 1 if response == "safe" else 0
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            "SELECT id FROM crisis_events WHERE user_id=? AND resolved=0"
-            " ORDER BY id DESC LIMIT 1", (uid,))
-        row = await cur.fetchone()
-        if not row:
-            return
-        await db.execute(
-            "UPDATE crisis_events SET user_response=?, resolved=? WHERE id=?",
-            (response, resolved, row[0]))
+            "UPDATE crisis_events SET user_response=?, resolved=? "
+            "WHERE id=? AND user_id=? AND resolved=0",
+            (response, resolved, event_id, requester_user_id))
+        if cur.rowcount == 1:
+            await db.commit()
+            return CRISIS_RESPONSE_UPDATED
+
+        # rowcount==0 for an event that turns out to be owned can ONLY mean
+        # its resolved column was already 1 (the guarded UPDATE's own
+        # WHERE ... AND resolved=0 clause is what ruled out any other
+        # reason) -- but that alone does not prove it was resolved as
+        # 'safe' specifically. Read the exact state, never just existence,
+        # to tell a genuine duplicate 'safe' apart from any other terminal
+        # state. The ownership check itself is identical to the
+        # not-found case, so existence is still never revealed to a
+        # non-owner.
+        cur2 = await db.execute(
+            "SELECT resolved, user_response FROM crisis_events WHERE id=? AND user_id=?",
+            (event_id, requester_user_id))
+        owned_row = await cur2.fetchone()
         await db.commit()
+        if owned_row is None:
+            return CRISIS_RESPONSE_NOT_FOUND_OR_NOT_OWNED
+        owned_resolved, owned_response = owned_row
+        if owned_resolved == 1 and owned_response == response:
+            return CRISIS_RESPONSE_ALREADY_SAFE
+        return CRISIS_RESPONSE_NOT_ACTIONABLE
 
 
 async def get_active_crisis_events() -> list:
@@ -2550,15 +2895,33 @@ async def get_active_crisis(uid: int, within_hours: int = 24):
     return (row[0], row[1], row[2]) if row else None
 
 
-async def bump_crisis_stage(event_id: int, target: int) -> bool:
+async def crisis_event_owner(event_id: int) -> int | None:
+    """The user_id that owns this crisis event, or None if it doesn't exist.
+    Read-only ownership check used as a SINGLE early gate for the entire
+    crisis:* callback surface -- every action (safe/call/contact/safe_place/
+    contacted/still/cant_call) must pass this before any Telegram send,
+    keyboard replacement, delivery-log write, database mutation, or admin/
+    reviewer alert. Never distinguishes "doesn't exist" from a caller
+    supplying the wrong id -- both simply return None/mismatch, so a
+    non-owner can never learn which."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT user_id FROM crisis_events WHERE id=?", (event_id,))
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def bump_crisis_stage(event_id: int, target: int, requester_user_id: int) -> bool:
     """ATOMIC monotonic stage raise. Sets stage to `target` only if current < target
-    (so a stale/double tap is a no-op). Returns True iff it actually changed —
-    callers use that as the once-only guard for admin alerts."""
+    (so a stale/double tap is a no-op) AND the event belongs to
+    requester_user_id (enforced in the SQL mutation itself -- defense in
+    depth, not reliant solely on an earlier ownership SELECT by the caller).
+    Returns True iff it actually changed — callers use that as the
+    once-only guard for admin alerts."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             "UPDATE crisis_events SET crisis_stage=?"
-            "  WHERE id=? AND COALESCE(crisis_stage,0) < ?",
-            (target, event_id, target))
+            "  WHERE id=? AND user_id=? AND COALESCE(crisis_stage,0) < ?",
+            (target, event_id, requester_user_id, target))
         await db.commit()
         return cur.rowcount > 0
 
@@ -2577,11 +2940,12 @@ async def resolve_crisis(event_id: int) -> None:
         await db.commit()
 
 
-async def set_stage3_at(event_id: int) -> None:
+async def set_stage3_at(event_id: int, requester_user_id: int) -> None:
     async with aiosqlite.connect(DB) as db:
         await db.execute(
-            "UPDATE crisis_events SET stage3_at=datetime('now') WHERE id=? AND stage3_at IS NULL",
-            (event_id,))
+            "UPDATE crisis_events SET stage3_at=datetime('now') "
+            "WHERE id=? AND user_id=? AND stage3_at IS NULL",
+            (event_id, requester_user_id))
         await db.commit()
 
 
@@ -2972,6 +3336,527 @@ async def transition_dass21_discuss_claim(user_id: int, session_id: int, topic_i
              response_id, from_status))
         await db.commit()
         return cur.rowcount > 0
+
+
+# ── Generic first-turn contract: persistence/concurrency primitives ───────────
+# Phase 1 foundation only -- callers are added in a later phase. All
+# transitions are single atomic UPDATEs guarded by a WHERE clause on the
+# expected prior state, matching the convention above (transition_dass21_
+# discuss_claim et al.): rowcount is the sole success signal, never assumed.
+
+# Bounded internal error codes -- never a raw exception message or user
+# content is stored in reply_error_code.
+SEND_EXCEPTION = "SEND_EXCEPTION"
+SAVE_EXCEPTION = "SAVE_EXCEPTION"
+FINALIZE_EXCEPTION = "FINALIZE_EXCEPTION"
+INTERACTION_ERROR_CODES = {SEND_EXCEPTION, SAVE_EXCEPTION, FINALIZE_EXCEPTION}
+
+# The complete, closed set of button actions. Anything outside this set is
+# rejected before any SQL runs -- never silently accepted or defaulted.
+# Phase 3: replaces the retired hardreply:easier/same/harder-only flow with
+# the fuller hard:regulate / hard:understand / hard:quiet continuation graph.
+ALLOWED_INTERACTION_ACTIONS = {
+    "elaborate", "clarify", "hard",
+    "hard:regulate", "hard:understand", "hard:quiet",
+    "hardreg:easier", "hardreg:same", "hardreg:harder", "hardreg:unsafe",
+    "hardreg:repeat", "hardreg:alt",
+    "hardstate:anxiety", "hardstate:anger", "hardstate:hurt", "hardstate:numb",
+}
+
+# Explicit immutable first_turn_claims transition graph. Only these exact
+# (from, to) pairs are legal; every status not appearing as a "from" here is
+# terminal by construction (no code path can move it further).
+FIRST_TURN_CLAIM_STATUSES = {
+    "pending_before_llm", "generated", "send_started", "reply_delivered",
+    "delivered", "delivered_without_buttons", "delivered_context_missing",
+    "failed_before_send", "delivery_uncertain", "legacy_exempt",
+}
+FIRST_TURN_CLAIM_TRANSITIONS = {
+    ("pending_before_llm", "generated"),
+    ("pending_before_llm", "failed_before_send"),
+    ("generated", "send_started"),
+    ("generated", "failed_before_send"),
+    ("send_started", "reply_delivered"),
+    ("send_started", "delivered_without_buttons"),
+    ("send_started", "delivered_context_missing"),
+    ("send_started", "delivery_uncertain"),
+    ("reply_delivered", "delivered"),
+    ("reply_delivered", "delivered_without_buttons"),
+}
+FIRST_TURN_CLAIM_TERMINAL_STATUSES = {
+    "delivered", "delivered_without_buttons", "delivered_context_missing",
+    "failed_before_send", "delivery_uncertain", "legacy_exempt",
+}
+# turn_id is assigned exactly here -- nowhere else -- and is mandatory for
+# both.
+FIRST_TURN_CLAIM_TURN_ID_TRANSITIONS = {
+    ("send_started", "reply_delivered"),
+    ("send_started", "delivered_without_buttons"),
+}
+
+
+async def bump_user_revision(user_id: int) -> int:
+    """Atomic per-user monotonic increment. Read-back happens in the same
+    uncommitted transaction as the write (SQLite serializes writers per
+    connection/lock), so no concurrent bump can be interleaved between the
+    write and the read."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO user_interaction_revision (user_id, revision) VALUES (?, 1) "
+            "ON CONFLICT(user_id) DO UPDATE SET revision = revision + 1",
+            (user_id,))
+        cur = await db.execute(
+            "SELECT revision FROM user_interaction_revision WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        await db.commit()
+        return row[0]
+
+
+async def get_user_revision(user_id: int) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT revision FROM user_interaction_revision WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def claim_first_turn(user_id: int, contract_version: str, claim_token: str,
+                           scenario: str) -> bool:
+    """Version-scoped, fail-closed, no-reclaim claim. Returns True iff this
+    call, and only this call, ever owns (user_id, contract_version).
+
+    v1-only lazy legacy exemption: a user with prior assistant message
+    history is exempted from FIRST_TURN_INITIAL_ROLLOUT_VERSION only. Any
+    LATER contract_version skips this check entirely and claims
+    independently, regardless of how much history exists."""
+    from config import FIRST_TURN_INITIAL_ROLLOUT_VERSION
+    async with aiosqlite.connect(DB) as db:
+        if contract_version == FIRST_TURN_INITIAL_ROLLOUT_VERSION:
+            cur = await db.execute(
+                "SELECT 1 FROM first_turn_claims WHERE user_id=? AND contract_version=?",
+                (user_id, contract_version))
+            if not await cur.fetchone():
+                cur2 = await db.execute(
+                    "SELECT 1 FROM messages WHERE user_id=? AND role='assistant' LIMIT 1",
+                    (user_id,))
+                if await cur2.fetchone():
+                    await db.execute(
+                        "INSERT INTO first_turn_claims "
+                        "(user_id, contract_version, claim_token, status) "
+                        "VALUES (?,?,?,'legacy_exempt') "
+                        "ON CONFLICT(user_id, contract_version) DO NOTHING",
+                        (user_id, contract_version, claim_token))
+                    await db.commit()
+                    return False
+        cur = await db.execute(
+            "INSERT INTO first_turn_claims "
+            "(user_id, contract_version, claim_token, status, scenario) "
+            "VALUES (?, ?, ?, 'pending_before_llm', ?) "
+            "ON CONFLICT(user_id, contract_version) DO NOTHING",
+            (user_id, contract_version, claim_token, scenario))
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def transition_first_turn_claim(user_id: int, contract_version: str, claim_token: str,
+                                      from_status: str, to_status: str,
+                                      turn_id: int | None = None) -> bool:
+    """Guarded single UPDATE, gated by the explicit transition graph.
+
+    Rejects (raises ValueError) BEFORE executing any SQL: an unknown status,
+    a (from, to) pair outside FIRST_TURN_CLAIM_TRANSITIONS (which by
+    construction makes every terminal status a dead end), a non-null turn_id
+    on any transition other than the two that require one, or a null turn_id
+    on those two.
+
+    Once past validation: requires the exact user_id, contract_version,
+    claim_token, and from_status -- rowcount is the sole success signal. On
+    failure (rowcount 0 or a raised exception) the caller must leave the
+    claim in its last confirmed state and must NOT attempt a follow-up
+    transition to compensate -- a failed DB transition cannot be assumed to
+    be safely followed by another one."""
+    if from_status not in FIRST_TURN_CLAIM_STATUSES or to_status not in FIRST_TURN_CLAIM_STATUSES:
+        raise ValueError(f"unknown first-turn claim status: {from_status!r} -> {to_status!r}")
+    if (from_status, to_status) not in FIRST_TURN_CLAIM_TRANSITIONS:
+        raise ValueError(f"illegal first-turn claim transition: {from_status!r} -> {to_status!r}")
+    requires_turn_id = (from_status, to_status) in FIRST_TURN_CLAIM_TURN_ID_TRANSITIONS
+    if requires_turn_id and turn_id is None:
+        raise ValueError(
+            f"transition {from_status!r} -> {to_status!r} requires a non-null turn_id")
+    if not requires_turn_id and turn_id is not None:
+        raise ValueError(
+            f"transition {from_status!r} -> {to_status!r} must not set turn_id")
+
+    if turn_id is not None:
+        sql = ("UPDATE first_turn_claims SET status=?, turn_id=?, updated_at=datetime('now') "
+               "WHERE user_id=? AND contract_version=? AND claim_token=? AND status=?")
+        params = (to_status, turn_id, user_id, contract_version, claim_token, from_status)
+    else:
+        sql = ("UPDATE first_turn_claims SET status=?, updated_at=datetime('now') "
+               "WHERE user_id=? AND contract_version=? AND claim_token=? AND status=?")
+        params = (to_status, user_id, contract_version, claim_token, from_status)
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(sql, params)
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def create_keyboard_batch_if_current(user_id: int, response_revision: int,
+                                           rows: list[dict]) -> bool:
+    """All-or-nothing: inserts every per-button row only if the CURRENT user
+    revision still equals response_revision at the moment this transaction
+    runs (checked live, inside the same BEGIN IMMEDIATE transaction, never
+    trusting a value read earlier by the caller). Returns False (nothing
+    written) if the revision has moved.
+
+    Every row's action is validated against ALLOWED_INTERACTION_ACTIONS
+    BEFORE any SQL runs (raises ValueError) -- a batch with even one unknown
+    action inserts nothing, not a partial set."""
+    for row in rows:
+        if row["action"] not in ALLOWED_INTERACTION_ACTIONS:
+            raise ValueError(f"unknown interaction action: {row['action']!r}")
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT revision FROM user_interaction_revision WHERE user_id=?", (user_id,))
+        r = await cur.fetchone()
+        current = r[0] if r else 0
+        if current != response_revision:
+            await db.commit()
+            return False
+        for row in rows:
+            await db.execute(
+                "INSERT INTO interaction_button_bindings "
+                "(token, turn_id, user_id, chat_id, source_message_id, action, "
+                " binding_revision, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+                (row["token"], row["turn_id"], user_id, row["chat_id"],
+                 row["source_message_id"], row["action"], response_revision, row["expires_at"]))
+        await db.commit()
+        return True
+
+
+@dataclass(frozen=True)
+class ConsumptionResult:
+    event_id: int
+    action: str
+    turn_id: int
+    post_consumption_revision: int
+    lang: str
+    scenario: str
+    source_text: str
+
+
+async def consume_interaction_binding(token: str, user_id: int, chat_id: int,
+                                      source_message_id: int) -> "ConsumptionResult | None":
+    """Atomic, single-use. The caller supplies only the opaque token; action
+    is loaded exclusively from the DB row, never trusted from callback_data.
+
+    Before consuming, loads and verifies the assistant `messages` row
+    referenced by the binding's turn_id: it must exist, have role='assistant',
+    and belong to the same user_id. scenario/lang for the normalized user
+    action are taken exclusively from that row -- never from callback data,
+    which carries only the token.
+
+    Returns None on any rejection (missing/unknown-action token, wrong
+    user/chat/message, missing or foreign assistant turn, already consumed,
+    expired, or revision mismatch -- all collapse to the same outcome, never
+    distinguished to the caller)."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT action, turn_id, user_id, chat_id, source_message_id "
+            "FROM interaction_button_bindings WHERE token=?", (token,))
+        row = await cur.fetchone()
+        if not row:
+            await db.commit()
+            return None
+        action, turn_id, row_user_id, row_chat_id, row_source_message_id = row
+        if action not in ALLOWED_INTERACTION_ACTIONS:
+            await db.commit()
+            return None
+        if (row_user_id != user_id or row_chat_id != chat_id
+                or row_source_message_id != source_message_id):
+            await db.commit()
+            return None
+
+        cur = await db.execute(
+            "SELECT role, user_id, scenario, lang, content FROM messages WHERE id=?", (turn_id,))
+        turn_row = await cur.fetchone()
+        if turn_row is None:
+            await db.commit()
+            return None
+        turn_role, turn_user_id, turn_scenario, turn_lang, turn_content = turn_row
+        if turn_role != "assistant" or turn_user_id != user_id:
+            await db.commit()
+            return None
+        turn_scenario = turn_scenario or "open_chat"
+        turn_lang = turn_lang or "ru"
+
+        cur = await db.execute(
+            "UPDATE interaction_button_bindings SET consumed_at=datetime('now') "
+            "WHERE token=? AND user_id=? AND chat_id=? AND source_message_id=? "
+            "  AND consumed_at IS NULL AND expires_at > datetime('now') "
+            "  AND binding_revision = (SELECT revision FROM user_interaction_revision WHERE user_id=?)",
+            (token, user_id, chat_id, source_message_id, user_id))
+        if cur.rowcount != 1:
+            await db.commit()
+            return None
+
+        cur = await db.execute(
+            "INSERT INTO user_interaction_revision (user_id, revision) VALUES (?, 1) "
+            "ON CONFLICT(user_id) DO UPDATE SET revision = revision + 1",
+            (user_id,))
+        cur = await db.execute(
+            "SELECT revision FROM user_interaction_revision WHERE user_id=?", (user_id,))
+        rev_row = await cur.fetchone()
+        post_consumption_revision = rev_row[0]
+
+        normalized_text = normalized_action_text(action, turn_lang)
+        await db.execute(
+            "INSERT INTO messages (user_id, role, content, scenario, lang) VALUES (?, 'user', ?, ?, ?)",
+            (user_id, normalized_text, turn_scenario, turn_lang))
+
+        cur = await db.execute(
+            "INSERT INTO user_interaction_events "
+            "(user_id, turn_id, event_type, action, normalized_text, reply_status) "
+            "VALUES (?, ?, 'first_turn_button', ?, ?, 'pending_before_send')",
+            (user_id, turn_id, action, normalized_text))
+        event_id = cur.lastrowid
+
+        await db.commit()
+        return ConsumptionResult(event_id=event_id, action=action, turn_id=turn_id,
+                                 post_consumption_revision=post_consumption_revision,
+                                 lang=turn_lang, scenario=turn_scenario,
+                                 source_text=turn_content or "")
+
+
+async def get_last_user_message_before(user_id: int, before_turn_id: int) -> str:
+    """The nearest prior user-role message that produced the given assistant
+    turn -- i.e. what the user actually said right before the source reply.
+    Read-only, single indexed lookup. Returns "" if none exists OR on any read
+    failure (never raises, never guesses at content, never logs the raw
+    exception message -- only its class and the fixed event name)."""
+    try:
+        async with aiosqlite.connect(DB) as db:
+            cur = await db.execute(
+                "SELECT content FROM messages WHERE user_id=? AND role='user' AND id<? "
+                "ORDER BY id DESC LIMIT 1",
+                (user_id, before_turn_id))
+            row = await cur.fetchone()
+            return row[0] if row else ""
+    except Exception as e:
+        print(f"event=get_last_user_message_before_failed uid={user_id} "
+              f"exc_type={type(e).__name__}")
+        return ""
+
+
+# Localized, deterministic, enum-mapped labels -- RU/EN, matching this
+# project's bilingual convention throughout (crisis/dependency/onboarding
+# text). Never raw user content; never a free-form fallback string.
+_NORMALIZED_ACTION_TEXT_RU = {
+    "elaborate": "[Пользователь выбрал: Расскажу подробнее]",
+    "clarify": "[Пользователь выбрал: Помоги разобраться]",
+    "hard": "[Пользователь выбрал: Мне трудно сейчас говорить]",
+    "hard:regulate": "[Пользователь выбрал: Немного снизить напряжение]",
+    "hard:understand": "[Пользователь выбрал: Понять своё состояние]",
+    "hard:quiet": "[Пользователь выбрал: Пока без вопросов]",
+    "hardreg:easier": "[Пользователь ответил: Стало чуть легче]",
+    "hardreg:same": "[Пользователь ответил: Без изменений]",
+    "hardreg:harder": "[Пользователь ответил: Стало тяжелее]",
+    "hardreg:unsafe": "[Пользователь ответил: Мне небезопасно]",
+    "hardreg:repeat": "[Пользователь выбрал: Повторить]",
+    "hardreg:alt": "[Пользователь выбрал: Другой мягкий способ]",
+    "hardstate:anxiety": "[Пользователь выбрал: Тревога]",
+    "hardstate:anger": "[Пользователь выбрал: Злость]",
+    "hardstate:hurt": "[Пользователь выбрал: Боль или обида]",
+    "hardstate:numb": "[Пользователь выбрал: Пустота или непонимание]",
+}
+_NORMALIZED_ACTION_TEXT_EN = {
+    "elaborate": "[User selected: I'll tell you more]",
+    "clarify": "[User selected: Help me figure it out]",
+    "hard": "[User selected: It's hard to talk right now]",
+    "hard:regulate": "[User selected: Ease the tension a little]",
+    "hard:understand": "[User selected: Understand my state]",
+    "hard:quiet": "[User selected: No questions for now]",
+    "hardreg:easier": "[User replied: A bit easier]",
+    "hardreg:same": "[User replied: No change]",
+    "hardreg:harder": "[User replied: Harder]",
+    "hardreg:unsafe": "[User replied: I don't feel safe]",
+    "hardreg:repeat": "[User selected: Repeat]",
+    "hardreg:alt": "[User selected: Try a different gentle way]",
+    "hardstate:anxiety": "[User selected: Anxiety]",
+    "hardstate:anger": "[User selected: Anger]",
+    "hardstate:hurt": "[User selected: Hurt or resentment]",
+    "hardstate:numb": "[User selected: Emptiness or confusion]",
+}
+
+
+def normalized_action_text(action: str, lang: str = "ru") -> str:
+    """Fixed, enum-mapped, localized label -- never raw user content, never
+    a free-form fallback. Raises ValueError for any action outside
+    ALLOWED_INTERACTION_ACTIONS."""
+    if action not in ALLOWED_INTERACTION_ACTIONS:
+        raise ValueError(f"unknown interaction action: {action!r}")
+    table = _NORMALIZED_ACTION_TEXT_EN if lang == "en" else _NORMALIZED_ACTION_TEXT_RU
+    return table[action]
+
+
+@dataclass(frozen=True)
+class FinalizationResult:
+    status: str
+    assistant_turn_id: int | None
+
+
+async def finalize_callback_reply(event_id: int, user_id: int,
+                                  reply_text: str) -> "FinalizationResult":
+    """Call ONLY after the Telegram send is already confirmed successful.
+
+    Server-owned context preservation: scenario and lang are never supplied
+    by the caller. Ownership is enforced in the INITIAL lookup's SQL itself
+    (WHERE id=? AND user_id=?), not by a later Python-side comparison: a
+    foreign event_id (owned by someone else) is therefore indistinguishable
+    from "no such event" / "already resolved" from this point on -- it
+    collapses into the identical already_resolved result with ZERO further
+    processing, and critically, the best-effort fallback below is NEVER
+    reached for a foreign event, so it can never mutate another user's row.
+    Inside the same BEGIN IMMEDIATE transaction: after confirming ownership
+    this way, load the source assistant `messages` row referenced by the
+    event's turn_id (must exist, belong to the same user, have
+    role='assistant') and use ITS scenario/lang for the inserted reply --
+    never a value chosen independently of that source turn.
+
+    If the event is no longer pending_before_send, doesn't exist, or belongs
+    to a different user (already resolved by an earlier/concurrent call, or
+    a foreign/guessed id), returns already_resolved and attempts NO write --
+    this is not treated as a failure and never reveals which case occurred.
+    If the event genuinely belongs to user_id but its source turn is
+    missing/foreign/non-assistant, that is a real persistence integrity
+    failure discovered AFTER the Telegram send was already confirmed -- by
+    this point ownership is already established, so the best-effort
+    delivered_context_missing transition below is owner-scoped correctly.
+
+    Returns FinalizationResult(status, assistant_turn_id) -- assistant_turn_id
+    is non-None only when status == 'delivered'."""
+    try:
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT reply_status, turn_id FROM user_interaction_events "
+                "WHERE id=? AND user_id=?",
+                (event_id, user_id))
+            row = await cur.fetchone()
+            if row is None or row[0] != "pending_before_send":
+                await db.rollback()
+                return FinalizationResult(status="already_resolved", assistant_turn_id=None)
+            _, turn_id = row
+
+            source_ok = False
+            scenario = lang = None
+            cur = await db.execute(
+                "SELECT user_id, role, scenario, lang FROM messages WHERE id=?", (turn_id,))
+            turn_row = await cur.fetchone()
+            if turn_row is not None:
+                turn_user_id, turn_role, turn_scenario, turn_lang = turn_row
+                if turn_role == "assistant" and turn_user_id == user_id:
+                    source_ok = True
+                    scenario = turn_scenario or "open_chat"
+                    lang = turn_lang or "ru"
+
+            if not source_ok:
+                await db.rollback()
+                raise RuntimeError(
+                    "finalize_callback_reply: event/source-turn integrity check failed")
+
+            cur = await db.execute(
+                "INSERT INTO messages (user_id, role, content, scenario, lang) VALUES (?,?,?,?,?)",
+                (user_id, "assistant", reply_text, scenario, lang))
+            assistant_turn_id = cur.lastrowid
+            cur2 = await db.execute(
+                "UPDATE user_interaction_events SET reply_status='delivered', "
+                "assistant_turn_id=?, reply_updated_at=datetime('now') "
+                "WHERE id=? AND user_id=? AND reply_status='pending_before_send'",
+                (assistant_turn_id, event_id, user_id))
+            if cur2.rowcount != 1:
+                await db.rollback()
+                return FinalizationResult(status="already_resolved", assistant_turn_id=None)
+            await db.commit()
+            return FinalizationResult(status="delivered", assistant_turn_id=assistant_turn_id)
+    except Exception as e:
+        # Redacted diagnostic: fixed event name + uid + exception CLASS only --
+        # never the raw exception message/repr (which could echo reply_text,
+        # a DB path, or SQL), never source/generated text, never a token.
+        print(f"event=callback_reply_persistence_failed uid={user_id} "
+              f"exc_type={type(e).__name__}")
+        # user_id is the confirmed owner by this point (the initial SELECT's
+        # own WHERE clause already scoped it) -- never a foreign uid, since a
+        # foreign event_id can never reach this except block at all.
+        besteffort_status = await mark_event_besteffort(event_id, user_id, "delivered_context_missing",
+                                                         FINALIZE_EXCEPTION)
+        return FinalizationResult(status=besteffort_status, assistant_turn_id=None)
+
+
+_EVENT_BESTEFFORT_ALLOWED_STATUSES = {
+    "delivery_uncertain", "delivered_context_missing", "no_reply_required",
+}
+
+
+async def mark_event_besteffort(event_id: int, requester_user_id: int, status: str,
+                                error_code: str | None = None) -> str:
+    """Best-effort transition for user_interaction_events, restricted to the
+    three honest fallback targets (delivery_uncertain, delivered_context_missing,
+    no_reply_required -- the last used when the revision moved during an
+    in-flight LLM generation, so the reply is deliberately never sent).
+
+    Owner-scoped directly in the SQL itself (WHERE id=? AND user_id=?), not
+    reliant solely on an earlier ownership check by the caller -- a foreign
+    or guessed event_id can never mutate another user's row through this
+    function, no matter what status/error_code is requested.
+
+    Validates status and error_code BEFORE executing any SQL (raises
+    ValueError for either being invalid). Checks cursor.rowcount and returns
+    the requested status only when exactly one pending event, owned by
+    requester_user_id, was updated. If the event was no longer
+    pending_before_send, doesn't exist, or belongs to someone else, returns
+    'already_resolved' -- never reports a status that was not actually
+    persisted, and never distinguishes "foreign owner" from "already
+    resolved" to the caller. On a genuine exception (including a complete DB
+    outage) returns 'pending_before_send' honestly -- never resends, never
+    force-writes."""
+    if status not in _EVENT_BESTEFFORT_ALLOWED_STATUSES:
+        raise ValueError(f"mark_event_besteffort: invalid target status {status!r}")
+    if error_code is not None and error_code not in INTERACTION_ERROR_CODES:
+        raise ValueError(f"mark_event_besteffort: invalid error_code {error_code!r}")
+    try:
+        async with aiosqlite.connect(DB) as db:
+            cur = await db.execute(
+                "UPDATE user_interaction_events "
+                "SET reply_status=?, reply_updated_at=datetime('now'), reply_error_code=? "
+                "WHERE id=? AND user_id=? AND reply_status='pending_before_send'",
+                (status, error_code, event_id, requester_user_id))
+            await db.commit()
+            if cur.rowcount != 1:
+                return "already_resolved"
+            return status
+    except Exception:
+        return "pending_before_send"
+
+
+async def count_quiet_events(user_id: int) -> int:
+    """Minimal step value for the hard:quiet rotation -- derived entirely
+    from the already-persisted event log (no dedicated column, no stored
+    text). Never raises (including on a read failure, where a fresh user's
+    step-0 default is returned and only the fixed event name + exception
+    class are logged -- never the raw exception message)."""
+    try:
+        async with aiosqlite.connect(DB) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM user_interaction_events WHERE user_id=? AND action='hard:quiet'",
+                (user_id,))
+            row = await cur.fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        print(f"event=count_quiet_events_failed uid={user_id} exc_type={type(e).__name__}")
+        return 0
 
 
 # ── Sync helpers (Flask) ──────────────────────────────────────────────────────

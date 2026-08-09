@@ -101,30 +101,38 @@ def _env(monkeypatch):
 
 def _gated_llm(monkeypatch):
     """First completion blocks on an Event (the 'slow' turn); the rest return
-    immediately. Returns the gate so the test releases the slow turn."""
-    gate = asyncio.Event()
+    immediately. Returns (release_gate, first_call_entered): the test sets
+    release_gate to release the slow turn, and may await
+    first_call_entered.wait() for a deterministic proof that the slow turn
+    has actually reached this call -- an asyncio.sleep of any fixed duration
+    is not a guarantee, only a probabilistic one, and can invert which turn
+    becomes the blocked "first" call under real timing variance (a fixed
+    sleep long enough on one run is not necessarily long enough on another)."""
+    release_gate = asyncio.Event()
+    first_call_entered = asyncio.Event()
     calls = {"n": 0}
 
     async def create(*a, **kw):
         idx = calls["n"]
         calls["n"] += 1
         if idx == 0:
-            await gate.wait()
+            first_call_entered.set()
+            await release_gate.wait()
         return types.SimpleNamespace(choices=[types.SimpleNamespace(
             message=types.SimpleNamespace(content=f"answer{idx}"))])
     monkeypatch.setattr(bot.client.chat.completions, "create", create)
-    return gate
+    return release_gate, first_call_entered
 
 
 def test_slow_A_then_fast_B_only_B_is_delivered(tmp_db, monkeypatch):
     run(database.upsert_user(1, "u", "U"))
-    gate = _gated_llm(monkeypatch)
+    gate, first_call_entered = _gated_llm(monkeypatch)
     mA = FakeMessage(FakeUser(1), "первое сообщение")
     mB = FakeMessage(FakeUser(1), "второе сообщение")
 
     async def scenario():
         tA = asyncio.create_task(bot.pipeline(mA, "первое сообщение", FakeFSM()))
-        await asyncio.sleep(0.02)              # A reaches the blocked LLM
+        await first_call_entered.wait()         # A has definitely reached the blocked LLM
         tB = asyncio.create_task(bot.pipeline(mB, "второе сообщение", FakeFSM()))
         await tB                                # B finishes fast and delivers
         gate.set()                              # release the slow A
@@ -133,6 +141,17 @@ def test_slow_A_then_fast_B_only_B_is_delivered(tmp_db, monkeypatch):
 
     assert mB.answers == ["answer1"]            # newer turn delivered
     assert mA.answers == []                     # stale older turn suppressed
+
+
+async def _consume_first_turn(uid: int) -> None:
+    """Pre-consumes the one-time first-turn claim via the real, tested API
+    (database.claim_first_turn -- same call already used directly as setup
+    in tests/test_first_turn_foundation.py) so a subsequent pipeline() call
+    for this uid is definitively past first-turn eligibility (ft_claimed
+    resolves False on its own PRIMARY KEY conflict) and exercises the
+    ordinary/legacy path these tests are actually about."""
+    await database.claim_first_turn(uid, config.FIRST_TURN_CONTRACT_VERSION,
+                                    f"test-preconsumed-{uid}", "test_setup")
 
 
 async def _message_roles(uid):
@@ -154,13 +173,13 @@ def test_persistence_order_slow_A_then_fast_B_keeps_arrival_order(tmp_db, monkey
     # newest active context. Required order (by id): user_A, user_B, assistant_B
     # -- and NO assistant_A (the stale answer is never persisted).
     run(database.upsert_user(1, "u", "U"))
-    gate = _gated_llm(monkeypatch)
+    gate, first_call_entered = _gated_llm(monkeypatch)
     mA = FakeMessage(FakeUser(1), "first arrives, slow")
     mB = FakeMessage(FakeUser(1), "second arrives, fast")
 
     async def scenario():
         tA = asyncio.create_task(bot.pipeline(mA, "first arrives, slow", FakeFSM()))
-        await asyncio.sleep(0.02)               # A saves its user row, then blocks in LLM
+        await first_call_entered.wait()         # A saves its user row, then blocks in LLM
         tB = asyncio.create_task(bot.pipeline(mB, "second arrives, fast", FakeFSM()))
         await tB
         gate.set()
@@ -259,13 +278,13 @@ def test_early_order_A_paused_in_summarize_keeps_arrival_order(tmp_db, monkeypat
 
 def test_stale_turn_persists_no_assistant_row(tmp_db, monkeypatch):
     run(database.upsert_user(1, "u", "U"))
-    gate = _gated_llm(monkeypatch)
+    gate, first_call_entered = _gated_llm(monkeypatch)
     mA = FakeMessage(FakeUser(1), "slow")
     mB = FakeMessage(FakeUser(1), "fast")
 
     async def scenario():
         tA = asyncio.create_task(bot.pipeline(mA, "slow", FakeFSM()))
-        await asyncio.sleep(0.02)
+        await first_call_entered.wait()
         await bot.pipeline(mB, "fast", FakeFSM())
         gate.set()
         await tA
@@ -279,6 +298,7 @@ def test_non_overlapping_two_messages_both_get_answered(tmp_db, monkeypatch):
     # The guard must ONLY suppress an answer superseded WHILE in flight. Two
     # sequential, non-overlapping messages must each still get their answer.
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     async def create(*a, **kw):
         return types.SimpleNamespace(choices=[types.SimpleNamespace(
             message=types.SimpleNamespace(content="ok"))])
@@ -293,6 +313,7 @@ def test_non_overlapping_two_messages_both_get_answered(tmp_db, monkeypatch):
 
 def test_single_ordinary_message_gets_exactly_one_answer(tmp_db, monkeypatch):
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     async def create(*a, **kw):
         return types.SimpleNamespace(choices=[types.SimpleNamespace(
             message=types.SimpleNamespace(content="ok"))])
@@ -305,7 +326,7 @@ def test_single_ordinary_message_gets_exactly_one_answer(tmp_db, monkeypatch):
 def test_slow_A_then_start_suppresses_A(tmp_db, monkeypatch):
     # Race B: an in-flight ordinary answer must not appear after /start.
     run(database.upsert_user(1, "u", "U"))
-    gate = _gated_llm(monkeypatch)
+    gate, _first_call_entered = _gated_llm(monkeypatch)
     # cmd_start does a lot of I/O; stub the parts that would hit network/LLM,
     # but let it run its real generation bump.
     monkeypatch.setattr(bot, "_send_mood_entry", _async(None))
@@ -327,7 +348,7 @@ def test_slow_A_then_crisis_delivers_crisis_and_suppresses_A(tmp_db, monkeypatch
     # Race C: crisis is delivered; the older ordinary answer is suppressed;
     # crisis is NEVER suppressed by the stale guard.
     run(database.upsert_user(1, "u", "U"))
-    gate = _gated_llm(monkeypatch)
+    gate, _first_call_entered = _gated_llm(monkeypatch)
     crisis_sent = []
     async def spy_send_crisis(answer_fn, text, kb, lang, uid, eid, kind):
         crisis_sent.append(text)
@@ -357,8 +378,12 @@ def test_slow_user1_does_not_suppress_user2(tmp_db, monkeypatch):
     # Race D: a slow request from user 1 must not affect user 2.
     run(database.upsert_user(1, "u", "U"))
     run(database.upsert_user(2, "u", "U"))
+    # Cross-user generation isolation is the subject here, not first-turn --
+    # pre-consume for BOTH users so both enter the ordinary path.
+    run(_consume_first_turn(1))
+    run(_consume_first_turn(2))
     monkeypatch.setattr(ac, "OWNER_USER_ID", 1)
-    gate = _gated_llm(monkeypatch)
+    gate, first_call_entered = _gated_llm(monkeypatch)
 
     m1 = FakeMessage(FakeUser(1), "user one slow")
     # user 2 must also be authorized; personal_use grants only the owner, so
@@ -369,7 +394,7 @@ def test_slow_user1_does_not_suppress_user2(tmp_db, monkeypatch):
 
     async def scenario():
         t1 = asyncio.create_task(bot.pipeline(m1, "user one slow", FakeFSM()))
-        await asyncio.sleep(0.02)
+        await first_call_entered.wait()         # user 1 has definitely reached the blocked LLM
         await bot.pipeline(m2, "user two", FakeFSM())   # different user
         gate.set()
         await t1
@@ -452,6 +477,7 @@ def test_T6_waiting_holder_is_not_evicted():
 
 def test_T7_error_before_save_releases_lock_and_user_not_blocked(tmp_db, monkeypatch):
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     calls = {"n": 0}
 
     async def sometimes_raises(uid):

@@ -169,6 +169,13 @@ def test_ordinary_message_unaffected_when_no_dependency_signal(monkeypatch, tmp_
     monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
     monkeypatch.setattr(bot.dependency_monitor, "assess", _async(None))
     user = FakeUser(1)
+    # Steady-state ordinary-pipeline test, not first-turn onboarding --
+    # pre-consume the one-time first-turn claim via the real, tested API
+    # (same pattern already validated in tests/test_stale_response_race.py)
+    # so this fresh uid is definitively past first-turn eligibility.
+    run(database.upsert_user(1, "u", "U"))
+    run(database.claim_first_turn(1, config.FIRST_TURN_CONTRACT_VERSION,
+                                  "test-preconsumed-1", "test_setup"))
     msg = FakeMessage(user, "у меня был тяжёлый день на работе")
     run(bot.pipeline(msg, msg.text, None, tg_user=user))
     assert len(msg.answers) == 1

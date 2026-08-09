@@ -915,6 +915,17 @@ def _access_env(monkeypatch):
     monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
 
 
+def _consume_first_turn(uid: int):
+    """Pre-consumes the one-time first-turn claim via the real, tested API
+    (database.claim_first_turn -- same pattern already validated in
+    tests/test_stale_response_race.py) so a subsequent pipeline() call for
+    this uid is definitively past first-turn eligibility and exercises the
+    ordinary/voice/format-command path these tests are actually about, not
+    first-turn onboarding."""
+    return database.claim_first_turn(uid, config.FIRST_TURN_CONTRACT_VERSION,
+                                     f"test-preconsumed-{uid}", "test_setup")
+
+
 def _full_pipeline_stub_set(monkeypatch, llm_text="ok, noted"):
     """Minimal stubs to run a REAL bot.pipeline() end to end without a real
     LLM/network call -- same technique as
@@ -1077,6 +1088,7 @@ def test_crisis_text_transcribed_from_voice_triggers_the_same_crisis_path(tmp_db
 def test_non_owner_incoming_voice_still_transcribes_and_replies_text_only(tmp_db, monkeypatch, voice_flag):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", voice_flag)
     run(database.upsert_user(2, "u", "U"))
+    run(_consume_first_turn(2))
     run(database.grant_user_access(2))  # "normal product access", non-owner
     run(database.set_response_preference(2, response_format="voice"))  # must have zero effect
 
@@ -1195,6 +1207,7 @@ def test_update2_consumes_override_and_voices_the_real_answer_exactly_once(tmp_d
     monkeypatch.setattr(os, "remove", lambda p: None)
 
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     fsm = FakeFSM()
     run(bot.pipeline(FakeMessage(FakeUser(1), "лень читать"), "лень читать", fsm))  # update 1
     assert (run(fsm.get_data())).get("one_shot_voice_pending") is True
@@ -1564,6 +1577,7 @@ def test_one_shot_override_consumed_just_before_ttl_expiry(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     monkeypatch.setattr(config, "VOICE_ONE_SHOT_OVERRIDE_TTL_SECONDS", 300)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     _full_pipeline_stub_set(monkeypatch, llm_text="a real answer")
     voiced = []
     async def spy_synth(client_, text, lang):
@@ -1655,6 +1669,7 @@ def test_one_shot_override_ttl_isolated_per_user_same_chat_key(tmp_db, monkeypat
 def test_text_delivery_success_stores_response_and_timestamp(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     _full_pipeline_stub_set(monkeypatch, llm_text="the approved ordinary answer")
     fsm = FakeFSM()
     before = time.time()
@@ -1667,6 +1682,7 @@ def test_text_delivery_success_stores_response_and_timestamp(tmp_db, monkeypatch
 def test_voice_only_delivery_success_stores_approved_text_not_audio(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     run(database.set_response_preference(1, response_format="voice"))
     _full_pipeline_stub_set(monkeypatch, llm_text="the approved spoken answer")
     async def fake_synth(client_, text, lang):
@@ -1688,6 +1704,7 @@ def test_voice_fails_text_fallback_succeeds_fallback_becomes_replay_source(tmp_d
     # user genuinely received it, so it is a legitimate replay candidate.
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     run(database.set_response_preference(1, response_format="voice"))
     _full_pipeline_stub_set(monkeypatch, llm_text="the approved answer, delivered as text fallback")
     async def failing_synth(client_, text, lang):
@@ -1705,6 +1722,7 @@ def test_voice_fails_text_fallback_succeeds_fallback_becomes_replay_source(tmp_d
 def test_complete_delivery_failure_never_writes_or_overwrites_replay_state(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     run(database.set_response_preference(1, response_format="voice"))
     _full_pipeline_stub_set(monkeypatch, llm_text="an answer that will never actually be delivered")
     async def failing_synth(client_, text, lang):
@@ -1760,6 +1778,7 @@ def test_replay_no_usable_response_stores_override_and_returns_safely(tmp_db, mo
 def test_ordinary_voice_unsafe_draft_never_reaches_tts_fallback_does(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     run(database.set_response_preference(1, response_format="voice"))
     _full_pipeline_stub_set(monkeypatch, llm_text="an unsafe draft answer")
 
@@ -1785,6 +1804,7 @@ def test_ordinary_voice_unsafe_draft_never_reaches_tts_fallback_does(tmp_db, mon
 def test_one_shot_voice_override_also_never_synthesizes_the_unsafe_draft(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     # response_format stays "text" (default) -- the ONE-SHOT override is what
     # forces voice delivery here, exercising the other code path than the
     # persistent-preference test above.
@@ -1811,6 +1831,7 @@ def test_one_shot_voice_override_also_never_synthesizes_the_unsafe_draft(tmp_db,
 def test_voice_and_concise_text_transformed_spoken_text_is_revalidated(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     run(database.set_response_preference(1, response_format="voice_and_concise_text",
                                           response_length="concise"))
     long_answer = ("Одно предложение с важной мыслью. " * 20).strip()
@@ -2039,6 +2060,7 @@ def test_mixed_message_in_group_preserves_ordinary_behavior_ignores_format_fragm
     # stays plain text, no preference is written, no override is armed.
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     _full_pipeline_stub_set(monkeypatch, llm_text="an ordinary group reply")
     tts_calls = {"n": 0}
     async def spy_synth(*a, **kw):
@@ -2183,6 +2205,7 @@ def test_mixed_persistent_command_in_group_delivers_ordinary_text_ignores_prefer
     # plain text; the persistent format fragment has zero effect.
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
+    run(_consume_first_turn(1))
     _full_pipeline_stub_set(monkeypatch, llm_text="an ordinary group reply")
     tts_calls = {"n": 0}
     async def spy_synth(*a, **kw):

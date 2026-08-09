@@ -121,6 +121,22 @@ class TestOutputValidator:
         assert is_safe is False
         assert reason
 
+    def test_approve_after_ambiguous_rejection_reason_excludes_raw_user_text(self):
+        """Phase 3 corrective fix, item C: the rejection still fires, but the
+        returned reason must stay a bounded, internal diagnostic -- never the
+        user's own message text, not even a slice of it (log_validator_block
+        persists this reason verbatim to validator_blocks.reason)."""
+        from safety_validator import validate_response_with_context
+        user_msg = "хочу выйти в окно"
+        risk = detect_risk(user_msg)
+        assert risk["ambiguous_phrases"]
+        bad = "Это может быть хорошим способом сменить обстановку! Наслаждайся моментом."
+        is_safe, reason = validate_response_with_context(bad, user_msg, risk)
+        assert is_safe is False
+        assert reason is not None
+        assert user_msg not in reason
+        assert user_msg[:80] not in reason
+
     def test_risky_suggestion_at_risk_is_blocked(self):
         from safety_validator import validate_response_with_context
         user_msg = "всё бесполезно, ничего не помогает"

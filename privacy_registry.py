@@ -328,6 +328,36 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
         log_policy="Notice id, version tag and timestamp only — no raw content of "
                   "any kind; never in logs/alerts."),
 
+    # Generic first-turn contract (persistence/concurrency foundation).
+    "user_interaction_revision": _e(
+        table="user_interaction_revision", user_id_column="user_id", category="STATE",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="A single integer counter — never in logs/alerts."),
+
+    "first_turn_claims": _e(
+        table="first_turn_claims", user_id_column="user_id", category="RESEARCH_LOG",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="status/scenario/version/claim_token only — claim_token is an "
+                  "opaque bookkeeping value, never in logs/alerts beyond internal DB read."),
+
+    "interaction_button_bindings": _e(
+        table="interaction_button_bindings", user_id_column="user_id", category="ENGAGEMENT",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="The opaque callback token is never emitted in logs/alerts; "
+                  "no raw content of any kind lives in this table."),
+
+    "user_interaction_events": _e(
+        table="user_interaction_events", user_id_column="user_id", category="ENGAGEMENT",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="`normalized_text` is a fixed enum-mapped label, never raw "
+                  "content; `reply_error_code` is a bounded internal code, never a "
+                  "raw exception message — neither is ever emitted in logs/alerts "
+                  "beyond internal DB read."),
+
     # Therapeutic Core Foundation (Phase 1, master prompt SS15) — same
     # PSYCH_PROFILE treatment as user_psychology_profile/psychology_profile_history:
     # structured therapeutic working state, not a safety-audit record, so it does

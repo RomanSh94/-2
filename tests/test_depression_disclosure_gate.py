@@ -203,6 +203,14 @@ def test_gate_off_or_rollout_off_reproduces_prior_behavior(monkeypatch, tmp_db, 
     llm_calls = {"n": 0}
     _full_pipeline_stub_set(monkeypatch, llm_calls=llm_calls)
     user = FakeUser(1)
+    # This test verifies gate-off/rollout-off REPRODUCES the ordinary/legacy
+    # pipeline behavior -- it is not testing first-turn onboarding, so
+    # pre-consume the one-time first-turn claim via the real, tested API
+    # (same pattern already validated in tests/test_stale_response_race.py)
+    # so this fresh uid is definitively past first-turn eligibility.
+    run(database.upsert_user(1, "u", "U"))
+    run(database.claim_first_turn(1, config.FIRST_TURN_CONTRACT_VERSION,
+                                  "test-preconsumed-1", "test_setup"))
     msg = FakeMessage(user, "у меня депрессия")
     run(bot.pipeline(msg, msg.text, None, tg_user=user))
     assert llm_calls["n"] == 1

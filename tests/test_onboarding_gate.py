@@ -313,7 +313,10 @@ def test_text_reaches_ordinary_pipeline_after_onboarding_completed(monkeypatch, 
     monkeypatch.setattr(bot, "get_user_message_count", _async(1))
     monkeypatch.setattr(bot, "check_sudden_improvement", _async(False))
     monkeypatch.setattr(bot, "log_moderation", _async(None))
-    monkeypatch.setattr(bot, "save_message", _async(None))
+    # save_message is intentionally left real (against the already-configured
+    # tmp_db fixture): _deliver_first_turn_response relies on its actual
+    # integer turn_id return value for the delivered_without_buttons
+    # transition, and that production requirement must not be weakened here.
     monkeypatch.setattr(bot, "push_alert", _async(None))
 
     class _Choice:
