@@ -87,6 +87,7 @@ from state_engine import (
 from psychology_profile import maybe_update_profile, format_profile_for_user
 from readiness_engine import assess_readiness
 from cognitive_capacity import get_capacity
+from interaction_preference import detect_interaction_preference
 from practice_registry import select_practice, get_production_practice_by_id
 from safety_validator import (
     validate_response,
@@ -1968,8 +1969,10 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
 
         # 9. Select scenario
         variant = get_variant(uid)
+        interaction_pref = detect_interaction_preference(user_text, lang)
         scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
-                                   variant, trajectory=trajectory)
+                                   variant, trajectory=trajectory,
+                                   interaction_preference=interaction_pref)
 
         # 9.4 First-turn eligibility (spec item D) -- computed only now that
         # scenario/stage/capacity/risk are all known; no lexical/topic
