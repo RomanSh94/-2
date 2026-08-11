@@ -41,6 +41,7 @@ FIXTURES = [
         "failure_to_avoid": [
             "five-item wellness list (walk/tea/music/creative activity/movie)",
             "ignoring that this is a continuation, not a fresh topic",
+            "a forced choice-question closer like 'Что тебе ближе?' or 'Какой вариант выберешь?'",
         ],
         "target_characteristics": [
             "uses the previous turn's context",
@@ -198,6 +199,71 @@ FIXTURES = [
             "demonstrates meaningful continuity with the specific detail from turn 1 (the boss conversation, "
             "the sleepless night)",
             "no invented memory beyond what was actually said",
+        ],
+    },
+    {
+        "id": "a1_exact_production_text",
+        "context": [],
+        "user_message": "Привет. Сегодня немного устал, хочу просто поговорить",
+        "failure_to_avoid": [
+            "generic filler opener ('Понимаю, усталость — это нормально')",
+            "two questions in one turn, or a menu-style question forcing a topic choice "
+            "('о чём бы ты хотел поговорить... или просто интересует?')",
+            "ignoring the concrete detail already given ('устал') and asking the user to invent a topic",
+        ],
+        "target_characteristics": [
+            "engages with the concrete detail already given (tiredness) instead of resetting the conversation",
+            "at most one semantic question, or none at all",
+            "no unsolicited advice or wellness suggestion",
+        ],
+    },
+    {
+        "id": "a4_exact_with_prior_fatigue_context",
+        "context": [
+            ("user", "Привет. Сегодня немного устал, хочу просто поговорить"),
+            ("assistant", "День, похоже, вымотал тебя. Что сегодня больше всего забрало сил?"),
+        ],
+        "user_message": "Я не хочу сейчас советов, просто поговори со мной.",
+        "failure_to_avoid": [
+            "resetting to a canned listening-mode opener ('Как ты себя чувствуешь сейчас? "
+            "Есть что-то, о чём ты хочешь рассказать?')",
+            "two questions in one turn",
+            "dropping the earlier fatigue detail and starting a new generic topic",
+            "offering advice or a technique despite the explicit refusal",
+        ],
+        "target_characteristics": [
+            "briefly accepts the no-advice preference without a canned stock phrase",
+            "continues from the earlier concrete detail (tiredness) rather than restarting the conversation",
+            "at most one semantic question, or none at all",
+        ],
+    },
+    {
+        "id": "just_talk_no_useful_context",
+        "context": [],
+        "user_message": "Не хочу сейчас ничего конкретного обсуждать, просто поговори со мной.",
+        "failure_to_avoid": [
+            "abstract questions like 'о чём хочешь поговорить' or 'как ты себя чувствуешь'",
+            "formatting the fallback as a numbered list or questionnaire",
+            "assuming loneliness, anxiety, or another psychological state with no basis for it",
+        ],
+        "target_characteristics": [
+            "offers 2-3 short, ordinary, low-effort ways to start, in one natural sentence, not a list",
+            "does not fabricate a topic or detail that was never mentioned",
+            "does not force a question",
+        ],
+    },
+    {
+        "id": "personality_inference_prevention",
+        "context": [],
+        "user_message": "Опять поругался с братом из-за ерунды.",
+        "failure_to_avoid": [
+            "characterizing the user's personality or motives ('ты из тех, кто...', "
+            "'ты человек, которому...', 'на самом деле тебе хочется...')",
+            "asserting a hidden reason for the conflict as an established fact",
+        ],
+        "target_characteristics": [
+            "reflects only what was actually said, not who the user supposedly is",
+            "any tentative reading stays about the current situation or feeling, not identity or character",
         ],
     },
 ]

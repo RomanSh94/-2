@@ -46,6 +46,16 @@ def test_open_chat_ru_includes_new_quality_rules():
         "не предполагай автоматически одиночество",      # zero-context fallback: no assumed distress
         "Если пользователь явно просит совет",           # explicit advice request
         "Не переигрывай в терапию",                      # don't over-therapize
+        "«Это нормально»",                                # Phase 4A.1c: extended filler-opener list
+        "Тепло должно идти от внимания к",                # Phase 4A.1c: warmth-from-attention, not phrase
+        "Не приписывай пользователю тип личности",       # Phase 4A.1c: no personality/identity inference
+        "Максимум один смысловой вопрос за ответ",        # Phase 4A.1c: question economy
+        "это фактически два вопроса или меню",           # Phase 4A.1c: compound/menu question ban
+        "Ответ без единого вопроса — нормальный",        # Phase 4A.1c: zero-question responses encouraged
+        "не переключайся в шаблонный режим «слушателя»", # Phase 4A.1c: just-talk, no canned listening mode
+        "избегай механических «ты говорил»",             # Phase 4A.1c: no mechanical memory-signaling
+        "Не превращай ответ в каталог из нескольких обычных вариантов",  # Phase 4A.1c: no advice menu
+        "закрывающий вопрос-выбор вроде «Что тебе ближе?»",  # Phase 4A.1c: no forced choice-closer
     ]
     for m in markers:
         assert m in text, f"missing quality-contract marker: {m!r}"
@@ -77,6 +87,16 @@ def test_open_chat_en_provides_semantic_parity():
         "do not automatically assume loneliness",         # zero-context fallback: no assumed distress
         "If the user explicitly asks for advice",
         "Don't over-therapize",
+        "\"That's normal\"",                              # Phase 4A.1c: extended filler-opener list
+        "Warmth should come from attention",              # Phase 4A.1c: warmth-from-attention, not phrase
+        "Don't characterize the user's personality",      # Phase 4A.1c: no personality/identity inference
+        "At most one semantic question per response",     # Phase 4A.1c: question economy
+        "effectively two questions or a menu of choices", # Phase 4A.1c: compound/menu question ban
+        "A reply with zero questions is a normal, often better outcome",  # Phase 4A.1c: zero-question ok
+        "don't switch into a canned \"listening mode\"",  # Phase 4A.1c: just-talk, no canned listening mode
+        "avoid mechanical phrases like \"you said\"",     # Phase 4A.1c: no mechanical memory-signaling
+        "Don't turn the reply into a catalogue of ordinary options",  # Phase 4A.1c: no advice menu
+        "a closing choice-question like \"which one sounds better?\"",  # Phase 4A.1c: no forced closer
     ]
     for m in markers:
         assert m in text, f"missing quality-contract marker: {m!r}"
@@ -178,7 +198,7 @@ def test_no_db_schema_changes():
 
 def test_quality_fixtures_load_and_are_well_formed():
     from tests.quality_fixtures_open_chat import FIXTURES
-    assert len(FIXTURES) == 10
+    assert len(FIXTURES) == 14
     required_keys = {"id", "context", "user_message", "failure_to_avoid", "target_characteristics"}
     ids = set()
     for fx in FIXTURES:
@@ -187,7 +207,7 @@ def test_quality_fixtures_load_and_are_well_formed():
         assert isinstance(fx["failure_to_avoid"], list) and fx["failure_to_avoid"]
         assert isinstance(fx["target_characteristics"], list) and fx["target_characteristics"]
         ids.add(fx["id"])
-    assert len(ids) == 10  # all ids unique
+    assert len(ids) == 14  # all ids unique
 
 
 def test_quality_fixtures_structural_integrity():
@@ -198,7 +218,7 @@ def test_quality_fixtures_structural_integrity():
     dialogue quality or content -- shape only."""
     from tests.quality_fixtures_open_chat import FIXTURES
 
-    assert len(FIXTURES) == 10
+    assert len(FIXTURES) == 14
 
     seen_ids = set()
     for fx in FIXTURES:
