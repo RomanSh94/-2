@@ -243,20 +243,22 @@ def apply_stage_restrictions(scenario: str, stage: str) -> str:
 
 def choose_scenario(state: Dict, risk_cats: list, stage: str,
                     readiness: str, capacity: float, variant: str = "control",
-                    trajectory: "EmotionalTrajectory | None" = None) -> str:
+                    trajectory: "EmotionalTrajectory | None" = None,
+                    interaction_preference: str = "NONE") -> str:
     """Pick a scenario, then enforce the stage hard-filter (STAGE_RESTRICTIONS).
 
     The selection heuristics live in _select_scenario; this wrapper guarantees
     the result is allowed for the user's stage (e.g. GROWTH no longer drops to
     grounding on a panic spike — it falls back to a safe allowed scenario)."""
     scenario = _select_scenario(state, risk_cats, stage, readiness, capacity,
-                                variant, trajectory)
+                                variant, trajectory, interaction_preference)
     return apply_stage_restrictions(scenario, stage)
 
 
 def _select_scenario(state: Dict, risk_cats: list, stage: str,
                      readiness: str, capacity: float, variant: str = "control",
-                     trajectory: "EmotionalTrajectory | None" = None) -> str:
+                     trajectory: "EmotionalTrajectory | None" = None,
+                     interaction_preference: str = "NONE") -> str:
     """
     Routes to psychological scenario.
     Respects Stage restrictions, Readiness, and Cognitive Capacity.
@@ -265,13 +267,27 @@ def _select_scenario(state: Dict, risk_cats: list, stage: str,
     `trajectory` (optional, §4): aggregated recent dynamics. It only *biases*
     non-crisis routing — it NEVER overrides the crisis path (that stays purely
     risk-driven).
+
+    `interaction_preference` (optional, current-turn only, never persisted):
+    "JUST_TALK" | "ADVICE_REQUEST" | "NONE". When the user has explicitly
+    stated a preference THIS turn, the non-acute historical/state-threshold
+    rules below are suppressed in favor of open_chat — but crisis and every
+    mandatory acute-safety rule (ACUTE_DISTRESS stage, panic/dissociation,
+    overwhelm) are never gated by this and always run unconditionally. Any
+    value other than the two recognized ones fails closed to "NONE" (no
+    suppression), so a malformed/unknown value can never bypass non-acute
+    routing.
     """
     if "suicide" in risk_cats or "self_harm" in risk_cats:
         return "crisis"
 
+    explicit_interaction_preference = interaction_preference in {"JUST_TALK", "ADVICE_REQUEST"}
+
     # §4 trajectory bias — applied before the state heuristics, but only for
-    # non-acute stages (acute distress keeps its grounding/stabilization rules).
-    if trajectory and trajectory.messages_analyzed >= 3 and stage != "ACUTE_DISTRESS":
+    # non-acute stages (acute distress keeps its grounding/stabilization rules)
+    # and only when the user hasn't just told us what they want this turn.
+    if (not explicit_interaction_preference and trajectory
+            and trajectory.messages_analyzed >= 3 and stage != "ACUTE_DISTRESS"):
         freq = trajectory.risk_categories_frequency
         if freq:
             top_cat, top_n = max(freq.items(), key=lambda x: x[1])
@@ -291,20 +307,21 @@ def _select_scenario(state: Dict, risk_cats: list, stage: str,
     if state.get("overwhelm", 0) > 0.7:
         return "stabilization"
 
-    if state.get("anxiety", 0) > 0.5:
+    if not explicit_interaction_preference and state.get("anxiety", 0) > 0.5:
         if capacity < 0.3:
             return "somatic"
         if variant == "variant_a":
             return "act_acceptance"
         return "cbt_thought"
 
-    if state.get("hopelessness", 0) > 0.5 and state.get("openness", 0.5) > 0.35:
+    if (not explicit_interaction_preference and state.get("hopelessness", 0) > 0.5
+            and state.get("openness", 0.5) > 0.35):
         return "act_acceptance"
 
-    if state.get("loneliness", 0) > 0.5:
+    if not explicit_interaction_preference and state.get("loneliness", 0) > 0.5:
         return "reflective"
 
-    if state.get("energy", 0.5) < 0.25:
+    if not explicit_interaction_preference and state.get("energy", 0.5) < 0.25:
         return "somatic"
 
     return "open_chat"
