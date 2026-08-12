@@ -2730,6 +2730,39 @@ def test_controller_claims_turn_after_first_turn_already_consumed(env, monkeypat
     assert _row("SELECT COUNT(*) FROM first_turn_claims WHERE user_id=?", (OWNER,))[0] == 1
 
 
+def test_first_turn_owns_the_turn_alone_single_visible_authority(env, monkeypatch):
+    """Closes the SINGLE_VISIBLE_AUTHORITY characterization gap: for a
+    message that is BOTH genuinely first-turn-eligible AND genuinely
+    Controller-recognizable (real classify_intent, not mocked) as an
+    explicit non-UNKNOWN intent, exactly one visible reply must be produced
+    and it must be the first-turn response -- not two replies, not the
+    Controller's, not a stray legacy append. Existing precedence tests
+    (test_eligible_first_turn_wins_over_controller_claim) prove the
+    Controller claim is never attempted, but never assert len(msg.answers)
+    -- this test closes exactly that gap, on real Controller-eligible
+    input."""
+    text = ("Мне нужно выговориться, в последнее время тревожно из-за "
+            "работы, не могу расслабиться по вечерам.")
+    # Real, unmocked classifier -- proves this exact text would have been
+    # Controller-recognizable (non-UNKNOWN) had the Controller path been
+    # reached, so the precedence proven below is not vacuous.
+    assert bot.controller.classify_intent(text, "ru").value == "VENT"
+
+    monkeypatch.setattr(bot.access_control, "core_rollout_allowed", _async(True))
+    claim_calls, deliver_calls = _controller_spy(monkeypatch, {"sentinel": "would-have-claimed"})
+    _set_llm(monkeypatch, content=sv.get_first_turn_fallback("ru"))
+
+    msg = FakeMessage(FakeUser(OWNER), text)
+    _run(msg)
+
+    assert _row("SELECT status FROM first_turn_claims WHERE user_id=?",
+               (OWNER,))[0] == "delivered"
+    assert len(claim_calls) == 0     # Controller claim never attempted
+    assert len(deliver_calls) == 0   # Controller delivery never invoked
+    assert len(msg.answers) == 1     # exactly one visible reply
+    assert msg.answers[0][0] == sv.get_first_turn_fallback("ru")
+
+
 def test_first_turn_claimed_turn_sends_no_reaction(env, monkeypatch):
     """Architecture decision 2: ft_claimed skips _maybe_react entirely,
     matching the Controller's own existing reaction bypass."""
