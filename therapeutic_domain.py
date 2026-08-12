@@ -1000,3 +1000,196 @@ class InteractionRequest:
         object.__setattr__(
             self, "signals",
             frozenset(as_enum(InteractionSignal, s) for s in self.signals))
+
+
+class ProfessionalObjective(str, Enum):
+    """What professional purpose THIS assistant turn should accomplish --
+    distinct from Intent (why the user wrote this turn) and from
+    PrimaryResponseMove (the dominant conversational act used to accomplish
+    the objective). Does not encode "just talk" / advice-refusal as a
+    VENT-like alias: conversational stance and advice preference are
+    InteractionSignal's job (InteractionSignal.JUST_TALK / NO_ADVICE), never
+    folded into this enum or into Intent.
+
+    ESTABLISH_CONTACT: low-evidence conversational engagement/opening. Does
+    not force formulation, technique, goal-setting, or advice.
+
+    CLARIFY: acquire exactly one professionally relevant missing link.
+
+    MAP_EPISODE: organize already-supported material into a useful
+    relationship/sequence. Must NOT acquire a missing link under this
+    objective -- that is CLARIFY's job, even on a later turn.
+
+    CLARIFY_GOAL: clarify the desired change/useful outcome when it is
+    absent, ambiguous, conflicting, or professionally necessary for deciding
+    what to do next. Never imposes a goal. This is NOT a mandatory
+    prerequisite for every OFFER_ACTION -- a request that already contains a
+    usable desired outcome (e.g. "что мне сегодня сделать, чтобы
+    разгрузить голову?") does not require a separate CLARIFY_GOAL turn
+    first.
+
+    TEST_HYPOTHESIS: explore a tentative hypothesis/mechanism against
+    evidence or alternatives.
+
+    CHECK_FORMULATION: present/check a tentative multi-link working
+    formulation for user correction. Never encodes confirmation bias or
+    established certainty.
+
+    EXPLAIN_MECHANISM: provide a relevant explanation grounded in supported
+    information.
+
+    OFFER_ACTION: offer one bounded actionable next step when appropriate.
+    Does not imply a prior CLARIFY_GOAL turn is always required.
+
+    REVIEW_OUTCOME: review what happened after a prior action/intervention/
+    strategy.
+
+    REPAIR: repair a conversational/professional miss or violated
+    interaction boundary.
+
+    CLOSE: close or transition the session/topic cleanly."""
+    ESTABLISH_CONTACT = "ESTABLISH_CONTACT"
+    CLARIFY = "CLARIFY"
+    MAP_EPISODE = "MAP_EPISODE"
+    CLARIFY_GOAL = "CLARIFY_GOAL"
+    TEST_HYPOTHESIS = "TEST_HYPOTHESIS"
+    CHECK_FORMULATION = "CHECK_FORMULATION"
+    EXPLAIN_MECHANISM = "EXPLAIN_MECHANISM"
+    OFFER_ACTION = "OFFER_ACTION"
+    REVIEW_OUTCOME = "REVIEW_OUTCOME"
+    REPAIR = "REPAIR"
+    CLOSE = "CLOSE"
+
+
+class ClarificationTarget(str, Enum):
+    """Which specific missing link a CLARIFY-objective turn pursues.
+    Deliberately NOT a mechanical alias of EvidenceKind or of Formulation's
+    field names -- it answers a different question (what is being pursued,
+    asked before the user answers) than EvidenceKind (what kind of thing
+    the user just said, tagged after) or Formulation (the persisted
+    working-hypothesis shape). CONSEQUENCE in particular does not map to a
+    single EvidenceKind or a single Formulation field.
+
+    EVENT: observable situation, trigger, or factual context being
+    clarified. Must preserve fact-vs-interpretation discipline.
+
+    INTERPRETATION: the user's thought, appraisal, meaning, prediction, or
+    conclusion about the event.
+
+    EMOTION: emotion to be explicitly elicited from the user. Never
+    inferred as established fact.
+
+    BODY: reported bodily sensation/state.
+
+    URGE: reported impulse/urge.
+
+    BEHAVIOR: what the user did or did not do in response. Avoidance is
+    representable as a behavior in V1 -- no separate AVOIDANCE member.
+
+    CONSEQUENCE: what followed from the behavior/episode. Does not
+    pre-decide short-term effect vs. long-term consequence before the
+    answer exists.
+
+    PATTERN: whether the relevant sequence/link recurs across episodes or
+    contexts.
+
+    Deliberately absent in V1: FACTS is not a clarification target -- V1
+    does not introduce a separate FACTS clarification target, and supported
+    factual material remains represented in the evidence/formulation layer,
+    not claimed to originate solely from EVENT. AVOIDANCE is representable
+    through BEHAVIOR in V1. ALTERNATIVE_EXPLANATION belongs to
+    TEST_HYPOTHESIS, not CLARIFY. GOAL has its own
+    ProfessionalObjective.CLARIFY_GOAL."""
+    EVENT = "EVENT"
+    INTERPRETATION = "INTERPRETATION"
+    EMOTION = "EMOTION"
+    BODY = "BODY"
+    URGE = "URGE"
+    BEHAVIOR = "BEHAVIOR"
+    CONSEQUENCE = "CONSEQUENCE"
+    PATTERN = "PATTERN"
+
+
+class PrimaryResponseMove(str, Enum):
+    """The dominant conversational act a turn uses to accomplish its
+    ProfessionalObjective. Brief connective/acknowledging language
+    accompanying the primary move is not a second move.
+
+    OPEN_INVITATION: low-pressure invitation to continue/contact. May
+    contain a brief acknowledgment. Does not itself imply advice or
+    technique.
+
+    REFLECTIVE_STATEMENT: concise reflection of one supported meaning/
+    content unit or immediate user-reported experience. Does not construct
+    a multi-link mechanism map.
+
+    FOCUSED_QUESTION: one meaningful question serving one professional
+    purpose.
+
+    STRUCTURED_SUMMARY: explicit synthesis of two or more supported links/
+    parts into an organized relationship or sequence. Does not require
+    bullets, headings, formal tone, or clinical terminology -- may be one
+    natural conversational paragraph.
+
+    EXPLANATION: evidence-grounded explanatory response.
+
+    HYPOTHESIS_CHECK: tentative hypothesis/formulation presented explicitly
+    for checking/correction, not as established fact.
+
+    ACTION_PROPOSAL: one bounded action/advice/intervention candidate.
+
+    CLOSING: close/transition without unnecessarily reopening another
+    thread."""
+    OPEN_INVITATION = "OPEN_INVITATION"
+    REFLECTIVE_STATEMENT = "REFLECTIVE_STATEMENT"
+    FOCUSED_QUESTION = "FOCUSED_QUESTION"
+    STRUCTURED_SUMMARY = "STRUCTURED_SUMMARY"
+    EXPLANATION = "EXPLANATION"
+    HYPOTHESIS_CHECK = "HYPOTHESIS_CHECK"
+    ACTION_PROPOSAL = "ACTION_PROPOSAL"
+    CLOSING = "CLOSING"
+
+
+# The canonical, closed objective<->move compatibility contract (Stage 1C
+# §5/§8 corrections). Immutable by construction: a frozenset of pairs, not a
+# dict, so there is no mutable per-objective list a caller could append to.
+# A pair is present only when the move can DIRECTLY accomplish the
+# objective under both types' own definitions above -- not merely because
+# it could indirectly help. In particular MAP_EPISODE never pairs with
+# FOCUSED_QUESTION (organizing already-supported material must not acquire
+# a missing link; that is CLARIFY's job), and CLARIFY never pairs with
+# REFLECTIVE_STATEMENT (acquiring one missing link is not the same act as
+# reflecting what's already known). No SessionPhase and no InteractionSignal
+# are represented here -- phase is session context, not a rigid controller
+# over this matrix. Interaction signals remain external inputs/constraints
+# for later planning: they do not alter the canonical set of allowed
+# objective/move pairs defined by this matrix. Later planner logic may use
+# them when selecting among otherwise valid objectives and moves.
+PROFESSIONAL_OBJECTIVE_MOVE_COMPATIBILITY: frozenset[
+    tuple[ProfessionalObjective, PrimaryResponseMove]] = frozenset({
+    (ProfessionalObjective.ESTABLISH_CONTACT, PrimaryResponseMove.OPEN_INVITATION),
+
+    (ProfessionalObjective.CLARIFY, PrimaryResponseMove.FOCUSED_QUESTION),
+
+    (ProfessionalObjective.MAP_EPISODE, PrimaryResponseMove.STRUCTURED_SUMMARY),
+
+    (ProfessionalObjective.CLARIFY_GOAL, PrimaryResponseMove.FOCUSED_QUESTION),
+
+    (ProfessionalObjective.TEST_HYPOTHESIS, PrimaryResponseMove.HYPOTHESIS_CHECK),
+    (ProfessionalObjective.TEST_HYPOTHESIS, PrimaryResponseMove.FOCUSED_QUESTION),
+
+    (ProfessionalObjective.CHECK_FORMULATION, PrimaryResponseMove.HYPOTHESIS_CHECK),
+
+    (ProfessionalObjective.EXPLAIN_MECHANISM, PrimaryResponseMove.EXPLANATION),
+
+    (ProfessionalObjective.OFFER_ACTION, PrimaryResponseMove.ACTION_PROPOSAL),
+
+    (ProfessionalObjective.REVIEW_OUTCOME, PrimaryResponseMove.FOCUSED_QUESTION),
+    (ProfessionalObjective.REVIEW_OUTCOME, PrimaryResponseMove.REFLECTIVE_STATEMENT),
+
+    (ProfessionalObjective.REPAIR, PrimaryResponseMove.REFLECTIVE_STATEMENT),
+    (ProfessionalObjective.REPAIR, PrimaryResponseMove.OPEN_INVITATION),
+    (ProfessionalObjective.REPAIR, PrimaryResponseMove.STRUCTURED_SUMMARY),
+
+    (ProfessionalObjective.CLOSE, PrimaryResponseMove.CLOSING),
+})
