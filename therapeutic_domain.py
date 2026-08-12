@@ -927,3 +927,76 @@ def validate_evidence_against_source(item: EvidenceItem, source_text: str) -> bo
     if item.ref.span_end > len(source_text):
         return False
     return source_text[item.ref.span_start:item.ref.span_end] == item.exact_source_span
+
+
+class InteractionSignal(str, Enum):
+    """Closed categories for explicit current-turn interaction signals.
+    These are raw-signal categories supplied by turn analysis, not planner
+    decisions, and not proof that the user actually expressed one -- the
+    type only defines the vocabulary; correct extraction from the user's
+    turn is the future producer's responsibility, not this enum's. None of
+    them mutates or derives any ResponsePlan field; that composition is
+    exclusively later planner work.
+
+    JUST_TALK: explicit conversational stance only -- the user wants to
+    talk, nothing more is implied.
+
+    NO_ADVICE: explicit current-turn prohibition of advice.
+
+    ADVICE_ALLOWED: explicit permission for advice/a suggestion. This is
+    permission, not a command -- it does not mean advice must be generated,
+    that advice is professionally appropriate, that unlimited advice is
+    permitted, or that an exact quantity/scope (e.g. "one idea") is encoded
+    here. Exact scope is Stage 2/3 responsibility, read from the original
+    turn text, not from this signal.
+
+    ADVICE_REQUESTED: explicit request for advice. Does not bypass safety,
+    capability, consent, or contraindications.
+
+    NO_EXERCISE: explicit refusal of an exercise/practice. This does NOT
+    mean intervention_allowed=False -- "intervention" is broader than
+    exercises today, and no ResponsePlan field isolates exercise-specific
+    permission. Exercise/practice-specific enforcement is future Stage 3
+    design, not derived here.
+
+    NO_QUESTIONS: explicit proactive current-turn refusal of questions.
+    This is NOT RepairConstraint.QUESTION_OVERLOAD -- that is a persisted,
+    decaying consequence of a past bot violation; this is a fresh turn-local
+    statement that may be the user's very first message, with no repair
+    history at all. The two remain structurally separate; a future planner
+    may compose both."""
+    JUST_TALK = "JUST_TALK"
+    NO_ADVICE = "NO_ADVICE"
+    ADVICE_ALLOWED = "ADVICE_ALLOWED"
+    ADVICE_REQUESTED = "ADVICE_REQUESTED"
+    NO_EXERCISE = "NO_EXERCISE"
+    NO_QUESTIONS = "NO_QUESTIONS"
+
+
+@dataclass(frozen=True)
+class InteractionRequest:
+    """A set of interaction signals supplied to this value object for the
+    current turn. Preserves every SUPPLIED signal category -- including
+    mutually conflicting ones (e.g. NO_ADVICE together with
+    ADVICE_REQUESTED) -- and resolves NOTHING: there is no enum precedence
+    here, no first-match-wins behavior, no silent drop of one signal in
+    favor of another. Conflict resolution is later Stage 2 work, done by
+    inspecting the original turn text/context, never by an arbitrary
+    ordering baked into this type.
+
+    This does NOT prove that extraction found every signal actually present
+    in the user's original turn -- it only guarantees that whatever
+    categories were supplied to it are not lost or silently overwritten
+    afterward. It also does not preserve signal order, source span, scope,
+    retraction semantics ("changed my mind"), or connective structure
+    ("but", "although") -- a frozenset carries only which categories were
+    supplied, not the sentence structure that produced them. Stage 1B
+    intentionally stores category membership only; later stages must
+    inspect the original turn/context whenever order, scope, or retraction
+    semantics matter."""
+    signals: frozenset[InteractionSignal] = frozenset()
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "signals",
+            frozenset(as_enum(InteractionSignal, s) for s in self.signals))
