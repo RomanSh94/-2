@@ -56,6 +56,13 @@ def test_open_chat_ru_includes_new_quality_rules():
         "избегай механических «ты говорил»",             # Phase 4A.1c: no mechanical memory-signaling
         "Не превращай ответ в каталог из нескольких обычных вариантов",  # Phase 4A.1c: no advice menu
         "закрывающий вопрос-выбор вроде «Что тебе ближе?»",  # Phase 4A.1c: no forced choice-closer
+        "психообразовательных фраз вроде «Усталость может накапливаться»",  # Phase 4A.1d: no generic psychoed openers
+        "мысль → эмоция → импульс → поведение → последствие",  # Phase 4A.1d: professional-depth chain
+        "не означает навсегда оставаться поверхностным",   # Phase 4A.1d: JUST_TALK != permanently superficial
+        "не достраивай историю за",                        # Phase 4A.1d: low-evidence no-story-completion
+        "неизвестное должно оставаться неизвестным",       # Phase 4A.1d: unknown stays unknown
+        "один разговорный ход",                            # Phase 4A.1d: one conversational move
+        "не заполняй отсутствующие эмоции, импульсы",      # Phase 4A.1d: missing-link guard
     ]
     for m in markers:
         assert m in text, f"missing quality-contract marker: {m!r}"
@@ -97,6 +104,13 @@ def test_open_chat_en_provides_semantic_parity():
         "avoid mechanical phrases like \"you said\"",     # Phase 4A.1c: no mechanical memory-signaling
         "Don't turn the reply into a catalogue of ordinary options",  # Phase 4A.1c: no advice menu
         "a closing choice-question like \"which one sounds better?\"",  # Phase 4A.1c: no forced closer
+        "generic psychoeducational lines like",           # Phase 4A.1d: no generic psychoed openers
+        "thought -> emotion -> impulse -> behavior -> consequence",  # Phase 4A.1d: professional-depth chain
+        "doesn't mean staying superficial forever",        # Phase 4A.1d: JUST_TALK != permanently superficial
+        "don't complete the story for them",               # Phase 4A.1d: low-evidence no-story-completion
+        "unknown information should stay unknown",         # Phase 4A.1d: unknown stays unknown
+        "one conversational move",                          # Phase 4A.1d: one conversational move
+        "don't fill in a missing emotion, impulse",        # Phase 4A.1d: missing-link guard
     ]
     for m in markers:
         assert m in text, f"missing quality-contract marker: {m!r}"
@@ -198,7 +212,7 @@ def test_no_db_schema_changes():
 
 def test_quality_fixtures_load_and_are_well_formed():
     from tests.quality_fixtures_open_chat import FIXTURES
-    assert len(FIXTURES) == 14
+    assert len(FIXTURES) == 15
     required_keys = {"id", "context", "user_message", "failure_to_avoid", "target_characteristics"}
     ids = set()
     for fx in FIXTURES:
@@ -207,7 +221,7 @@ def test_quality_fixtures_load_and_are_well_formed():
         assert isinstance(fx["failure_to_avoid"], list) and fx["failure_to_avoid"]
         assert isinstance(fx["target_characteristics"], list) and fx["target_characteristics"]
         ids.add(fx["id"])
-    assert len(ids) == 14  # all ids unique
+    assert len(ids) == 15  # all ids unique
 
 
 def test_quality_fixtures_structural_integrity():
@@ -218,7 +232,7 @@ def test_quality_fixtures_structural_integrity():
     dialogue quality or content -- shape only."""
     from tests.quality_fixtures_open_chat import FIXTURES
 
-    assert len(FIXTURES) == 14
+    assert len(FIXTURES) == 15
 
     seen_ids = set()
     for fx in FIXTURES:
