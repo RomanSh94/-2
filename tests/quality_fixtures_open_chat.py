@@ -207,6 +207,8 @@ FIXTURES = [
         "user_message": "Привет. Сегодня немного устал, хочу просто поговорить",
         "failure_to_avoid": [
             "generic filler opener ('Понимаю, усталость — это нормально')",
+            "generic psychoeducational opener that could apply to anyone ('Усталость может "
+            "накапливаться' as the FIRST sentence, with no grounding in this specific user)",
             "two questions in one turn, or a menu-style question forcing a topic choice "
             "('о чём бы ты хотел поговорить... или просто интересует?')",
             "ignoring the concrete detail already given ('устал') and asking the user to invent a topic",
@@ -264,6 +266,33 @@ FIXTURES = [
         "target_characteristics": [
             "reflects only what was actually said, not who the user supposedly is",
             "any tentative reading stays about the current situation or feeling, not identity or character",
+        ],
+    },
+    {
+        "id": "professional_depth_when_material_supports_it",
+        "context": [],
+        "user_message": (
+            "Начальник опять попросил всё переделать. Я сразу подумал, что он считает меня "
+            "полным идиотом. После этого весь вечер ничего не делал."
+        ),
+        "failure_to_avoid": [
+            "staying at generic validation level ('Понимаю, это неприятно. Расскажи ещё.') "
+            "when the message already contains an observable event, the user's interpretation, "
+            "and a subsequent behavioral consequence",
+            "asserting the interpretation ('he thinks I'm an idiot') as an established fact "
+            "instead of the user's own reading of the event",
+            "inventing a mechanism, diagnosis, or a specific emotion the user never named",
+        ],
+        "target_characteristics": [
+            "separates the observable fact (asked for a redo) from the user's interpretation "
+            "('thinks I'm an idiot')",
+            "recognizes the sequence from the user's interpretation to the behavior that "
+            "followed it, while treating any emotional response as unknown unless the user "
+            "names it or it is explored tentatively",
+            "offers at most one focused, tentative question that could deepen understanding "
+            "(e.g. what the user felt after that thought, or whether this interpretation-"
+            "behavior sequence shows up in other situations -- not both), phrased as "
+            "exploration not diagnosis",
         ],
     },
 ]
