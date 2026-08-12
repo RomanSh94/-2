@@ -845,3 +845,85 @@ class ResponsePlan:
             "max_interventions": self.max_interventions,
             "repair_constraints": sorted(c.value for c in self.repair_constraints),
         }
+
+
+class EvidenceKind(str, Enum):
+    """The epistemic content-kind of one atomic piece of turn-local evidence.
+    Every member is grounded in what the user actually said -- none of them
+    claims independently verified external truth (USER_REPORTED_FACT, not
+    EXPLICIT_FACT), and a system-generated hypothesis is deliberately absent:
+    a hypothesis is never evidence, it may only cite supporting EvidenceRef
+    values."""
+    USER_REPORTED_FACT = "USER_REPORTED_FACT"
+    USER_INTERPRETATION = "USER_INTERPRETATION"
+    USER_REPORTED_EMOTION = "USER_REPORTED_EMOTION"
+    USER_REPORTED_BODY = "USER_REPORTED_BODY"
+    USER_REPORTED_URGE = "USER_REPORTED_URGE"
+    USER_REPORTED_BEHAVIOR = "USER_REPORTED_BEHAVIOR"
+    USER_REPORTED_PATTERN = "USER_REPORTED_PATTERN"
+
+
+@dataclass(frozen=True)
+class EvidenceRef:
+    """The one canonical identity of a piece of evidence: which source
+    message, which exact code-point span, and what kind of claim it is.
+    Deliberately has no separate id/hash/UUID field -- the tuple itself
+    (frozen -> hashable, structurally equal) IS the identity, so it cannot
+    silently diverge from its own components, and re-extracting the exact
+    same span from the exact same message always resolves to an equal
+    EvidenceRef regardless of extraction order."""
+    source_message_row_id: int
+    span_start: int
+    span_end: int
+    evidence_kind: EvidenceKind
+
+    def __post_init__(self):
+        if type(self.source_message_row_id) is not int or self.source_message_row_id <= 0:
+            raise ValueError(
+                "EvidenceRef.source_message_row_id must be a positive int, "
+                f"got {self.source_message_row_id!r}")
+        if type(self.span_start) is not int or type(self.span_end) is not int:
+            raise ValueError("EvidenceRef.span_start/span_end must be int")
+        if not 0 <= self.span_start < self.span_end:
+            raise ValueError(
+                "EvidenceRef requires 0 <= span_start < span_end, got "
+                f"span_start={self.span_start}, span_end={self.span_end}")
+        object.__setattr__(self, "evidence_kind", as_enum(EvidenceKind, self.evidence_kind))
+
+
+@dataclass(frozen=True)
+class EvidenceItem:
+    """One extracted piece of evidence: its canonical identity (EvidenceRef)
+    plus the raw, unnormalized substring it was extracted from. This is an
+    immutable evidence observation, not mutable session state -- once
+    constructed and validated, neither its reference nor its exact span can
+    be reassigned. exact_source_span must never be stripped, cased, or
+    otherwise normalized; validate_evidence_against_source is the only place
+    a source message is ever consulted."""
+    ref: EvidenceRef
+    exact_source_span: str
+
+    def __post_init__(self):
+        if not isinstance(self.ref, EvidenceRef):
+            raise ValueError("EvidenceItem.ref must be an EvidenceRef")
+        if not isinstance(self.exact_source_span, str) or not self.exact_source_span:
+            raise ValueError("EvidenceItem.exact_source_span must be a non-empty str")
+        expected_len = self.ref.span_end - self.ref.span_start
+        if len(self.exact_source_span) != expected_len:
+            raise ValueError(
+                "EvidenceItem.exact_source_span length "
+                f"({len(self.exact_source_span)}) does not match "
+                f"ref span length ({expected_len})")
+
+
+def validate_evidence_against_source(item: EvidenceItem, source_text: str) -> bool:
+    """Deterministic, exact raw-slice provenance check. No normalization, no
+    fuzzy/semantic matching, no LLM: source_text[start:end] must equal
+    exact_source_span exactly, using the same Unicode code-point offsets
+    Python string slicing always uses. An ordinary mismatch returns False;
+    this never raises for a mismatch."""
+    if not isinstance(item, EvidenceItem) or not isinstance(source_text, str):
+        return False
+    if item.ref.span_end > len(source_text):
+        return False
+    return source_text[item.ref.span_start:item.ref.span_end] == item.exact_source_span
