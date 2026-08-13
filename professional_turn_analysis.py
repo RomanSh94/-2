@@ -1,14 +1,17 @@
 """Professional Core V2 -- Stage 2A pure structural primitives, component
-wrappers, and the turn-level aggregate (Slices 2A-1/2A-2/2A-3).
+wrappers, the turn-level aggregate, and the deterministic exact candidate
+locator (Slices 2A-1/2A-2/2A-3/2A-4).
 
 Pure, offline, no I/O: this module defines the untrusted-candidate,
 deterministically-located, canonically-classified primitive types, the
 per-component status wrappers (EvidenceAnalysis/InteractionAnalysis/
-IntentAnalysis), and the authoritative turn-level aggregate (TurnAnalysis/
-TurnAnalysisResult) for Stage 2A turn analysis. It contains NO offset-search
-algorithm, NO semantic labeler, NO candidate harvesting, NO orchestration,
-NO LLM/network calls, and NO database/bot/Telegram integration -- those are
-later, separately authorized slices. A candidate/exact span stored here is
+IntentAnalysis), the authoritative turn-level aggregate (TurnAnalysis/
+TurnAnalysisResult), and locate_evidence_candidate/locate_interaction_candidate
+(deterministic exact-match location of one untrusted candidate span inside
+one caller-supplied source_text) for Stage 2A turn analysis. It contains NO
+semantic labeler, NO candidate harvesting, NO orchestration, NO LLM/network
+calls, and NO database/bot/Telegram integration -- those are later,
+separately authorized slices. A candidate/exact span stored here is
 literal untrusted or deterministically-located text; nothing in this
 module proves that a span's assigned EvidenceKind would be correct beyond
 what the type system itself enforces, and nothing here classifies or
@@ -119,7 +122,8 @@ class EvidenceSpanCandidate:
     """Untrusted candidate evidence span, exactly as an extractor might
     propose it -- text only, never a kind, never offsets. Nothing here
     validates that exact_source_span actually occurs in any source_text;
-    that is a later, not-yet-implemented location algorithm's job."""
+    that is locate_evidence_candidate's job, not this type's own
+    construction-time validation."""
     exact_source_span: str
     context_before: str | None = None
     context_after: str | None = None
@@ -168,8 +172,8 @@ class InteractionSpanCandidate:
                 max_chars=CONTEXT_AFTER_MAX_CHARS)
 
 
-# -- Deterministic located tier (code-owned offsets; the actual
-# location-by-search algorithm is a later, not-yet-implemented slice) ----
+# -- Deterministic located tier (code-owned offsets, produced by
+# locate_evidence_candidate/locate_interaction_candidate below) ---------
 
 @dataclass(frozen=True)
 class LocatedEvidenceSpan:
@@ -225,6 +229,152 @@ class LocatedInteractionSpan:
                 "LocatedInteractionSpan.exact_source_span length "
                 f"({len(self.exact_source_span)}) does not match "
                 f"span length ({expected_len})")
+
+
+# -- Deterministic exact candidate locator (Slice 2A-4) ------------------
+# Deterministic, exact-match location of one untrusted candidate span
+# within one caller-supplied source_text. Pure and offline: no semantic
+# labeling, no candidate harvesting, no orchestration, no LLM/network/DB
+# calls. locate_evidence_candidate/locate_interaction_candidate below are
+# the only public additions in this section.
+
+def _require_source_text(value: str, *, field_name: str) -> None:
+    """Shared validation for a locator's source_text argument: must be
+    exactly str, non-empty, not whitespace-only. Deliberately has NO
+    maximum length (unlike _require_bounded_text) and never strips,
+    casefolds, or otherwise mutates the value -- a raw message can be
+    arbitrarily long. Used only by locate_evidence_candidate/
+    locate_interaction_candidate; TurnAnalysis keeps its own separate
+    inline source_text check unchanged."""
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be a str, got {type(value)!r}")
+    if not value:
+        raise ValueError(f"{field_name} must be non-empty")
+    if not value.strip():
+        raise ValueError(f"{field_name} must not be whitespace-only")
+
+
+def _locate_unique_exact_span(
+        *,
+        exact_source_span: str,
+        context_before: str | None,
+        context_after: str | None,
+        source_text: str,
+) -> tuple[int, int] | None:
+    """Module-private exact-match search core shared by both public
+    locators. Enumerates every raw occurrence of exact_source_span in
+    source_text allowing overlap (after a candidate occurrence beginning
+    at `start`, the next search resumes at start + 1, never
+    start + len(exact_source_span)), filters each occurrence by any
+    supplied context_before/context_after as an exact immediate-adjacency
+    constraint (never a fuzzy/nearby window), and returns the single
+    surviving (start, end) span. Returns None if zero or more than one
+    occurrence survives -- stops searching as soon as a second surviving
+    occurrence is found; it never picks a first/last/nearest match. No
+    normalization of any kind (no strip/casefold/Unicode normalization) is
+    ever applied to exact_source_span, context_before, context_after, or
+    source_text. Assumes its caller already validated argument types/
+    emptiness -- this helper itself only implements the search and
+    filter, nothing else."""
+    matches: list[tuple[int, int]] = []
+    start = source_text.find(exact_source_span)
+    while start != -1:
+        end = start + len(exact_source_span)
+        context_ok = True
+        if context_before is not None:
+            if start < len(context_before) or (
+                    source_text[start - len(context_before):start] != context_before):
+                context_ok = False
+        if context_ok and context_after is not None:
+            if end + len(context_after) > len(source_text) or (
+                    source_text[end:end + len(context_after)] != context_after):
+                context_ok = False
+        if context_ok:
+            matches.append((start, end))
+            if len(matches) > 1:
+                return None
+        start = source_text.find(exact_source_span, start + 1)
+    return matches[0] if len(matches) == 1 else None
+
+
+def locate_evidence_candidate(
+        candidate: EvidenceSpanCandidate,
+        *,
+        source_message_row_id: int,
+        source_text: str,
+) -> LocatedEvidenceSpan | None:
+    """Deterministically locate one untrusted EvidenceSpanCandidate inside
+    source_text using exact Python code-point matching only -- see
+    _locate_unique_exact_span for the exact search/context/uniqueness
+    contract. Returns a LocatedEvidenceSpan built from source_text itself
+    (not from the candidate) when exactly one valid location survives,
+    None when zero or more than one location survives. Raises ValueError
+    only for malformed API input (wrong candidate type, invalid
+    source_message_row_id, invalid source_text) -- never for an honest
+    not-found/ambiguous search outcome.
+
+    This function validates that candidate.exact_source_span occurs at a
+    specific position inside the given source_text; it has no way to
+    authenticate that source_text is actually the persisted message
+    content for source_message_row_id -- supplying a genuinely
+    corresponding (row id, source_text) pair is the caller's
+    responsibility, not something this pure function can check."""
+    if not isinstance(candidate, EvidenceSpanCandidate):
+        raise ValueError(
+            "locate_evidence_candidate: candidate must be an "
+            f"EvidenceSpanCandidate, got {type(candidate)!r}")
+    _require_row_id(
+        source_message_row_id,
+        field_name="locate_evidence_candidate.source_message_row_id")
+    _require_source_text(source_text, field_name="locate_evidence_candidate.source_text")
+    located = _locate_unique_exact_span(
+        exact_source_span=candidate.exact_source_span,
+        context_before=candidate.context_before,
+        context_after=candidate.context_after,
+        source_text=source_text)
+    if located is None:
+        return None
+    start, end = located
+    return LocatedEvidenceSpan(
+        source_message_row_id=source_message_row_id,
+        span_start=start,
+        span_end=end,
+        exact_source_span=source_text[start:end])
+
+
+def locate_interaction_candidate(
+        candidate: InteractionSpanCandidate,
+        *,
+        source_message_row_id: int,
+        source_text: str,
+) -> LocatedInteractionSpan | None:
+    """Same contract as locate_evidence_candidate for an untrusted
+    InteractionSpanCandidate, returning a LocatedInteractionSpan built
+    from source_text itself. Raises ValueError only for malformed API
+    input, never for an honest not-found/ambiguous outcome, and does not
+    authenticate that source_text is the persisted content for
+    source_message_row_id."""
+    if not isinstance(candidate, InteractionSpanCandidate):
+        raise ValueError(
+            "locate_interaction_candidate: candidate must be an "
+            f"InteractionSpanCandidate, got {type(candidate)!r}")
+    _require_row_id(
+        source_message_row_id,
+        field_name="locate_interaction_candidate.source_message_row_id")
+    _require_source_text(source_text, field_name="locate_interaction_candidate.source_text")
+    located = _locate_unique_exact_span(
+        exact_source_span=candidate.exact_source_span,
+        context_before=candidate.context_before,
+        context_after=candidate.context_after,
+        source_text=source_text)
+    if located is None:
+        return None
+    start, end = located
+    return LocatedInteractionSpan(
+        source_message_row_id=source_message_row_id,
+        span_start=start,
+        span_end=end,
+        exact_source_span=source_text[start:end])
 
 
 # -- Canonical, already-classified occurrence tier -----------------------
