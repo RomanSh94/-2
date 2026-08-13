@@ -1,25 +1,36 @@
-"""Professional Core V2 -- Stage 2A pure structural primitives (Slice 2A-1).
+"""Professional Core V2 -- Stage 2A pure structural primitives and
+component wrappers (Slices 2A-1/2A-2).
 
-Pure, offline, no I/O: this module defines only the untrusted-candidate,
-deterministically-located, and canonically-classified primitive types for
-Stage 2A turn analysis. It contains NO offset-search algorithm, NO semantic
-labeler, NO candidate harvesting, NO orchestration, NO LLM/network calls,
-and NO database/bot/Telegram integration -- those are later, separately
-authorized slices. A candidate/exact span stored here is literal untrusted
-or deterministically-located text; nothing in this module proves that a
-span's assigned EvidenceKind (not yet implemented here) would be correct,
-and nothing here classifies or labels any span's semantic content.
+Pure, offline, no I/O: this module defines the untrusted-candidate,
+deterministically-located, canonically-classified primitive types, and the
+per-component status wrappers (EvidenceAnalysis/InteractionAnalysis/
+IntentAnalysis) for Stage 2A turn analysis. It contains NO offset-search
+algorithm, NO semantic labeler, NO candidate harvesting, NO orchestration,
+NO LLM/network calls, and NO database/bot/Telegram integration -- those are
+later, separately authorized slices. A candidate/exact span stored here is
+literal untrusted or deterministically-located text; nothing in this
+module proves that a span's assigned EvidenceKind would be correct beyond
+what the type system itself enforces, and nothing here classifies or
+labels any span's semantic content. The component wrappers REPRESENT a
+component's AnalysisComponentStatus; they do not compute it -- status
+computation belongs to later, not-yet-implemented orchestration.
 
 Only imports: __future__, dataclasses, enum, and therapeutic_domain
-(reusing InteractionSignal and as_enum rather than duplicating them).
-Python 3.10 target (prod 3.10.12).
+(reusing EvidenceItem, Intent, InteractionRequest, InteractionSignal, and
+as_enum rather than duplicating them). Python 3.10 target (prod 3.10.12).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
 
-from therapeutic_domain import InteractionSignal, as_enum
+from therapeutic_domain import (
+    EvidenceItem,
+    Intent,
+    InteractionRequest,
+    InteractionSignal,
+    as_enum,
+)
 
 
 # -- Status enums -------------------------------------------------------
@@ -247,3 +258,145 @@ class InteractionSignalOccurrence:
         object.__setattr__(
             self, "applicability", as_enum(InteractionApplicability, self.applicability))
         object.__setattr__(self, "state", as_enum(InteractionOccurrenceState, self.state))
+
+
+# -- Component-status wrapper tier (represents, does not compute, status) -
+
+@dataclass(frozen=True)
+class EvidenceAnalysis:
+    """The evidence component's result for one turn: how trustworthy the
+    component's own output is (AnalysisComponentStatus) plus the validated
+    EvidenceItem tuple it produced. Represents status; does not compute it
+    -- status computation is later orchestration's job. Does not contain
+    source_text: full slice re-validation belongs to a future TurnAnalysis
+    that actually holds the source text."""
+    status: AnalysisComponentStatus
+    items: tuple[EvidenceItem, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "status", as_enum(AnalysisComponentStatus, self.status))
+        if type(self.items) is not tuple:
+            raise ValueError(
+                f"EvidenceAnalysis.items must be a tuple, got {type(self.items)!r}")
+        for item in self.items:
+            if not isinstance(item, EvidenceItem):
+                raise ValueError(
+                    "EvidenceAnalysis.items must contain only EvidenceItem, "
+                    f"got {type(item)!r}")
+        if self.status is AnalysisComponentStatus.UNAVAILABLE and self.items:
+            raise ValueError("EvidenceAnalysis: UNAVAILABLE requires items == ()")
+        if self.items:
+            row_ids = {item.ref.source_message_row_id for item in self.items}
+            if len(row_ids) > 1:
+                raise ValueError(
+                    "EvidenceAnalysis.items must all share the same "
+                    "source_message_row_id -- one EvidenceAnalysis is one-turn "
+                    "analysis, not a multi-message ledger")
+            locations = [
+                (item.ref.source_message_row_id, item.ref.span_start, item.ref.span_end)
+                for item in self.items]
+            if len(set(locations)) != len(locations):
+                raise ValueError(
+                    "EvidenceAnalysis.items contains duplicate evidence locations "
+                    "-- exactly one EvidenceKind result is canonical per "
+                    "deterministically-located span, even if evidence_kind differs")
+            canonical = tuple(sorted(
+                self.items,
+                key=lambda item: (
+                    item.ref.span_start, item.ref.span_end, item.ref.evidence_kind.value)))
+            if canonical != self.items:
+                raise ValueError(
+                    "EvidenceAnalysis.items must already be in canonical "
+                    "(span_start, span_end, evidence_kind) order -- not silently sorted")
+
+
+@dataclass(frozen=True)
+class InteractionAnalysis:
+    """The interaction component's result for one turn: status, the
+    deterministic InteractionRequest projection, and the full occurrence
+    tuple it was derived from. request is never independently supplied
+    information -- it must always equal the CURRENT_DIRECTIVE+ACTIVE
+    projection over occurrences, enforced here, not left to caller
+    convention. Conflicting simultaneously-active signals (e.g. NO_ADVICE
+    and ADVICE_REQUESTED on two different current+active spans) are valid
+    and preserved -- this type resolves nothing, matching
+    InteractionRequest's own Stage 1 contract."""
+    status: AnalysisComponentStatus
+    request: InteractionRequest = InteractionRequest()
+    occurrences: tuple[InteractionSignalOccurrence, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "status", as_enum(AnalysisComponentStatus, self.status))
+        if not isinstance(self.request, InteractionRequest):
+            raise ValueError(
+                "InteractionAnalysis.request must be an InteractionRequest, "
+                f"got {type(self.request)!r}")
+        if type(self.occurrences) is not tuple:
+            raise ValueError(
+                "InteractionAnalysis.occurrences must be a tuple, "
+                f"got {type(self.occurrences)!r}")
+        for occurrence in self.occurrences:
+            if not isinstance(occurrence, InteractionSignalOccurrence):
+                raise ValueError(
+                    "InteractionAnalysis.occurrences must contain only "
+                    f"InteractionSignalOccurrence, got {type(occurrence)!r}")
+        if self.status is AnalysisComponentStatus.UNAVAILABLE:
+            if self.request != InteractionRequest() or self.occurrences:
+                raise ValueError(
+                    "InteractionAnalysis: UNAVAILABLE requires an empty "
+                    "InteractionRequest and empty occurrences")
+        if self.occurrences:
+            row_ids = {o.source_message_row_id for o in self.occurrences}
+            if len(row_ids) > 1:
+                raise ValueError(
+                    "InteractionAnalysis.occurrences must all share the same "
+                    "source_message_row_id -- one InteractionAnalysis is "
+                    "one-turn analysis, not a multi-message ledger")
+            locations = [
+                (o.source_message_row_id, o.span_start, o.span_end)
+                for o in self.occurrences]
+            if len(set(locations)) != len(locations):
+                raise ValueError(
+                    "InteractionAnalysis.occurrences contains duplicate source "
+                    "locations -- exactly one interaction-signal result is "
+                    "canonical per deterministically-located span")
+            canonical = tuple(sorted(
+                self.occurrences,
+                key=lambda o: (
+                    o.span_start, o.span_end, o.signal.value,
+                    o.applicability.value, o.state.value)))
+            if canonical != self.occurrences:
+                raise ValueError(
+                    "InteractionAnalysis.occurrences must already be in "
+                    "canonical order -- not silently sorted")
+        expected_signals = frozenset(
+            o.signal for o in self.occurrences
+            if o.applicability is InteractionApplicability.CURRENT_DIRECTIVE
+            and o.state is InteractionOccurrenceState.ACTIVE)
+        if self.request.signals != expected_signals:
+            raise ValueError(
+                "InteractionAnalysis.request must equal the deterministic "
+                "CURRENT_DIRECTIVE+ACTIVE projection of occurrences")
+
+
+@dataclass(frozen=True)
+class IntentAnalysis:
+    """The intent component's result for one turn: status plus a
+    best-effort analyzer_intent classification. analyzer_intent carries no
+    evidentiary weight independent of status -- unlike EvidenceAnalysis/
+    InteractionAnalysis, it has no sub-items to partially accept, so
+    DEGRADED and UNAVAILABLE both force Intent.UNKNOWN; only VALIDATED may
+    carry a specific classification, and VALIDATED + UNKNOWN is itself a
+    legitimate, non-failure result ('no sufficiently specific intent
+    assigned'), not an error."""
+    status: AnalysisComponentStatus
+    analyzer_intent: Intent = Intent.UNKNOWN
+
+    def __post_init__(self):
+        object.__setattr__(self, "status", as_enum(AnalysisComponentStatus, self.status))
+        object.__setattr__(self, "analyzer_intent", as_enum(Intent, self.analyzer_intent))
+        if self.status is not AnalysisComponentStatus.VALIDATED \
+                and self.analyzer_intent is not Intent.UNKNOWN:
+            raise ValueError(
+                "IntentAnalysis: DEGRADED/UNAVAILABLE requires "
+                "analyzer_intent == Intent.UNKNOWN")
