@@ -1,23 +1,28 @@
-"""Professional Core V2 -- Stage 2A pure structural primitives and
-component wrappers (Slices 2A-1/2A-2).
+"""Professional Core V2 -- Stage 2A pure structural primitives, component
+wrappers, and the turn-level aggregate (Slices 2A-1/2A-2/2A-3).
 
 Pure, offline, no I/O: this module defines the untrusted-candidate,
-deterministically-located, canonically-classified primitive types, and the
+deterministically-located, canonically-classified primitive types, the
 per-component status wrappers (EvidenceAnalysis/InteractionAnalysis/
-IntentAnalysis) for Stage 2A turn analysis. It contains NO offset-search
+IntentAnalysis), and the authoritative turn-level aggregate (TurnAnalysis/
+TurnAnalysisResult) for Stage 2A turn analysis. It contains NO offset-search
 algorithm, NO semantic labeler, NO candidate harvesting, NO orchestration,
 NO LLM/network calls, and NO database/bot/Telegram integration -- those are
 later, separately authorized slices. A candidate/exact span stored here is
 literal untrusted or deterministically-located text; nothing in this
 module proves that a span's assigned EvidenceKind would be correct beyond
 what the type system itself enforces, and nothing here classifies or
-labels any span's semantic content. The component wrappers REPRESENT a
-component's AnalysisComponentStatus; they do not compute it -- status
-computation belongs to later, not-yet-implemented orchestration.
+labels any span's semantic content. The component wrappers represent
+their supplied AnalysisComponentStatus values and do not derive them.
+TurnAnalysis validates the authoritative aggregate, while
+TurnAnalysisResult derives the overall TurnAnalysisStatus from aggregate
+existence and component statuses. Production of component analyses and
+construction/recovery of aggregate results belong to later orchestration.
 
 Only imports: __future__, dataclasses, enum, and therapeutic_domain
-(reusing EvidenceItem, Intent, InteractionRequest, InteractionSignal, and
-as_enum rather than duplicating them). Python 3.10 target (prod 3.10.12).
+(reusing EvidenceItem, Intent, InteractionRequest, InteractionSignal,
+as_enum, and validate_evidence_against_source rather than duplicating
+them). Python 3.10 target (prod 3.10.12).
 """
 from __future__ import annotations
 
@@ -30,6 +35,7 @@ from therapeutic_domain import (
     InteractionRequest,
     InteractionSignal,
     as_enum,
+    validate_evidence_against_source,
 )
 
 
@@ -400,3 +406,139 @@ class IntentAnalysis:
             raise ValueError(
                 "IntentAnalysis: DEGRADED/UNAVAILABLE requires "
                 "analyzer_intent == Intent.UNKNOWN")
+
+
+# -- Turn-level aggregate/result tier (validation + derived overall status) --
+
+def _validate_occurrence_against_source(
+        occurrence: InteractionSignalOccurrence, source_text: str) -> bool:
+    """Deterministic, exact raw-slice provenance check for an
+    already-validated InteractionSignalOccurrence and source_text, using
+    the same raw Python code-point slice semantics as
+    validate_evidence_against_source: no normalization, no fuzzy/semantic
+    matching. Argument type validation is owned by the public aggregate/
+    component constructors before this private helper is called -- unlike
+    its Stage 1 sibling, it does not independently type-guard its own
+    arguments. An ordinary mismatch returns False; this never raises for a
+    mismatch. Module-private -- InteractionSignalOccurrence has no Stage 1
+    equivalent of its own, so this exists only to be called from
+    TurnAnalysis's own construction, never as a standalone public API."""
+    if occurrence.span_end > len(source_text):
+        return False
+    return source_text[occurrence.span_start:occurrence.span_end] == occurrence.exact_source_span
+
+
+@dataclass(frozen=True)
+class TurnAnalysis:
+    """The authoritative, one-turn aggregate combining all three Stage 2A
+    component analyses under one source identity.
+
+    VALIDATED means a component completed successfully. DEGRADED means any
+    payload the component actually contains remains accepted/canonical
+    payload, but the component's own completeness/reliability is degraded
+    -- DEGRADED payload is never dropped here, nor treated as equivalent to
+    VALIDATED. UNAVAILABLE means the component produced no usable output,
+    with its own wrapper (EvidenceAnalysis/InteractionAnalysis) already
+    enforcing an empty payload in that case.
+
+    A TurnAnalysis being "authoritative" means the aggregate and whatever
+    payload it actually contains satisfy every structural/provenance
+    invariant below. It does NOT mean every component is VALIDATED or
+    complete -- an aggregate may be fully authoritative while its eventual
+    TurnAnalysisResult.status is PARTIAL.
+
+    IntentAnalysis's analyzer_intent, when present here, is authoritative
+    analyzer output that Stage 2B may consume subject to its own component
+    status -- it is a turn-level classification signal, never evidence,
+    factual truth, a confirmed formulation, or a clinical diagnosis.
+    """
+    source_message_row_id: int
+    source_text: str
+    evidence: EvidenceAnalysis
+    interaction: InteractionAnalysis
+    intent: IntentAnalysis
+
+    def __post_init__(self):
+        _require_row_id(
+            self.source_message_row_id,
+            field_name="TurnAnalysis.source_message_row_id")
+        if type(self.source_text) is not str:
+            raise ValueError(
+                f"TurnAnalysis.source_text must be a str, got {type(self.source_text)!r}")
+        if not self.source_text:
+            raise ValueError("TurnAnalysis.source_text must be non-empty")
+        if not self.source_text.strip():
+            raise ValueError("TurnAnalysis.source_text must not be whitespace-only")
+        if not isinstance(self.evidence, EvidenceAnalysis):
+            raise ValueError(
+                "TurnAnalysis.evidence must be an EvidenceAnalysis, "
+                f"got {type(self.evidence)!r}")
+        if not isinstance(self.interaction, InteractionAnalysis):
+            raise ValueError(
+                "TurnAnalysis.interaction must be an InteractionAnalysis, "
+                f"got {type(self.interaction)!r}")
+        if not isinstance(self.intent, IntentAnalysis):
+            raise ValueError(
+                f"TurnAnalysis.intent must be an IntentAnalysis, got {type(self.intent)!r}")
+        if (self.evidence.status is AnalysisComponentStatus.UNAVAILABLE
+                and self.interaction.status is AnalysisComponentStatus.UNAVAILABLE
+                and self.intent.status is AnalysisComponentStatus.UNAVAILABLE):
+            raise ValueError(
+                "TurnAnalysis: evidence, interaction, and intent must not all be "
+                "UNAVAILABLE simultaneously -- no authoritative aggregate exists "
+                "in that case")
+        for item in self.evidence.items:
+            if item.ref.source_message_row_id != self.source_message_row_id:
+                raise ValueError(
+                    "TurnAnalysis: an evidence item's source_message_row_id does "
+                    "not match the aggregate's source_message_row_id")
+            if not validate_evidence_against_source(item, self.source_text):
+                raise ValueError(
+                    "TurnAnalysis: an evidence item's exact_source_span does not "
+                    "match source_text at its recorded span")
+        for occurrence in self.interaction.occurrences:
+            if occurrence.source_message_row_id != self.source_message_row_id:
+                raise ValueError(
+                    "TurnAnalysis: an interaction occurrence's "
+                    "source_message_row_id does not match the aggregate's "
+                    "source_message_row_id")
+            if not _validate_occurrence_against_source(occurrence, self.source_text):
+                raise ValueError(
+                    "TurnAnalysis: an interaction occurrence's exact_source_span "
+                    "does not match source_text at its recorded span")
+
+
+@dataclass(frozen=True)
+class TurnAnalysisResult:
+    """The outcome envelope for one turn's analysis attempt: either an
+    authoritative TurnAnalysis, or None if no authoritative aggregate could
+    be constructed. status is always derived from analysis, never
+    independently supplied -- this makes a self-contradictory result (e.g.
+    status=FAILED alongside a real, valid analysis) structurally impossible
+    rather than merely checked, not a dataclass field, and not a
+    constructor argument.
+
+    FAILED means only that no authoritative TurnAnalysis exists for
+    Stage 2B to consume -- it does NOT prove every intermediate component
+    that was attempted was unusable (e.g. an otherwise-VALIDATED component
+    pair can still yield FAILED via a cross-component provenance mismatch).
+    Recovery policy for a FAILED result is future orchestration's
+    responsibility, not this type's.
+    """
+    analysis: TurnAnalysis | None
+
+    def __post_init__(self):
+        if self.analysis is not None and not isinstance(self.analysis, TurnAnalysis):
+            raise ValueError(
+                "TurnAnalysisResult.analysis must be None or a TurnAnalysis, "
+                f"got {type(self.analysis)!r}")
+
+    @property
+    def status(self) -> TurnAnalysisStatus:
+        if self.analysis is None:
+            return TurnAnalysisStatus.FAILED
+        if (self.analysis.evidence.status is AnalysisComponentStatus.VALIDATED
+                and self.analysis.interaction.status is AnalysisComponentStatus.VALIDATED
+                and self.analysis.intent.status is AnalysisComponentStatus.VALIDATED):
+            return TurnAnalysisStatus.OK
+        return TurnAnalysisStatus.PARTIAL
