@@ -898,8 +898,9 @@ class EvidenceItem:
     immutable evidence observation, not mutable session state -- once
     constructed and validated, neither its reference nor its exact span can
     be reassigned. exact_source_span must never be stripped, cased, or
-    otherwise normalized; validate_evidence_against_source is the only place
-    a source message is ever consulted."""
+    otherwise normalized; validate_evidence_against_source is the canonical
+    validator for an already-constructed EvidenceItem against a supplied
+    source message."""
     ref: EvidenceRef
     exact_source_span: str
 
