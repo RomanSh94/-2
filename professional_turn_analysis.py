@@ -1,7 +1,7 @@
 """Professional Core V2 -- Stage 2A pure structural primitives, component
 wrappers, the turn-level aggregate, the deterministic exact candidate
-locator, and the evidence proposal canonicalization boundary (Slices
-2A-1/2A-2/2A-3/2A-4/2A-5).
+locator, and the evidence/interaction proposal canonicalization boundaries
+(Slices 2A-1/2A-2/2A-3/2A-4/2A-5/2A-6).
 
 Pure, offline, no I/O: this module defines the untrusted-candidate,
 deterministically-located, canonically-classified primitive types, the
@@ -9,20 +9,24 @@ per-component status wrappers (EvidenceAnalysis/InteractionAnalysis/
 IntentAnalysis), the authoritative turn-level aggregate (TurnAnalysis/
 TurnAnalysisResult), locate_evidence_candidate/locate_interaction_candidate
 (deterministic exact-match location of one untrusted candidate span inside
-one caller-supplied source_text), and canonicalize_evidence_proposal
+one caller-supplied source_text), canonicalize_evidence_proposal
 (deterministic canonicalization of one external analyzer's untrusted
 EvidenceKind proposal, or its explicit abstention, for one already-located
-evidence span) for Stage 2A turn analysis. It contains NO semantic
-analyzer, NO candidate harvesting, NO orchestration, NO LLM/network calls,
-and NO database/bot/Telegram integration -- those are later, separately
-authorized slices. A candidate/exact span stored here is literal untrusted
-or deterministically-located text; nothing in this module proves that a
-span's assigned EvidenceKind is correct beyond what the type system itself
-enforces, and nothing derives or classifies a span's semantic content --
-canonicalize_evidence_proposal only validates and structurally records an
-EvidenceKind value supplied by something outside this module. The
-component wrappers represent their supplied AnalysisComponentStatus values
-and do not derive them. TurnAnalysis validates the authoritative
+evidence span), and canonicalize_interaction_proposal (the same
+canonicalization boundary for an untrusted InteractionOccurrenceProposal --
+signal/applicability/state together, or explicit abstention -- for one
+already-located interaction span) for Stage 2A turn analysis. It contains
+NO semantic analyzer, NO candidate harvesting, NO orchestration, NO
+LLM/network calls, and NO database/bot/Telegram integration -- those are
+later, separately authorized slices. A candidate/exact span stored here is
+literal untrusted or deterministically-located text; nothing in this
+module proves that a span's assigned EvidenceKind or InteractionSignal/
+InteractionApplicability/InteractionOccurrenceState triple is correct
+beyond what the type system itself enforces, and nothing derives or
+classifies a span's semantic content -- both canonicalizers only validate
+and structurally record values supplied by something outside this module.
+The component wrappers represent their supplied AnalysisComponentStatus
+values and do not derive them. TurnAnalysis validates the authoritative
 aggregate, while TurnAnalysisResult derives the overall TurnAnalysisStatus
 from aggregate existence and component statuses. Production of component
 analyses and construction/recovery of aggregate results belong to later
@@ -254,9 +258,9 @@ def _require_source_text(value: str, *, field_name: str) -> None:
     maximum length (unlike _require_bounded_text) and never strips,
     casefolds, or otherwise mutates the value -- a raw message can be
     arbitrarily long. Used by locate_evidence_candidate/
-    locate_interaction_candidate/canonicalize_evidence_proposal;
-    TurnAnalysis keeps its own separate inline source_text check
-    unchanged."""
+    locate_interaction_candidate/canonicalize_evidence_proposal/
+    canonicalize_interaction_proposal; TurnAnalysis keeps its own
+    separate inline source_text check unchanged."""
     if type(value) is not str:
         raise ValueError(f"{field_name} must be a str, got {type(value)!r}")
     if not value:
@@ -465,10 +469,14 @@ def canonicalize_evidence_proposal(
 class InteractionSignalOccurrence:
     """One already-classified interaction-signal occurrence: which
     message, which exact span, which InteractionSignal, and its
-    applicability/retraction state. This type only REPRESENTS an
-    already-classified occurrence -- it does not derive InteractionRequest,
-    resolve policy conflicts, or implement retraction detection; those are
-    later Stage 2A/2B concerns."""
+    applicability/retraction state. A structurally valid instance proves
+    only that its fields satisfy the closed shape/enum invariants -- it
+    does NOT prove that an external analyzer's signal/applicability/state
+    judgments are semantically correct, and does NOT prove a RETRACTED
+    state is grounded by another actual retracting span. This type only
+    REPRESENTS an already-classified occurrence -- it does not derive
+    InteractionRequest, resolve policy conflicts, or implement retraction
+    detection; those are later Stage 2A/2B concerns."""
     source_message_row_id: int
     signal: InteractionSignal
     span_start: int
@@ -496,6 +504,120 @@ class InteractionSignalOccurrence:
         object.__setattr__(
             self, "applicability", as_enum(InteractionApplicability, self.applicability))
         object.__setattr__(self, "state", as_enum(InteractionOccurrenceState, self.state))
+
+
+# -- Interaction proposal canonicalization boundary (Slice 2A-6) --------
+# Deterministic canonicalization of one external analyzer's untrusted,
+# all-three-axes-or-nothing interaction proposal (or explicit abstention)
+# for one already-located interaction span. Pure and offline: no semantic
+# analyzer, no keyword/regex classifier, no negation/quotation/retraction
+# parsing, no confidence calculation, no LLM/network/DB calls.
+# canonicalize_interaction_proposal below is the only public function
+# addition in this section; InteractionOccurrenceProposal is the only
+# public type addition. Neither inspects the words of exact_source_span
+# to decide a signal/applicability/state.
+
+@dataclass(frozen=True)
+class InteractionOccurrenceProposal:
+    """Untrusted external-analyzer transport for one interaction
+    occurrence proposal -- signal, applicability, and state together, as a
+    single atomic unit. The field annotations describe the INTENDED shape
+    of a well-formed proposal; they are not runtime validation, and this
+    type performs none of its own: no enum canonicalization, no
+    normalization, no source/provenance validation, and no __post_init__
+    at all. Merely constructing an instance -- even with a malformed
+    runtime value such as signal=None or
+    applicability="NOT_A_REAL_APPLICABILITY" -- never raises here; that is
+    intentional, since this type only carries an external, not-yet-vetted
+    claim. Only canonicalize_interaction_proposal, in this Stage 2A path,
+    may convert a well-formed instance into a canonical
+    InteractionSignalOccurrence. If the external producer cannot
+    responsibly supply all three semantic axes at once, it must represent
+    that as total proposal abstention (passing None to
+    canonicalize_interaction_proposal) rather than constructing a partial
+    or invented instance of this type -- this type's required fields
+    prevent omitting constructor arguments, not supplying invalid runtime
+    values for them."""
+    signal: InteractionSignal | str
+    applicability: InteractionApplicability | str
+    state: InteractionOccurrenceState | str
+
+
+def canonicalize_interaction_proposal(
+        located: LocatedInteractionSpan,
+        *,
+        source_text: str,
+        proposal: InteractionOccurrenceProposal | None,
+) -> InteractionSignalOccurrence | None:
+    """Deterministically canonicalize one external analyzer's untrusted
+    InteractionOccurrenceProposal for an already-located interaction span
+    into a provenance-valid InteractionSignalOccurrence, or honor the
+    analyzer's explicit abstention. This function performs NO semantic
+    classification itself -- it never inspects exact_source_span's words
+    to decide a signal, applicability, or state; the external analyzer
+    (not implemented anywhere in this module) alone judges all three axes.
+
+    Structural/provenance validation (located's type, source_text's
+    validity, and located's provenance against source_text) always runs
+    BEFORE proposal is ever inspected, so proposal=None (explicit analyzer
+    abstention) can never mask a wrong located type, a malformed
+    source_text, or a stale/mismatched located span -- all of those raise
+    ValueError regardless of proposal. Only after provenance passes is
+    proposal's own type checked, and only then are its three fields each
+    canonicalized independently via as_enum -- an invalid runtime value on
+    any single axis (None, an unknown string, an alias, or a wrong scalar
+    type) raises ValueError there; it is never defaulted, repaired, or
+    treated as equivalent to abstention.
+
+    A returned InteractionSignalOccurrence means only that exact
+    supplied-source provenance was valid and an external analyzer's
+    proposal was parsed to three supported enum values. It does NOT mean
+    the signal, applicability, or state judgment is semantically correct,
+    and it does NOT mean a RETRACTED state is grounded by another actual
+    retracting span elsewhere in source_text -- those remain external
+    analyzer judgment and trust, never verified here. The analyzer may
+    inspect the full source_text to judge applicability/state (present vs
+    historical/quoted/hypothetical framing, correction, supersession), but
+    the signal itself must remain attributable to the located span's own
+    clause -- this function has no way to verify that attribution.
+
+    This function validates that located.exact_source_span occurs at its
+    recorded position inside the given source_text; it has no way to
+    authenticate that source_text is actually the persisted message
+    content for located.source_message_row_id -- supplying a genuinely
+    corresponding (located span, source_text) pair is the caller's
+    responsibility, not something this pure function can check."""
+    if not isinstance(located, LocatedInteractionSpan):
+        raise ValueError(
+            "canonicalize_interaction_proposal: located must be a "
+            f"LocatedInteractionSpan, got {type(located)!r}")
+    _require_source_text(
+        source_text, field_name="canonicalize_interaction_proposal.source_text")
+    if located.span_end > len(source_text):
+        raise ValueError(
+            "canonicalize_interaction_proposal: located.span_end exceeds "
+            "len(source_text)")
+    if source_text[located.span_start:located.span_end] != located.exact_source_span:
+        raise ValueError(
+            "canonicalize_interaction_proposal: located.exact_source_span "
+            "does not match source_text at its recorded span")
+    if proposal is None:
+        return None
+    if not isinstance(proposal, InteractionOccurrenceProposal):
+        raise ValueError(
+            "canonicalize_interaction_proposal: proposal must be None or an "
+            f"InteractionOccurrenceProposal, got {type(proposal)!r}")
+    canonical_signal = as_enum(InteractionSignal, proposal.signal)
+    canonical_applicability = as_enum(InteractionApplicability, proposal.applicability)
+    canonical_state = as_enum(InteractionOccurrenceState, proposal.state)
+    return InteractionSignalOccurrence(
+        source_message_row_id=located.source_message_row_id,
+        signal=canonical_signal,
+        span_start=located.span_start,
+        span_end=located.span_end,
+        exact_source_span=source_text[located.span_start:located.span_end],
+        applicability=canonical_applicability,
+        state=canonical_state)
 
 
 # -- Component-status wrapper tier (represents, does not compute, status) -
