@@ -582,16 +582,17 @@ def test_all_six_v1_engineering_limits_are_locked():
 def test_module_import_allowlist_is_exact():
     """professional_turn_analysis.py must import only __future__.annotations,
     dataclasses.dataclass, enum.Enum, and therapeutic_domain.{EvidenceItem,
-    Intent, InteractionRequest, InteractionSignal, as_enum,
-    validate_evidence_against_source} -- an exact allowlist, not a
+    EvidenceKind, EvidenceRef, Intent, InteractionRequest, InteractionSignal,
+    as_enum, validate_evidence_against_source} -- an exact allowlist, not a
     blacklist, so an unexpected future import (database, bot,
     conversation_controller, interaction_preference, openai, asyncio,
     requests, httpx, aiohttp, os, pathlib, subprocess, sqlite3, aiosqlite,
     aiogram, or anything else) fails this test closed rather than silently
-    passing because it wasn't on a blacklist. Updated for Slice 2A-3: the
-    module now legitimately needs validate_evidence_against_source for
-    TurnAnalysis's own source-provenance check, added here in the same
-    mutation -- reused unchanged from Stage 1, never duplicated."""
+    passing because it wasn't on a blacklist. Updated for Slice 2A-5: the
+    module now legitimately needs EvidenceKind and EvidenceRef to
+    canonicalize an external analyzer's untrusted EvidenceKind proposal
+    into an EvidenceItem, added here in the same mutation -- reused
+    unchanged from Stage 1, never duplicated."""
     module_path = pathlib.Path(professional_turn_analysis.__file__)
     tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
 
@@ -608,8 +609,8 @@ def test_module_import_allowlist_is_exact():
         ("dataclasses", ("dataclass",)),
         ("enum", ("Enum",)),
         ("therapeutic_domain", (
-            "EvidenceItem", "Intent", "InteractionRequest", "InteractionSignal", "as_enum",
-            "validate_evidence_against_source")),
+            "EvidenceItem", "EvidenceKind", "EvidenceRef", "Intent", "InteractionRequest",
+            "InteractionSignal", "as_enum", "validate_evidence_against_source")),
     ]
     assert actual_imports == expected_imports
 

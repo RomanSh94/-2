@@ -1,31 +1,38 @@
 """Professional Core V2 -- Stage 2A pure structural primitives, component
-wrappers, the turn-level aggregate, and the deterministic exact candidate
-locator (Slices 2A-1/2A-2/2A-3/2A-4).
+wrappers, the turn-level aggregate, the deterministic exact candidate
+locator, and the evidence proposal canonicalization boundary (Slices
+2A-1/2A-2/2A-3/2A-4/2A-5).
 
 Pure, offline, no I/O: this module defines the untrusted-candidate,
 deterministically-located, canonically-classified primitive types, the
 per-component status wrappers (EvidenceAnalysis/InteractionAnalysis/
 IntentAnalysis), the authoritative turn-level aggregate (TurnAnalysis/
-TurnAnalysisResult), and locate_evidence_candidate/locate_interaction_candidate
+TurnAnalysisResult), locate_evidence_candidate/locate_interaction_candidate
 (deterministic exact-match location of one untrusted candidate span inside
-one caller-supplied source_text) for Stage 2A turn analysis. It contains NO
-semantic labeler, NO candidate harvesting, NO orchestration, NO LLM/network
-calls, and NO database/bot/Telegram integration -- those are later,
-separately authorized slices. A candidate/exact span stored here is
-literal untrusted or deterministically-located text; nothing in this
-module proves that a span's assigned EvidenceKind would be correct beyond
-what the type system itself enforces, and nothing here classifies or
-labels any span's semantic content. The component wrappers represent
-their supplied AnalysisComponentStatus values and do not derive them.
-TurnAnalysis validates the authoritative aggregate, while
-TurnAnalysisResult derives the overall TurnAnalysisStatus from aggregate
-existence and component statuses. Production of component analyses and
-construction/recovery of aggregate results belong to later orchestration.
+one caller-supplied source_text), and canonicalize_evidence_proposal
+(deterministic canonicalization of one external analyzer's untrusted
+EvidenceKind proposal, or its explicit abstention, for one already-located
+evidence span) for Stage 2A turn analysis. It contains NO semantic
+analyzer, NO candidate harvesting, NO orchestration, NO LLM/network calls,
+and NO database/bot/Telegram integration -- those are later, separately
+authorized slices. A candidate/exact span stored here is literal untrusted
+or deterministically-located text; nothing in this module proves that a
+span's assigned EvidenceKind is correct beyond what the type system itself
+enforces, and nothing derives or classifies a span's semantic content --
+canonicalize_evidence_proposal only validates and structurally records an
+EvidenceKind value supplied by something outside this module. The
+component wrappers represent their supplied AnalysisComponentStatus values
+and do not derive them. TurnAnalysis validates the authoritative
+aggregate, while TurnAnalysisResult derives the overall TurnAnalysisStatus
+from aggregate existence and component statuses. Production of component
+analyses and construction/recovery of aggregate results belong to later
+orchestration.
 
 Only imports: __future__, dataclasses, enum, and therapeutic_domain
-(reusing EvidenceItem, Intent, InteractionRequest, InteractionSignal,
-as_enum, and validate_evidence_against_source rather than duplicating
-them). Python 3.10 target (prod 3.10.12).
+(reusing EvidenceItem, EvidenceKind, EvidenceRef, Intent,
+InteractionRequest, InteractionSignal, as_enum, and
+validate_evidence_against_source rather than duplicating them). Python
+3.10 target (prod 3.10.12).
 """
 from __future__ import annotations
 
@@ -34,6 +41,8 @@ from enum import Enum
 
 from therapeutic_domain import (
     EvidenceItem,
+    EvidenceKind,
+    EvidenceRef,
     Intent,
     InteractionRequest,
     InteractionSignal,
@@ -239,13 +248,15 @@ class LocatedInteractionSpan:
 # the only public additions in this section.
 
 def _require_source_text(value: str, *, field_name: str) -> None:
-    """Shared validation for a locator's source_text argument: must be
+    """Shared raw source_text validator for pure Professional Turn
+    Analysis operations that require a supplied source message: must be
     exactly str, non-empty, not whitespace-only. Deliberately has NO
     maximum length (unlike _require_bounded_text) and never strips,
     casefolds, or otherwise mutates the value -- a raw message can be
-    arbitrarily long. Used only by locate_evidence_candidate/
-    locate_interaction_candidate; TurnAnalysis keeps its own separate
-    inline source_text check unchanged."""
+    arbitrarily long. Used by locate_evidence_candidate/
+    locate_interaction_candidate/canonicalize_evidence_proposal;
+    TurnAnalysis keeps its own separate inline source_text check
+    unchanged."""
     if type(value) is not str:
         raise ValueError(f"{field_name} must be a str, got {type(value)!r}")
     if not value:
@@ -375,6 +386,77 @@ def locate_interaction_candidate(
         span_start=start,
         span_end=end,
         exact_source_span=source_text[start:end])
+
+
+# -- Evidence proposal canonicalization boundary (Slice 2A-5) -----------
+# Deterministic canonicalization of one external analyzer's untrusted
+# EvidenceKind proposal (or explicit abstention) for one already-located
+# evidence span. Pure and offline: no semantic analyzer, no keyword/regex
+# classifier, no negation/quotation parsing, no confidence calculation, no
+# LLM/network/DB calls. canonicalize_evidence_proposal below is the only
+# public addition in this section; it never inspects the words of
+# exact_source_span to decide a kind.
+
+def canonicalize_evidence_proposal(
+        located: LocatedEvidenceSpan,
+        *,
+        source_text: str,
+        proposed_kind: EvidenceKind | str | None,
+) -> EvidenceItem | None:
+    """Deterministically canonicalize one external analyzer's untrusted
+    EvidenceKind proposal for an already-located evidence span into a
+    provenance-valid EvidenceItem, or honor the analyzer's explicit
+    abstention. This function performs NO semantic classification itself
+    -- it never inspects exact_source_span's words to decide a kind; the
+    external analyzer (not implemented anywhere in this module) alone
+    judges which EvidenceKind, if any, applies.
+
+    Structural/provenance validation (located's type, source_text's
+    validity, and located's provenance against source_text) always runs
+    BEFORE proposed_kind is ever inspected, so proposed_kind=None
+    (explicit analyzer abstention) can never mask a wrong located type, a
+    malformed source_text, or a stale/mismatched located span -- all of
+    those raise ValueError regardless of proposed_kind.
+
+    A returned EvidenceItem means only that exact supplied-source
+    provenance was valid and an external analyzer's proposal was parsed
+    to one supported EvidenceKind. It does NOT mean objective truth, a
+    clinician-confirmed finding, a diagnosis, a confirmed cause, a
+    confirmed case conceptualization, or deterministic proof that the
+    EvidenceKind is semantically correct -- the classification itself
+    remains external analyzer judgment throughout.
+
+    This function validates that located.exact_source_span occurs at its
+    recorded position inside the given source_text; it has no way to
+    authenticate that source_text is actually the persisted message
+    content for located.source_message_row_id -- supplying a genuinely
+    corresponding (located span, source_text) pair is the caller's
+    responsibility, not something this pure function can check."""
+    if not isinstance(located, LocatedEvidenceSpan):
+        raise ValueError(
+            "canonicalize_evidence_proposal: located must be a "
+            f"LocatedEvidenceSpan, got {type(located)!r}")
+    _require_source_text(
+        source_text, field_name="canonicalize_evidence_proposal.source_text")
+    if located.span_end > len(source_text):
+        raise ValueError(
+            "canonicalize_evidence_proposal: located.span_end exceeds "
+            "len(source_text)")
+    if source_text[located.span_start:located.span_end] != located.exact_source_span:
+        raise ValueError(
+            "canonicalize_evidence_proposal: located.exact_source_span "
+            "does not match source_text at its recorded span")
+    if proposed_kind is None:
+        return None
+    canonical_kind = as_enum(EvidenceKind, proposed_kind)
+    ref = EvidenceRef(
+        source_message_row_id=located.source_message_row_id,
+        span_start=located.span_start,
+        span_end=located.span_end,
+        evidence_kind=canonical_kind)
+    return EvidenceItem(
+        ref=ref,
+        exact_source_span=source_text[located.span_start:located.span_end])
 
 
 # -- Canonical, already-classified occurrence tier -----------------------
@@ -600,7 +682,8 @@ class TurnAnalysis:
     IntentAnalysis's analyzer_intent, when present here, is authoritative
     analyzer output that Stage 2B may consume subject to its own component
     status -- it is a turn-level classification signal, never evidence,
-    factual truth, a confirmed formulation, or a clinical diagnosis.
+    factual truth, a confirmed case conceptualization, or a clinical
+    diagnosis.
     """
     source_message_row_id: int
     source_text: str
