@@ -25,9 +25,11 @@ Python version note: Python 3.14 has install issues for some deps; the repo ship
 
 ## Architecture: current live runtime pipeline
 
-The core design constraint — repeated throughout the code — is **model output never decides safety; deterministic code does.** In the current live pipeline, GPT-4o-mini generates conversational responses inside tightly scoped scenarios; deterministic Python gates whether and how it may speak. This section describes the runtime that is live now, not the long-term target architecture.
+The core design constraint — repeated throughout the code — is **model output never decides safety; deterministic code does.** The runtime is not a single linear conversational pipeline: `bot.py` has a live Conversation Controller path for turns it claims and an ordinary scenario-based path for turns it does not. This section describes the runtime that is live now, not the long-term target architecture.
 
-[bot.py:pipeline()](bot.py#L61) runs every text message through these stages in order, and each stage corresponds to one module. To make non-trivial changes you almost always need to understand this whole chain:
+For the Controller path, `_controller_claim_turn()` in `bot.py` may claim a turn from a current repair signal, a deterministically classified explicit intent, a handoff-derived intent, or continuation of an already-open Core session with a real base intent. `conversation_controller.py` supplies deterministic intent/repair handling, `ResponsePlan` construction, system-prompt construction, and Controller Fidelity validation; `bot.py` owns the surrounding orchestration, bounded LLM call, persistence calls, and delivery. If `_controller_claim_turn()` returns `None`, processing falls through to the ordinary scenario-based path.
+
+The numbered stages below describe that ordinary scenario-based path; they do not form one universal chain that every text message necessarily completes. To make non-trivial changes to the ordinary path, you almost always need to understand this whole chain:
 
 1. [language_detector.py](language_detector.py) — RU/EN by Cyrillic-vs-Latin char count (no langdetect dep at runtime).
 2. [risk_detector.py](risk_detector.py) — pattern-based scoring of 9 categories (suicide, self_harm, panic, hopelessness, dissociation, dependency, loneliness, burnout, aggression). Explicit phrases weighted 1.0, implicit 0.6, with compound-rule bonuses. Returns `score`/`level`/`categories`.
@@ -47,9 +49,9 @@ The core design constraint — repeated throughout the code — is **model outpu
 
 When adding signals (new risk categories, state dimensions, stage cues, dependency phrases, forbidden output phrases), they must be added in **both** `ru` and `en` lists — every detector loops over both languages regardless of detected language, so missing one side silently weakens detection.
 
-## Professional Core V2 (offline, not runtime owner)
+## Professional Core V2 (analysis/planning offline, not runtime owner)
 
-`therapeutic_domain.py`, `professional_turn_analysis.py`, `professional_turn_producer.py`, and `professional_turn_analyzer.py` define the merged offline foundations for Professional Core V2: domain contracts, validated turn analysis, deterministic assembly of analyzer output, and the external-model response adapter. They are not imported by `bot.py` and do not own Telegram delivery, persistence, live routing, or response delivery. Do not wire them into runtime or make them owners of live behavior without a separately reviewed and authorized integration.
+`therapeutic_domain.py` is shared pure domain vocabulary and is already used by the live Conversation Controller path. `professional_turn_analysis.py`, `professional_turn_producer.py`, and `professional_turn_analyzer.py` define the merged offline Professional Core V2 turn-analysis foundations: validated turn analysis, deterministic assembly of analyzer output, and the external-model response adapter. Those offline turn-analysis modules are not wired into `bot.py` and do not own Telegram delivery, persistence, live routing, or response delivery. Do not wire the offline Professional Core analysis/planning path into runtime or make it an owner of live behavior without a separately reviewed and authorized integration.
 
 Model/analyzer output is epistemically untrusted and must never be authoritative for crisis or safety decisions. Deterministic safety controls in the live runtime remain authoritative unless a future safety architecture change is explicitly designed, reviewed, tested, and authorized.
 
