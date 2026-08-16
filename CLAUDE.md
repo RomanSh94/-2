@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-X20 is a Telegram bot providing AI-assisted emotional support, built on `aiogram 3.7` + OpenAI `gpt-4o-mini` + SQLite (via `aiosqlite`) + a Flask admin dashboard. Bilingual (RU/EN). Target runtime: Python 3.12 or 3.13.
+X20 is a Telegram bot providing AI-assisted emotional support, built on `aiogram 3.7` + OpenAI `gpt-4o-mini` + SQLite (via `aiosqlite`) + a Flask admin dashboard. Bilingual (RU/EN). Production compatibility target: Python 3.10.12. Code that may run in production, including Professional Core V2, must remain Python 3.10-compatible unless the runtime target is explicitly changed and verified. `.github/workflows/ci.yml` is authoritative for the interpreters currently exercised by CI.
 
 ## Commands
 
@@ -14,18 +14,18 @@ Setup and run (PowerShell, Windows):
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # includes runtime requirements + pytest
 copy .env.example .env   # then fill BOT_TOKEN, OPENAI_API_KEY, ADMIN_PASSWORD
 python bot.py            # starts bot + dashboard at http://localhost:8080
 ```
 
-There are no tests, linters, or build steps in this repo. The only entry point is `python bot.py`, which calls `init_db()`, starts the Flask dashboard on a background thread, starts the APScheduler check-in job, and enters aiogram polling.
+Tests live under `tests/`; install `requirements-dev.txt` and run `python -m pytest -q` from the repository root. CI's `smoke` job uses this command as the full-suite test gate. The only runtime entry point is `python bot.py`, which calls `init_db()`, starts the Flask dashboard on a background thread, starts the APScheduler check-in job, and enters aiogram polling.
 
 Python version note: Python 3.14 has install issues for some deps; the repo ships parallel files for that case — `language_detector_py314.py`, `notifications_py314.py`, and `requirements_win_py314.txt` / `requirements_py312.txt`. Default code uses the non-suffixed modules; don't import the `_py314` variants unless explicitly switching toolchain.
 
-## Architecture: the pipeline is the whole program
+## Architecture: current live runtime pipeline
 
-The core design constraint — repeated throughout the code — is **the LLM never decides safety; deterministic code does.** GPT-4o-mini only generates the conversational response inside a tightly scoped scenario; everything that gates *whether* and *how* it speaks is rule-based Python.
+The core design constraint — repeated throughout the code — is **model output never decides safety; deterministic code does.** In the current live pipeline, GPT-4o-mini generates conversational responses inside tightly scoped scenarios; deterministic Python gates whether and how it may speak. This section describes the runtime that is live now, not the long-term target architecture.
 
 [bot.py:pipeline()](bot.py#L61) runs every text message through these stages in order, and each stage corresponds to one module. To make non-trivial changes you almost always need to understand this whole chain:
 
@@ -46,6 +46,14 @@ The core design constraint — repeated throughout the code — is **the LLM nev
 15. Outcome tracking — for non-`crisis` / non-`open_chat` scenarios, the bot prompts for a before-score (1–10) via inline keyboard, then runs the practice, then prompts for after-score, then a 👍/➖/👎 quality rating. Three callback handlers (`cb_before`, `cb_after`, `cb_quality` in bot.py) drive this state machine using **aiogram FSM** (`InterventionStates` + `MemoryStorage`) — not a global dict. The score scale is **1 = bad, 10 = good**, so improvement means `after_score > before_score`.
 
 When adding signals (new risk categories, state dimensions, stage cues, dependency phrases, forbidden output phrases), they must be added in **both** `ru` and `en` lists — every detector loops over both languages regardless of detected language, so missing one side silently weakens detection.
+
+## Professional Core V2 (offline, not runtime owner)
+
+`therapeutic_domain.py`, `professional_turn_analysis.py`, `professional_turn_producer.py`, and `professional_turn_analyzer.py` define the merged offline foundations for Professional Core V2: domain contracts, validated turn analysis, deterministic assembly of analyzer output, and the external-model response adapter. They are not imported by `bot.py` and do not own Telegram delivery, persistence, live routing, or response delivery. Do not wire them into runtime or make them owners of live behavior without a separately reviewed and authorized integration.
+
+Model/analyzer output is epistemically untrusted and must never be authoritative for crisis or safety decisions. Deterministic safety controls in the live runtime remain authoritative unless a future safety architecture change is explicitly designed, reviewed, tested, and authorized.
+
+Use the Professional Core module contracts and tests as the source of truth for detailed behavior; do not duplicate volatile stage, PR, branch, or commit-SHA status in this file.
 
 ## Database layer
 
