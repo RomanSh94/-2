@@ -83,13 +83,32 @@ jobs:
           python --version
           python -c "import sys; assert sys.version_info[:3] == (3, 10, 12), sys.version_info"
 
-      - name: Syntax check (py_compile every production file changed by PR #75)
+      - name: Syntax check (production compatibility surface)
         run: |
-          python -m py_compile bot.py database.py therapeutic_domain.py
+          python -m py_compile \
+            bot.py \
+            database.py \
+            therapeutic_domain.py \
+            professional_turn_planner.py \
+            professional_turn_response_fidelity_validator.py \
+            professional_turn_response_policy_validator.py \
+            professional_turn_response_acceptance.py \
+            safety_validator.py
 
       - name: Safe import smoke (no Telegram/OpenAI clients, no secrets, no DB mutation)
         run: |
           python -c "import database, therapeutic_domain; print('safe import smoke: OK')"
 
+      - name: Professional response boundary safe import (Fidelity/Policy/Acceptance)
+        run: |
+          python -c "import professional_turn_response_fidelity_validator, professional_turn_response_policy_validator, professional_turn_response_acceptance; print('professional response boundary safe import smoke: OK')"
+
       - name: Focused database contract tests under 3.10.12
         run: python -m pytest -q tests/test_practice_proposal_transition_contract.py
+
+      - name: Professional response boundary tests under 3.10.12
+        run: |
+          python -m pytest -q \
+            tests/test_professional_turn_response_fidelity_validator.py \
+            tests/test_professional_turn_response_policy_validator.py \
+            tests/test_professional_turn_response_acceptance.py
