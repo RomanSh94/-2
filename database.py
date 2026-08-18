@@ -13,6 +13,13 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+# Professional Core V2 -- Entry Triage runtime binding only. The category
+# vocabulary's single source of truth is this enum, never a hand-maintained
+# SQL string list (see professional_entry_triage_bindings below). Safe
+# import: professional_reply_affordances.py has zero imports beyond
+# __future__/dataclasses/enum, so this cannot create an import cycle.
+from professional_reply_affordances import EntryTriageCategory
+
 DB = "x20.db"
 
 # Single source of truth for the interaction-tables shape, used BOTH inside
@@ -70,6 +77,36 @@ _INTERACTION_EVENTS_TABLE_DDL = """CREATE TABLE IF NOT EXISTS user_interaction_e
                              ('SEND_EXCEPTION','SAVE_EXCEPTION','FINALIZE_EXCEPTION')),
     created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 )"""
+
+# Professional Core V2 -- Entry Triage runtime binding ONLY. Deliberately
+# isolated from interaction_button_bindings/user_interaction_events above:
+# never referenced by consume_interaction_binding, never written to by
+# create_keyboard_batch_if_current, and this table's own consume function
+# never writes to `messages` or `user_interaction_events` -- an Entry Triage
+# tap is a trusted UI selection, never fabricated USER_FREE_TEXT (see
+# professional_turn_ui_context.py). category is TEXT NOT NULL rather than a
+# hand-maintained CHECK list: the single source of truth for the six legal
+# values is professional_reply_affordances.EntryTriageCategory, enforced in
+# Python on both write (create_professional_entry_triage_bindings) and read
+# (consume_professional_entry_triage_binding) -- a second, drift-prone SQL
+# vocabulary copy was deliberately avoided.
+_PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_TABLE_DDL = """CREATE TABLE IF NOT EXISTS professional_entry_triage_bindings (
+    token              TEXT PRIMARY KEY,
+    user_id            INTEGER NOT NULL,
+    chat_id            INTEGER NOT NULL,
+    source_message_id  INTEGER NOT NULL,
+    category           TEXT NOT NULL,
+    binding_revision   INTEGER NOT NULL,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at         TEXT NOT NULL,
+    consumed_at        TEXT,
+    superseded_at      TEXT
+)"""
+
+_PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_professional_entry_triage_bindings_open\n"
+    "    ON professional_entry_triage_bindings(user_id, consumed_at, superseded_at, expires_at)"
+)
 
 SCHEMA = f"""
 PRAGMA journal_mode=WAL;
@@ -633,6 +670,12 @@ CREATE TABLE IF NOT EXISTS first_turn_claims (
 -- bounded internal label (see database.INTERACTION_ERROR_CODES) -- never a
 -- raw exception message or user content.
 {_INTERACTION_EVENTS_TABLE_DDL};
+
+-- Professional Core V2 -- Entry Triage runtime binding ONLY (additive,
+-- isolated from the legacy interaction tables directly above -- see the
+-- Python-side comment on _PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_TABLE_DDL).
+{_PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_TABLE_DDL};
+{_PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_INDEX_DDL};
 
 -- Voice and Adaptive Response UX — neutral response-delivery UI preference,
 -- nothing more. Stores ONLY the three closed-set choices below, never a raw
@@ -3648,6 +3691,168 @@ async def get_last_user_message_before(user_id: int, before_turn_id: int) -> str
         print(f"event=get_last_user_message_before_failed uid={user_id} "
               f"exc_type={type(e).__name__}")
         return ""
+
+
+# ── Professional Core V2 -- Entry Triage runtime binding (isolated) ─────────
+# Deliberately separate from create_keyboard_batch_if_current/
+# consume_interaction_binding above: an Entry Triage tap is a trusted UI
+# selection, never USER_FREE_TEXT, so neither function below ever touches
+# `messages` or `user_interaction_events`, and neither ever calls
+# normalized_action_text or consume_interaction_binding. Legacy ucbtn
+# behavior is completely untouched by this section.
+
+async def create_professional_entry_triage_bindings(
+        user_id: int, chat_id: int, source_message_id: int,
+        response_revision: int, bindings: list[dict]) -> bool:
+    """Atomic, all-or-nothing creation of the six Professional Entry Triage
+    option bindings for one just-sent Telegram message. Every category is
+    validated against the sealed EntryTriageCategory enum BEFORE any SQL
+    runs -- a batch containing even one invalid category writes nothing.
+    The batch must also contain EXACTLY one row per EntryTriageCategory
+    member -- not fewer, not more, and no duplicate standing in for a
+    missing category -- checked BEFORE any SQL runs, against
+    EntryTriageCategory itself (never a second hand-maintained six-string
+    list) so this can never silently drift from the real enum. Insertion
+    order still follows the caller's own batch order (the visible keyboard
+    order is owned by professional_reply_affordances.ENTRY_TRIAGE_
+    CONTRACT_V1.options, not by this function).
+
+    Inside one BEGIN IMMEDIATE transaction: (1) requires the LIVE
+    user_interaction_revision to still equal response_revision (a genuine
+    newer user turn between render and this call means no offer is created
+    at all -- the prompt is left as plain, freely-typeable text by the
+    caller); (2) supersedes every still-open Professional Entry Triage
+    binding this user already has, so a repeated /start always leaves only
+    the newest offer actionable even when the revision itself did not
+    change; (3) inserts the new six rows. Returns False (nothing written) if
+    the revision has moved."""
+    for row in bindings:
+        if not isinstance(row["category"], EntryTriageCategory):
+            raise ValueError(
+                f"invalid Professional Entry Triage category: {row['category']!r}")
+    categories = [row["category"] for row in bindings]
+    if len(categories) != len(set(categories)):
+        raise ValueError(
+            "Professional Entry Triage binding batch must not contain a "
+            "duplicate category")
+    if set(categories) != set(EntryTriageCategory):
+        raise ValueError(
+            "Professional Entry Triage binding batch must contain exactly "
+            "one row per EntryTriageCategory member -- got "
+            f"{sorted(c.value for c in categories)}")
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT revision FROM user_interaction_revision WHERE user_id=?", (user_id,))
+        r = await cur.fetchone()
+        current_revision = r[0] if r else 0
+        if current_revision != response_revision:
+            await db.commit()
+            return False
+        await db.execute(
+            "UPDATE professional_entry_triage_bindings SET superseded_at=datetime('now') "
+            "WHERE user_id=? AND consumed_at IS NULL AND superseded_at IS NULL",
+            (user_id,))
+        for row in bindings:
+            await db.execute(
+                "INSERT INTO professional_entry_triage_bindings "
+                "(token, user_id, chat_id, source_message_id, category, "
+                " binding_revision, expires_at) VALUES (?,?,?,?,?,?,?)",
+                (row["token"], user_id, chat_id, source_message_id,
+                 row["category"].value, response_revision, row["expires_at"]))
+        await db.commit()
+        return True
+
+
+@dataclass(frozen=True)
+class ProfessionalEntryTriageConsumptionResult:
+    category: EntryTriageCategory
+
+
+async def consume_professional_entry_triage_binding(
+        token: str, user_id: int, chat_id: int, source_message_id: int
+) -> "ProfessionalEntryTriageConsumptionResult | None":
+    """Atomic, single-use, isolated consumption. The caller supplies only the
+    opaque token; category is loaded exclusively from the DB row, never
+    trusted from callback_data.
+
+    Returns None on any rejection (missing token, wrong user/chat/message,
+    invalid stored category, already consumed, superseded, expired, or
+    revision mismatch -- all collapse to the same outcome, never
+    distinguished to the caller). On success, also supersedes every sibling
+    option from the same offer (same user_id + source_message_id) so at most
+    one category can ever be consumed from one Entry Triage offer."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT category, user_id, chat_id, source_message_id, binding_revision "
+            "FROM professional_entry_triage_bindings WHERE token=?", (token,))
+        row = await cur.fetchone()
+        if not row:
+            await db.commit()
+            return None
+        category_value, row_user_id, row_chat_id, row_source_message_id, binding_revision = row
+        if (row_user_id != user_id or row_chat_id != chat_id
+                or row_source_message_id != source_message_id):
+            await db.commit()
+            return None
+        try:
+            category = EntryTriageCategory(category_value)
+        except ValueError:
+            await db.commit()
+            return None
+
+        cur = await db.execute(
+            "SELECT revision FROM user_interaction_revision WHERE user_id=?", (user_id,))
+        r = await cur.fetchone()
+        current_revision = r[0] if r else 0
+        if current_revision != binding_revision:
+            await db.commit()
+            return None
+
+        cur = await db.execute(
+            "UPDATE professional_entry_triage_bindings SET consumed_at=datetime('now') "
+            "WHERE token=? AND user_id=? AND chat_id=? AND source_message_id=? "
+            "  AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at > datetime('now')",
+            (token, user_id, chat_id, source_message_id))
+        if cur.rowcount != 1:
+            await db.commit()
+            return None
+
+        await db.execute(
+            "UPDATE professional_entry_triage_bindings SET superseded_at=datetime('now') "
+            "WHERE user_id=? AND source_message_id=? AND token != ? "
+            "  AND consumed_at IS NULL AND superseded_at IS NULL",
+            (user_id, source_message_id, token))
+
+        await db.commit()
+        return ProfessionalEntryTriageConsumptionResult(category=category)
+
+
+async def supersede_professional_entry_triage_bindings(user_id: int) -> int:
+    """Lifecycle invalidation ONLY -- this is NOT consumption of a category
+    selection, and it never reads/returns `category` at all. Marks every
+    currently open (not yet consumed, not yet superseded) Professional
+    Entry Triage binding for this exact user_id as superseded, so an offer
+    that existed before this call can never later be tapped into a
+    delivered response.
+
+    Used both as best-effort crisis-start cleanup (bot.trigger_crisis) and
+    as defense-in-depth inside cb_professional_entry_triage's own
+    active-crisis branch -- this is what stops a pre-crisis offer from
+    becoming actionable again once the crisis resolves. Idempotent: a
+    second call when nothing is open affects zero rows and is a safe
+    no-op. Affects ONLY professional_entry_triage_bindings, ONLY the exact
+    user_id -- never `messages`, never `user_interaction_events`, never
+    `interaction_button_bindings`, never `user_interaction_revision`.
+    Returns the number of rows actually superseded."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE professional_entry_triage_bindings SET superseded_at=datetime('now') "
+            "WHERE user_id=? AND consumed_at IS NULL AND superseded_at IS NULL",
+            (user_id,))
+        await db.commit()
+        return cur.rowcount
 
 
 # Localized, deterministic, enum-mapped labels -- RU/EN, matching this

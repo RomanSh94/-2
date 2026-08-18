@@ -429,6 +429,25 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
                   "DURATION_OPTIONS/FUNCTIONING_OPTIONS/SUPPORT_OPTIONS/"
                   "PURPOSE_OPTIONS (depression_disclosure.py) -- never raw user "
                   "text; never in logs/alerts."),
+
+    # Professional Core V2 -- Entry Triage runtime binding. ENGAGEMENT (not
+    # CRISIS_SAFETY): this is a bounded conversation-entry navigation choice
+    # (which of six closed categories the user tapped to begin), not a
+    # safety-audit record and not raw free text -- same shape/treatment as
+    # interaction_button_bindings/user_interaction_events above, so it takes
+    # the same CASCADE_DELETE (never RETAIN) a delete-all request removes it
+    # in full, with no special retention.
+    "professional_entry_triage_bindings": _e(
+        table="professional_entry_triage_bindings", user_id_column="user_id",
+        category="ENGAGEMENT",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="The opaque callback token must never appear in logs/alerts. "
+                  "`category` is user-linked psychological navigation data (which "
+                  "of the six closed EntryTriageCategory values the user tapped) "
+                  "-- never in logs/alerts. chat_id/source_message_id are Telegram "
+                  "transport identifiers, not content, but are still never logged "
+                  "beyond what is already necessary for delivery."),
 }
 
 

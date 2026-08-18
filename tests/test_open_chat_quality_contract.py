@@ -205,7 +205,7 @@ def test_no_state_engine_labels_injected_into_open_chat():
 
 def test_no_db_schema_changes():
     assert _h(database.SCHEMA) == (
-        "1d76fefe6a13834504be69dc20c0bbfa6c0e9bdeecf18f1fd768242ef3866336")
+        "c3ddee9c7b1f38e822ed52b0af866bbb7d329d512951464ad241a61bb1285678")
 
 
 # ── Fixture-file sanity (structural only -- never asserts response quality) ─
