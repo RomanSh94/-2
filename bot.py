@@ -175,6 +175,20 @@ from database import (
     mark_prompt_delivered, mark_prompt_failed,
     get_proposals_with_failed_prompts, claim_prompt_send,
 )
+# Professional Core V2 -- Entry Triage runtime V1 ONLY. Deliberately isolated
+# from the legacy interaction-button/mood-entry imports above: no other
+# Professional Core module (Analyzer, Planner, Proposer, Renderer,
+# Acceptance) is imported anywhere in bot.py.
+from professional_reply_affordances import ENTRY_TRIAGE_CONTRACT_V1
+from professional_turn_ui_context import (
+    UntrustedEntryTriageSelection, canonicalize_entry_triage_selection,
+    EntryTriageSelectionStatus,
+)
+from professional_turn_ui_immediate_response import build_trusted_ui_immediate_response
+from database import (
+    create_professional_entry_triage_bindings, consume_professional_entry_triage_binding,
+    supersede_professional_entry_triage_bindings,
+)
 import conversation_controller as controller
 from therapeutic_domain import (
     Intent, RepairConstraint, LifecycleStatus, ConsentState, PracticeProposalStatus,
@@ -284,6 +298,85 @@ def _binding_expiry() -> str:
     from datetime import datetime, timezone, timedelta
     return (datetime.now(timezone.utc)
             + timedelta(hours=_FIRST_TURN_BINDING_LEASE_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ── Professional Core V2 -- Entry Triage runtime V1 (isolated) ──────────────
+# Its own lease constant, deliberately not shared with
+# _FIRST_TURN_BINDING_LEASE_HOURS above -- that constant belongs to the
+# unrelated first-turn continuation-button feature; decoupling the two
+# means a future change to either lease duration cannot silently affect
+# the other.
+_PROFESSIONAL_ENTRY_TRIAGE_BINDING_LEASE_HOURS = 24
+
+
+def _professional_entry_triage_expiry() -> str:
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc)
+            + timedelta(hours=_PROFESSIONAL_ENTRY_TRIAGE_BINDING_LEASE_HOURS)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _professional_entry_triage_keyboard(tokens: dict) -> InlineKeyboardMarkup:
+    """One row per sealed V1 Entry Triage option, in the sealed V1 order.
+    callback_data carries only the opaque per-category token -- category,
+    lang, and revision never travel in callback_data."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=option.label_ru,
+                              callback_data=f"pucbtn:{tokens[option.category]}")]
+        for option in ENTRY_TRIAGE_CONTRACT_V1.options
+    ])
+
+
+async def _send_professional_entry_triage(target, uid: int) -> None:
+    """Professional Entry Triage V1 render path -- replaces (not duplicates)
+    the legacy mood-entry buttons for RU users under
+    access_control.core_rollout_allowed (see _send_mood_entry). The
+    delivered Telegram message text is EXACTLY
+    ENTRY_TRIAGE_CONTRACT_V1.prompt_ru -- no legacy greeting prefix, no
+    legacy mood question, no "⚠️ Я не терапевт." disclaimer suffix, no
+    extra newline. Professional Entry Triage owns its own exact sealed
+    entry surface; the legacy greeting/disclaimer belong only to the
+    legacy mood-entry branch in _send_mood_entry, never to this one.
+
+    V2->V3 correction: the interaction revision is captured BEFORE the
+    prompt is sent, not after. Capturing it after would let a genuine free
+    text message the user sends in the gap between delivery and this
+    function's own DB write bump the live revision first -- FREE TEXT
+    BEATS BUTTONS means that race must make the offer stale, not
+    actionable; create_professional_entry_triage_bindings independently
+    re-verifies the LIVE revision still equals the value captured here
+    before writing anything, inside its own transaction, so this is a
+    genuine close of the race, not just an earlier read.
+
+    Strict revision-capture-then-send-then-bind-then-attach-keyboard
+    ordering, mirroring _publish_continuation_options: the message is sent
+    WITHOUT a keyboard first, the bindings are created against the real
+    sent message_id, and the keyboard is attached only after the bindings
+    are durably written -- this removes the fast-tap race where a keyboard
+    could be tappable before its bindings exist. Rendering this prompt
+    never itself bumps the revision."""
+    revision = await get_user_revision(uid)
+    sent = await target.answer(ENTRY_TRIAGE_CONTRACT_V1.prompt_ru)
+    tokens = {option.category: secrets.token_urlsafe(9)
+              for option in ENTRY_TRIAGE_CONTRACT_V1.options}
+    expires_at = _professional_entry_triage_expiry()
+    bindings = [{"token": tokens[option.category], "category": option.category,
+                 "expires_at": expires_at}
+                for option in ENTRY_TRIAGE_CONTRACT_V1.options]
+    try:
+        batch_ok = await create_professional_entry_triage_bindings(
+            uid, sent.chat.id, sent.message_id, revision, bindings)
+    except Exception as e:
+        print(f"[professional-entry-triage] bind FAILED uid={uid}: {type(e).__name__}")
+        return
+    if not batch_ok:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=sent.chat.id, message_id=sent.message_id,
+            reply_markup=_professional_entry_triage_keyboard(tokens))
+    except Exception:
+        pass
 
 
 def _continuation_options(lang: str, buttons_ru: list, buttons_en: list) -> list:
@@ -1086,6 +1179,18 @@ async def trigger_crisis(message: Message, uid: int, username: str,
         await supersede_active_core_sessions_for_crisis(uid)
     except Exception as e:
         print(f"[crisis] core-session supersession FAILED uid={uid}: {type(e).__name__}: {e}")
+    # Professional Entry Triage correction pass: an offer that existed
+    # BEFORE this crisis became active must never become actionable again
+    # once the crisis resolves (bump_user_revision has not necessarily run
+    # yet at this point in the pipeline, so the offer's binding_revision
+    # alone cannot be trusted to have gone stale). Same unconditional,
+    # logging-independent, best-effort placement as the two supersession
+    # calls above -- a failure here NEVER blocks, delays, or degrades
+    # crisis delivery below. No token/category/user text in the log line.
+    try:
+        await supersede_professional_entry_triage_bindings(uid)
+    except Exception as e:
+        print(f"[crisis] entry-triage supersession FAILED uid={uid}: {type(e).__name__}")
 
     eid = None
     try:
@@ -4462,7 +4567,7 @@ async def cmd_start(message: Message):
         tz_off, tz_set, ulang = await get_user_tz(uid)
         local_hour = (datetime.now(timezone.utc).hour + effective_tz(tz_off, tz_set, ulang)) % 24
         text = pick_greeting(False, local_hour, lang)
-    await _send_mood_entry(message, lang, text)
+    await _send_mood_entry(message, uid, lang, text)
 
 
 def _mood_entry_keyboard(lang: str, buttons: list) -> InlineKeyboardMarkup:
@@ -4478,11 +4583,18 @@ def _mood_entry_keyboard(lang: str, buttons: list) -> InlineKeyboardMarkup:
         text=("🗺 Карта эмоций" if lang == "ru" else "🗺 Emotion map"), callback_data="emotion:map")]])
 
 
-async def _send_mood_entry(target, lang: str, text: str) -> None:
-    """Render the existing mood-selection entry (mood buttons + emotion-map row +
-    the '⚠️ Я не терапевт.' line). Shared verbatim by cmd_start and the
-    first-user onboarding Start button, so the mood entry stays byte-identical
-    whichever path opened it."""
+async def _send_mood_entry(target, uid: int, lang: str, text: str) -> None:
+    """Render the conversation-entry surface: Professional Entry Triage V1
+    for RU users under access_control.core_rollout_allowed (replaces, not
+    duplicates, the legacy mood buttons for those users -- see
+    _send_professional_entry_triage); the existing legacy mood-selection
+    entry (mood buttons + emotion-map row + the '⚠️ Я не терапевт.' line)
+    otherwise. Shared verbatim by cmd_start and the first-user onboarding
+    Start button, so whichever surface renders stays byte-identical
+    regardless of which caller opened it."""
+    if lang == "ru" and await access_control.core_rollout_allowed(uid):
+        await _send_professional_entry_triage(target, uid)
+        return
     _, buttons = get_onboarding(lang)
     kb = _mood_entry_keyboard(lang, buttons)
     await target.answer(
@@ -4501,6 +4613,42 @@ async def cb_mood(callback: CallbackQuery, state: FSMContext):
     exactly the "scattered check" the middleware exists to avoid)."""
     uid = callback.from_user.id
     lang = await get_user_language(uid)
+    # Professional Entry Triage migration bridge: a HISTORICAL legacy mood:*
+    # tap (rendered before this rollout, or before the user became eligible)
+    # from a user who is NOW RU + core_rollout_allowed-eligible must not
+    # fall through to pipeline() below with a fabricated free-text choice --
+    # that would create a real role='user' message from a button tap, which
+    # is exactly what Entry Triage must never do. A non-eligible or non-RU
+    # user's tap is completely unaffected by this branch and reaches the
+    # unchanged legacy pipeline() call below exactly as before.
+    #
+    # V4 correction: once RU + core_rollout_allowed eligibility is
+    # established, this function ALWAYS returns from within this block --
+    # it never falls through to the legacy synthetic-mood pipeline() call
+    # below under any outcome. A fresh access_control.has_full_access(uid)
+    # check decides only WHICH terminal outcome: has_full_access=True
+    # redirects to the real Entry Triage surface; has_full_access=False, or
+    # an exception raised while checking it, is a neutral no-op (callback
+    # answered, nothing rendered, nothing persisted) -- NOT a signal to use
+    # the legacy mood pipeline. A revoked/unknown access state for a
+    # Professional-rollout-eligible user must never be reinterpreted as
+    # permission to route a stale button label through pipeline() as if it
+    # were the user's own free text.
+    if lang == "ru" and await access_control.core_rollout_allowed(uid):
+        try:
+            currently_has_access = await access_control.has_full_access(uid)
+        except Exception:
+            await callback.answer()
+            return
+        await callback.answer()
+        if not currently_has_access:
+            return
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await _send_professional_entry_triage(callback.message, uid)
+        return
     _, buttons = get_onboarding(lang)
     try:
         choice = buttons[int(callback.data.split(":")[1])]
@@ -4514,6 +4662,99 @@ async def cb_mood(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     await pipeline(callback.message, choice, state, tg_user=callback.from_user)
+
+
+@dp.callback_query(F.data.startswith("pucbtn:"))
+async def cb_professional_entry_triage(callback: CallbackQuery):
+    """Professional Entry Triage tap -- a trusted UI selection, never user
+    free text. Isolated from the legacy ucbtn/mood systems: never calls
+    consume_interaction_binding, normalized_action_text, or pipeline();
+    never reaches the Analyzer/Planner/Proposer/Renderer/Acceptance or any
+    model call. This tap itself NEVER writes a fabricated role='user'
+    message -- the category selection is never persisted as if the user
+    had typed it. It DOES intentionally persist the exact sealed
+    role='assistant' response as a real `messages` row, but ONLY after
+    that response has actually been delivered to Telegram successfully --
+    see the delivery-then-persist block below. `user_interaction_events`
+    is never written by this tap under any outcome.
+
+    Every check below is independent defense-in-depth, mirroring
+    cb_cc_consent -- a token could only ever have been created under the
+    same RU + core_rollout_allowed gate, but that is rechecked live here
+    rather than trusted from the token's mere existence. Crisis is checked
+    BEFORE any binding consumption -- on an active crisis, the category is
+    never consumed, never canonicalized, and no Professional response is
+    sent; this user's still-open Professional Entry Triage offers are
+    best-effort superseded instead (never consumption -- see
+    database.supersede_professional_entry_triage_bindings), which is what
+    stops a pre-crisis offer from becoming actionable again once the
+    crisis resolves. A failure of that cleanup is swallowed and never
+    surfaced -- crisis safety does not depend on Entry Triage bookkeeping.
+
+    V3 correction: a fresh access_control.has_full_access(uid) recheck
+    runs AFTER the crisis check but BEFORE any binding consumption -- a
+    token minted while access was valid must not remain a capability that
+    survives a later revocation of ordinary product access. A lookup
+    exception fails closed (no consumption, no response) exactly like a
+    False result."""
+    uid = callback.from_user.id
+    token = callback.data[len("pucbtn:"):]
+    await callback.answer()
+    lang = await get_user_language(uid)
+    if not (lang == "ru" and await access_control.core_rollout_allowed(uid)):
+        return
+    if await get_active_crisis(uid) is not None:
+        try:
+            await supersede_professional_entry_triage_bindings(uid)
+        except Exception:
+            pass
+        return
+    try:
+        currently_has_access = await access_control.has_full_access(uid)
+    except Exception:
+        currently_has_access = False
+    if not currently_has_access:
+        return
+    result = await consume_professional_entry_triage_binding(
+        token, uid, callback.message.chat.id, callback.message.message_id)
+    if result is None:
+        return
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    canon = canonicalize_entry_triage_selection(
+        UntrustedEntryTriageSelection(category=result.category))
+    if canon.status is not EntryTriageSelectionStatus.ACCEPTED:
+        return
+    response = build_trusted_ui_immediate_response(canon.directive)
+    valid, _reason = validate_response(response.text_ru, "ru")
+    if not valid:
+        return
+    # Delivery BEFORE persistence: a Telegram send failure must leave zero
+    # assistant rows -- never save first and pretend delivery succeeded.
+    # The callback has already been answered above, so a failure here
+    # produces no second callback-popup response either -- only a fixed,
+    # redacted diagnostic (exception class only; never token, category,
+    # response text, or callback_data).
+    try:
+        await callback.message.answer(response.text_ru)
+    except Exception as e:
+        print(f"[professional-entry-triage] delivery FAILED uid={uid}: {type(e).__name__}")
+        return
+    # Delivery succeeded. Persist the exact sealed assistant response for
+    # conversation continuity (build_context can see what was asked), so a
+    # genuine free-text reply the user types next has the right context.
+    # A save failure here must not trigger a duplicate Telegram send, must
+    # not roll the already-consumed binding back into an actionable state,
+    # and must not fabricate any user text -- delivery already happened
+    # and that is the honest, final state either way.
+    try:
+        await save_message(uid, "assistant", response.text_ru, "open_chat", "ru")
+    except Exception as e:
+        print(f"[professional-entry-triage] assistant persistence FAILED uid={uid}: "
+              f"{type(e).__name__}")
+        return
 
 
 @dp.callback_query(F.data.startswith("onb:"))
@@ -4583,7 +4824,7 @@ async def cb_onboarding(callback: CallbackQuery):
         except TelegramBadRequest:
             pass
         text, _ = get_onboarding(lang)
-        await _send_mood_entry(callback.message, lang, text)
+        await _send_mood_entry(callback.message, uid, lang, text)
         return
 
     state = await get_active_onboarding_state(uid)
@@ -4625,7 +4866,7 @@ async def cb_onboarding(callback: CallbackQuery):
         # Open the existing mood-selection entry (first-time greeting text). No
         # therapeutic response is generated until the user chooses/writes.
         text, _ = get_onboarding(lang)
-        await _send_mood_entry(callback.message, lang, text)
+        await _send_mood_entry(callback.message, uid, lang, text)
         return
 
     if data.startswith(onboarding_content.CB_PREFIX + "next:"):
