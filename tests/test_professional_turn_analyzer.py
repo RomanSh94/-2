@@ -30,6 +30,12 @@ from professional_turn_producer import (
 )
 from therapeutic_domain import EvidenceKind, Intent, InteractionSignal
 
+from professional_turn_conversation_context import (
+    ConversationTurn,
+    ConversationTurnRole,
+    ProfessionalConversationContext,
+)
+
 from professional_turn_analyzer import (
     ANALYZER_TEMPERATURE,
     DEFAULT_ANALYZER_TIMEOUT_SECONDS,
@@ -848,3 +854,162 @@ def test_result_rejects_both_output_and_failure_category_set():
 def test_result_rejects_neither_output_nor_failure_category_set():
     with pytest.raises(ValueError):
         TurnAnalyzerCallResult(output=None, failure_category=None, model="gpt-4o-mini")
+
+
+# ── Q. OPTIONAL MULTI-TURN CONVERSATION CONTEXT (V1 addition) ──────────────
+
+def _context(*turns):
+    return ProfessionalConversationContext(turns=tuple(turns))
+
+
+def _u(row_id, content):
+    return ConversationTurn(message_row_id=row_id, role=ConversationTurnRole.USER, content=content)
+
+
+def _a(row_id, content):
+    return ConversationTurn(
+        message_row_id=row_id, role=ConversationTurnRole.ASSISTANT, content=content)
+
+
+def test_no_context_call_keeps_the_user_payload_in_its_pre_slice_shape():
+    """Proves USER-PAYLOAD shape compatibility only -- the user-message
+    content is source_text unwrapped, exactly as before this slice. This
+    is NOT a claim that the complete request (including the fixed system
+    instruction, which this slice intentionally extended and which is
+    sent on every call) is byte-identical to pre-slice behavior."""
+    client = _client_returning(_VALID_JSON)
+    result = _call(client, model="gpt-4o-mini", source_text="hello world")
+    assert result.failure_category is None
+    call = client.chat.completions.calls[0]
+    user_message = [m for m in call["messages"] if m["role"] == "user"][0]
+    assert user_message["content"] == "hello world"
+
+
+def test_explicit_none_context_is_identical_to_omitting_it():
+    """Both sides of this comparison use the CURRENT (post-slice)
+    implementation -- this proves omitting conversation_context and
+    passing conversation_context=None explicitly produce the same request
+    under today's code, not that either matches pre-slice behavior."""
+    client_a = _client_returning(_VALID_JSON)
+    client_b = _client_returning(_VALID_JSON)
+    _call(client_a, model="gpt-4o-mini", source_text="hello world")
+    _call(client_b, model="gpt-4o-mini", source_text="hello world", conversation_context=None)
+    call_a = client_a.chat.completions.calls[0]
+    call_b = client_b.chat.completions.calls[0]
+    assert call_a["messages"] == call_b["messages"]
+
+
+def test_rejects_conversation_context_of_wrong_type():
+    client = _client_returning(_VALID_JSON)
+    with pytest.raises(ValueError):
+        _call(client, model="gpt-4o-mini", source_text="hi", conversation_context=[])
+    with pytest.raises(ValueError):
+        _call(client, model="gpt-4o-mini", source_text="hi", conversation_context="not a context")
+
+
+def test_context_is_serialized_as_a_structurally_separate_json_field():
+    context = _context(_u(1, "У меня тревога."), _a(2, "Что именно тревожит?"))
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", source_text="Работа.", conversation_context=context)
+    call = client.chat.completions.calls[0]
+    user_message = [m for m in call["messages"] if m["role"] == "user"][0]
+    payload = json.loads(user_message["content"])
+    assert set(payload.keys()) == {"source_text", "conversation_context"}
+    assert payload["source_text"] == "Работа."
+    assert payload["conversation_context"] == [
+        {"role": "USER", "content": "У меня тревога."},
+        {"role": "ASSISTANT", "content": "Что именно тревожит?"},
+    ]
+
+
+def test_source_text_and_context_are_never_concatenated():
+    context = _context(_u(1, "PRIOR_MARKER_TEXT"))
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", source_text="CURRENT_MARKER_TEXT",
+          conversation_context=context)
+    call = client.chat.completions.calls[0]
+    user_message = [m for m in call["messages"] if m["role"] == "user"][0]
+    payload = json.loads(user_message["content"])
+    # Each marker appears in exactly its own field, never merged into one string.
+    assert payload["source_text"] == "CURRENT_MARKER_TEXT"
+    assert payload["conversation_context"][0]["content"] == "PRIOR_MARKER_TEXT"
+    assert "PRIOR_MARKER_TEXT" not in payload["source_text"]
+    assert "CURRENT_MARKER_TEXT" not in payload["conversation_context"][0]["content"]
+
+
+def test_empty_context_still_serializes_the_wrapped_shape():
+    context = _context()
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", source_text="hi", conversation_context=context)
+    call = client.chat.completions.calls[0]
+    user_message = [m for m in call["messages"] if m["role"] == "user"][0]
+    payload = json.loads(user_message["content"])
+    assert payload["source_text"] == "hi"
+    assert payload["conversation_context"] == []
+
+
+def test_context_roles_round_trip_exactly_through_serialization():
+    context = _context(_u(1, "первое"), _a(2, "второе"), _u(3, "третье"))
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", source_text="hi", conversation_context=context)
+    call = client.chat.completions.calls[0]
+    payload = json.loads([m for m in call["messages"] if m["role"] == "user"][0]["content"])
+    assert [entry["role"] for entry in payload["conversation_context"]] == [
+        "USER", "ASSISTANT", "USER"]
+    assert [entry["content"] for entry in payload["conversation_context"]] == [
+        "первое", "второе", "третье"]
+
+
+def test_system_instruction_documents_the_two_payload_shapes_and_provenance_rule():
+    from professional_turn_analyzer import _SYSTEM_INSTRUCTION
+    assert "conversation_context" in _SYSTEM_INSTRUCTION
+    assert "NEVER evidence" in _SYSTEM_INSTRUCTION
+    assert "copied literally from source_text ONLY" in _SYSTEM_INSTRUCTION
+
+
+def test_system_instruction_documents_current_newer_user_correction_precedence():
+    from professional_turn_analyzer import _SYSTEM_INSTRUCTION
+    assert "CURRENT/NEWER USER CORRECTIONS TAKE PRECEDENCE" in _SYSTEM_INSTRUCTION
+    assert "corrects, retracts, rejects, narrows, or replaces" in _SYSTEM_INSTRUCTION
+    assert "never resistance" in _SYSTEM_INSTRUCTION
+    assert "never an instruction to you" in _SYSTEM_INSTRUCTION
+
+
+def test_model_output_with_context_present_is_still_validated_against_current_source_text():
+    # Model output candidate spans, even when a context object is supplied to
+    # the call, are validated by the existing, UNMODIFIED Producer exactly as
+    # before -- this module never changes what Producer receives.
+    doc = _document(
+        evidence=[_evidence_entry(span="работа", proposed_kind="USER_REPORTED_FACT")])
+    output = parse_model_response(_dumps(doc))
+    result = produce_turn_analysis(
+        source_message_row_id=1, source_text="Меня беспокоит работа.", analyzer_output=output)
+    assert result.analysis.evidence.status is AnalysisComponentStatus.VALIDATED
+    assert result.analysis.evidence.items[0].exact_source_span == "работа"
+
+
+def test_fake_model_cannot_promote_prior_context_text_into_accepted_current_evidence():
+    """The CRITICAL provenance proof: a candidate whose exact_source_span
+    equals text that exists ONLY in prior conversation_context (never in
+    the real current source_text) must be rejected by Producer's own,
+    unmodified span-locating validation -- proving that even a
+    fake/malicious model response cannot turn prior-context text into
+    accepted current-turn evidence. This module has no offsets and no
+    substring search of its own; the guarantee lives entirely in
+    professional_turn_producer.locate_evidence_candidate, exercised here
+    unmodified."""
+    context_only_text = "ОТКЛАДЫВАЮ_ДЕЛА_МАРКЕР"
+    current_source_text = "Мне сегодня грустно."
+    assert context_only_text not in current_source_text
+
+    doc = _document(evidence=[
+        _evidence_entry(span=context_only_text, proposed_kind="USER_REPORTED_FACT")])
+    output = parse_model_response(_dumps(doc))
+
+    result = produce_turn_analysis(
+        source_message_row_id=1, source_text=current_source_text, analyzer_output=output)
+
+    # The context-derived span was never located inside the real source_text
+    # -- it produces zero accepted evidence items, never a survivor.
+    assert result.analysis.evidence.items == ()
+    assert result.analysis.evidence.status is AnalysisComponentStatus.UNAVAILABLE
