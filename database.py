@@ -1570,6 +1570,71 @@ async def get_recent_messages(uid: int, limit: int = 8) -> list:
             " ORDER BY id DESC LIMIT ?", (uid, limit))
         rows = await cur.fetchall(); rows.reverse(); return rows
 
+async def get_professional_conversation_history_rows(
+        user_id: int, current_source_message_row_id: int) -> list:
+    """PROFESSIONAL RUNTIME HISTORY BUILDER V1 read primitive. Returns raw
+    (id, role, content, source) rows for PRIOR turns only -- strictly
+    before the current turn's own row -- already restricted to the two
+    conversation-safe MessageSource values. This is a read-only SELECT: no
+    summarization, no truncation, no prompt construction, no model call, no
+    semantic inference, and it never mutates the `summarized` flag (that
+    flag belongs to the separate, unrelated legacy rolling-summary
+    mechanism in memory.py -- Professional history is based on trusted
+    conversation provenance, not on whether memory.py has gotten around to
+    summarizing a row yet, so this query does not filter on it).
+
+    current_source_message_row_id is the id of the row already persisted
+    for the CURRENT turn (see MessageSource.SYNTHETIC_UI usage note below);
+    it must be a positive int -- callers must capture and pass the real id
+    returned by the save_message() call for the current turn, never 0 or a
+    placeholder. The `id < ?` bound is enforced in SQL, not in Python after
+    the fact, so the current row can never leak into its own prior history
+    regardless of what a caller does afterward.
+
+    `source IN ('USER_AUTHORED','ASSISTANT_DELIVERED')` excludes
+    SYNTHETIC_UI (normalized Telegram-button labels -- see
+    consume_interaction_binding) and `source IS NULL` (every row persisted
+    before MESSAGES PROVENANCE V1) at the SQL layer. No role/scenario/
+    content heuristic recovers a NULL row's provenance, and this function
+    does not attempt to.
+
+    Deliberately NO SQL LIMIT: this function returns every eligible prior
+    row for the user, unbounded. An earlier V1 draft used `ORDER BY id DESC
+    LIMIT 200`, which could silently underfill the final
+    ProfessionalConversationContext -- if the newest N raw rows happened to
+    be individually excluded downstream (oversized/empty/malformed), an
+    older, perfectly valid trusted row sitting just past that SQL window
+    would never even be considered, even though a caller correctly using
+    professional_turn_conversation_context.build_conversation_context_
+    from_history_rows only ever needs and keeps at most MAX_CONTEXT_TURNS=8
+    turns. Correctness must not depend on an arbitrary SQL limit standing
+    in for that builder-owned selection logic, so there is none here. All
+    bounding (turn count, per-turn/total char caps, oldest-first omission)
+    is exclusively the pure builder's responsibility -- see that module's
+    OMISSION POLICY. No pagination is added in this correction; nothing in
+    this repository's current operational scale gives evidence an
+    unbounded per-user prior-row scan is unacceptable, and adding one back
+    without such evidence would just reintroduce this same underfill risk
+    under a different number.
+
+    The caller is responsible for passing these rows through
+    professional_turn_conversation_context.build_conversation_context_
+    from_history_rows -- this function performs no bounds/omission logic
+    of its own and returns raw rows, oldest-first."""
+    if type(current_source_message_row_id) is not int or current_source_message_row_id <= 0:
+        raise ValueError(
+            "get_professional_conversation_history_rows: "
+            "current_source_message_row_id must be a positive int, got "
+            f"{current_source_message_row_id!r}")
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id, role, content, source FROM messages"
+            " WHERE user_id=? AND id<?"
+            " AND source IN ('USER_AUTHORED','ASSISTANT_DELIVERED')"
+            " ORDER BY id ASC",
+            (user_id, current_source_message_row_id))
+        return await cur.fetchall()
+
 async def get_unsummarized_messages(uid: int) -> list:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(

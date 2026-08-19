@@ -116,14 +116,26 @@ never to silently trim it into shape.
     and makes the per-turn cap the binding constraint only for unusually
     long individual turns, not the common case.
 
-OMISSION POLICY (for a future, not-yet-authorized runtime builder -- this
-module defines the policy, but implements no database-reading builder
-itself, since no runtime persistence is part of this slice): when raw
-material exceeds these bounds, prefer deterministic omission of the OLDEST
-turns first, always preserving the EXACT, unmodified content of whichever
-newer turns remain included. Never truncate a turn's content to make it
-fit; either the whole turn is included exactly as persisted, or it is
-omitted entirely.
+OMISSION POLICY: when raw material exceeds these bounds, prefer
+deterministic omission of the OLDEST turns first, always preserving the
+EXACT, unmodified content of whichever newer turns remain included. Never
+truncate a turn's content to make it fit; either the whole turn is
+included exactly as persisted, or it is omitted entirely.
+
+PROFESSIONAL RUNTIME HISTORY BUILDER V1 (this slice) -- adds exactly one
+pure function, build_conversation_context_from_history_rows, that applies
+the OMISSION POLICY above over already-fetched plain rows and returns a
+ProfessionalConversationContext. It performs no I/O of its own: the DB read
+(database.get_professional_conversation_history_rows) is a separate,
+already-bounded, already-provenance-filtered query that lives in
+database.py, never here -- this module's own "no I/O anywhere" contract is
+unchanged. The builder independently re-validates role/source on every row
+rather than trusting the caller's own filtering, so a raw row whose source
+is not exactly the value TRUSTED for its own role (see TRUST SEMANTICS
+above) is excluded, not reinterpreted -- defense in depth against a future
+caller that bypasses or misuses the DB-side filter. Still no runtime
+wiring: nothing in this repository calls this function from bot.py as of
+this slice.
 
 Only imports: __future__, dataclasses, enum. No bot.py import, no
 conversation_controller.py import, no database import, no Telegram import,
@@ -234,3 +246,89 @@ class ProfessionalConversationContext:
 
 
 EMPTY_CONVERSATION_CONTEXT = ProfessionalConversationContext(turns=())
+
+
+# Mirrors (does not import) database.MessageSource's two conversation-safe
+# values -- see PROFESSIONAL RUNTIME HISTORY BUILDER V1 in the module
+# docstring. Kept as plain strings, not an Enum imported from database.py,
+# to preserve this module's own closed import contract (only __future__,
+# dataclasses, enum -- see test_module_imports_only_allowed_roots). If
+# database.MessageSource's frozen vocabulary ever changes, this mapping
+# must be updated in lockstep; it is intentionally not the single source of
+# truth for that vocabulary, only this module's own defense-in-depth check.
+_TRUSTED_SOURCE_BY_ROLE = {
+    ConversationTurnRole.USER: "USER_AUTHORED",
+    ConversationTurnRole.ASSISTANT: "ASSISTANT_DELIVERED",
+}
+
+
+def build_conversation_context_from_history_rows(rows) -> ProfessionalConversationContext:
+    """Pure, synchronous builder: turns already-fetched plain history rows
+    into a ProfessionalConversationContext by applying the OMISSION POLICY
+    (module docstring) and the FROZEN V1 BOUNDS. No I/O of any kind -- the
+    caller (database.get_professional_conversation_history_rows) is
+    responsible for the actual DB read, the id < current_source_message_
+    row_id upper bound, and the source IN ('USER_AUTHORED',
+    'ASSISTANT_DELIVERED') filter; this function trusts none of that by
+    itself (see PROVENANCE DEFENSE IN DEPTH below).
+
+    `rows` -- any iterable of (message_row_id, role, content, source)
+    4-tuples, exactly the shape database.get_professional_conversation_
+    history_rows returns, in ascending message_row_id order. `role` is the
+    raw stored string ("user" / "assistant" / anything else); `source` is
+    the raw stored `messages.source` value (a MessageSource.value string,
+    or None for legacy/unknown provenance).
+
+    PROVENANCE DEFENSE IN DEPTH -- every row is independently re-validated
+    here, not merely trusted from the caller's own SQL filter: a row is
+    excluded (never reinterpreted) unless its `source` is EXACTLY the one
+    TRUSTED value for its own `role` (USER_AUTHORED only for role='user',
+    ASSISTANT_DELIVERED only for role='assistant'). A mismatched pair
+    (e.g. USER_AUTHORED with role='assistant'), a SYNTHETIC_UI row, a
+    source IS NULL / UNKNOWN_LEGACY_PROVENANCE row, or any unrecognized
+    future source value are all excluded on the same path -- this function
+    never infers the "intended" role from source, and never infers
+    provenance from role. This is what makes it safe to call even if a
+    future caller (by mistake, in a test, or via a bypassed query) hands
+    this function rows that were not actually filtered upstream.
+
+    Never truncates, never summarizes, never merges or deduplicates turns,
+    never invents alternation, never reorders input -- if the surviving
+    rows are not already in strictly increasing message_row_id order (or
+    contain a duplicate id), ProfessionalConversationContext's own
+    __post_init__ fails closed with ValueError; this function does not
+    pre-sort or de-duplicate to paper over that.
+
+    No model call, no source_text parameter, no current-turn text
+    concatenation -- this function only ever sees PRIOR rows the caller
+    already excluded the current turn from."""
+    eligible = []
+    for message_row_id, role, content, source in rows:
+        if type(message_row_id) is not int or message_row_id <= 0:
+            continue
+        if role == "user":
+            turn_role = ConversationTurnRole.USER
+        elif role == "assistant":
+            turn_role = ConversationTurnRole.ASSISTANT
+        else:
+            continue
+        if source != _TRUSTED_SOURCE_BY_ROLE[turn_role]:
+            continue
+        if type(content) is not str or not content.strip():
+            continue
+        if len(content) > MAX_TURN_CONTENT_CHARS:
+            continue
+        eligible.append((message_row_id, turn_role, content))
+
+    if len(eligible) > MAX_CONTEXT_TURNS:
+        eligible = eligible[-MAX_CONTEXT_TURNS:]
+
+    total_chars = sum(len(content) for _row_id, _role, content in eligible)
+    while total_chars > MAX_TOTAL_CONTEXT_CHARS and eligible:
+        _dropped_id, _dropped_role, dropped_content = eligible.pop(0)
+        total_chars -= len(dropped_content)
+
+    turns = tuple(
+        ConversationTurn(message_row_id=row_id, role=role, content=content)
+        for row_id, role, content in eligible)
+    return ProfessionalConversationContext(turns=turns)

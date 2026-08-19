@@ -6,7 +6,9 @@ Pure, offline, no I/O anywhere in this module or the one under test.
 from __future__ import annotations
 
 import ast
+import inspect
 import pathlib
+import textwrap
 
 import pytest
 
@@ -405,3 +407,245 @@ def test_bot_py_does_not_runtime_wire_professional_free_text_pipeline():
     missing_allowed = _ALLOWED_LIVE_ENTRY_TRIAGE_MODULES - imported_modules
     assert not missing_allowed, (
         f"expected LIVE Entry Triage surface import(s) missing from bot.py: {missing_allowed}")
+
+
+def test_bot_py_remains_unmodified_by_this_slice():
+    """PROFESSIONAL RUNTIME HISTORY BUILDER V1 is history-construction
+    only -- this is a slice-specific scope assertion (bot.py must be
+    git-content-identical to the HEAD blob this branch started from), NOT
+    a permanent product prohibition. It is expected to be replaced or
+    removed by whatever future, separately authorized runtime-cutover
+    slice actually needs to edit bot.py -- the same way the byte-identity
+    test above this file used to assert was itself replaced."""
+    import subprocess
+    repo_root = pathlib.Path(ctx.__file__).resolve().parent
+    working = (repo_root / "bot.py").read_bytes()
+    head_blob = subprocess.run(
+        ["git", "show", "HEAD:bot.py"], cwd=str(repo_root),
+        capture_output=True, check=True).stdout
+    assert working.replace(b"\r\n", b"\n") == head_blob.replace(b"\r\n", b"\n")
+
+
+# ── build_conversation_context_from_history_rows (PROFESSIONAL RUNTIME ─────
+# ── HISTORY BUILDER V1 pure builder) ────────────────────────────────────────
+
+from professional_turn_conversation_context import build_conversation_context_from_history_rows
+
+
+def _row(row_id, role, content, source):
+    return (row_id, role, content, source)
+
+
+def _u_row(row_id, content, source="USER_AUTHORED"):
+    return _row(row_id, "user", content, source)
+
+
+def _a_row(row_id, content, source="ASSISTANT_DELIVERED"):
+    return _row(row_id, "assistant", content, source)
+
+
+def test_empty_rows_yield_empty_conversation_context():
+    result = build_conversation_context_from_history_rows([])
+    from professional_turn_conversation_context import EMPTY_CONVERSATION_CONTEXT
+    assert result == EMPTY_CONVERSATION_CONTEXT
+    assert result.is_empty
+
+
+def test_single_user_turn():
+    result = build_conversation_context_from_history_rows([_u_row(1, "hi")])
+    assert len(result.turns) == 1
+    assert result.turns[0].role is ConversationTurnRole.USER
+    assert result.turns[0].content == "hi"
+
+
+def test_single_assistant_turn():
+    result = build_conversation_context_from_history_rows([_a_row(1, "hello")])
+    assert len(result.turns) == 1
+    assert result.turns[0].role is ConversationTurnRole.ASSISTANT
+
+
+def test_normal_user_assistant_sequence():
+    rows = [_u_row(1, "hi"), _a_row(2, "hello"), _u_row(3, "how are you")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert [t.message_row_id for t in result.turns] == [1, 2, 3]
+
+
+def test_assistant_only_sequence_accepted():
+    rows = [_a_row(1, "a"), _a_row(2, "b"), _a_row(3, "c")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 3
+    assert all(t.role is ConversationTurnRole.ASSISTANT for t in result.turns)
+
+
+def test_user_only_sequence_accepted():
+    rows = [_u_row(1, "a"), _u_row(2, "b")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 2
+    assert all(t.role is ConversationTurnRole.USER for t in result.turns)
+
+
+def test_exact_ru_unicode_preserved():
+    text = "Последние пару дней я откладываю дела."
+    result = build_conversation_context_from_history_rows([_u_row(1, text)])
+    assert result.turns[0].content == text
+
+
+def test_exact_en_preserved():
+    text = "I keep procrastinating and then getting angry at myself."
+    result = build_conversation_context_from_history_rows([_u_row(1, text)])
+    assert result.turns[0].content == text
+
+
+def test_leading_trailing_whitespace_preserved_when_content_nonempty():
+    text = "  hello there  "
+    result = build_conversation_context_from_history_rows([_u_row(1, text)])
+    assert result.turns[0].content == text
+
+
+def test_empty_content_excluded():
+    rows = [_u_row(1, ""), _a_row(2, "real reply")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 1
+    assert result.turns[0].message_row_id == 2
+
+
+def test_whitespace_only_content_excluded():
+    rows = [_u_row(1, "   \n\t  "), _a_row(2, "real reply")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 1
+    assert result.turns[0].message_row_id == 2
+
+
+def test_oversized_turn_omitted_whole_never_truncated():
+    oversized = "x" * (MAX_TURN_CONTENT_CHARS + 1)
+    rows = [_u_row(1, oversized), _a_row(2, "short reply")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 1
+    assert result.turns[0].message_row_id == 2
+
+
+def test_exactly_at_bound_turn_is_kept():
+    exact = "x" * MAX_TURN_CONTENT_CHARS
+    result = build_conversation_context_from_history_rows([_u_row(1, exact)])
+    assert len(result.turns) == 1
+    assert result.turns[0].content == exact
+
+
+def test_max_eight_newest_whole_turns_oldest_omitted():
+    rows = [_u_row(i, f"turn {i}") if i % 2 else _a_row(i, f"turn {i}")
+            for i in range(1, 13)]  # 12 rows, ids 1..12
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == MAX_CONTEXT_TURNS
+    assert [t.message_row_id for t in result.turns] == list(range(5, 13))
+
+
+def test_total_over_bound_drops_oldest_whole_turns():
+    per_turn = MAX_TOTAL_CONTEXT_CHARS // 3 + 100  # 3 turns already exceed total bound
+    rows = [_u_row(1, "a" * per_turn), _a_row(2, "b" * per_turn), _u_row(3, "c" * per_turn)]
+    result = build_conversation_context_from_history_rows(rows)
+    total = sum(len(t.content) for t in result.turns)
+    assert total <= MAX_TOTAL_CONTEXT_CHARS
+    assert result.turns[-1].message_row_id == 3  # newest always survives
+    assert result.turns[0].message_row_id != 1   # oldest dropped first
+
+
+def test_total_bound_never_produces_partial_truncation():
+    per_turn = MAX_TOTAL_CONTEXT_CHARS // 3 + 100
+    rows = [_u_row(1, "a" * per_turn), _a_row(2, "b" * per_turn), _u_row(3, "c" * per_turn)]
+    result = build_conversation_context_from_history_rows(rows)
+    survivors = {1: "a" * per_turn, 2: "b" * per_turn, 3: "c" * per_turn}
+    for t in result.turns:
+        assert t.content == survivors[t.message_row_id]  # whole or absent, never partial
+
+
+def test_identical_genuine_content_preserved_as_separate_turns():
+    rows = [_u_row(1, "мне грустно"), _u_row(3, "мне грустно")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 2
+    assert result.turns[0].content == result.turns[1].content == "мне грустно"
+    assert result.turns[0].message_row_id != result.turns[1].message_row_id
+
+
+def test_synthetic_ui_raw_row_rejected():
+    rows = [_u_row(1, "elaborate", source="SYNTHETIC_UI"), _a_row(2, "real reply")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 1
+    assert result.turns[0].message_row_id == 2
+
+
+def test_null_provenance_raw_row_rejected():
+    rows = [_u_row(1, "legacy row", source=None), _a_row(2, "real reply")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 1
+    assert result.turns[0].message_row_id == 2
+
+
+def test_unknown_future_provenance_value_rejected():
+    rows = [_u_row(1, "future row", source="SOME_FUTURE_VALUE"), _a_row(2, "real reply")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 1
+    assert result.turns[0].message_row_id == 2
+
+
+def test_role_source_mismatch_user_authored_with_assistant_role_rejected():
+    rows = [_row(1, "assistant", "spoofed", "USER_AUTHORED"), _a_row(2, "real reply")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 1
+    assert result.turns[0].message_row_id == 2
+
+
+def test_role_source_mismatch_assistant_delivered_with_user_role_rejected():
+    rows = [_row(1, "user", "spoofed", "ASSISTANT_DELIVERED"), _a_row(2, "real reply")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 1
+    assert result.turns[0].message_row_id == 2
+
+
+def test_non_positive_row_id_excluded():
+    rows = [_u_row(0, "bad id"), _u_row(-5, "also bad"), _a_row(2, "real reply")]
+    result = build_conversation_context_from_history_rows(rows)
+    assert len(result.turns) == 1
+    assert result.turns[0].message_row_id == 2
+
+
+def test_strict_final_ordering_holds():
+    rows = [_u_row(1, "a"), _a_row(5, "b"), _u_row(9, "c")]
+    result = build_conversation_context_from_history_rows(rows)
+    ids = [t.message_row_id for t in result.turns]
+    assert ids == sorted(ids)
+
+
+def test_out_of_order_input_fails_closed_via_context_contract():
+    rows = [_u_row(5, "later"), _a_row(2, "earlier")]  # deliberately out of order
+    with pytest.raises(ValueError):
+        build_conversation_context_from_history_rows(rows)
+
+
+def test_duplicate_row_id_input_fails_closed_via_context_contract():
+    rows = [_u_row(1, "a"), _a_row(1, "b")]  # duplicate id
+    with pytest.raises(ValueError):
+        build_conversation_context_from_history_rows(rows)
+
+
+def test_builder_makes_no_model_call_no_summary_no_source_text_param():
+    """The docstring itself says "never summarizes" (a documented negative
+    claim, not summarization code), so this checks for actual model/
+    summarization CALLS -- not a substring ban that would collide with
+    that legitimate prose."""
+    sig = inspect.signature(build_conversation_context_from_history_rows)
+    assert list(sig.parameters) == ["rows"]
+    tree = ast.parse(textwrap.dedent(inspect.getsource(build_conversation_context_from_history_rows)))
+    called_names = {n.func.id for n in ast.walk(tree)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    called_attrs = {n.func.attr for n in ast.walk(tree)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert not called_names & {"maybe_summarize", "save_summary"}
+    assert not called_attrs & {"maybe_summarize", "save_summary", "create", "chat"}
+    src = inspect.getsource(build_conversation_context_from_history_rows)
+    assert "openai" not in src.lower()
+
+
+def test_builder_never_concatenates_rows_into_a_single_string():
+    src = inspect.getsource(build_conversation_context_from_history_rows)
+    assert "+ content" not in src and "content +" not in src
+    assert "join(" not in src
