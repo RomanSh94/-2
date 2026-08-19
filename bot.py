@@ -110,7 +110,7 @@ from format_commands import parse_format_command, is_pure_format_command
 from reaction_selector import ReactionCategory, select_reaction_category, pick_supported_emoji
 from tts import synthesize_speech, TTSError
 from database import (
-    init_db, upsert_user, save_message, load_state, save_state,
+    init_db, upsert_user, save_message, MessageSource, load_state, save_state,
     log_moderation, log_validator_block, log_router_decision,
     log_adverse_event, update_user_profile,
     start_intervention, finish_intervention,
@@ -572,7 +572,8 @@ async def _deliver_first_turn_response(message, uid: int, answer: str, buttons_a
         return
 
     try:
-        turn_id = await save_message(uid, "assistant", answer, scenario, lang)
+        turn_id = await save_message(uid, "assistant", answer, scenario, lang,
+                                     source=MessageSource.ASSISTANT_DELIVERED)
     except Exception:
         await transition_first_turn_claim(uid, FIRST_TURN_CONTRACT_VERSION, claim_token,
                                           "send_started", "delivered_context_missing")
@@ -1240,7 +1241,8 @@ async def trigger_crisis(message: Message, uid: int, username: str,
         # non-empty text), so this is unchanged behavior for them.
         if role != access_control.UNKNOWN and user_text:
             await save_message(uid, "user", user_text, "crisis", lang,
-                               risk["score"], risk["categories"])
+                               risk["score"], risk["categories"],
+                               source=MessageSource.USER_AUTHORED)
             await maybe_update_profile(uid, await get_user_message_count(uid), force=True)
     except Exception as e:
         print(f"[crisis] post-screen persist failed uid={uid}: {e}")
@@ -1555,7 +1557,8 @@ async def _controller_claim_turn(uid: int, user_text: str, lang: str, risk: dict
     # placeholder -- a Controller-owned turn is still a real inbound message
     # for research/audit purposes.
     await save_message(uid, "user", user_text, "controller", lang,
-                       risk.get("score", 0), risk.get("categories", []))
+                       risk.get("score", 0), risk.get("categories", []),
+                       source=MessageSource.USER_AUTHORED)
     return {"session": session, "plan": plan, "known_facts": known_facts,
            "recent_context": recent_context, "user_text": user_text, "lang": lang,
            "base_state_json": base_state_json, "proposal": proposal,
@@ -1609,7 +1612,8 @@ async def _controller_generate_and_deliver(message: Message, uid: int, claim: di
                 to_status="DELIVERY_FAILED", reason="send_exception")
             return
         await mark_proposal_delivered(proposal.proposal_id, uid, sent.message_id)
-        await save_message(uid, "assistant", text, "controller", lang)
+        await save_message(uid, "assistant", text, "controller", lang,
+                           source=MessageSource.ASSISTANT_DELIVERED)
         return
     practice_name = proposal.purpose if proposal is not None else None
     expected_duration = proposal.expected_duration if proposal is not None else None
@@ -1732,7 +1736,8 @@ async def _controller_generate_and_deliver(message: Message, uid: int, claim: di
         return
     if plan.intent is Intent.PRACTICE and proposal is not None:
         await mark_proposal_delivered(proposal.proposal_id, uid, sent.message_id)
-    await save_message(uid, "assistant", text, "controller", lang)
+    await save_message(uid, "assistant", text, "controller", lang,
+                       source=MessageSource.ASSISTANT_DELIVERED)
 
 
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
@@ -1791,7 +1796,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 # (uninvited) uid does not get ordinary message/profile persistence.
                 if access_control.resolve_role_safe(uid) != access_control.UNKNOWN:
                     await save_message(uid, "user", user_text, "crisis", lang,
-                                       risk["score"], risk["categories"])
+                                       risk["score"], risk["categories"],
+                                       source=MessageSource.USER_AUTHORED)
                 text, kb = crisis_screen(stage, lang, event_id)
                 await send_crisis(message.answer, text, kb, lang, uid, event_id, "screen")
             return
@@ -1881,13 +1887,15 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 await supersede_active_practice_proposals(uid, "new_disclosure_flow")
                 flow = await create_disclosure_flow(uid, lang, origin_message_id=message.message_id)
                 await save_message(uid, "user", user_text, "depression_disclosure", lang,
-                                   risk["score"], risk["categories"])
+                                   risk["score"], risk["categories"],
+                                   source=MessageSource.USER_AUTHORED)
                 text = safety_check_text(lang)
                 sent = await message.answer(text, reply_markup=_dd_safety_check_kb(flow["id"], lang))
                 prompt_mid = getattr(sent, "message_id", None)
                 if prompt_mid is not None:
                     await set_disclosure_prompt_message_id(flow["id"], uid, prompt_mid)
-                await save_message(uid, "assistant", text, "depression_disclosure", lang)
+                await save_message(uid, "assistant", text, "depression_disclosure", lang,
+                                   source=MessageSource.ASSISTANT_DELIVERED)
                 return
             if active_flow is not None:
                 # §8: an unrelated ordinary message while a flow is pending is a
@@ -1921,8 +1929,10 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 disambig = get_disambiguation_message(
                     phrase, lang, with_hotline=(signal == "force_crisis"))
                 await save_message(uid, "user", user_text, "disambiguation", lang,
-                                   risk["score"], risk["categories"])
-                await save_message(uid, "assistant", disambig, "disambiguation", lang)
+                                   risk["score"], risk["categories"],
+                                   source=MessageSource.USER_AUTHORED)
+                await save_message(uid, "assistant", disambig, "disambiguation", lang,
+                                   source=MessageSource.ASSISTANT_DELIVERED)
                 await message.answer(disambig)
                 await log_disambiguation(uid, user_text, phrase, signal)
                 return
@@ -2155,7 +2165,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             # and only if this turn was not superseded. A duplicate Telegram update
             # never reaches here (DuplicateUpdateGuard drops it), so no duplicate row.
             await save_message(uid, "user", user_text, scenario, lang,
-                               risk["score"], risk["categories"])
+                               risk["score"], risk["categories"],
+                               source=MessageSource.USER_AUTHORED)
     finally:
         _ingest_leave(uid, _ingest)
 
@@ -2304,7 +2315,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     if _user_generation_superseded(uid, _turn_gen):
         _dispatch_log(f"cid={_cid} stage=skipped_stale source=normal")
         return
-    await save_message(uid, "assistant", answer, scenario, lang)
+    await save_message(uid, "assistant", answer, scenario, lang,
+                       source=MessageSource.ASSISTANT_DELIVERED)
     await deliver_response(message, uid, answer, lang,
                            one_shot_voice=one_shot_voice, one_shot_concise=one_shot_concise)
     # Only reached if deliver_response did not raise -- an exception during
@@ -4750,7 +4762,8 @@ async def cb_professional_entry_triage(callback: CallbackQuery):
     # and must not fabricate any user text -- delivery already happened
     # and that is the honest, final state either way.
     try:
-        await save_message(uid, "assistant", response.text_ru, "open_chat", "ru")
+        await save_message(uid, "assistant", response.text_ru, "open_chat", "ru",
+                           source=MessageSource.ASSISTANT_DELIVERED)
     except Exception as e:
         print(f"[professional-entry-triage] assistant persistence FAILED uid={uid}: "
               f"{type(e).__name__}")

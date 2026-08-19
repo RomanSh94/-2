@@ -318,7 +318,7 @@ async def _exempt_from_first_turn_and_seed_low_energy(uid, energy):
     # contract_version == FIRST_TURN_INITIAL_ROLLOUT_VERSION), so the
     # first-turn contract/button flow — a separate, already-hardened
     # feature — never engages and ordinary routing is exercised directly.
-    await database.save_message(uid, "assistant", "предыдущий ответ", "open_chat", "ru")
+    await database.save_message(uid, "assistant", "предыдущий ответ", "open_chat", "ru", source=database.MessageSource.ASSISTANT_DELIVERED)
     seed_state = dict(bot.DEFAULT_STATE)
     seed_state["energy"] = energy
     await database.save_state(uid, seed_state)

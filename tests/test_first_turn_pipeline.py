@@ -146,8 +146,8 @@ async def _make_bound_button(uid, action, chat_id=100, source_message_id=200,
     exactly what get_last_user_message_before is meant to retrieve."""
     if turn_id is None:
         if user_text is not None:
-            await database.save_message(uid, "user", user_text, scenario, lang)
-        turn_id = await database.save_message(uid, "assistant", "первый ответ", scenario, lang)
+            await database.save_message(uid, "user", user_text, scenario, lang, source=database.MessageSource.USER_AUTHORED)
+        turn_id = await database.save_message(uid, "assistant", "первый ответ", scenario, lang, source=database.MessageSource.ASSISTANT_DELIVERED)
     rev = await database.bump_user_revision(uid)
     token = secrets.token_urlsafe(9)
     rows = [{"token": token, "turn_id": turn_id, "chat_id": chat_id,
@@ -2066,7 +2066,7 @@ def test_no_hard_flow_action_dead_ends(env, action):
 def test_publish_continuation_options_not_published_after_revision_moved(env):
     async def go():
         turn_id = await database.save_message(OWNER, "assistant", "низкозатратный ответ",
-                                              "open_chat", "ru")
+                                              "open_chat", "ru", source=database.MessageSource.ASSISTANT_DELIVERED)
         stale_rev = await database.bump_user_revision(OWNER)
         await database.bump_user_revision(OWNER)   # revision moves on before publish
         msg = FakeMessage(FakeUser(OWNER))
@@ -2111,7 +2111,7 @@ def test_wrong_message_id_callback_sends_no_reply(env):
 
 def test_expired_binding_sends_no_reply(env):
     async def go():
-        turn_id = await database.save_message(OWNER, "assistant", "ответ", "open_chat", "ru")
+        turn_id = await database.save_message(OWNER, "assistant", "ответ", "open_chat", "ru", source=database.MessageSource.ASSISTANT_DELIVERED)
         rev = await database.bump_user_revision(OWNER)
         token = secrets.token_urlsafe(9)
         rows = [{"token": token, "turn_id": turn_id, "chat_id": 100,
@@ -2267,8 +2267,8 @@ def test_finalize_callback_reply_real_exception_elaborate_path_full_redaction_pr
 
     async def go():
         turn_id = await database.save_message(
-            OWNER, "assistant", distinctive_source_assistant_text, "reflective", "ru")
-        await database.save_message(OWNER, "user", distinctive_user_text, "reflective", "ru")
+            OWNER, "assistant", distinctive_source_assistant_text, "reflective", "ru", source=database.MessageSource.ASSISTANT_DELIVERED)
+        await database.save_message(OWNER, "user", distinctive_user_text, "reflective", "ru", source=database.MessageSource.USER_AUTHORED)
         rev = await database.bump_user_revision(OWNER)
         token = secrets.token_urlsafe(9)
         rows = [{"token": token, "turn_id": turn_id, "chat_id": 100,
@@ -2606,7 +2606,7 @@ def test_scenario_and_lang_survive_multi_step_hard_chain(env):
 
 def _insert_raw_legacy_binding(uid, token, action, chat_id=100, source_message_id=200):
     async def go():
-        turn_id = await database.save_message(uid, "assistant", "старый ответ", "open_chat", "ru")
+        turn_id = await database.save_message(uid, "assistant", "старый ответ", "open_chat", "ru", source=database.MessageSource.ASSISTANT_DELIVERED)
         rev = await database.bump_user_revision(uid)
         async with database.aiosqlite.connect(database.DB) as db:
             await db.execute(

@@ -12,6 +12,7 @@ import aiosqlite, sqlite3, json, uuid
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 
 # Professional Core V2 -- Entry Triage runtime binding only. The category
 # vocabulary's single source of truth is this enum, never a hand-maintained
@@ -898,6 +899,13 @@ _MIGRATIONS = [
     # cannot be the source (it's blind to the calm majority of messages).
     ("messages", "risk_score", "INTEGER DEFAULT 0"),
     ("messages", "risk_categories", "TEXT DEFAULT ''"),
+    # MESSAGES PROVENANCE V1: nullable on purpose -- existing rows MUST stay
+    # source IS NULL (UNKNOWN_LEGACY_PROVENANCE), never backfilled. The CHECK
+    # constraint mirrors interaction_button_bindings.action's existing
+    # pattern (a closed vocabulary enforced at the DB layer, not just in
+    # Python) -- see MessageSource in save_message's section above.
+    ("messages", "source", "TEXT CHECK(source IS NULL OR source IN "
+                            "('USER_AUTHORED','ASSISTANT_DELIVERED','SYNTHETIC_UI'))"),
     # Protective factors (Columbia) — context attached to a crisis event.
     ("crisis_events", "protective_factors_json", "TEXT DEFAULT '[]'"),
     # Epic 8: per-user UTC offset (hours) for local-time journal reminders.
@@ -1479,18 +1487,62 @@ async def get_stored_user_language(uid: int) -> str | None:
 
 # ── Messages ──────────────────────────────────────────────────────────────────
 
+class MessageSource(str, Enum):
+    """MESSAGES PROVENANCE V1 -- frozen closed vocabulary for
+    `messages.source`. Distinct from `role`: `role` says who a persisted
+    conversational turn is attributed to; `source` says how that row
+    actually originated. role='user' is NOT proof of user-authored text --
+    consume_interaction_binding below persists a normalized Telegram-button
+    label as role='user', and that is exactly the gap this column closes.
+
+    USER_AUTHORED       -- genuine user-authored conversational material:
+                            typed text, or a genuine incoming voice
+                            transcript once it has entered the ordinary
+                            pipeline as the user's own utterance.
+    ASSISTANT_DELIVERED -- text actually delivered/persisted as an
+                            assistant conversational turn, regardless of
+                            whether it was model-generated or deterministic.
+    SYNTHETIC_UI        -- a normalized textual representation created by
+                            the system from a Telegram button/callback
+                            action. Never genuine user-authored speech.
+
+    Legacy rows written before this column existed are `source IS NULL`
+    (UNKNOWN_LEGACY_PROVENANCE) and are NEVER backfilled -- not from role,
+    not from scenario, not from content matching, not from timestamp, not
+    from LLM inference. A NULL row simply predates this contract."""
+    USER_AUTHORED = "USER_AUTHORED"
+    ASSISTANT_DELIVERED = "ASSISTANT_DELIVERED"
+    SYNTHETIC_UI = "SYNTHETIC_UI"
+
+
 async def save_message(uid: int, role: str, content: str,
                         scenario: str = "open_chat", lang: str = "ru",
-                        risk_score: int = 0, risk_categories=None) -> int:
+                        risk_score: int = 0, risk_categories=None,
+                        *, source: MessageSource) -> int:
     """Returns the new row's id (cursor.lastrowid). Every existing call site
     calls this bare (return value ignored), so adding this return is
-    backward-compatible."""
+    backward-compatible.
+
+    `source` is REQUIRED and keyword-only (MESSAGES PROVENANCE V1): every
+    production caller must explicitly state how this row originated -- see
+    MessageSource above. It is never inferred from `role`. A caller that
+    omits it fails at the Python call boundary (TypeError: missing
+    required keyword-only argument) before any DB access happens -- fail
+    closed by construction, not by a runtime check alone. A caller that
+    passes something other than an actual MessageSource member fails
+    closed here with ValueError before the INSERT runs. The database's own
+    CHECK constraint (see the `messages.source` migration below) rejects
+    any stored value outside the frozen vocabulary as defense-in-depth,
+    the same pattern already used for `interaction_button_bindings.action`."""
+    if type(source) is not MessageSource:
+        raise ValueError(
+            f"save_message: source must be exactly a MessageSource, got {type(source)!r}")
     cats = ",".join(risk_categories) if risk_categories else ""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            "INSERT INTO messages (user_id,role,content,scenario,lang,risk_score,risk_categories)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (uid, role, content, scenario, lang, int(risk_score), cats))
+            "INSERT INTO messages (user_id,role,content,scenario,lang,risk_score,"
+            "risk_categories,source) VALUES (?,?,?,?,?,?,?,?)",
+            (uid, role, content, scenario, lang, int(risk_score), cats, source.value))
         await db.commit()
         return cur.lastrowid
 
@@ -3656,8 +3708,9 @@ async def consume_interaction_binding(token: str, user_id: int, chat_id: int,
 
         normalized_text = normalized_action_text(action, turn_lang)
         await db.execute(
-            "INSERT INTO messages (user_id, role, content, scenario, lang) VALUES (?, 'user', ?, ?, ?)",
-            (user_id, normalized_text, turn_scenario, turn_lang))
+            "INSERT INTO messages (user_id, role, content, scenario, lang, source) "
+            "VALUES (?, 'user', ?, ?, ?, ?)",
+            (user_id, normalized_text, turn_scenario, turn_lang, MessageSource.SYNTHETIC_UI.value))
 
         cur = await db.execute(
             "INSERT INTO user_interaction_events "
@@ -3973,8 +4026,10 @@ async def finalize_callback_reply(event_id: int, user_id: int,
                     "finalize_callback_reply: event/source-turn integrity check failed")
 
             cur = await db.execute(
-                "INSERT INTO messages (user_id, role, content, scenario, lang) VALUES (?,?,?,?,?)",
-                (user_id, "assistant", reply_text, scenario, lang))
+                "INSERT INTO messages (user_id, role, content, scenario, lang, source) "
+                "VALUES (?,?,?,?,?,?)",
+                (user_id, "assistant", reply_text, scenario, lang,
+                 MessageSource.ASSISTANT_DELIVERED.value))
             assistant_turn_id = cur.lastrowid
             cur2 = await db.execute(
                 "UPDATE user_interaction_events SET reply_status='delivered', "

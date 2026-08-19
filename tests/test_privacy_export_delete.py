@@ -22,7 +22,7 @@ def tmp_db(tmp_path, monkeypatch):
 
 async def _seed(db, uid=42):
     await db.upsert_user(uid, "alice", "Alice", "ru")
-    await db.save_message(uid, "user", "hello", "open_chat", "ru", 0, "")
+    await db.save_message(uid, "user", "hello", "open_chat", "ru", 0, "", source=db.MessageSource.USER_AUTHORED)
     await db.save_emotion_entry(uid, {"event": "x", "feeling": "sad", "intensity": 5})
     await db.log_crisis_event(uid, "critical", 100, ["suicide"], "excerpt", "ru", True)
     active = await db.get_active_crisis(uid)

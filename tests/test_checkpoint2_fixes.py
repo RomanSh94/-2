@@ -230,7 +230,7 @@ def test_owner_non_red_ordinary_persistence_still_works(pipeline_spies, phase2_t
     # eligibility logic. pipeline_spies replaces bot.save_message, so this must
     # go through database.save_message directly.
     asyncio.run(database.save_message(1, "assistant", "синтетический предыдущий ответ",
-                                      "open_chat", "ru"))
+                                      "open_chat", "ru", source=database.MessageSource.ASSISTANT_DELIVERED))
     user = FakeUser(1)
     msg = FakeMessage(user, "у меня был тяжёлый день на работе")
     # Stub everything downstream of the gate so this stays a narrow ordering test.

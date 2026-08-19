@@ -83,7 +83,7 @@ def _decode_doc_json(doc):
 def test_export_self_service_works_for_fully_unknown_uid(tmp_db):
     async def seed():
         await tmp_db.upsert_user(424242, "u", "U", "ru")
-        await tmp_db.save_message(424242, "user", "hello", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(424242, "user", "hello", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     user = FakeUser(424242)
@@ -126,8 +126,8 @@ def test_export_only_ever_reads_the_callers_own_uid(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "a", "A", "ru")
         await tmp_db.upsert_user(2, "b", "B", "ru")
-        await tmp_db.save_message(1, "user", "from A", "open_chat", "ru", 0, [])
-        await tmp_db.save_message(2, "user", "from B", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "from A", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
+        await tmp_db.save_message(2, "user", "from B", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     msg = FakeMessage(FakeUser(1))
@@ -142,7 +142,7 @@ def test_export_only_ever_reads_the_callers_own_uid(tmp_db):
 def test_delete_preview_shown_before_any_deletion(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "a", "A", "ru")
-        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     msg = FakeMessage(FakeUser(1))
@@ -164,7 +164,7 @@ def test_delete_preview_reflects_real_row_counts_not_static_text(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "a", "A", "ru")
         for i in range(4):
-            await tmp_db.save_message(1, "user", f"msg {i}", "open_chat", "ru", 0, [])
+            await tmp_db.save_message(1, "user", f"msg {i}", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     msg = FakeMessage(FakeUser(1))
@@ -176,7 +176,7 @@ def test_delete_preview_reflects_real_row_counts_not_static_text(tmp_db):
     # Seed a user with a DIFFERENT row count and confirm the preview differs.
     async def seed_other():
         await tmp_db.upsert_user(2, "b", "B", "ru")
-        await tmp_db.save_message(2, "user", "only one", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(2, "user", "only one", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed_other())
     msg2 = FakeMessage(FakeUser(2))
     asyncio.run(bot.cmd_privacy_delete_all(msg2))
@@ -200,8 +200,8 @@ def test_delete_confirm_owner_does_not_touch_tester(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "owner", "O", "ru")
         await tmp_db.upsert_user(10, "tester", "T", "ru")
-        await tmp_db.save_message(1, "user", "owner msg", "open_chat", "ru", 0, [])
-        await tmp_db.save_message(10, "user", "tester msg", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "owner msg", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
+        await tmp_db.save_message(10, "user", "tester msg", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     owner = FakeUser(1)
@@ -219,8 +219,8 @@ def test_delete_confirm_tester_does_not_touch_owner(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "owner", "O", "ru")
         await tmp_db.upsert_user(10, "tester", "T", "ru")
-        await tmp_db.save_message(1, "user", "owner msg", "open_chat", "ru", 0, [])
-        await tmp_db.save_message(10, "user", "tester msg", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "owner msg", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
+        await tmp_db.save_message(10, "user", "tester msg", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     tester = FakeUser(10)
@@ -238,7 +238,7 @@ def test_delete_retains_crisis_events_and_says_so(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "u", "U", "ru")
         await tmp_db.log_crisis_event(1, "critical", 100, ["suicide"], "text", "ru")
-        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     user = FakeUser(1)
@@ -258,7 +258,7 @@ def test_delete_retains_crisis_events_and_says_so(tmp_db):
 def test_delete_confirm_callback_uid_mismatch_rejected(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "victim", "V", "ru")
-        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     attacker = FakeUser(999)   # NOT the uid embedded in the callback_data
@@ -274,7 +274,7 @@ def test_delete_confirm_callback_uid_mismatch_rejected(tmp_db):
 def test_delete_cancel_does_not_delete(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "u", "U", "ru")
-        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     user = FakeUser(1)
@@ -312,7 +312,7 @@ def test_forget_all_self_service_bypasses_product_gate(tmp_db):
     # be blocked by ensure_full_access_or_closed_test for any product command.
     async def seed():
         await tmp_db.upsert_user(424242, "u", "U", "ru")
-        await tmp_db.save_message(424242, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(424242, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     user = FakeUser(424242)
@@ -330,7 +330,7 @@ def test_forget_all_self_service_bypasses_product_gate(tmp_db):
 def test_forget_all_legacy_missing_uid_does_not_delete(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "u", "U", "ru")
-        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     user = FakeUser(1)
@@ -346,7 +346,7 @@ def test_forget_all_legacy_missing_uid_does_not_delete(tmp_db):
 def test_privacy_delete_legacy_missing_uid_does_not_delete(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "u", "U", "ru")
-        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     user = FakeUser(1)
@@ -362,7 +362,7 @@ def test_privacy_delete_legacy_missing_uid_does_not_delete(tmp_db):
 def test_forget_all_malformed_uid_does_not_delete(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "u", "U", "ru")
-        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     user = FakeUser(1)
@@ -378,7 +378,7 @@ def test_forget_all_malformed_uid_does_not_delete(tmp_db):
 def test_forget_all_mismatched_uid_does_not_delete(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "victim", "V", "ru")
-        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     attacker = FakeUser(999)
@@ -394,7 +394,7 @@ def test_forget_all_mismatched_uid_does_not_delete(tmp_db):
 def test_forget_all_matching_uid_deletes(tmp_db):
     async def seed():
         await tmp_db.upsert_user(1, "u", "U", "ru")
-        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(1, "user", "hi", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
     asyncio.run(seed())
 
     user = FakeUser(1)

@@ -163,7 +163,7 @@ def _authorized(uid):
 
 def _make_prior_message(uid):
     """Simulate meaningful prior product use so message_count > 0 (legacy)."""
-    run(database.save_message(uid, "user", "hello from before"))
+    run(database.save_message(uid, "user", "hello from before", source=database.MessageSource.USER_AUTHORED))
 
 
 def _start(uid, text="/start", language_code="ru"):

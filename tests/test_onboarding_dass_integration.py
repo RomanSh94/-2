@@ -76,7 +76,7 @@ def test_privacy_only_owed_blocks_a_generic_product_command_via_real_middleware(
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", True)
     uid = 9101
     _authorized(uid)
-    run(database.save_message(uid, "user", "prior activity"))  # -> legacy, no notice ack
+    run(database.save_message(uid, "user", "prior activity", source=database.MessageSource.USER_AUTHORED))  # -> legacy, no notice ack
     assert run(database.get_active_onboarding_state(uid)) is None  # no row at all
 
     async def stand_in_dass_command(message):
@@ -91,7 +91,7 @@ def test_privacy_only_owed_blocks_a_qm_style_callback_via_real_middleware(tmp_db
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", True)
     uid = 9102
     _authorized(uid)
-    run(database.save_message(uid, "user", "prior activity"))
+    run(database.save_message(uid, "user", "prior activity", source=database.MessageSource.USER_AUTHORED))
 
     async def stand_in_qm_callback(callback):
         pass
@@ -105,7 +105,7 @@ def test_settled_privacy_notice_no_longer_blocks_product_command(tmp_db, monkeyp
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", True)
     uid = 9103
     _authorized(uid)
-    run(database.save_message(uid, "user", "prior activity"))
+    run(database.save_message(uid, "user", "prior activity", source=database.MessageSource.USER_AUTHORED))
     run(database.record_notice_acknowledgement(uid, "privacy_notice", oc.PRIVACY_NOTICE_VERSION))
 
     async def stand_in_dass_command(message):
@@ -159,7 +159,7 @@ def test_onboarding_true_dass_discussion_false_privacy_only_flow_unaffected(tmp_
     monkeypatch.setattr(config, "DASS21_DISCUSSION_ENABLED", False)
     uid = 9107
     _authorized(uid)
-    run(database.save_message(uid, "user", "prior activity"))
+    run(database.save_message(uid, "user", "prior activity", source=database.MessageSource.USER_AUTHORED))
     msg = FakeMessage(FakeUser(uid), "/start")
     run(bot.cmd_start(msg))
     # Privacy-only path is independent of DASS21_DISCUSSION_ENABLED entirely.
@@ -187,7 +187,7 @@ def test_both_flags_true_dass_unblocked_only_after_settling(tmp_db, monkeypatch)
     monkeypatch.setattr(config, "DASS21_DISCUSSION_ENABLED", True)
     uid = 9109
     _authorized(uid)
-    run(database.save_message(uid, "user", "prior activity"))
+    run(database.save_message(uid, "user", "prior activity", source=database.MessageSource.USER_AUTHORED))
 
     async def stand_in_dass_command(message):
         pass
