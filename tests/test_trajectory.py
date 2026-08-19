@@ -108,7 +108,7 @@ def test_get_emotional_trajectory_reads_persisted_risk(tmp_db):
     async def go():
         await tmp_db.upsert_user(1, "u", "U")
         for sc in (0, 10, 40, 60):
-            await tmp_db.save_message(1, "user", "msg", "open_chat", "ru", sc, ["hopelessness"] if sc >= 40 else [])
+            await tmp_db.save_message(1, "user", "msg", "open_chat", "ru", sc, ["hopelessness"] if sc >= 40 else [], source=tmp_db.MessageSource.USER_AUTHORED)
         return await get_emotional_trajectory(1, 24)
     t = asyncio.run(go())
     assert t.messages_analyzed == 4

@@ -315,15 +315,93 @@ def test_producer_planner_fidelity_policy_acceptance_remain_unmodified():
         assert working.replace(b"\r\n", b"\n") == head_blob.replace(b"\r\n", b"\n"), rel
 
 
-def test_bot_py_and_database_py_remain_unmodified():
-    """This correction pass, like the slice before it, is offline-only --
-    no runtime wiring. bot.py and database.py must be git-content-
-    identical to the HEAD blob (CRLF-normalized comparison, see above)."""
-    import subprocess
+_FORBIDDEN_PROFESSIONAL_FREE_TEXT_MODULES = {
+    "professional_turn_conversation_context",
+    "professional_turn_analyzer",
+    "professional_turn_producer",
+    "professional_turn_plan_proposer",
+    "professional_turn_planner",
+    "professional_turn_response_renderer",
+    "professional_turn_response_fidelity_validator",
+    "professional_turn_response_policy_validator",
+    "professional_turn_response_acceptance",
+}
+
+_ALLOWED_LIVE_ENTRY_TRIAGE_MODULES = {
+    "professional_reply_affordances",
+    "professional_turn_ui_context",
+    "professional_turn_ui_immediate_response",
+}
+
+_FORBIDDEN_PROFESSIONAL_FREE_TEXT_SYMBOLS = {
+    "ProfessionalConversationContext",
+    "call_turn_analyzer",
+    "produce_turn_analysis",
+    "call_turn_plan_proposer",
+    "govern_turn_plan",
+    "render_turn_response",
+    "validate_response_fidelity",
+    "validate_response_policy",
+    "accept_professional_response",
+}
+
+
+def test_bot_py_does_not_runtime_wire_professional_free_text_pipeline():
+    """Replaces the stale byte-identity invariant this test used to assert
+    (bot.py/database.py unchanged from HEAD). That was correct only for
+    PR #98's own offline-only scope; it is not a durable repository
+    invariant once a later, separately authorized slice legitimately edits
+    bot.py/database.py (see MESSAGES PROVENANCE V1, which stamps explicit
+    message provenance in both files). The invariant this test enforces is
+    architectural, not permanent: as of this slice, ordinary user free-text
+    has not been wired to reach the offline Professional Analyzer /
+    Producer / Plan-Proposer / Planner / Renderer / Fidelity / Policy /
+    Acceptance chain, while the already-LIVE Professional Entry Triage /
+    trusted UI immediate-response surface remains explicitly allowed --
+    this is NOT a blanket "no professional_turn_* anywhere in bot.py" ban,
+    and it is NOT a claim that this pipeline may never be wired.
+    Professional free-text runtime remains unwired only until a separately
+    authorized runtime-cutover slice; when that slice lands, it is
+    expected to update or replace this test, the same way this test
+    itself replaced the prior byte-identity check. Verified by AST
+    import/call inspection (not a byte-identity or substring check), so it
+    survives any future bot.py/database.py edit that does not actually
+    activate that pipeline."""
     repo_root = pathlib.Path(ctx.__file__).resolve().parent
-    for rel in ("bot.py", "database.py"):
-        working = (repo_root / rel).read_bytes()
-        head_blob = subprocess.run(
-            ["git", "show", f"HEAD:{rel}"], cwd=str(repo_root),
-            capture_output=True, check=True).stdout
-        assert working.replace(b"\r\n", b"\n") == head_blob.replace(b"\r\n", b"\n"), rel
+    text = (repo_root / "bot.py").read_text(encoding="utf-8")
+    tree = ast.parse(text)
+
+    imported_modules = set()
+    imported_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_modules.add(node.module.split(".")[0])
+            imported_names.update(alias.name for alias in node.names)
+
+    forbidden_module_hit = _FORBIDDEN_PROFESSIONAL_FREE_TEXT_MODULES & imported_modules
+    assert not forbidden_module_hit, (
+        f"bot.py imports offline Professional free-text pipeline module(s): {forbidden_module_hit}")
+
+    forbidden_symbol_hit = _FORBIDDEN_PROFESSIONAL_FREE_TEXT_SYMBOLS & imported_names
+    assert not forbidden_symbol_hit, (
+        f"bot.py imports offline Professional free-text pipeline symbol(s): {forbidden_symbol_hit}")
+
+    called_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                called_names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                called_names.add(node.func.attr)
+    forbidden_call_hit = _FORBIDDEN_PROFESSIONAL_FREE_TEXT_SYMBOLS & called_names
+    assert not forbidden_call_hit, (
+        f"bot.py calls offline Professional free-text pipeline function(s): {forbidden_call_hit}")
+
+    # Positive check: the ALLOWED live surface (Entry Triage) must still be
+    # present, proving this test distinguishes "forbidden" from "merely
+    # professional_turn_*-named".
+    missing_allowed = _ALLOWED_LIVE_ENTRY_TRIAGE_MODULES - imported_modules
+    assert not missing_allowed, (
+        f"expected LIVE Entry Triage surface import(s) missing from bot.py: {missing_allowed}")

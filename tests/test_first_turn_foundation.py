@@ -34,7 +34,7 @@ async def _make_bound_button(uid, action="elaborate", chat_id=100, source_messag
     """Creates a real assistant `messages` row (unless turn_id is supplied)
     and binds exactly one button to it. Returns (token, turn_id)."""
     if turn_id is None:
-        turn_id = await database.save_message(uid, "assistant", "первый ответ", scenario, lang)
+        turn_id = await database.save_message(uid, "assistant", "первый ответ", scenario, lang, source=database.MessageSource.ASSISTANT_DELIVERED)
     rev = await database.bump_user_revision(uid)
     token = _new_token()
     rows = [{"token": token, "turn_id": turn_id, "chat_id": chat_id,
@@ -49,8 +49,8 @@ async def _make_bound_button(uid, action="elaborate", chat_id=100, source_messag
 
 def test_save_message_returns_row_id(db):
     async def go():
-        mid1 = await database.save_message(UID, "user", "hello")
-        mid2 = await database.save_message(UID, "assistant", "hi there")
+        mid1 = await database.save_message(UID, "user", "hello", source=database.MessageSource.USER_AUTHORED)
+        mid2 = await database.save_message(UID, "assistant", "hi there", source=database.MessageSource.ASSISTANT_DELIVERED)
         return mid1, mid2
     mid1, mid2 = asyncio.run(go())
     assert isinstance(mid1, int) and isinstance(mid2, int)
@@ -58,7 +58,7 @@ def test_save_message_returns_row_id(db):
 
 
 def test_save_message_bare_call_still_works(db):
-    asyncio.run(database.save_message(UID, "user", "hi"))  # must not raise
+    asyncio.run(database.save_message(UID, "user", "hi", source=database.MessageSource.USER_AUTHORED))  # must not raise
 
 
 # ── revision ──────────────────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ def test_claim_version_isolation(db):
 
 def test_v1_legacy_exemption_for_user_with_prior_history(db):
     async def go():
-        await database.save_message(UID, "assistant", "an old reply from before this feature")
+        await database.save_message(UID, "assistant", "an old reply from before this feature", source=database.MessageSource.ASSISTANT_DELIVERED)
         won = await database.claim_first_turn(UID, "v1", _new_token(), "reflective")
         async with aiosqlite.connect(database.DB) as conn:
             cur = await conn.execute(
@@ -119,7 +119,7 @@ def test_v1_legacy_exemption_for_user_with_prior_history(db):
 
 def test_later_version_eligible_despite_old_messages(db):
     async def go():
-        await database.save_message(UID, "assistant", "an old reply from before this feature")
+        await database.save_message(UID, "assistant", "an old reply from before this feature", source=database.MessageSource.ASSISTANT_DELIVERED)
         return await database.claim_first_turn(UID, "v2", _new_token(), "reflective")
     assert asyncio.run(go()) is True
 
@@ -343,7 +343,7 @@ def test_schema_check_rejects_unknown_action_insert(db):
     """Defense-in-depth: even a raw INSERT bypassing the Python-level check
     is rejected by the table's own CHECK constraint."""
     async def go():
-        turn_id = await database.save_message(UID, "assistant", "reply", "reflective", "ru")
+        turn_id = await database.save_message(UID, "assistant", "reply", "reflective", "ru", source=database.MessageSource.ASSISTANT_DELIVERED)
         async with aiosqlite.connect(database.DB) as conn:
             with pytest.raises(Exception):
                 await conn.execute(
@@ -381,7 +381,7 @@ def test_wrong_message_rejected(db):
 
 def test_expired_binding_rejected(db):
     async def go():
-        turn_id = await database.save_message(UID, "assistant", "reply", "reflective", "ru")
+        turn_id = await database.save_message(UID, "assistant", "reply", "reflective", "ru", source=database.MessageSource.ASSISTANT_DELIVERED)
         rev = await database.bump_user_revision(UID)
         token = _new_token()
         rows = [{"token": token, "turn_id": turn_id, "chat_id": 100, "source_message_id": 200,
@@ -423,7 +423,7 @@ def test_wrong_user_assistant_turn_rejected(db):
     other_uid = UID + 1
     async def go():
         turn_id = await database.save_message(other_uid, "assistant", "reply for someone else",
-                                              "reflective", "ru")
+                                              "reflective", "ru", source=database.MessageSource.ASSISTANT_DELIVERED)
         rev = await database.bump_user_revision(UID)
         token = _new_token()
         rows = [{"token": token, "turn_id": turn_id, "chat_id": 100, "source_message_id": 200,
@@ -435,7 +435,7 @@ def test_wrong_user_assistant_turn_rejected(db):
 
 def test_user_role_turn_rejected_not_assistant(db):
     async def go():
-        turn_id = await database.save_message(UID, "user", "the user's own message", "reflective", "ru")
+        turn_id = await database.save_message(UID, "user", "the user's own message", "reflective", "ru", source=database.MessageSource.USER_AUTHORED)
         rev = await database.bump_user_revision(UID)
         token = _new_token()
         rows = [{"token": token, "turn_id": turn_id, "chat_id": 100, "source_message_id": 200,
@@ -593,7 +593,7 @@ def test_finalize_rejects_wrong_user_source_turn(db):
     OTHER = UID + 1
 
     async def go():
-        turn_id = await database.save_message(OTHER, "assistant", "чужой ответ", "reflective", "ru")
+        turn_id = await database.save_message(OTHER, "assistant", "чужой ответ", "reflective", "ru", source=database.MessageSource.ASSISTANT_DELIVERED)
         event_id = await _make_pending_event(UID, turn_id)
         return await database.finalize_callback_reply(event_id, UID, "текст")
     fin = asyncio.run(go())

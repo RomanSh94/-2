@@ -78,7 +78,7 @@ def test_loneliness_high_after_loneliness_messages(tmp_db):
     async def go():
         await tmp_db.upsert_user(1, "u", "U")
         for _ in range(3):
-            await tmp_db.save_message(1, "user", "мне одиноко", "open_chat", "ru", 25, ["loneliness"])
+            await tmp_db.save_message(1, "user", "мне одиноко", "open_chat", "ru", 25, ["loneliness"], source=tmp_db.MessageSource.USER_AUTHORED)
         return await pp.compute_profile(1)
     prof = asyncio.run(go())
     assert prof.loneliness[0] > 0.5
@@ -93,7 +93,7 @@ def test_no_llm_called_during_compute(tmp_db, monkeypatch):
     monkeypatch.setattr(openai, "AsyncOpenAI", Boom)
     async def go():
         await tmp_db.upsert_user(2, "u", "U")
-        await tmp_db.save_message(2, "user", "привет", "open_chat", "ru", 0, [])
+        await tmp_db.save_message(2, "user", "привет", "open_chat", "ru", 0, [], source=tmp_db.MessageSource.USER_AUTHORED)
         return await pp.compute_profile(2)
     asyncio.run(go())
     assert called["n"] == 0
@@ -102,7 +102,7 @@ def test_no_llm_called_during_compute(tmp_db, monkeypatch):
 def test_profile_save_get_delete_roundtrip(tmp_db):
     async def go():
         await tmp_db.upsert_user(3, "u", "U")
-        await tmp_db.save_message(3, "user", "мне одиноко", "open_chat", "ru", 25, ["loneliness"])
+        await tmp_db.save_message(3, "user", "мне одиноко", "open_chat", "ru", 25, ["loneliness"], source=tmp_db.MessageSource.USER_AUTHORED)
         prof = await pp.compute_profile(3)
         await tmp_db.save_profile(3, prof.to_db_fields())
         got = await tmp_db.get_profile(3)
