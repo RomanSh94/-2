@@ -34,6 +34,11 @@ from professional_turn_planner import (
     UntrustedTurnPlanProposal,
     govern_turn_plan,
 )
+from professional_turn_conversation_context import (
+    ConversationTurn,
+    ConversationTurnRole,
+    ProfessionalConversationContext,
+)
 from therapeutic_domain import (
     ClarificationTarget,
     Intent,
@@ -767,7 +772,8 @@ def test_production_module_imports_only_allowed_modules():
     tree = ast.parse(source)
     allowed_roots = {
         "__future__", "asyncio", "json", "dataclasses", "enum", "openai",
-        "professional_turn_analysis", "professional_turn_planner", "therapeutic_domain"}
+        "professional_turn_analysis", "professional_turn_planner", "therapeutic_domain",
+        "professional_turn_conversation_context"}
     found_roots = set()
     imported_names = set()
     for node in ast.walk(tree):
@@ -800,3 +806,142 @@ def test_production_module_contains_no_latent_source_symbols():
     source = pathlib.Path(professional_turn_plan_proposer.__file__).read_text(encoding="utf-8")
     offenders = [s for s in _FORBIDDEN_LATENT_SOURCE_SUBSTRINGS if s in source]
     assert not offenders, offenders
+
+
+# ── OPTIONAL MULTI-TURN CONVERSATION CONTEXT (V1 addition) ──────────────────
+
+def _context(*turns):
+    return ProfessionalConversationContext(turns=tuple(turns))
+
+
+def _u(row_id, content):
+    return ConversationTurn(message_row_id=row_id, role=ConversationTurnRole.USER, content=content)
+
+
+def _a(row_id, content):
+    return ConversationTurn(
+        message_row_id=row_id, role=ConversationTurnRole.ASSISTANT, content=content)
+
+
+def test_no_context_call_keeps_the_user_payload_in_its_pre_slice_shape():
+    """Proves USER-PAYLOAD shape compatibility only -- the serialized
+    payload has exactly its original keys, unchanged. This is NOT a claim
+    that the complete request (including the fixed system instruction,
+    which this slice intentionally extended and which is sent on every
+    call) is byte-identical to pre-slice behavior."""
+    client = _client_returning(_VALID_JSON)
+    result = _call(client, model="gpt-4o-mini", analysis_result=_turn_analysis_result())
+    assert result.status is TurnPlanProposerCallStatus.PROPOSAL
+    call = client.chat.completions.calls[0]
+    user_message = [m for m in call["messages"] if m["role"] == "user"][0]
+    payload = json.loads(user_message["content"])
+    assert "conversation_context" not in payload
+
+
+def test_explicit_none_context_is_identical_to_omitting_it():
+    """Both sides of this comparison use the CURRENT (post-slice)
+    implementation -- this proves omitting conversation_context and
+    passing conversation_context=None explicitly produce the same request
+    under today's code, not that either matches pre-slice behavior."""
+    analysis_result = _turn_analysis_result()
+    client_a = _client_returning(_VALID_JSON)
+    client_b = _client_returning(_VALID_JSON)
+    _call(client_a, model="gpt-4o-mini", analysis_result=analysis_result)
+    _call(client_b, model="gpt-4o-mini", analysis_result=analysis_result, conversation_context=None)
+    assert (client_a.chat.completions.calls[0]["messages"]
+            == client_b.chat.completions.calls[0]["messages"])
+
+
+def test_rejects_conversation_context_of_wrong_type():
+    client = _client_returning(_VALID_JSON)
+    with pytest.raises(ValueError):
+        _call(client, model="gpt-4o-mini", analysis_result=_turn_analysis_result(),
+              conversation_context={"not": "valid"})
+
+
+def test_context_is_serialized_as_a_structurally_separate_json_field():
+    context = _context(_u(1, "У меня тревога."), _a(2, "Что именно тревожит?"))
+    analysis_result = _turn_analysis_result(source_text="Работа.")
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", analysis_result=analysis_result,
+          conversation_context=context)
+    call = client.chat.completions.calls[0]
+    payload = json.loads([m for m in call["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["source_text"] == "Работа."
+    assert payload["conversation_context"] == [
+        {"role": "USER", "content": "У меня тревога."},
+        {"role": "ASSISTANT", "content": "Что именно тревожит?"},
+    ]
+
+
+def test_source_text_and_context_stay_structurally_separate_keys():
+    context = _context(_u(1, "PRIOR_MARKER_TEXT"))
+    analysis_result = _turn_analysis_result(source_text="CURRENT_MARKER_TEXT")
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", analysis_result=analysis_result,
+          conversation_context=context)
+    call = client.chat.completions.calls[0]
+    payload = json.loads([m for m in call["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["source_text"] == "CURRENT_MARKER_TEXT"
+    assert "PRIOR_MARKER_TEXT" not in payload["source_text"]
+    assert payload["conversation_context"][0]["content"] == "PRIOR_MARKER_TEXT"
+
+
+def test_upstream_failed_skip_never_touches_client_even_with_context():
+    context = _context(_u(1, "hi"))
+    client = _client_returning(_VALID_JSON)
+    result = _call(
+        client, model="gpt-4o-mini",
+        analysis_result=TurnAnalysisResult(analysis=None),
+        conversation_context=context)
+    assert result.status is TurnPlanProposerCallStatus.SKIPPED_UPSTREAM_FAILED
+    assert client.chat.completions.calls == []
+
+
+def test_system_instruction_documents_context_as_advisory_and_provenance_rule():
+    from professional_turn_plan_proposer import _SYSTEM_INSTRUCTION
+    assert "conversation_context" in _SYSTEM_INSTRUCTION
+    assert "NEVER evidence that" in _SYSTEM_INSTRUCTION
+
+
+def test_system_instruction_documents_current_newer_user_correction_precedence():
+    from professional_turn_plan_proposer import _SYSTEM_INSTRUCTION
+    assert "CURRENT/NEWER USER CORRECTIONS TAKE PRECEDENCE" in _SYSTEM_INSTRUCTION
+    assert "explicitly corrected, retracted, rejected, narrowed, or" in _SYSTEM_INSTRUCTION
+    assert "never resistance" in _SYSTEM_INSTRUCTION
+    assert "choose {\"proposal\": null}" in _SYSTEM_INSTRUCTION
+
+
+def test_context_cannot_add_an_objective_outside_planner_v1_through_the_real_governor():
+    """conversation_context is advisory to the Proposer only -- the real,
+    unmodified Planner Governor still only ever accepts a proposal for one
+    of its own five supported objectives. A proposal naming an
+    out-of-scope objective (as if a context-influenced proposer had tried
+    to solicit one) is still governed exactly as before: abstention, never
+    a plan."""
+    proposal = UntrustedTurnPlanProposal(
+        objective="OFFER_ACTION", move="ACTION_PROPOSAL", clarification_target=None)
+    result = govern_turn_plan(_turn_analysis_result(), proposal)
+    assert result.plan is None
+    assert result.abstention_reason is ProfessionalPlanAbstentionReason.OBJECTIVE_UNSUPPORTED_IN_V1
+
+
+def test_govern_turn_plan_signature_is_structurally_unchanged():
+    """Proves the real Planner Governor cannot even syntactically receive a
+    conversation_context argument -- it still takes exactly the same two
+    positional parameters as before this slice."""
+    import inspect
+    sig = inspect.signature(govern_turn_plan)
+    assert list(sig.parameters) == ["analysis_result", "proposal"]
+
+
+def test_question_allowed_still_derives_only_from_analysis_result():
+    """question_allowed remains exclusively governor-derived from the
+    authoritative TurnAnalysisResult -- proposing WITH a conversation_
+    context present cannot change it, because the Proposer's own
+    TurnPlanProposerCallResult never carries a question_allowed field at
+    all (it is not part of UntrustedTurnPlanProposal's transport shape)."""
+    assert not hasattr(UntrustedTurnPlanProposal, "question_allowed")
+    proposal = UntrustedTurnPlanProposal(
+        objective="CLARIFY", move="FOCUSED_QUESTION", clarification_target="EVENT")
+    assert not hasattr(proposal, "question_allowed")
