@@ -29,7 +29,7 @@ import config
 import database
 import professional_free_text_runtime as pftr
 from professional_turn_analysis import TurnAnalysisStatus
-from professional_turn_analyzer import TurnAnalyzerFailureCategory
+from professional_turn_analyzer import TurnAnalyzerFailureCategory, TurnAnalyzerStructuralFailureReason
 from professional_turn_plan_proposer import TurnPlanProposerCallResult, TurnPlanProposerCallStatus
 from professional_turn_planner import UntrustedTurnPlanProposal, ProfessionalPlanAbstentionReason
 from professional_turn_response_renderer import TurnResponseRenderResult, TurnResponseRenderStatus
@@ -177,17 +177,17 @@ def _stub_runtime_result(monkeypatch, result):
 SUCCESS_RESULT = pftr.ProfessionalFreeTextRuntimeResult(
     status=pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS,
     reply_text="Похоже, тебе сейчас непросто. Что для тебя сейчас самое сложное в этом?",
-    failure_stage=None, failure_reason=None)
+    failure_stage=None, failure_reason=None, failure_detail=None)
 
 REJECTED_RESULT = pftr.ProfessionalFreeTextRuntimeResult(
     status=pftr.ProfessionalFreeTextRuntimeStatus.REJECTED, reply_text=None,
     failure_stage=pftr.ProfessionalFreeTextFailureStage.ACCEPTANCE,
-    failure_reason=AcceptanceSafetyRejectionReason.SAFETY_REJECTED)
+    failure_reason=AcceptanceSafetyRejectionReason.SAFETY_REJECTED, failure_detail=None)
 
 FAILED_RESULT = pftr.ProfessionalFreeTextRuntimeResult(
     status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
     failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
-    failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE)
+    failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE, failure_detail=None)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -198,22 +198,22 @@ def test_result_success_requires_nonempty_text_and_no_failure_stage():
     with pytest.raises(ValueError):
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS, reply_text=None,
-            failure_stage=None, failure_reason=None)
+            failure_stage=None, failure_reason=None, failure_detail=None)
     with pytest.raises(ValueError):
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS, reply_text="  ",
-            failure_stage=None, failure_reason=None)
+            failure_stage=None, failure_reason=None, failure_detail=None)
     with pytest.raises(ValueError):
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS, reply_text="ok",
-            failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER, failure_reason=None)
+            failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER, failure_reason=None, failure_detail=None)
 
 
 def test_result_success_must_not_carry_a_failure_reason():
     with pytest.raises(ValueError):
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS, reply_text="ok",
-            failure_stage=None, failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE)
+            failure_stage=None, failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE, failure_detail=None)
 
 
 def test_result_non_success_must_not_carry_reply_text():
@@ -221,21 +221,21 @@ def test_result_non_success_must_not_carry_reply_text():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text="leaked candidate",
             failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
-            failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE)
+            failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE, failure_detail=None)
 
 
 def test_result_non_success_requires_a_failure_stage():
     with pytest.raises(ValueError):
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.REJECTED, reply_text=None,
-            failure_stage=None, failure_reason=AcceptanceSafetyRejectionReason.SAFETY_REJECTED)
+            failure_stage=None, failure_reason=AcceptanceSafetyRejectionReason.SAFETY_REJECTED, failure_detail=None)
 
 
 def test_result_non_success_requires_a_failure_reason():
     with pytest.raises(ValueError):
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
-            failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER, failure_reason=None)
+            failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER, failure_reason=None, failure_detail=None)
 
 
 def test_result_failure_reason_must_be_a_bounded_enum_member_not_a_raw_string():
@@ -243,7 +243,73 @@ def test_result_failure_reason_must_be_a_bounded_enum_member_not_a_raw_string():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
             failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
-            failure_reason="PROVIDER_FAILURE")
+            failure_reason="PROVIDER_FAILURE", failure_detail=None)
+
+
+# ── failure_detail contract lock: optional, and scoped to the exact
+# (stage, reason) pair -- currently only ANALYZER+STRUCTURALLY_INVALID_
+# RESPONSE may carry one. ══════════════════════════════════════════════════
+
+def test_result_success_must_not_carry_a_failure_detail():
+    with pytest.raises(ValueError):
+        pftr.ProfessionalFreeTextRuntimeResult(
+            status=pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS, reply_text="ok",
+            failure_stage=None, failure_reason=None,
+            failure_detail=TurnAnalyzerStructuralFailureReason.MALFORMED_JSON)
+
+
+def test_analyzer_provider_failure_must_not_carry_a_failure_detail():
+    with pytest.raises(ValueError):
+        pftr.ProfessionalFreeTextRuntimeResult(
+            status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
+            failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
+            failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE,
+            failure_detail=TurnAnalyzerStructuralFailureReason.MALFORMED_JSON)
+
+
+def test_analyzer_no_usable_content_must_not_carry_a_failure_detail():
+    with pytest.raises(ValueError):
+        pftr.ProfessionalFreeTextRuntimeResult(
+            status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
+            failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
+            failure_reason=TurnAnalyzerFailureCategory.NO_USABLE_CONTENT,
+            failure_detail=TurnAnalyzerStructuralFailureReason.MALFORMED_JSON)
+
+
+def test_non_analyzer_stage_must_not_carry_a_failure_detail():
+    with pytest.raises(ValueError):
+        pftr.ProfessionalFreeTextRuntimeResult(
+            status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
+            failure_stage=pftr.ProfessionalFreeTextFailureStage.PRODUCER,
+            failure_reason=pftr.ProfessionalFreeTextProducerFailureReason.PRODUCER_FAILED,
+            failure_detail=TurnAnalyzerStructuralFailureReason.MALFORMED_JSON)
+
+
+def test_analyzer_structurally_invalid_requires_a_failure_detail():
+    with pytest.raises(ValueError):
+        pftr.ProfessionalFreeTextRuntimeResult(
+            status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
+            failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
+            failure_reason=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
+            failure_detail=None)
+
+
+def test_analyzer_structurally_invalid_accepts_exact_detail():
+    result = pftr.ProfessionalFreeTextRuntimeResult(
+        status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
+        failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
+        failure_reason=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
+        failure_detail=TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS)
+    assert result.failure_detail is TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS
+
+
+def test_failure_detail_must_be_exact_enum_member_not_a_raw_string():
+    with pytest.raises(ValueError):
+        pftr.ProfessionalFreeTextRuntimeResult(
+            status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
+            failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
+            failure_reason=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
+            failure_detail="MALFORMED_JSON")
 
 
 # ── stage/reason contract lock: reason must belong to exactly the stage it
@@ -280,7 +346,7 @@ def test_valid_result_for_every_real_failure_stage():
     ]
     for status, stage, reason in valid:
         result = pftr.ProfessionalFreeTextRuntimeResult(
-            status=status, reply_text=None, failure_stage=stage, failure_reason=reason)
+            status=status, reply_text=None, failure_stage=stage, failure_reason=reason, failure_detail=None)
         assert result.failure_stage is stage
         assert result.failure_reason is reason
 
@@ -290,7 +356,7 @@ def test_analyzer_stage_rejects_reason_from_another_stage():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
             failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
-            failure_reason=AcceptanceSafetyRejectionReason.SAFETY_REJECTED)
+            failure_reason=AcceptanceSafetyRejectionReason.SAFETY_REJECTED, failure_detail=None)
 
 
 def test_producer_stage_rejects_analyzer_reason():
@@ -298,7 +364,7 @@ def test_producer_stage_rejects_analyzer_reason():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
             failure_stage=pftr.ProfessionalFreeTextFailureStage.PRODUCER,
-            failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE)
+            failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE, failure_detail=None)
 
 
 def test_plan_proposer_stage_rejects_proposal_as_a_failure_reason():
@@ -308,7 +374,7 @@ def test_plan_proposer_stage_rejects_proposal_as_a_failure_reason():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
             failure_stage=pftr.ProfessionalFreeTextFailureStage.PLAN_PROPOSER,
-            failure_reason=TurnPlanProposerCallStatus.PROPOSAL)
+            failure_reason=TurnPlanProposerCallStatus.PROPOSAL, failure_detail=None)
 
 
 def test_renderer_stage_rejects_candidate_as_a_failure_reason():
@@ -318,7 +384,7 @@ def test_renderer_stage_rejects_candidate_as_a_failure_reason():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
             failure_stage=pftr.ProfessionalFreeTextFailureStage.RENDERER,
-            failure_reason=TurnResponseRenderStatus.CANDIDATE)
+            failure_reason=TurnResponseRenderStatus.CANDIDATE, failure_detail=None)
 
 
 def test_planner_stage_rejects_reason_from_another_stage():
@@ -326,7 +392,7 @@ def test_planner_stage_rejects_reason_from_another_stage():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
             failure_stage=pftr.ProfessionalFreeTextFailureStage.PLANNER,
-            failure_reason=TurnResponseRenderStatus.NO_USABLE_CONTENT)
+            failure_reason=TurnResponseRenderStatus.NO_USABLE_CONTENT, failure_detail=None)
 
 
 def test_acceptance_stage_rejects_reason_from_another_stage():
@@ -334,7 +400,7 @@ def test_acceptance_stage_rejects_reason_from_another_stage():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.REJECTED, reply_text=None,
             failure_stage=pftr.ProfessionalFreeTextFailureStage.ACCEPTANCE,
-            failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE)
+            failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE, failure_detail=None)
 
 
 def test_rejected_status_requires_acceptance_stage():
@@ -342,7 +408,7 @@ def test_rejected_status_requires_acceptance_stage():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.REJECTED, reply_text=None,
             failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
-            failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE)
+            failure_reason=TurnAnalyzerFailureCategory.PROVIDER_FAILURE, failure_detail=None)
 
 
 def test_failed_status_must_not_carry_acceptance_stage():
@@ -353,7 +419,7 @@ def test_failed_status_must_not_carry_acceptance_stage():
         pftr.ProfessionalFreeTextRuntimeResult(
             status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
             failure_stage=pftr.ProfessionalFreeTextFailureStage.ACCEPTANCE,
-            failure_reason=AcceptanceSafetyRejectionReason.SAFETY_REJECTED)
+            failure_reason=AcceptanceSafetyRejectionReason.SAFETY_REJECTED, failure_detail=None)
 
 
 def test_run_rejects_non_positive_row_id():
@@ -380,16 +446,29 @@ def _empty_context():
 
 
 def _monkeypatch_chain(monkeypatch, *, analyzer_failed=False,
-                       analyzer_failure_category=None, producer_failed=False,
+                       analyzer_failure_category=None, analyzer_structural_failure_reason=None,
+                       producer_failed=False,
                        proposer_status=None, plan_none=False, render_status=None,
                        accept_status=None):
     effective_analyzer_category = analyzer_failure_category or TurnAnalyzerFailureCategory.PROVIDER_FAILURE
+    # structural_failure_reason mirrors TurnAnalyzerCallResult's own contract:
+    # set iff the category is STRUCTURALLY_INVALID_RESPONSE, defaulting to a
+    # concrete member so a test that only cares about the category doesn't
+    # have to also specify a detail.
+    if effective_analyzer_category is TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE:
+        effective_structural_failure_reason = (
+            analyzer_structural_failure_reason or TurnAnalyzerStructuralFailureReason.MALFORMED_JSON)
+    else:
+        effective_structural_failure_reason = None
 
     async def fake_analyzer(**kw):
         if analyzer_failed:
             return types.SimpleNamespace(
-                output=None, failure_category=effective_analyzer_category, model=kw["model"])
-        return types.SimpleNamespace(output=object(), failure_category=None, model=kw["model"])
+                output=None, failure_category=effective_analyzer_category, model=kw["model"],
+                structural_failure_reason=effective_structural_failure_reason)
+        return types.SimpleNamespace(
+            output=object(), failure_category=None, model=kw["model"],
+            structural_failure_reason=None)
     monkeypatch.setattr(pftr, "call_turn_analyzer", fake_analyzer)
 
     def fake_produce(**kw):
@@ -483,6 +562,62 @@ def test_chain_analyzer_failure_propagates_exact_bounded_category(monkeypatch, c
         conversation_context=_empty_context(), risk_result={}, lang="ru"))
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
     assert result.failure_reason is category
+
+
+def test_chain_analyzer_structurally_invalid_propagates_exact_detail(monkeypatch):
+    """The one case that carries a failure_detail: ANALYZER +
+    STRUCTURALLY_INVALID_RESPONSE must forward the orchestrator-level
+    analyzer_result.structural_failure_reason exactly, proving real
+    end-to-end propagation through run_professional_free_text_turn, not
+    just the dataclass-level contract already covered separately."""
+    _monkeypatch_chain(
+        monkeypatch, analyzer_failed=True,
+        analyzer_failure_category=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
+        analyzer_structural_failure_reason=TurnAnalyzerStructuralFailureReason.WRONG_REQUIRED_KEY_SET)
+    result = run(pftr.run_professional_free_text_turn(
+        client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
+        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+    assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
+    assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
+    assert result.failure_reason is TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE
+    assert result.failure_detail is TurnAnalyzerStructuralFailureReason.WRONG_REQUIRED_KEY_SET
+
+
+def test_chain_analyzer_provider_failure_has_no_detail(monkeypatch):
+    _monkeypatch_chain(
+        monkeypatch, analyzer_failed=True,
+        analyzer_failure_category=TurnAnalyzerFailureCategory.PROVIDER_FAILURE)
+    result = run(pftr.run_professional_free_text_turn(
+        client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
+        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+    assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
+    assert result.failure_detail is None
+
+
+def test_chain_non_analyzer_failures_never_carry_a_detail(monkeypatch):
+    cases = [
+        dict(producer_failed=True),
+        dict(proposer_status=TurnPlanProposerCallStatus.PROVIDER_FAILURE),
+        dict(plan_none=True),
+        dict(render_status=TurnResponseRenderStatus.NO_USABLE_CONTENT),
+        dict(accept_status=ProfessionalResponseAcceptanceStatus.REJECT),
+    ]
+    for kwargs in cases:
+        _monkeypatch_chain(monkeypatch, **kwargs)
+        result = run(pftr.run_professional_free_text_turn(
+            client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
+            conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        assert result.status is not pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
+        assert result.failure_detail is None
+
+
+def test_chain_success_has_no_detail(monkeypatch):
+    _monkeypatch_chain(monkeypatch)
+    result = run(pftr.run_professional_free_text_turn(
+        client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
+        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+    assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
+    assert result.failure_detail is None
 
 
 def test_chain_producer_failure_yields_failed_producer_stage_distinct_from_analyzer(monkeypatch):
@@ -861,9 +996,39 @@ def test_professional_failed_dispatch_log_includes_bounded_stage_and_reason(tmp_
     line = failed_lines[0]
     assert f"pro_stage={FAILED_RESULT.failure_stage.value}" in line
     assert f"reason={FAILED_RESULT.failure_reason.value}" in line
+    # FAILED_RESULT is ANALYZER+PROVIDER_FAILURE, which never carries a
+    # failure_detail -- the log line must not invent one.
+    assert "detail=" not in line
     for c in calls:
         assert user_text not in c
         assert bot._professional_technical_fallback_text("ru") not in c
+
+
+def test_professional_failed_dispatch_log_includes_bounded_detail_when_present(tmp_db, monkeypatch):
+    run(_seed_user(OWNER))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    structural_result = pftr.ProfessionalFreeTextRuntimeResult(
+        status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
+        failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
+        failure_reason=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
+        failure_detail=TurnAnalyzerStructuralFailureReason.WRONG_REQUIRED_KEY_SET)
+    _stub_runtime_result(monkeypatch, structural_result)
+    calls = _capture_dispatch_log(monkeypatch)
+
+    user_text = "Очень личная и деликатная тема, сложно объяснить в двух словах."
+    msg = FakeMessage(FakeUser(OWNER), user_text)
+    run(bot.pipeline(msg, msg.text))
+
+    failed_lines = [c for c in calls if "stage=professional_failed" in c and "pro_stage=" in c]
+    assert failed_lines, calls
+    line = failed_lines[0]
+    assert "pro_stage=ANALYZER" in line
+    assert "reason=STRUCTURALLY_INVALID_RESPONSE" in line
+    assert "detail=WRONG_REQUIRED_KEY_SET" in line
+    for c in calls:
+        assert user_text not in c
 
 
 def test_professional_rejected_dispatch_log_includes_bounded_stage_and_reason(tmp_db, monkeypatch):
@@ -1197,7 +1362,7 @@ assert len(LONG_REPLY_TEXT) > 220
 
 LONG_SUCCESS_RESULT = pftr.ProfessionalFreeTextRuntimeResult(
     status=pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS,
-    reply_text=LONG_REPLY_TEXT, failure_stage=None, failure_reason=None)
+    reply_text=LONG_REPLY_TEXT, failure_stage=None, failure_reason=None, failure_detail=None)
 
 
 async def _read_persisted_assistant_content(uid):

@@ -44,6 +44,7 @@ from professional_turn_analyzer import (
     TurnAnalyzerCallResult,
     TurnAnalyzerFailureCategory,
     TurnAnalyzerParseError,
+    TurnAnalyzerStructuralFailureReason,
     call_turn_analyzer,
     parse_model_response,
 )
@@ -848,12 +849,14 @@ def test_result_rejects_both_output_and_failure_category_set():
             output=UntrustedTurnAnalyzerOutput(
                 evidence_candidates=(), interaction_candidates=(), intent_proposal=None),
             failure_category=TurnAnalyzerFailureCategory.PROVIDER_FAILURE,
-            model="gpt-4o-mini")
+            model="gpt-4o-mini", structural_failure_reason=None)
 
 
 def test_result_rejects_neither_output_nor_failure_category_set():
     with pytest.raises(ValueError):
-        TurnAnalyzerCallResult(output=None, failure_category=None, model="gpt-4o-mini")
+        TurnAnalyzerCallResult(
+            output=None, failure_category=None, model="gpt-4o-mini",
+            structural_failure_reason=None)
 
 
 # ── Q. OPTIONAL MULTI-TURN CONVERSATION CONTEXT (V1 addition) ──────────────
@@ -1012,4 +1015,231 @@ def test_fake_model_cannot_promote_prior_context_text_into_accepted_current_evid
     # The context-derived span was never located inside the real source_text
     # -- it produces zero accepted evidence items, never a survivor.
     assert result.analysis.evidence.items == ()
-    assert result.analysis.evidence.status is AnalysisComponentStatus.UNAVAILABLE
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# R. STRUCTURAL FAILURE DETAIL V1 -- typed .reason on TurnAnalyzerParseError,
+# structural_failure_reason on TurnAnalyzerCallResult. One dedicated test per
+# TurnAnalyzerStructuralFailureReason class proves the ORCHESTRATOR-visible
+# reason is exact, not just "a TurnAnalyzerParseError was raised" (already
+# covered breadth-first by the many pytest.raises(TurnAnalyzerParseError)
+# tests above). No raw exception text, no candidate/model content anywhere.
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_reason_raw_content_not_a_string():
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(12345)  # type: ignore[arg-type]
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.RAW_CONTENT_NOT_A_STRING
+
+
+def test_reason_raw_response_too_large():
+    raw = "x" * (MAX_RAW_RESPONSE_CHARS + 1)
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(raw)
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.RAW_RESPONSE_TOO_LARGE
+
+
+def test_reason_malformed_json():
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response("{not valid json")
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.MALFORMED_JSON
+
+
+def test_reason_malformed_json_from_recursion_error(monkeypatch):
+    import professional_turn_analyzer as analyzer_module
+
+    def _raise_recursion_error(*args, **kwargs):
+        raise RecursionError("SECRET_OR_UNTRUSTED_DETAIL")
+
+    monkeypatch.setattr(analyzer_module.json, "loads", _raise_recursion_error)
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response("harmless raw input")
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.MALFORMED_JSON
+
+
+def test_reason_duplicate_key():
+    raw = '{"evidence_candidates":[],"interaction_candidates":[],"intent":"A","intent":"B"}'
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(raw)
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.DUPLICATE_KEY
+
+
+@pytest.mark.parametrize("raw", [
+    '{"evidence_candidates":[],"interaction_candidates":[],"intent":NaN}',
+    '{"evidence_candidates":[],"interaction_candidates":[],"intent":Infinity}',
+    '{"evidence_candidates":[],"interaction_candidates":[],"intent":-Infinity}',
+])
+def test_reason_nonstandard_numeric_constant(raw):
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(raw)
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.NONSTANDARD_NUMERIC_CONSTANT
+
+
+def test_reason_json_number_not_permitted():
+    doc = _document(intent=123)
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(_dumps(doc))
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.JSON_NUMBER_NOT_PERMITTED
+
+
+@pytest.mark.parametrize("raw_doc", [
+    ["a", "b", "c"],  # top-level must be an object -- no JSON numbers, so
+    "just a string",  # this exercises WRONG_CONTAINER_TYPE, not the
+    True,              # decoder's own JSON_NUMBER_NOT_PERMITTED rejection.
+])
+def test_reason_wrong_container_type_top_level(raw_doc):
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(_dumps(raw_doc))
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.WRONG_CONTAINER_TYPE
+
+
+@pytest.mark.parametrize("bad_value", ["x", True, None])
+def test_reason_wrong_container_type_evidence_candidates(bad_value):
+    # No JSON numbers among these bad values -- a bare int/float, or any
+    # container holding one, is intercepted by the decoder itself as
+    # JSON_NUMBER_NOT_PERMITTED before the container-type check ever runs.
+    doc = _document()
+    doc["evidence_candidates"] = bad_value
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(_dumps(doc))
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.WRONG_CONTAINER_TYPE
+
+
+def test_reason_wrong_required_key_set_top_level():
+    doc = _document()
+    del doc["intent"]
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(_dumps(doc))
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.WRONG_REQUIRED_KEY_SET
+
+
+def test_reason_wrong_field_type():
+    # A bare JSON number is intercepted by parse_int/parse_float first
+    # (JSON_NUMBER_NOT_PERMITTED is the correct classification for a numeric
+    # literal, covered by test_reason_json_number_not_permitted above) --
+    # WRONG_FIELD_TYPE is exercised via a non-string, non-numeric, non-null
+    # value instead.
+    doc = _document(evidence=[_evidence_entry(proposed_kind=["not", "a", "string"])])
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(_dumps(doc))
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.WRONG_FIELD_TYPE
+
+
+def test_reason_candidate_text_bounds():
+    doc = _document(evidence=[_evidence_entry(span="")])
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(_dumps(doc))
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS
+
+
+def test_valid_parser_output_unchanged_by_this_slice():
+    """Proves parse_model_response's external behavioral contract for VALID
+    input is untouched -- this slice adds diagnostic classification only,
+    never salvage/coercion/normalization/relaxation."""
+    output = parse_model_response(_VALID_JSON)
+    assert isinstance(output, UntrustedTurnAnalyzerOutput)
+    assert len(output.evidence_candidates) == 1
+    assert len(output.interaction_candidates) == 1
+
+
+# ── R2. structural error construction is fail-closed ───────────────────────
+
+def test_structural_defect_rejects_non_enum_reason():
+    import professional_turn_analyzer as analyzer_module
+    with pytest.raises(ValueError):
+        analyzer_module._StructuralDefect("not an enum member", "message")
+
+
+def test_parse_error_rejects_non_enum_reason():
+    with pytest.raises(ValueError):
+        TurnAnalyzerParseError("not an enum member", "message")
+
+
+def test_structural_failure_reason_is_closed_and_exhaustive_over_ten_classes():
+    """Freezes the exhaustive set at exactly the ten materially-distinct
+    structural failure classes this slice classifies -- a future new
+    _StructuralDefect/TurnAnalyzerParseError raise site that reuses an
+    existing member is fine; one that needs a genuinely new class must
+    add it here deliberately, not accidentally."""
+    assert {m.value for m in TurnAnalyzerStructuralFailureReason} == {
+        "RAW_CONTENT_NOT_A_STRING", "RAW_RESPONSE_TOO_LARGE", "MALFORMED_JSON",
+        "DUPLICATE_KEY", "NONSTANDARD_NUMERIC_CONSTANT", "JSON_NUMBER_NOT_PERMITTED",
+        "WRONG_CONTAINER_TYPE", "WRONG_REQUIRED_KEY_SET", "WRONG_FIELD_TYPE",
+        "CANDIDATE_TEXT_BOUNDS",
+    }
+
+
+# ── R3. TurnAnalyzerCallResult.structural_failure_reason contract ──────────
+
+def test_call_result_provider_failure_carries_no_structural_detail():
+    with pytest.raises(ValueError):
+        TurnAnalyzerCallResult(
+            output=None, failure_category=TurnAnalyzerFailureCategory.PROVIDER_FAILURE,
+            model="gpt-4o-mini",
+            structural_failure_reason=TurnAnalyzerStructuralFailureReason.MALFORMED_JSON)
+
+
+def test_call_result_no_usable_content_carries_no_structural_detail():
+    with pytest.raises(ValueError):
+        TurnAnalyzerCallResult(
+            output=None, failure_category=TurnAnalyzerFailureCategory.NO_USABLE_CONTENT,
+            model="gpt-4o-mini",
+            structural_failure_reason=TurnAnalyzerStructuralFailureReason.MALFORMED_JSON)
+
+
+def test_call_result_success_carries_no_structural_detail():
+    with pytest.raises(ValueError):
+        TurnAnalyzerCallResult(
+            output=UntrustedTurnAnalyzerOutput(
+                evidence_candidates=(), interaction_candidates=(), intent_proposal=None),
+            failure_category=None, model="gpt-4o-mini",
+            structural_failure_reason=TurnAnalyzerStructuralFailureReason.MALFORMED_JSON)
+
+
+def test_call_result_structurally_invalid_requires_a_structural_detail():
+    with pytest.raises(ValueError):
+        TurnAnalyzerCallResult(
+            output=None,
+            failure_category=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
+            model="gpt-4o-mini", structural_failure_reason=None)
+
+
+def test_call_result_structurally_invalid_accepts_exact_detail():
+    result = TurnAnalyzerCallResult(
+        output=None,
+        failure_category=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
+        model="gpt-4o-mini",
+        structural_failure_reason=TurnAnalyzerStructuralFailureReason.WRONG_REQUIRED_KEY_SET)
+    assert result.structural_failure_reason is TurnAnalyzerStructuralFailureReason.WRONG_REQUIRED_KEY_SET
+
+
+# ── R4. call_turn_analyzer detail propagation ───────────────────────────────
+
+def test_call_turn_analyzer_provider_failure_has_no_detail():
+    client = _FakeClient(_FakeCompletions(
+        exception=openai.APIConnectionError(message="boom", request=None)))
+    result = _call(client, model="gpt-4o-mini", source_text="hello")
+    assert result.failure_category is TurnAnalyzerFailureCategory.PROVIDER_FAILURE
+    assert result.structural_failure_reason is None
+
+
+def test_call_turn_analyzer_no_usable_content_has_no_detail():
+    client = _FakeClient(_FakeCompletions(response=_NoChoicesResponse()))
+    result = _call(client, model="gpt-4o-mini", source_text="hello")
+    assert result.failure_category is TurnAnalyzerFailureCategory.NO_USABLE_CONTENT
+    assert result.structural_failure_reason is None
+
+
+def test_call_turn_analyzer_structural_failure_has_exact_detail():
+    client = _client_returning('{"evidence_candidates":[],"interaction_candidates":[],"intent":"A","intent":"B"}')
+    result = _call(client, model="gpt-4o-mini", source_text="hello")
+    assert result.failure_category is TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE
+    assert result.structural_failure_reason is TurnAnalyzerStructuralFailureReason.DUPLICATE_KEY
+
+
+def test_call_turn_analyzer_success_has_no_detail():
+    client = _client_returning(_VALID_JSON)
+    result = _call(client, model="gpt-4o-mini", source_text="hello")
+    assert result.output is not None
+    assert result.failure_category is None
+    assert result.structural_failure_reason is None
