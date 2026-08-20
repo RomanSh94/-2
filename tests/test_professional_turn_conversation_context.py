@@ -318,7 +318,6 @@ def test_producer_planner_fidelity_policy_acceptance_remain_unmodified():
 
 
 _FORBIDDEN_PROFESSIONAL_FREE_TEXT_MODULES = {
-    "professional_turn_conversation_context",
     "professional_turn_analyzer",
     "professional_turn_producer",
     "professional_turn_plan_proposer",
@@ -335,6 +334,17 @@ _ALLOWED_LIVE_ENTRY_TRIAGE_MODULES = {
     "professional_turn_ui_immediate_response",
 }
 
+# PROFESSIONAL FREE-TEXT RUNTIME V1: bot.py legitimately imports the
+# dedicated orchestrator, plus the offline, no-model-call, no-DB
+# professional_turn_conversation_context contract module (PR #98) directly,
+# to shape trusted history before calling the orchestrator -- this is a
+# transport/contract module, not part of the raw model-calling chain, the
+# same category as the Entry Triage transport modules above.
+_ALLOWED_LIVE_FREE_TEXT_RUNTIME_MODULES = {
+    "professional_free_text_runtime",
+    "professional_turn_conversation_context",
+}
+
 _FORBIDDEN_PROFESSIONAL_FREE_TEXT_SYMBOLS = {
     "ProfessionalConversationContext",
     "call_turn_analyzer",
@@ -348,27 +358,25 @@ _FORBIDDEN_PROFESSIONAL_FREE_TEXT_SYMBOLS = {
 }
 
 
-def test_bot_py_does_not_runtime_wire_professional_free_text_pipeline():
-    """Replaces the stale byte-identity invariant this test used to assert
-    (bot.py/database.py unchanged from HEAD). That was correct only for
-    PR #98's own offline-only scope; it is not a durable repository
-    invariant once a later, separately authorized slice legitimately edits
-    bot.py/database.py (see MESSAGES PROVENANCE V1, which stamps explicit
-    message provenance in both files). The invariant this test enforces is
-    architectural, not permanent: as of this slice, ordinary user free-text
-    has not been wired to reach the offline Professional Analyzer /
-    Producer / Plan-Proposer / Planner / Renderer / Fidelity / Policy /
-    Acceptance chain, while the already-LIVE Professional Entry Triage /
-    trusted UI immediate-response surface remains explicitly allowed --
-    this is NOT a blanket "no professional_turn_* anywhere in bot.py" ban,
-    and it is NOT a claim that this pipeline may never be wired.
-    Professional free-text runtime remains unwired only until a separately
-    authorized runtime-cutover slice; when that slice lands, it is
-    expected to update or replace this test, the same way this test
-    itself replaced the prior byte-identity check. Verified by AST
-    import/call inspection (not a byte-identity or substring check), so it
-    survives any future bot.py/database.py edit that does not actually
-    activate that pipeline."""
+def test_bot_py_imports_only_the_dedicated_professional_free_text_orchestrator():
+    """PROFESSIONAL FREE-TEXT RUNTIME V1 is the separately authorized
+    runtime-cutover slice this test's own predecessor (test_bot_py_does_
+    not_runtime_wire_professional_free_text_pipeline) explicitly anticipated
+    and said would need to update or replace it -- this is that update, not
+    a weakening. The durable invariant is now: when Professional free-text
+    runtime claims an eligible turn, it owns the turn before First-Turn/
+    Controller/legacy psychological routing and cannot silently fall back
+    to them (see the real behavioral proof of that claim in
+    tests/test_professional_free_text_runtime.py -- an AST check alone
+    cannot prove control-flow ordering as convincingly as a real runtime
+    test that mocks each lower-precedence owner to raise if called). What
+    THIS test still proves structurally: bot.py never inlines the raw
+    Professional Core Analyzer/Producer/Plan-Proposer/Planner/Renderer/
+    Fidelity/Policy/Acceptance symbols directly -- it imports ONLY the
+    dedicated orchestrator (professional_free_text_runtime.py), which is
+    the sole place those symbols are wired in this codebase's runtime path.
+    The already-LIVE Professional Entry Triage / trusted UI immediate-
+    response surface remains explicitly allowed, same as before."""
     repo_root = pathlib.Path(ctx.__file__).resolve().parent
     text = (repo_root / "bot.py").read_text(encoding="utf-8")
     tree = ast.parse(text)
@@ -384,11 +392,14 @@ def test_bot_py_does_not_runtime_wire_professional_free_text_pipeline():
 
     forbidden_module_hit = _FORBIDDEN_PROFESSIONAL_FREE_TEXT_MODULES & imported_modules
     assert not forbidden_module_hit, (
-        f"bot.py imports offline Professional free-text pipeline module(s): {forbidden_module_hit}")
+        f"bot.py imports offline Professional free-text pipeline module(s) "
+        f"directly (must go through professional_free_text_runtime instead): "
+        f"{forbidden_module_hit}")
 
     forbidden_symbol_hit = _FORBIDDEN_PROFESSIONAL_FREE_TEXT_SYMBOLS & imported_names
     assert not forbidden_symbol_hit, (
-        f"bot.py imports offline Professional free-text pipeline symbol(s): {forbidden_symbol_hit}")
+        f"bot.py imports offline Professional free-text pipeline symbol(s) "
+        f"directly: {forbidden_symbol_hit}")
 
     called_names = set()
     for node in ast.walk(tree):
@@ -399,31 +410,32 @@ def test_bot_py_does_not_runtime_wire_professional_free_text_pipeline():
                 called_names.add(node.func.attr)
     forbidden_call_hit = _FORBIDDEN_PROFESSIONAL_FREE_TEXT_SYMBOLS & called_names
     assert not forbidden_call_hit, (
-        f"bot.py calls offline Professional free-text pipeline function(s): {forbidden_call_hit}")
+        f"bot.py calls offline Professional free-text pipeline function(s) "
+        f"directly: {forbidden_call_hit}")
 
-    # Positive check: the ALLOWED live surface (Entry Triage) must still be
-    # present, proving this test distinguishes "forbidden" from "merely
-    # professional_turn_*-named".
-    missing_allowed = _ALLOWED_LIVE_ENTRY_TRIAGE_MODULES - imported_modules
+    # Positive checks: the ALLOWED live surfaces (Entry Triage, and the
+    # dedicated Free-Text Runtime orchestrator + its transport contract
+    # module) must actually be present -- proving this test distinguishes
+    # "forbidden" from "merely professional_turn_*-named", and that this is
+    # a deliberate, scoped wiring rather than a coincidental absence.
+    missing_allowed = (_ALLOWED_LIVE_ENTRY_TRIAGE_MODULES
+                       | _ALLOWED_LIVE_FREE_TEXT_RUNTIME_MODULES) - imported_modules
     assert not missing_allowed, (
-        f"expected LIVE Entry Triage surface import(s) missing from bot.py: {missing_allowed}")
+        f"expected LIVE Professional surface import(s) missing from bot.py: {missing_allowed}")
 
 
-def test_bot_py_remains_unmodified_by_this_slice():
-    """PROFESSIONAL RUNTIME HISTORY BUILDER V1 is history-construction
-    only -- this is a slice-specific scope assertion (bot.py must be
-    git-content-identical to the HEAD blob this branch started from), NOT
-    a permanent product prohibition. It is expected to be replaced or
-    removed by whatever future, separately authorized runtime-cutover
-    slice actually needs to edit bot.py -- the same way the byte-identity
-    test above this file used to assert was itself replaced."""
-    import subprocess
-    repo_root = pathlib.Path(ctx.__file__).resolve().parent
-    working = (repo_root / "bot.py").read_bytes()
-    head_blob = subprocess.run(
-        ["git", "show", "HEAD:bot.py"], cwd=str(repo_root),
-        capture_output=True, check=True).stdout
-    assert working.replace(b"\r\n", b"\n") == head_blob.replace(b"\r\n", b"\n")
+# The PROFESSIONAL RUNTIME HISTORY BUILDER V1 slice-scope test that used to
+# live here (test_bot_py_remains_unmodified_by_this_slice, asserting bot.py
+# stayed git-content-identical to that slice's own HEAD blob) has been
+# removed, not weakened: its own docstring explicitly anticipated and
+# authorized exactly this -- "expected to be replaced or removed by whatever
+# future, separately authorized runtime-cutover slice actually needs to edit
+# bot.py". PROFESSIONAL FREE-TEXT RUNTIME V1 is that slice; bot.py is now
+# legitimately and permanently a file every future Professional-runtime
+# slice may need to touch, so a per-slice "bot.py unmodified" assertion no
+# longer has a stable premise to assert. The durable invariant that
+# replaces it lives in test_bot_py_imports_only_the_dedicated_professional_
+# free_text_orchestrator above.
 
 
 # ── build_conversation_context_from_history_rows (PROFESSIONAL RUNTIME ─────

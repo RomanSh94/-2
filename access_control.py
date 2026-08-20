@@ -135,6 +135,23 @@ async def depression_disclosure_allowed_for(uid: int) -> bool:
     return await core_rollout_allowed(uid)
 
 
+async def professional_free_text_allowed_for(uid: int) -> bool:
+    """PROFESSIONAL FREE-TEXT RUNTIME V1 -- the ONE centralized effective-
+    eligibility helper for Professional Core taking ownership of an ordinary
+    free-text/voice turn. Same pattern as depression_disclosure_allowed_for
+    above: PROFESSIONAL_FREE_TEXT_RUNTIME_ENABLED is a feature-specific kill
+    switch, not an independent rollout system -- the effective contract is
+    ALWAYS gate_flag AND core_rollout_allowed(uid), reusing the existing
+    off/owner/invited/all contract rather than inventing a second invited-
+    user registry or hardcoding any uid. pipeline() must call this fresh at
+    the claim point (not cache it), so a rollout change takes effect on the
+    very next turn, same as every other Core entry point."""
+    import config
+    if not config.PROFESSIONAL_FREE_TEXT_RUNTIME_ENABLED:
+        return False
+    return await core_rollout_allowed(uid)
+
+
 def resolved_reviewers_for(tester_uid: int) -> list[int]:
     """Reviewers explicitly mapped to this tester.
 
