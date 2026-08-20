@@ -1825,10 +1825,14 @@ async def _run_professional_free_text_and_deliver(
         _dispatch_log(f"cid={cid} stage=professional_success")
         reply_text = result.reply_text
     elif result.status is ProfessionalFreeTextRuntimeStatus.REJECTED:
-        _dispatch_log(f"cid={cid} stage=professional_rejected reason={result.failure_stage.value}")
+        _dispatch_log(
+            f"cid={cid} stage=professional_rejected "
+            f"pro_stage={result.failure_stage.value} reason={result.failure_reason.value}")
         reply_text = _professional_technical_fallback_text(lang)
     else:
-        _dispatch_log(f"cid={cid} stage=professional_failed reason={result.failure_stage.value}")
+        _dispatch_log(
+            f"cid={cid} stage=professional_failed "
+            f"pro_stage={result.failure_stage.value} reason={result.failure_reason.value}")
         reply_text = _professional_technical_fallback_text(lang)
 
     # Final stale check, as late as possible -- right before the point of no

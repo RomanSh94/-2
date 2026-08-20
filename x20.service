@@ -19,6 +19,13 @@ Type=simple
 User=root
 WorkingDirectory=/root/-2
 EnvironmentFile=/root/-2/.env
+# stdout is a pipe under systemd, so CPython fully block-buffers it by
+# default -- privacy-safe dispatch diagnostics (_dispatch_log in bot.py)
+# can then sit unflushed in-process for an unbounded time before appearing
+# in `journalctl -u x20`, even though the process is healthy and handling
+# real traffic. This does not change bot behavior, only when its existing
+# print() output reaches the journal.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/root/-2/venv/bin/python bot.py
 # always, не on-failure: aiogram при SIGTERM выходит с кодом 0,
 # и on-failure такой выход не перезапустил бы.
