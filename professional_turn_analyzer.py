@@ -139,16 +139,51 @@ DEFAULT_MAX_OUTPUT_TOKENS = 4096
 ANALYZER_TEMPERATURE = 0.0
 
 
+class TurnAnalyzerStructuralFailureReason(str, Enum):
+    """Closed, exhaustive classification of every distinct way
+    parse_model_response's deterministic parser branches can reject a
+    response -- one member per materially different structural class, not
+    one per raise site (several raise sites share a class where they
+    represent the same underlying defect, e.g. every "wrong exact key set"
+    check across top-level/evidence-wrapper/interaction-wrapper/proposal
+    objects). This is the runtime observability contract: bounded, closed,
+    privacy-safe -- never a free-form string, never str(exc), never any
+    model-supplied key name or value."""
+    RAW_CONTENT_NOT_A_STRING = "RAW_CONTENT_NOT_A_STRING"
+    RAW_RESPONSE_TOO_LARGE = "RAW_RESPONSE_TOO_LARGE"
+    MALFORMED_JSON = "MALFORMED_JSON"
+    DUPLICATE_KEY = "DUPLICATE_KEY"
+    NONSTANDARD_NUMERIC_CONSTANT = "NONSTANDARD_NUMERIC_CONSTANT"
+    JSON_NUMBER_NOT_PERMITTED = "JSON_NUMBER_NOT_PERMITTED"
+    WRONG_CONTAINER_TYPE = "WRONG_CONTAINER_TYPE"
+    WRONG_REQUIRED_KEY_SET = "WRONG_REQUIRED_KEY_SET"
+    WRONG_FIELD_TYPE = "WRONG_FIELD_TYPE"
+    CANDIDATE_TEXT_BOUNDS = "CANDIDATE_TEXT_BOUNDS"
+
+
 class TurnAnalyzerParseError(Exception):
-    """Raised only for whole-response structural failure. Its message is
+    """Raised only for whole-response structural failure. Carries a
+    structured `reason` (exactly one TurnAnalyzerStructuralFailureReason
+    member) as the runtime observability contract -- callers must consume
+    `.reason`, never str(self)/args[0]. The Exception's own message is
     always one of a small, fixed set of safe reason strings authored by
-    this module -- never source_text, raw model content, a candidate value,
-    an unknown model-supplied key name, or str() of any caught exception.
-    Always raised from a point with no exception currently being handled
-    (see _reject_document below), so both __cause__ and __context__ are
-    None -- `raise X from None` executed *inside* an except block is not
-    sufficient for that on its own, since __context__ is still implicitly
-    populated at raise time regardless of __cause__/display suppression."""
+    this module -- never source_text, raw model content, a candidate
+    value, an unknown model-supplied key name, or str() of any caught
+    exception -- and remains solely for tests/debugging, not the runtime
+    contract. Always raised from a point with no exception currently being
+    handled (see parse_model_response below), so both __cause__ and
+    __context__ are None -- `raise X from None` executed *inside* an
+    except block is not sufficient for that on its own, since __context__
+    is still implicitly populated at raise time regardless of
+    __cause__/display suppression."""
+
+    def __init__(self, reason: TurnAnalyzerStructuralFailureReason, message: str):
+        if type(reason) is not TurnAnalyzerStructuralFailureReason:
+            raise ValueError(
+                "TurnAnalyzerParseError: reason must be exactly a "
+                f"TurnAnalyzerStructuralFailureReason, got {type(reason)!r}")
+        super().__init__(message)
+        self.reason = reason
 
 
 class _StructuralDefect(Exception):
@@ -156,7 +191,18 @@ class _StructuralDefect(Exception):
     nested parsing helpers below. Never exposed outside this module --
     parse_model_response is the sole place that catches it and translates
     it into the public TurnAnalyzerParseError, from a point outside any
-    active exception handler."""
+    active exception handler. Carries the same typed `reason` as
+    TurnAnalyzerParseError, assigned at the exact point the defect
+    originates -- reason propagation never depends on mapping a fragile
+    exception-message string after the fact."""
+
+    def __init__(self, reason: TurnAnalyzerStructuralFailureReason, message: str):
+        if type(reason) is not TurnAnalyzerStructuralFailureReason:
+            raise ValueError(
+                "_StructuralDefect: reason must be exactly a "
+                f"TurnAnalyzerStructuralFailureReason, got {type(reason)!r}")
+        super().__init__(message)
+        self.reason = reason
 
 
 class TurnAnalyzerFailureCategory(str, Enum):
@@ -172,16 +218,36 @@ class TurnAnalyzerCallResult:
     not just by convention. Carries no request id, no dropped-candidate
     counters, no raw response, and no provider error message: nothing here
     is ever built from source_text, raw model content, or str() of a
-    caught provider exception."""
+    caught provider exception.
+
+    structural_failure_reason is set if and only if failure_category is
+    STRUCTURALLY_INVALID_RESPONSE -- PROVIDER_FAILURE and NO_USABLE_CONTENT
+    never reached the deterministic parser at all, so they can never carry
+    a parser-originated detail; SUCCESS (output set) never carries one
+    either."""
     output: UntrustedTurnAnalyzerOutput | None
     failure_category: TurnAnalyzerFailureCategory | None
     model: str
+    structural_failure_reason: TurnAnalyzerStructuralFailureReason | None
 
     def __post_init__(self):
         if (self.output is None) == (self.failure_category is None):
             raise ValueError(
                 "TurnAnalyzerCallResult: exactly one of output/failure_category "
                 "must be set")
+        if self.failure_category is TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE:
+            if type(self.structural_failure_reason) is not TurnAnalyzerStructuralFailureReason:
+                raise ValueError(
+                    "TurnAnalyzerCallResult: failure_category="
+                    "STRUCTURALLY_INVALID_RESPONSE requires a "
+                    "structural_failure_reason that is exactly a "
+                    f"TurnAnalyzerStructuralFailureReason, got {self.structural_failure_reason!r}")
+        elif self.structural_failure_reason is not None:
+            raise ValueError(
+                "TurnAnalyzerCallResult: structural_failure_reason must be None "
+                "unless failure_category is STRUCTURALLY_INVALID_RESPONSE, got "
+                f"failure_category={self.failure_category!r} "
+                f"structural_failure_reason={self.structural_failure_reason!r}")
 
 
 # -- Exact transport key sets ----------------------------------------------
@@ -197,19 +263,25 @@ def _require_exact_keys(obj, expected_keys):
     """Fixed, generic failure message only -- never echoes an actual
     (possibly attacker-supplied) key name found in obj."""
     if type(obj) is not dict:
-        raise _StructuralDefect("expected a JSON object")
+        raise _StructuralDefect(
+            TurnAnalyzerStructuralFailureReason.WRONG_CONTAINER_TYPE, "expected a JSON object")
     if set(obj.keys()) != expected_keys:
-        raise _StructuralDefect("object does not have the exact required key set")
+        raise _StructuralDefect(
+            TurnAnalyzerStructuralFailureReason.WRONG_REQUIRED_KEY_SET,
+            "object does not have the exact required key set")
     return obj
 
 
 def _require_string_or_none(value, *, allow_none: bool):
     if value is None:
         if not allow_none:
-            raise _StructuralDefect("expected a JSON string")
+            raise _StructuralDefect(
+                TurnAnalyzerStructuralFailureReason.WRONG_FIELD_TYPE, "expected a JSON string")
         return None
     if type(value) is not str:
-        raise _StructuralDefect("expected a JSON string or null")
+        raise _StructuralDefect(
+            TurnAnalyzerStructuralFailureReason.WRONG_FIELD_TYPE,
+            "expected a JSON string or null")
     return value
 
 
@@ -217,7 +289,9 @@ def _parse_candidate_fields(candidate_obj):
     _require_exact_keys(candidate_obj, _CANDIDATE_KEYS)
     span = candidate_obj["exact_source_span"]
     if type(span) is not str:
-        raise _StructuralDefect("exact_source_span must be a JSON string")
+        raise _StructuralDefect(
+            TurnAnalyzerStructuralFailureReason.WRONG_FIELD_TYPE,
+            "exact_source_span must be a JSON string")
     before = _require_string_or_none(candidate_obj["context_before"], allow_none=True)
     after = _require_string_or_none(candidate_obj["context_after"], allow_none=True)
     return span, before, after
@@ -230,6 +304,7 @@ def _build_evidence_span_candidate(candidate_obj):
             exact_source_span=span, context_before=before, context_after=after)
     except ValueError:
         raise _StructuralDefect(
+            TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS,
             "evidence candidate text violates length/emptiness bounds") from None
 
 
@@ -240,12 +315,15 @@ def _build_interaction_span_candidate(candidate_obj):
             exact_source_span=span, context_before=before, context_after=after)
     except ValueError:
         raise _StructuralDefect(
+            TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS,
             "interaction candidate text violates length/emptiness bounds") from None
 
 
 def _parse_evidence_candidates(raw_list):
     if type(raw_list) is not list:
-        raise _StructuralDefect("evidence_candidates must be a JSON array")
+        raise _StructuralDefect(
+            TurnAnalyzerStructuralFailureReason.WRONG_CONTAINER_TYPE,
+            "evidence_candidates must be a JSON array")
     proposals = []
     for item in raw_list:
         _require_exact_keys(item, _EVIDENCE_WRAPPER_KEYS)
@@ -269,7 +347,9 @@ def _parse_interaction_proposal(proposal_obj):
 
 def _parse_interaction_candidates(raw_list):
     if type(raw_list) is not list:
-        raise _StructuralDefect("interaction_candidates must be a JSON array")
+        raise _StructuralDefect(
+            TurnAnalyzerStructuralFailureReason.WRONG_CONTAINER_TYPE,
+            "interaction_candidates must be a JSON array")
     proposals = []
     for item in raw_list:
         _require_exact_keys(item, _INTERACTION_WRAPPER_KEYS)
@@ -302,14 +382,17 @@ def _reject_duplicate_keys(pairs):
     result = {}
     for key, value in pairs:
         if key in seen:
-            raise _StructuralDefect("duplicate JSON object key")
+            raise _StructuralDefect(
+                TurnAnalyzerStructuralFailureReason.DUPLICATE_KEY, "duplicate JSON object key")
         seen.add(key)
         result[key] = value
     return result
 
 
 def _reject_nonstandard_constant(_constant_string):
-    raise _StructuralDefect("non-standard numeric constant in JSON")
+    raise _StructuralDefect(
+        TurnAnalyzerStructuralFailureReason.NONSTANDARD_NUMERIC_CONSTANT,
+        "non-standard numeric constant in JSON")
 
 
 def _reject_json_number(_number_string):
@@ -319,7 +402,9 @@ def _reject_json_number(_number_string):
     int()/float() conversion ever runs on the (possibly adversarially huge)
     matched digit string. The supplied text is never inspected, never
     converted, and never echoed."""
-    raise _StructuralDefect("JSON numeric values are not permitted")
+    raise _StructuralDefect(
+        TurnAnalyzerStructuralFailureReason.JSON_NUMBER_NOT_PERMITTED,
+        "JSON numeric values are not permitted")
 
 
 def parse_model_response(raw_content: str) -> UntrustedTurnAnalyzerOutput:
@@ -329,13 +414,20 @@ def parse_model_response(raw_content: str) -> UntrustedTurnAnalyzerOutput:
     as_enum call anywhere in this module); an unknown-but-correctly-typed
     proposed_kind/signal/applicability/state/intent string passes through
     unchanged into the returned UntrustedTurnAnalyzerOutput for the
-    Producer to judge."""
+    Producer to judge. Every raised TurnAnalyzerParseError carries a typed
+    `.reason` assigned at the exact point the defect originates (either
+    directly here, or propagated from a caught _StructuralDefect's own
+    `.reason`) -- never derived from str(exc) after the fact."""
     if type(raw_content) is not str:
-        raise TurnAnalyzerParseError("raw_content must be a str")
+        raise TurnAnalyzerParseError(
+            TurnAnalyzerStructuralFailureReason.RAW_CONTENT_NOT_A_STRING,
+            "raw_content must be a str")
     if len(raw_content) > MAX_RAW_RESPONSE_CHARS:
-        raise TurnAnalyzerParseError("raw response exceeds the maximum allowed length")
+        raise TurnAnalyzerParseError(
+            TurnAnalyzerStructuralFailureReason.RAW_RESPONSE_TOO_LARGE,
+            "raw response exceeds the maximum allowed length")
 
-    decode_failure_reason = None
+    decode_failure = None
     try:
         document = json.loads(
             raw_content,
@@ -343,24 +435,25 @@ def parse_model_response(raw_content: str) -> UntrustedTurnAnalyzerOutput:
             parse_constant=_reject_nonstandard_constant,
             parse_int=_reject_json_number,
             parse_float=_reject_json_number)
-    except (json.JSONDecodeError, RecursionError, _StructuralDefect) as exc:
-        decode_failure_reason = (
-            str(exc) if isinstance(exc, _StructuralDefect)
-            else "malformed or unparseable JSON")
-    if decode_failure_reason is not None:
-        # Raised strictly outside the except block above: by this point
+    except _StructuralDefect as exc:
+        decode_failure = (exc.reason, str(exc))
+    except (json.JSONDecodeError, RecursionError):
+        decode_failure = (
+            TurnAnalyzerStructuralFailureReason.MALFORMED_JSON, "malformed or unparseable JSON")
+    if decode_failure is not None:
+        # Raised strictly outside the except blocks above: by this point
         # sys.exc_info() has already been restored to empty, so this
         # TurnAnalyzerParseError's __context__ is None without needing
         # `from None` -- there is no active exception left to chain.
-        raise TurnAnalyzerParseError(decode_failure_reason)
+        raise TurnAnalyzerParseError(*decode_failure)
 
-    structural_failure_reason = None
+    structural_failure = None
     try:
         output = _parse_top_level(document)
     except _StructuralDefect as exc:
-        structural_failure_reason = str(exc)
-    if structural_failure_reason is not None:
-        raise TurnAnalyzerParseError(structural_failure_reason)
+        structural_failure = (exc.reason, str(exc))
+    if structural_failure is not None:
+        raise TurnAnalyzerParseError(*structural_failure)
 
     return output
 
@@ -634,20 +727,21 @@ async def call_turn_analyzer(
     except (openai.OpenAIError, asyncio.TimeoutError):
         return TurnAnalyzerCallResult(
             output=None, failure_category=TurnAnalyzerFailureCategory.PROVIDER_FAILURE,
-            model=model)
+            model=model, structural_failure_reason=None)
 
     content = _extract_usable_content(response)
     if content is None:
         return TurnAnalyzerCallResult(
             output=None, failure_category=TurnAnalyzerFailureCategory.NO_USABLE_CONTENT,
-            model=model)
+            model=model, structural_failure_reason=None)
 
     try:
         output = parse_model_response(content)
-    except TurnAnalyzerParseError:
+    except TurnAnalyzerParseError as exc:
         return TurnAnalyzerCallResult(
             output=None,
             failure_category=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
-            model=model)
+            model=model, structural_failure_reason=exc.reason)
 
-    return TurnAnalyzerCallResult(output=output, failure_category=None, model=model)
+    return TurnAnalyzerCallResult(
+        output=output, failure_category=None, model=model, structural_failure_reason=None)

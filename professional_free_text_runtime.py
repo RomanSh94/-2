@@ -59,6 +59,15 @@ analyzer call succeeded but produce_turn_analysis's own deterministic
 assembly still failed -- see ProfessionalFreeTextFailureStage's own
 docstring for why collapsing these would be observability-inaccurate.
 
+failure_detail is a second, OPTIONAL, more granular diagnostic field for
+the rare case where a stage's own failure_reason itself has a richer,
+already-bounded sub-classification worth exposing -- currently exactly one
+case: ANALYZER's STRUCTURALLY_INVALID_RESPONSE carries the exact
+TurnAnalyzerStructuralFailureReason (which deterministic parser branch
+rejected the response). Every other (stage, reason) pair has
+failure_detail=None, enforced structurally by
+_validate_failure_detail_for_stage_and_reason.
+
 Only imports: __future__, dataclasses, enum, and the already-merged
 Professional Core V2 modules (professional_turn_analyzer,
 professional_turn_producer, professional_turn_analysis,
@@ -73,7 +82,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from professional_turn_analyzer import call_turn_analyzer, TurnAnalyzerFailureCategory
+from professional_turn_analyzer import (
+    call_turn_analyzer,
+    TurnAnalyzerFailureCategory,
+    TurnAnalyzerStructuralFailureReason,
+)
 from professional_turn_analysis import TurnAnalysisStatus
 from professional_turn_producer import produce_turn_analysis
 from professional_turn_plan_proposer import call_turn_plan_proposer, TurnPlanProposerCallStatus
@@ -191,6 +204,51 @@ def _validate_failure_reason_for_stage(
             "that member means the stage did NOT fail")
 
 
+# The complete closed set of values failure_detail may ever hold. Currently
+# exactly one member type: Analyzer's STRUCTURALLY_INVALID_RESPONSE category
+# has a richer, already-bounded, already-privacy-safe sub-classification
+# (which exact deterministic parser branch rejected the response) worth
+# exposing -- a future slice adding a detail type for another stage/reason
+# extends this with `| SomeOtherReason`, exactly like ProfessionalFreeText
+# FailureReason itself was extended stage by stage.
+ProfessionalFreeTextFailureDetail = TurnAnalyzerStructuralFailureReason
+
+# Which exact (stage, reason) pairs MAY carry a failure_detail, and the
+# closed type it must be when present. A pair absent from this dict means
+# failure_detail must be None -- this is deliberately keyed on the exact
+# reason, not just the stage: ANALYZER's own PROVIDER_FAILURE/NO_USABLE_
+# CONTENT reasons never reached the deterministic parser at all, so only
+# STRUCTURALLY_INVALID_RESPONSE ever has a detail.
+_STAGE_REASON_DETAIL_TYPE: dict[tuple, type] = {
+    (ProfessionalFreeTextFailureStage.ANALYZER,
+     TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE): TurnAnalyzerStructuralFailureReason,
+}
+
+
+def _validate_failure_detail_for_stage_and_reason(
+        stage: ProfessionalFreeTextFailureStage,
+        reason: ProfessionalFreeTextFailureReason,
+        detail: ProfessionalFreeTextFailureDetail | None,
+) -> None:
+    """Fail-closed check mirroring _validate_failure_reason_for_stage, one
+    level more specific: keyed on the exact (stage, reason) pair rather
+    than the stage alone, since only one specific reason within ANALYZER
+    ever carries a detail."""
+    expected_type = _STAGE_REASON_DETAIL_TYPE.get((stage, reason))
+    if expected_type is None:
+        if detail is not None:
+            raise ValueError(
+                "ProfessionalFreeTextRuntimeResult: failure_stage="
+                f"{stage.value} reason={reason!r} must not carry a "
+                f"failure_detail, got {detail!r}")
+        return
+    if type(detail) is not expected_type:
+        raise ValueError(
+            "ProfessionalFreeTextRuntimeResult: failure_stage="
+            f"{stage.value} reason={reason!r} requires a failure_detail "
+            f"that is exactly a {expected_type!r}, got {detail!r}")
+
+
 @dataclass(frozen=True)
 class ProfessionalFreeTextRuntimeResult:
     """The outcome envelope for one run_professional_free_text_turn call.
@@ -206,6 +264,7 @@ class ProfessionalFreeTextRuntimeResult:
     reply_text: str | None
     failure_stage: ProfessionalFreeTextFailureStage | None
     failure_reason: ProfessionalFreeTextFailureReason | None
+    failure_detail: ProfessionalFreeTextFailureDetail | None
 
     def __post_init__(self):
         if type(self.status) is not ProfessionalFreeTextRuntimeStatus:
@@ -225,6 +284,10 @@ class ProfessionalFreeTextRuntimeResult:
                 raise ValueError(
                     "ProfessionalFreeTextRuntimeResult: SUCCESS must not carry "
                     "a failure_reason")
+            if self.failure_detail is not None:
+                raise ValueError(
+                    "ProfessionalFreeTextRuntimeResult: SUCCESS must not carry "
+                    "a failure_detail")
         else:
             if self.reply_text is not None:
                 raise ValueError(
@@ -255,15 +318,20 @@ class ProfessionalFreeTextRuntimeResult:
             # reason-enum type this stage is allowed to carry, and must not
             # be that type's own success-shaped member (PROPOSAL/CANDIDATE).
             _validate_failure_reason_for_stage(self.failure_stage, self.failure_reason)
+            # stage+reason/detail compatibility: detail is optional and
+            # scoped to the exact (stage, reason) pair, not just the stage.
+            _validate_failure_detail_for_stage_and_reason(
+                self.failure_stage, self.failure_reason, self.failure_detail)
 
 
 def _failed(
         stage: ProfessionalFreeTextFailureStage,
         reason: ProfessionalFreeTextFailureReason,
+        detail: ProfessionalFreeTextFailureDetail | None = None,
 ) -> ProfessionalFreeTextRuntimeResult:
     return ProfessionalFreeTextRuntimeResult(
         status=ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
-        failure_stage=stage, failure_reason=reason)
+        failure_stage=stage, failure_reason=reason, failure_detail=detail)
 
 
 async def run_professional_free_text_turn(
@@ -321,7 +389,12 @@ async def run_professional_free_text_turn(
             # analyzer_result.failure_category is structurally guaranteed
             # non-None here (TurnAnalyzerCallResult.__post_init__ enforces
             # exactly one of output/failure_category set).
-            return _failed(ProfessionalFreeTextFailureStage.ANALYZER, analyzer_result.failure_category)
+            # structural_failure_reason is set iff failure_category is
+            # STRUCTURALLY_INVALID_RESPONSE (same TurnAnalyzerCallResult
+            # contract), which is exactly when a failure_detail is allowed.
+            return _failed(
+                ProfessionalFreeTextFailureStage.ANALYZER, analyzer_result.failure_category,
+                analyzer_result.structural_failure_reason)
         # Analyzer produced usable output, but Producer's own deterministic
         # assembly still could not construct an authoritative TurnAnalysis --
         # a distinct outcome from an analyzer provider/parse failure.
@@ -355,8 +428,9 @@ async def run_professional_free_text_turn(
         return ProfessionalFreeTextRuntimeResult(
             status=ProfessionalFreeTextRuntimeStatus.REJECTED, reply_text=None,
             failure_stage=ProfessionalFreeTextFailureStage.ACCEPTANCE,
-            failure_reason=acceptance_result.reason)
+            failure_reason=acceptance_result.reason, failure_detail=None)
 
     return ProfessionalFreeTextRuntimeResult(
         status=ProfessionalFreeTextRuntimeStatus.SUCCESS,
-        reply_text=render_result.candidate_text, failure_stage=None, failure_reason=None)
+        reply_text=render_result.candidate_text, failure_stage=None, failure_reason=None,
+        failure_detail=None)
