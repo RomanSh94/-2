@@ -175,10 +175,7 @@ from database import (
     mark_prompt_delivered, mark_prompt_failed,
     get_proposals_with_failed_prompts, claim_prompt_send,
 )
-# Professional Core V2 -- Entry Triage runtime V1 ONLY. Deliberately isolated
-# from the legacy interaction-button/mood-entry imports above: no other
-# Professional Core module (Analyzer, Planner, Proposer, Renderer,
-# Acceptance) is imported anywhere in bot.py.
+# Professional Core V2 -- Entry Triage runtime V1.
 from professional_reply_affordances import ENTRY_TRIAGE_CONTRACT_V1
 from professional_turn_ui_context import (
     UntrustedEntryTriageSelection, canonicalize_entry_triage_selection,
@@ -188,6 +185,19 @@ from professional_turn_ui_immediate_response import build_trusted_ui_immediate_r
 from database import (
     create_professional_entry_triage_bindings, consume_professional_entry_triage_binding,
     supersede_professional_entry_triage_bindings,
+)
+# Professional Free-Text Runtime V1 -- bot.py imports ONLY the dedicated
+# orchestrator module (professional_free_text_runtime) plus the already-
+# merged, offline history read/build primitives; it never imports the
+# Analyzer/Producer/Plan-Proposer/Planner/Renderer/Acceptance symbols
+# directly (see professional_free_text_runtime.py's own module docstring --
+# it is the sole place those are imported in this codebase's runtime path).
+from database import get_professional_conversation_history_rows
+from professional_turn_conversation_context import build_conversation_context_from_history_rows
+from professional_free_text_runtime import (
+    run_professional_free_text_turn,
+    ProfessionalFreeTextRuntimeStatus,
+    ProfessionalFreeTextFailureStage,
 )
 import conversation_controller as controller
 from therapeutic_domain import (
@@ -893,7 +903,8 @@ async def _synthesize_and_send_voice(target, uid: int, text: str, lang: str) -> 
 async def deliver_response(message: Message, uid: int, answer: str, lang: str,
                             *, one_shot_voice: bool = False,
                             one_shot_concise: bool = False,
-                            reply_markup=None) -> Message | None:
+                            reply_markup=None,
+                            preserve_exact_text: bool = False) -> Message | None:
     """The SINGLE shared point where a final, Safety-Validator-approved
     response is delivered — text / voice / voice_and_concise_text, from the
     user's stored preference or a one-shot meta-command override. Flag OFF
@@ -911,7 +922,23 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
     voice delivery consumed it) so a caller needing the message id (e.g. to
     record a PracticeProposal's delivered message) can read it -- every
     other existing caller already ignored the previous None return, so this
-    is additive, not a breaking change."""
+    is additive, not a breaking change.
+
+    preserve_exact_text (PROFESSIONAL FREE-TEXT RUNTIME V1): default False,
+    so every existing caller's behavior is byte-for-byte unchanged -- with
+    it False, `not preserve_exact_text and (...)` reduces to exactly the
+    original `concise` expression, and the voice_and_concise_text `visible`
+    line reduces to exactly the original _safe_concise_version(...) call.
+    When True: the text/voice FORMAT choice still follows the stored
+    preference or one_shot_voice exactly as always (transport is
+    unaffected), but neither the stored response_length="concise"
+    preference nor one_shot_concise may shorten the CONTENT -- no
+    _safe_concise_version call is ever made, and voice_and_concise_text's
+    visible text is the exact `answer`, not a concise rewrite. This exists
+    because Professional Free-Text Runtime V1 must never let this
+    presentation layer create a second, ungoverned psychological wording
+    after Acceptance -- the persisted ASSISTANT_DELIVERED content must
+    always equal what the user actually received, for every format."""
     is_private = getattr(message.chat, "type", "private") == "private"
     if reply_markup is not None:
         return await message.answer(answer, reply_markup=reply_markup)
@@ -920,13 +947,13 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
 
     prefs = await get_response_preferences(uid)
     fmt = "voice" if one_shot_voice else prefs["response_format"]
-    concise = one_shot_concise or prefs["response_length"] == "concise"
+    concise = not preserve_exact_text and (one_shot_concise or prefs["response_length"] == "concise")
 
     if fmt == "text":
         return await message.answer(answer, reply_markup=_listen_kb(uid, lang))
 
     if fmt == "voice_and_concise_text":
-        visible = _safe_concise_version(answer, lang)
+        visible = answer if preserve_exact_text else _safe_concise_version(answer, lang)
         voice_text = visible if concise else answer
         sent = await message.answer(visible)
         await _synthesize_and_send_voice(message, uid, voice_text, lang)
@@ -1740,6 +1767,93 @@ async def _controller_generate_and_deliver(message: Message, uid: int, claim: di
                        source=MessageSource.ASSISTANT_DELIVERED)
 
 
+# Professional Free-Text Runtime V1 -- bounded, deterministic, technical-only.
+# Never pseudo-therapeutic, never advice, never a diagnosis, never an
+# emotional interpretation, never a question beyond "try again". Never routed
+# through the legacy generator or the Professional Renderer -- it is fixed
+# copy, not a model candidate, so it can never carry a rejected/unsafe answer.
+_PROFESSIONAL_TECHNICAL_FALLBACK_TEXT = {
+    "ru": "Не получилось корректно сформировать ответ. Попробуй отправить сообщение ещё раз.",
+    "en": "I couldn't generate a reliable response. Please send your message again.",
+}
+
+
+def _professional_technical_fallback_text(lang: str) -> str:
+    return _PROFESSIONAL_TECHNICAL_FALLBACK_TEXT.get(lang, _PROFESSIONAL_TECHNICAL_FALLBACK_TEXT["en"])
+
+
+async def _run_professional_free_text_and_deliver(
+        message: Message, uid: int, current_row_id: int, user_text: str,
+        risk: dict, lang: str, turn_gen: int, cid: str,
+        one_shot_voice: bool = False, one_shot_concise: bool = False) -> None:
+    """The SLOW half of a Professional-claimed turn -- called strictly AFTER
+    the per-user ingestion lock has been released (same contract as
+    _controller_generate_and_deliver: Professional's up-to-three model calls
+    must never hold that lock). The current USER row is already persisted
+    (source=USER_AUTHORED, scenario="professional") by the time this runs.
+
+    Structural no-silent-legacy-fallback guarantee: every branch below ends
+    in `return` with no path back into pipeline()'s legacy/first-turn/
+    Controller code -- this function is the entire remainder of a
+    Professional-claimed turn's lifecycle.
+
+    one_shot_voice/one_shot_concise: forwarded from pipeline()'s own format-
+    meta-command handling (e.g. "мне тревожно, ответь голосом" mixed with
+    genuine psychological content still selects voice transport for a
+    Professional turn) -- but deliver_response is always called with
+    preserve_exact_text=True below, so one_shot_concise (and any stored
+    response_length="concise" preference) can never shorten the accepted
+    Professional text or the technical fallback; the concise PRESENTATION
+    request is silently inert for V1, per the frozen exact-content rule,
+    while the psychological content is still fully handled by Professional
+    (never diverted to legacy)."""
+    _dispatch_log(f"cid={cid} stage=professional_claimed")
+    try:
+        rows = await get_professional_conversation_history_rows(uid, current_row_id)
+        context = build_conversation_context_from_history_rows(rows)
+        result = await run_professional_free_text_turn(
+            client=client, model="gpt-4o-mini",
+            source_message_row_id=current_row_id, source_text=user_text,
+            conversation_context=context, risk_result=risk, lang=lang)
+    except Exception as e:
+        _dispatch_log(f"cid={cid} stage=professional_failed error_type={type(e).__name__}")
+        result = None
+
+    if result is None:
+        reply_text = _professional_technical_fallback_text(lang)
+    elif result.status is ProfessionalFreeTextRuntimeStatus.SUCCESS:
+        _dispatch_log(f"cid={cid} stage=professional_success")
+        reply_text = result.reply_text
+    elif result.status is ProfessionalFreeTextRuntimeStatus.REJECTED:
+        _dispatch_log(f"cid={cid} stage=professional_rejected reason={result.failure_stage.value}")
+        reply_text = _professional_technical_fallback_text(lang)
+    else:
+        _dispatch_log(f"cid={cid} stage=professional_failed reason={result.failure_stage.value}")
+        reply_text = _professional_technical_fallback_text(lang)
+
+    # Final stale check, as late as possible -- right before the point of no
+    # return (send) -- same timing convention the legacy path already uses
+    # (see the identical check in pipeline() before its own assistant save).
+    if _user_generation_superseded(uid, turn_gen):
+        _dispatch_log(f"cid={cid} stage=professional_stale_dropped")
+        return
+
+    try:
+        await deliver_response(message, uid, reply_text, lang,
+                               one_shot_voice=one_shot_voice, one_shot_concise=one_shot_concise,
+                               preserve_exact_text=True)
+    except Exception as e:
+        _dispatch_log(f"cid={cid} stage=professional_send_failed error_type={type(e).__name__}")
+        return
+
+    try:
+        await save_message(uid, "assistant", reply_text, "professional", lang,
+                           source=MessageSource.ASSISTANT_DELIVERED)
+    except Exception as e:
+        _dispatch_log(f"cid={cid} stage=professional_persist_failed error_type={type(e).__name__}")
+        return
+
+
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
                    tg_user=None) -> None:
     """Complete X20 pipeline.
@@ -2068,107 +2182,137 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             # armed) and ordinary routing proceeds UNCHANGED for the emotional
             # content, exactly as it did before this feature existed.
 
-        # 5. Update state
-        state = await load_state(uid) or dict(DEFAULT_STATE)
-        state = update_state(state, user_text)
-        await save_state(uid, state)
-
-        # 6. Detect stage
-        stage = detect_stage(user_text, lang)
-
-        # 7. Assess readiness
-        readiness = assess_readiness(user_text, lang)
-
-        # 8. Cognitive capacity
-        capacity = get_capacity(state)
-
-        # 9. Select scenario
-        variant = get_variant(uid)
-        interaction_pref = detect_interaction_preference(user_text, lang)
-        scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
-                                   variant, trajectory=trajectory,
-                                   interaction_preference=interaction_pref)
-
-        # 9.4 First-turn eligibility (spec item D) -- computed only now that
-        # scenario/stage/capacity/risk are all known; no lexical/topic
-        # detection anywhere in this check. claim_first_turn succeeds AT MOST
-        # ONCE per (user_id, contract_version) ever (PRIMARY KEY-enforced), so
-        # a successfully claimed first-turn owns this turn's entire response
-        # lifecycle and takes precedence over the Conversation Controller
-        # below -- and costs nothing on any later turn, since the claim
-        # attempt then fails instantly and falls through to the Controller
-        # unaffected.
-        is_ftm_eligible = (
-            scenario in FIRST_TURN_ALLOWED_SCENARIOS
-            and stage not in FIRST_TURN_EXCLUDED_STAGES
-            and capacity >= FIRST_TURN_MIN_CAPACITY
-            and risk["level"] not in FIRST_TURN_EXCLUDED_RISK_LEVELS
-        )
+        # 5a. Professional Free-Text Runtime V1 claim -- evaluated BEFORE any
+        # lower-precedence psychological conversation owner runs (legacy
+        # state/scenario routing, first-turn, Controller), so a claimed turn
+        # never lets any of them obtain authority; see
+        # professional_free_text_runtime.py's own module docstring for the
+        # full chain contract. controller_claim/ft_claimed/claim_token are
+        # initialized here (not only inside the else: branch below) because
+        # they are read again after the `finally` releases the lock,
+        # regardless of which branch ran this turn.
+        professional_claimed = False
+        current_row_id = None
+        controller_claim = None
         ft_claimed = False
         claim_token = None
-        if is_ftm_eligible:
-            claim_token = secrets.token_urlsafe(16)
-            ft_claimed = await claim_first_turn(uid, FIRST_TURN_CONTRACT_VERSION, claim_token, scenario)
+        if await access_control.professional_free_text_allowed_for(uid):
+            current_row_id = await save_message(
+                uid, "user", user_text, "professional", lang,
+                risk["score"], risk["categories"], source=MessageSource.USER_AUTHORED)
+            professional_claimed = True
+        else:
+            # 5. Update state
+            state = await load_state(uid) or dict(DEFAULT_STATE)
+            state = update_state(state, user_text)
+            await save_state(uid, state)
 
-        # 5.5 Conversation Controller (Phase 3, master prompt §10/§15) -- FAST
-        # claim only, still inside the ingestion lock (matches the ordinary
-        # path's own inbound-persistence timing exactly). Runs strictly AFTER
-        # the RED crisis check, the Depression Disclosure Gate, the ambiguity
-        # check, and the dependency boundary above -- all already returned for
-        # this turn if triggered, so none of those deterministic safety/
-        # boundary routes can ever be bypassed by an explicit Controller
-        # intent (hardening §4). Attempted ONLY when first-turn did not
-        # already claim this turn above (see 9.4) -- a successfully claimed
-        # first-turn owns the turn outright. The LLM call itself happens
-        # later, OUTSIDE this lock (hardening §5) -- see
-        # _controller_generate_and_deliver, invoked right after the `finally`
-        # below releases it.
-        controller_claim = None
-        if not ft_claimed and await access_control.core_rollout_allowed(uid):
-            controller_claim = await _controller_claim_turn(uid, user_text, lang, risk)
+            # 6. Detect stage
+            stage = detect_stage(user_text, lang)
 
-        # 9.5 Emotional reaction (Voice and Adaptive Response UX) -- best-effort,
-        # deterministic, fires only for genuine (non-format-only) messages: a
-        # PURE format command already returned above and never reaches here.
-        cat, conf = select_reaction_category(user_text, risk["categories"], stage, lang,
-                                             is_meta_command=False, is_dependency_redirect=False)
+            # 7. Assess readiness
+            readiness = assess_readiness(user_text, lang)
 
-        # 11. Select practice
-        severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
-        practice = select_practice(scenario, stage, severity, lang)
+            # 8. Cognitive capacity
+            capacity = get_capacity(state)
 
-        # 12. Log router decision -- and 12.5's inbound persistence -- SKIPPED
-        # for a Controller-owned turn: _controller_claim_turn already persisted
-        # the inbound user message itself (tagged "controller", not a legacy
-        # scenario), and logging a legacy routing decision for a turn the
-        # Controller actually owns would misrepresent research/analytics data
-        # (hardening §6 -- the legacy router must not act as if it decided
-        # this turn). stage/readiness/capacity/scenario/practice above still
-        # ran (pure computation, no side effects, nothing delivered) -- a
-        # deliberate, documented minor inefficiency traded for not reindenting
-        # this entire legacy block, rather than a correctness gap: nothing
-        # computed here is used, persisted, or delivered for a Controller turn.
-        if controller_claim is None:
-            await log_router_decision(uid, state, risk["score"], risk["categories"],
-                                       stage, readiness, capacity, scenario,
-                                       practice["id"], variant, ROUTER_VERSION)
+            # 9. Select scenario
+            variant = get_variant(uid)
+            interaction_pref = detect_interaction_preference(user_text, lang)
+            scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
+                                       variant, trajectory=trajectory,
+                                       interaction_preference=interaction_pref)
 
-            # 12.5 Persist the USER message HERE -- before BOTH long LLM awaits
-            # (maybe_summarize below AND the answer call). Memory loads recent messages
-            # by autoincrement id (get_recent_messages ORDER BY id DESC), so a row's
-            # arrival ORDER is its id order. Every await before this point is a fast
-            # local/DB op; the two multi-second awaits (summarization, answer) come
-            # after. So a slow turn can no longer pause on an LLM call while a newer,
-            # faster turn's user row lands first and makes the slow turn look like the
-            # newest active context (P1 EARLY PERSISTENCE ORDER RACE -- previously this
-            # save sat after both LLM awaits). The assistant row is still saved later,
-            # and only if this turn was not superseded. A duplicate Telegram update
-            # never reaches here (DuplicateUpdateGuard drops it), so no duplicate row.
-            await save_message(uid, "user", user_text, scenario, lang,
-                               risk["score"], risk["categories"],
-                               source=MessageSource.USER_AUTHORED)
+            # 9.4 First-turn eligibility (spec item D) -- computed only now that
+            # scenario/stage/capacity/risk are all known; no lexical/topic
+            # detection anywhere in this check. claim_first_turn succeeds AT MOST
+            # ONCE per (user_id, contract_version) ever (PRIMARY KEY-enforced), so
+            # a successfully claimed first-turn owns this turn's entire response
+            # lifecycle and takes precedence over the Conversation Controller
+            # below -- and costs nothing on any later turn, since the claim
+            # attempt then fails instantly and falls through to the Controller
+            # unaffected.
+            is_ftm_eligible = (
+                scenario in FIRST_TURN_ALLOWED_SCENARIOS
+                and stage not in FIRST_TURN_EXCLUDED_STAGES
+                and capacity >= FIRST_TURN_MIN_CAPACITY
+                and risk["level"] not in FIRST_TURN_EXCLUDED_RISK_LEVELS
+            )
+            if is_ftm_eligible:
+                claim_token = secrets.token_urlsafe(16)
+                ft_claimed = await claim_first_turn(uid, FIRST_TURN_CONTRACT_VERSION, claim_token, scenario)
+
+            # 5.5 Conversation Controller (Phase 3, master prompt §10/§15) -- FAST
+            # claim only, still inside the ingestion lock (matches the ordinary
+            # path's own inbound-persistence timing exactly). Runs strictly AFTER
+            # the RED crisis check, the Depression Disclosure Gate, the ambiguity
+            # check, and the dependency boundary above -- all already returned for
+            # this turn if triggered, so none of those deterministic safety/
+            # boundary routes can ever be bypassed by an explicit Controller
+            # intent (hardening §4). Attempted ONLY when first-turn did not
+            # already claim this turn above (see 9.4) -- a successfully claimed
+            # first-turn owns the turn outright. The LLM call itself happens
+            # later, OUTSIDE this lock (hardening §5) -- see
+            # _controller_generate_and_deliver, invoked right after the `finally`
+            # below releases it.
+            if not ft_claimed and await access_control.core_rollout_allowed(uid):
+                controller_claim = await _controller_claim_turn(uid, user_text, lang, risk)
+
+            # 9.5 Emotional reaction (Voice and Adaptive Response UX) -- best-effort,
+            # deterministic, fires only for genuine (non-format-only) messages: a
+            # PURE format command already returned above and never reaches here.
+            cat, conf = select_reaction_category(user_text, risk["categories"], stage, lang,
+                                                 is_meta_command=False, is_dependency_redirect=False)
+
+            # 11. Select practice
+            severity = "high" if risk["score"] >= 70 else ("low" if risk["score"] < 40 else "medium")
+            practice = select_practice(scenario, stage, severity, lang)
+
+            # 12. Log router decision -- and 12.5's inbound persistence -- SKIPPED
+            # for a Controller-owned turn: _controller_claim_turn already persisted
+            # the inbound user message itself (tagged "controller", not a legacy
+            # scenario), and logging a legacy routing decision for a turn the
+            # Controller actually owns would misrepresent research/analytics data
+            # (hardening §6 -- the legacy router must not act as if it decided
+            # this turn). stage/readiness/capacity/scenario/practice above still
+            # ran (pure computation, no side effects, nothing delivered) -- a
+            # deliberate, documented minor inefficiency traded for not reindenting
+            # this entire legacy block, rather than a correctness gap: nothing
+            # computed here is used, persisted, or delivered for a Controller turn.
+            if controller_claim is None:
+                await log_router_decision(uid, state, risk["score"], risk["categories"],
+                                           stage, readiness, capacity, scenario,
+                                           practice["id"], variant, ROUTER_VERSION)
+
+                # 12.5 Persist the USER message HERE -- before BOTH long LLM awaits
+                # (maybe_summarize below AND the answer call). Memory loads recent messages
+                # by autoincrement id (get_recent_messages ORDER BY id DESC), so a row's
+                # arrival ORDER is its id order. Every await before this point is a fast
+                # local/DB op; the two multi-second awaits (summarization, answer) come
+                # after. So a slow turn can no longer pause on an LLM call while a newer,
+                # faster turn's user row lands first and makes the slow turn look like the
+                # newest active context (P1 EARLY PERSISTENCE ORDER RACE -- previously this
+                # save sat after both LLM awaits). The assistant row is still saved later,
+                # and only if this turn was not superseded. A duplicate Telegram update
+                # never reaches here (DuplicateUpdateGuard drops it), so no duplicate row.
+                await save_message(uid, "user", user_text, scenario, lang,
+                                   risk["score"], risk["categories"],
+                                   source=MessageSource.USER_AUTHORED)
     finally:
         _ingest_leave(uid, _ingest)
+
+    # Professional Free-Text Runtime V1: the SLOW half (up to three model
+    # calls, validation, delivery) -- strictly AFTER the ingestion lock above
+    # is released, and authoritative for this turn: none of the failed-
+    # practice retry surface, Controller, first-turn, or legacy reaction/
+    # memory/LLM/delivery code below ever runs for a Professional-claimed
+    # turn (no second reply surface, no silent legacy fallback -- see
+    # _run_professional_free_text_and_deliver's own docstring).
+    if professional_claimed:
+        await _run_professional_free_text_and_deliver(
+            message, uid, current_row_id, user_text, risk, lang, _turn_gen, _cid,
+            one_shot_voice, one_shot_concise)
+        return
 
     # PR #73 request-changes §6: best-effort, restart-safe recovery for any
     # post-practice follow-up prompt that previously failed to deliver --

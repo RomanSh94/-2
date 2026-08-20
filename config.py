@@ -218,6 +218,21 @@ DEPRESSION_DISCLOSURE_GATE_ENABLED = (
     in ("1", "true", "yes", "on")
 )
 
+# Professional Free-Text Runtime V1 — default OFF, own feature-specific kill
+# switch composed with (never replacing) THERAPEUTIC_CORE_ROLLOUT_MODE, same
+# pattern as DEPRESSION_DISCLOSURE_GATE_ENABLED above: this flag alone never
+# grants eligibility, and rollout population (owner/invited/all) is still
+# decided entirely by the existing core_rollout_allowed contract. Flag false
+# => pipeline() behaves byte-for-byte as before this slice; no ordinary
+# free-text/voice turn is ever claimed by Professional Core, no
+# scenario="professional" row is ever created. Deploys dormant; do not flip
+# true for owner/invited/all except through a separately authorized canary
+# phase (this PR is capability only).
+PROFESSIONAL_FREE_TEXT_RUNTIME_ENABLED = (
+    os.getenv("PROFESSIONAL_FREE_TEXT_RUNTIME_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
 # ── Voice and Adaptive Response UX — both default OFF ───────────────────────
 # VOICE_REPLIES_ENABLED gates: the /format selector, the "🔊 Прослушать"
 # listen button, natural-language format/voice meta-commands, and the

@@ -217,8 +217,17 @@ def test_no_save_message_call_in_bot_py_omits_or_mismatches_source():
     MessageSource member matches its own role argument. A future call site
     added without provenance, or with a role/source mismatch, fails this
     test. Covers every genuine writer: ordinary typed-user, crisis,
-    controller, depression-disclosure, disambiguation, and every assistant
-    writer (ordinary/deterministic/controller/Entry-Triage/first-turn)."""
+    controller, depression-disclosure, disambiguation, professional, and
+    every assistant writer (ordinary/deterministic/controller/Entry-Triage/
+    first-turn/professional). The exact count (15, up from 13 as of
+    PROFESSIONAL FREE-TEXT RUNTIME V1, which legitimately added the
+    Professional user-claim persist inside pipeline() and the Professional
+    assistant persist inside _run_professional_free_text_and_deliver) is
+    intentionally pinned here so a FUTURE writer added without provenance
+    is caught even if it happens to reuse an already-correct source= value
+    -- see test_pipeline_user_and_assistant_writers_classified_correctly
+    and test_run_professional_free_text_and_deliver_assistant_writer_uses_
+    assistant_delivered below for the two new call sites individually."""
     src = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     expected_by_role = {"user": "USER_AUTHORED", "assistant": "ASSISTANT_DELIVERED"}
@@ -236,7 +245,7 @@ def test_no_save_message_call_in_bot_py_omits_or_mismatches_source():
             assert source_attr is not None, f"save_message call at bot.py:{node.lineno} has no source="
             assert source_attr == expected_by_role.get(role), (
                 f"save_message call at bot.py:{node.lineno}: role={role!r} source={source_attr!r}")
-    assert checked == 13, f"expected exactly 13 known save_message call sites in bot.py, found {checked}"
+    assert checked == 15, f"expected exactly 15 known save_message call sites in bot.py, found {checked}"
 
 
 def test_trigger_crisis_user_writer_uses_user_authored():
@@ -252,13 +261,21 @@ def test_controller_generate_and_deliver_assistant_writers_use_assistant_deliver
     assert calls and all(role == "assistant" and src == "ASSISTANT_DELIVERED" for role, src in calls)
 
 
+def test_run_professional_free_text_and_deliver_assistant_writer_uses_assistant_delivered():
+    assert _save_message_calls(bot._run_professional_free_text_and_deliver) == [
+        ("assistant", "ASSISTANT_DELIVERED")]
+
+
 def test_pipeline_user_and_assistant_writers_classified_correctly():
     """Covers the ordinary-typed-user writer, the pipeline-inline crisis
-    writer, the depression-disclosure writer (both roles), and the
-    disambiguation writer (both roles) -- all within the single `pipeline`
-    function."""
+    writer, the depression-disclosure writer (both roles), the
+    disambiguation writer (both roles), and the Professional Free-Text
+    Runtime V1 claim's own user-persist writer -- all within the single
+    `pipeline` function. The Professional assistant persist lives in the
+    separate _run_professional_free_text_and_deliver function (see the
+    dedicated test above), so it is NOT counted here."""
     calls = _save_message_calls(bot.pipeline)
-    assert calls.count(("user", "USER_AUTHORED")) == 4  # crisis, disclosure, disambiguation, ordinary
+    assert calls.count(("user", "USER_AUTHORED")) == 5  # crisis, disclosure, disambiguation, professional, ordinary
     assert calls.count(("assistant", "ASSISTANT_DELIVERED")) == 3  # disclosure, disambiguation, ordinary
     assert all(src is not None for _role, src in calls)
 
