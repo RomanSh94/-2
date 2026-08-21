@@ -1125,11 +1125,206 @@ def test_reason_wrong_field_type():
     assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.WRONG_FIELD_TYPE
 
 
-def test_reason_candidate_text_bounds():
-    doc = _document(evidence=[_evidence_entry(span="")])
+# ── Candidate Text Bounds Detail V2 -- 2 families (evidence/interaction) x
+# 3 fields (span/context_before/context_after) x 3 violation kinds
+# (empty/whitespace-only/too-long) = 18 exact granular reasons, replacing
+# the earlier coarse CANDIDATE_TEXT_BOUNDS member. One dedicated case per
+# combination, proven through the real parse_model_response entry point
+# (not by calling the dataclasses directly) so this proves the full
+# BoundedTextViolation -> _StructuralDefect -> TurnAnalyzerParseError
+# chain, not just the validation authority in isolation. Uses the real
+# imported caps (not hardcoded magic numbers) so a future cap change
+# cannot silently desync these tests from the actual contract.
+from professional_turn_analysis import (
+    EVIDENCE_CANDIDATE_MAX_CHARS as _EVID_MAX,
+    INTERACTION_CANDIDATE_MAX_CHARS as _INT_MAX,
+    CONTEXT_BEFORE_MAX_CHARS as _CTX_BEFORE_MAX,
+    CONTEXT_AFTER_MAX_CHARS as _CTX_AFTER_MAX,
+    BoundedTextField,
+    BoundedTextViolationKind,
+)
+
+
+def _doc_evidence_span(value):
+    return _document(evidence=[{
+        "candidate": {"exact_source_span": value, "context_before": None, "context_after": None},
+        "proposed_kind": None}])
+
+
+def _doc_evidence_context_before(value):
+    return _document(evidence=[{
+        "candidate": {"exact_source_span": "valid span", "context_before": value, "context_after": None},
+        "proposed_kind": None}])
+
+
+def _doc_evidence_context_after(value):
+    return _document(evidence=[{
+        "candidate": {"exact_source_span": "valid span", "context_before": None, "context_after": value},
+        "proposed_kind": None}])
+
+
+def _doc_interaction_span(value):
+    return _document(interaction=[{
+        "candidate": {"exact_source_span": value, "context_before": None, "context_after": None},
+        "proposal": None}])
+
+
+def _doc_interaction_context_before(value):
+    return _document(interaction=[{
+        "candidate": {"exact_source_span": "valid span", "context_before": value, "context_after": None},
+        "proposal": None}])
+
+
+def _doc_interaction_context_after(value):
+    return _document(interaction=[{
+        "candidate": {"exact_source_span": "valid span", "context_before": None, "context_after": value},
+        "proposal": None}])
+
+
+@pytest.mark.parametrize("doc_fn,value,expected", [
+    (_doc_evidence_span, "", TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_EMPTY),
+    (_doc_evidence_span, "   ", TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_WHITESPACE_ONLY),
+    (_doc_evidence_span, "x" * (_EVID_MAX + 1), TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_TOO_LONG),
+    (_doc_evidence_context_before, "", TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_EMPTY),
+    (_doc_evidence_context_before, "  ",
+     TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_WHITESPACE_ONLY),
+    (_doc_evidence_context_before, "x" * (_CTX_BEFORE_MAX + 1),
+     TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_TOO_LONG),
+    (_doc_evidence_context_after, "", TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_AFTER_EMPTY),
+    (_doc_evidence_context_after, "\t",
+     TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_AFTER_WHITESPACE_ONLY),
+    (_doc_evidence_context_after, "x" * (_CTX_AFTER_MAX + 1),
+     TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_AFTER_TOO_LONG),
+    (_doc_interaction_span, "", TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_EMPTY),
+    (_doc_interaction_span, " ", TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_WHITESPACE_ONLY),
+    (_doc_interaction_span, "x" * (_INT_MAX + 1), TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_TOO_LONG),
+    (_doc_interaction_context_before, "", TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_BEFORE_EMPTY),
+    (_doc_interaction_context_before, "  ",
+     TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_BEFORE_WHITESPACE_ONLY),
+    (_doc_interaction_context_before, "x" * (_CTX_BEFORE_MAX + 1),
+     TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_BEFORE_TOO_LONG),
+    (_doc_interaction_context_after, "", TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_EMPTY),
+    (_doc_interaction_context_after, "\n",
+     TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_WHITESPACE_ONLY),
+    (_doc_interaction_context_after, "x" * (_CTX_AFTER_MAX + 1),
+     TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_TOO_LONG),
+])
+def test_reason_candidate_text_bounds_granular(doc_fn, value, expected):
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(_dumps(doc_fn(value)))
+    assert exc_info.value.reason is expected
+
+
+@pytest.mark.parametrize("doc_fn,value", [
+    (_doc_evidence_span, "x" * _EVID_MAX),
+    (_doc_evidence_context_before, "x" * _CTX_BEFORE_MAX),
+    (_doc_evidence_context_after, "x" * _CTX_AFTER_MAX),
+    (_doc_interaction_span, "x" * _INT_MAX),
+    (_doc_interaction_context_before, "x" * _CTX_BEFORE_MAX),
+    (_doc_interaction_context_after, "x" * _CTX_AFTER_MAX),
+])
+def test_candidate_text_exactly_at_max_length_is_valid(doc_fn, value):
+    """Boundary proof: exactly at the cap must NOT raise -- only max+1
+    does. Proves this slice did not accidentally shift any numeric cap."""
+    output = parse_model_response(_dumps(doc_fn(value)))
+    assert isinstance(output, UntrustedTurnAnalyzerOutput)
+
+
+def test_evidence_wrong_field_type_still_wrong_field_type_not_bounds():
+    """A wrong TYPE (not content) must still classify as WRONG_FIELD_TYPE,
+    never any of the new bounds-detail members -- proves the type check
+    at the parser boundary (which runs before candidate construction) is
+    unaffected by this slice."""
+    # A JSON array/object/bool, not a bare number -- a bare int/float would
+    # be intercepted by the decoder itself as JSON_NUMBER_NOT_PERMITTED
+    # before this field-type check ever runs (see the WRONG_CONTAINER_TYPE
+    # tests above, which hit the identical decoder-precedence issue).
+    doc = _document(evidence=[{
+        "candidate": {"exact_source_span": ["not", "a", "string"],
+                      "context_before": None, "context_after": None},
+        "proposed_kind": None}])
     with pytest.raises(TurnAnalyzerParseError) as exc_info:
         parse_model_response(_dumps(doc))
-    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.WRONG_FIELD_TYPE
+
+
+def test_interaction_wrong_field_type_still_wrong_field_type_not_bounds():
+    """Same proof as the evidence-family test above, for the interaction
+    family -- both builders share the identical parser-boundary type
+    check, but the family distinction matters for the candidate-text-
+    bounds mapping, so both are exercised explicitly."""
+    doc = _document(interaction=[{
+        "candidate": {"exact_source_span": ["not", "a", "string"],
+                      "context_before": None, "context_after": None},
+        "proposal": None}])
+    with pytest.raises(TurnAnalyzerParseError) as exc_info:
+        parse_model_response(_dumps(doc))
+    assert exc_info.value.reason is TurnAnalyzerStructuralFailureReason.WRONG_FIELD_TYPE
+
+
+# ── Contract-lock correction: a plain/unexpected ValueError from candidate
+# dataclass construction (i.e. NOT a BoundedTextViolation) has no evidence
+# behind a WRONG_FIELD_TYPE claim -- it must propagate as a genuine
+# exception, never be relabeled. This path is structurally unreachable
+# through real parser input (the type check happens earlier, at the
+# parser boundary -- see the two tests above), so it is proven here via
+# monkeypatch, simulating a hypothetical future defect inside the
+# candidate dataclass itself. ════════════════════════════════════════════
+
+def test_unexpected_valueerror_from_evidence_candidate_propagates_not_wrong_field_type(monkeypatch):
+    import professional_turn_analyzer as analyzer_module
+
+    def _raise_unexpected(**kwargs):
+        raise ValueError("some future internal defect, not a BoundedTextViolation")
+    monkeypatch.setattr(analyzer_module, "EvidenceSpanCandidate", _raise_unexpected)
+
+    doc = _document(evidence=[_evidence_entry(span="valid span text")])
+    with pytest.raises(ValueError) as exc_info:
+        parse_model_response(_dumps(doc))
+    # Must NOT have been caught and relabeled as a bounded structural
+    # rejection -- neither TurnAnalyzerParseError nor _StructuralDefect.
+    assert not isinstance(exc_info.value, TurnAnalyzerParseError)
+    assert not hasattr(exc_info.value, "reason")
+
+
+def test_unexpected_valueerror_from_interaction_candidate_propagates_not_wrong_field_type(monkeypatch):
+    import professional_turn_analyzer as analyzer_module
+
+    def _raise_unexpected(**kwargs):
+        raise ValueError("some future internal defect, not a BoundedTextViolation")
+    monkeypatch.setattr(analyzer_module, "InteractionSpanCandidate", _raise_unexpected)
+
+    doc = _document(interaction=[_interaction_entry(span="valid span text")])
+    with pytest.raises(ValueError) as exc_info:
+        parse_model_response(_dumps(doc))
+    assert not isinstance(exc_info.value, TurnAnalyzerParseError)
+    assert not hasattr(exc_info.value, "reason")
+
+
+def test_unexpected_valueerror_propagation_carries_no_raw_message_reclassification():
+    """Companion proof to the two propagation tests above: confirms the
+    propagation path introduces no str(exc) parsing anywhere in
+    _build_evidence_span_candidate/_build_interaction_span_candidate --
+    an AST-level structural check, not a behavioral one, so it catches a
+    future regression even if no test input happens to trigger it."""
+    import ast
+    import inspect
+    import professional_turn_analyzer as analyzer_module
+
+    for fn_name in ("_build_evidence_span_candidate", "_build_interaction_span_candidate"):
+        source = inspect.getsource(getattr(analyzer_module, fn_name))
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str":
+                pytest.fail(f"{fn_name} must never call str() on an exception")
+            if isinstance(node, ast.ExceptHandler) and node.type is not None:
+                # Only BoundedTextViolation may be caught -- a bare
+                # `except ValueError:`/`except Exception:` here would
+                # silently reintroduce the false-classification defect
+                # this correction removes.
+                caught = node.type.id if isinstance(node.type, ast.Name) else None
+                assert caught == "BoundedTextViolation", (
+                    f"{fn_name} must only catch BoundedTextViolation, found except {caught!r}")
 
 
 def test_valid_parser_output_unchanged_by_this_slice():
@@ -1155,18 +1350,55 @@ def test_parse_error_rejects_non_enum_reason():
         TurnAnalyzerParseError("not an enum member", "message")
 
 
-def test_structural_failure_reason_is_closed_and_exhaustive_over_ten_classes():
-    """Freezes the exhaustive set at exactly the ten materially-distinct
-    structural failure classes this slice classifies -- a future new
-    _StructuralDefect/TurnAnalyzerParseError raise site that reuses an
-    existing member is fine; one that needs a genuinely new class must
-    add it here deliberately, not accidentally."""
+def test_structural_failure_reason_is_closed_and_exhaustive_over_current_classes():
+    """Freezes the exhaustive set at exactly the current materially-
+    distinct structural failure classes this slice classifies -- a future
+    new _StructuralDefect/TurnAnalyzerParseError raise site that reuses an
+    existing member is fine; one that needs a genuinely new class must add
+    it here deliberately, not accidentally. Candidate Text Bounds Detail
+    V2 replaced the single coarse CANDIDATE_TEXT_BOUNDS member with the 18
+    exact (family x field x kind) members below -- it is intentionally
+    absent from this set (see test_generic_candidate_text_bounds_member_removed)."""
     assert {m.value for m in TurnAnalyzerStructuralFailureReason} == {
         "RAW_CONTENT_NOT_A_STRING", "RAW_RESPONSE_TOO_LARGE", "MALFORMED_JSON",
         "DUPLICATE_KEY", "NONSTANDARD_NUMERIC_CONSTANT", "JSON_NUMBER_NOT_PERMITTED",
         "WRONG_CONTAINER_TYPE", "WRONG_REQUIRED_KEY_SET", "WRONG_FIELD_TYPE",
-        "CANDIDATE_TEXT_BOUNDS",
+        "EVIDENCE_SPAN_EMPTY", "EVIDENCE_SPAN_WHITESPACE_ONLY", "EVIDENCE_SPAN_TOO_LONG",
+        "EVIDENCE_CONTEXT_BEFORE_EMPTY", "EVIDENCE_CONTEXT_BEFORE_WHITESPACE_ONLY",
+        "EVIDENCE_CONTEXT_BEFORE_TOO_LONG",
+        "EVIDENCE_CONTEXT_AFTER_EMPTY", "EVIDENCE_CONTEXT_AFTER_WHITESPACE_ONLY",
+        "EVIDENCE_CONTEXT_AFTER_TOO_LONG",
+        "INTERACTION_SPAN_EMPTY", "INTERACTION_SPAN_WHITESPACE_ONLY", "INTERACTION_SPAN_TOO_LONG",
+        "INTERACTION_CONTEXT_BEFORE_EMPTY", "INTERACTION_CONTEXT_BEFORE_WHITESPACE_ONLY",
+        "INTERACTION_CONTEXT_BEFORE_TOO_LONG",
+        "INTERACTION_CONTEXT_AFTER_EMPTY", "INTERACTION_CONTEXT_AFTER_WHITESPACE_ONLY",
+        "INTERACTION_CONTEXT_AFTER_TOO_LONG",
     }
+
+
+def test_generic_candidate_text_bounds_member_removed():
+    """No current candidate bounded-text failure path may emit the old
+    coarse member -- it no longer exists in the enum at all (V2 removed
+    it rather than retaining it as an unused legacy member, since a
+    repository-wide search found it referenced only inside this module
+    and its own tests)."""
+    assert "CANDIDATE_TEXT_BOUNDS" not in {m.value for m in TurnAnalyzerStructuralFailureReason}
+    assert not hasattr(TurnAnalyzerStructuralFailureReason, "CANDIDATE_TEXT_BOUNDS")
+
+
+def test_candidate_text_violation_mapping_has_exact_18_key_closed_set():
+    """Directly tests the closed (family, field, kind) -> reason mapping's
+    exact key set -- 2 families x 3 fields x 3 kinds, no more, no fewer."""
+    import professional_turn_analyzer as analyzer_module
+    mapping = analyzer_module._CANDIDATE_TEXT_VIOLATION_REASON
+    assert len(mapping) == 18
+    families = {k[0] for k in mapping}
+    fields = {k[1] for k in mapping}
+    kinds = {k[2] for k in mapping}
+    assert families == set(analyzer_module._CandidateFamily)
+    assert fields == set(BoundedTextField)
+    assert kinds == set(BoundedTextViolationKind)
+    assert len(mapping.values()) == len(set(mapping.values())) == 18
 
 
 # ── R3. TurnAnalyzerCallResult.structural_failure_reason contract ──────────

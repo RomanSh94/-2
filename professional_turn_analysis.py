@@ -98,20 +98,88 @@ MAX_INTERACTION_CANDIDATES_PER_TURN = 10
 # orchestration/harvesting layer, not by any single dataclass here.
 
 
-def _require_bounded_text(value: str, *, field_name: str, max_chars: int) -> None:
+class BoundedTextField(str, Enum):
+    """Which of a candidate span's three bounded-text fields a
+    BoundedTextViolation originated from -- closed, diagnostic-only
+    identity. Only ever set by the candidate-tier callers of
+    _require_bounded_text (EvidenceSpanCandidate/InteractionSpanCandidate);
+    every other caller (LocatedEvidenceSpan/LocatedInteractionSpan/
+    InteractionSignalOccurrence) leaves it None, since they are not part
+    of the Analyzer's untrusted-candidate structural-failure
+    classification and this slice must not alter their behavior."""
+    EXACT_SOURCE_SPAN = "EXACT_SOURCE_SPAN"
+    CONTEXT_BEFORE = "CONTEXT_BEFORE"
+    CONTEXT_AFTER = "CONTEXT_AFTER"
+
+
+class BoundedTextViolationKind(str, Enum):
+    """Which exact bounded-text rule a BoundedTextViolation represents --
+    closed, exhaustive over _require_bounded_text's own three content
+    checks (the type check is a separate, unrelated defect class -- see
+    BoundedTextViolation's own docstring)."""
+    EMPTY = "EMPTY"
+    WHITESPACE_ONLY = "WHITESPACE_ONLY"
+    TOO_LONG = "TOO_LONG"
+
+
+class BoundedTextViolation(ValueError):
+    """A ValueError subclass carrying a typed, closed diagnostic
+    (field, kind) pair -- diagnostic-only, does not change acceptance/
+    rejection behavior: every existing `except ValueError` caller (inside
+    this module and in professional_turn_analyzer.py) continues to catch
+    it exactly as before, and str(self) is unchanged from the plain
+    ValueError message this replaces. field is None for callers that
+    don't identify a specific candidate field (see BoundedTextField's own
+    docstring); kind is always set for the three content-rule violations
+    this class represents (never for the type-mismatch check, which
+    remains a plain ValueError -- see _require_bounded_text)."""
+
+    def __init__(
+            self, message: str, *,
+            kind: BoundedTextViolationKind,
+            field: BoundedTextField | None = None,
+    ):
+        if type(kind) is not BoundedTextViolationKind:
+            raise ValueError(
+                "BoundedTextViolation: kind must be exactly a "
+                f"BoundedTextViolationKind, got {type(kind)!r}")
+        if field is not None and type(field) is not BoundedTextField:
+            raise ValueError(
+                "BoundedTextViolation: field must be None or exactly a "
+                f"BoundedTextField, got {type(field)!r}")
+        super().__init__(message)
+        self.kind = kind
+        self.field = field
+
+
+def _require_bounded_text(
+        value: str, *, field_name: str, max_chars: int,
+        field: BoundedTextField | None = None,
+) -> None:
     """Shared, non-mutating validation for an untrusted/located text field:
     must be exactly `str`, non-empty, not whitespace-only, and within the
     given character cap. Never strips, casefolds, or truncates -- the
-    caller's own field always stores the exact original value."""
+    caller's own field always stores the exact original value. The type
+    check is unreachable from the Analyzer's real call path (that field's
+    type is already validated earlier, at the parser boundary, before this
+    function's caller is ever constructed) and remains a plain ValueError
+    with no field/kind -- WRONG_TYPE has no place in a text-CONTENT
+    violation taxonomy. `field` is optional and diagnostic-only; passing it
+    does not change which check runs or what value is accepted."""
     if type(value) is not str:
         raise ValueError(f"{field_name} must be a str, got {type(value)!r}")
     if not value:
-        raise ValueError(f"{field_name} must be non-empty")
+        raise BoundedTextViolation(
+            f"{field_name} must be non-empty",
+            kind=BoundedTextViolationKind.EMPTY, field=field)
     if not value.strip():
-        raise ValueError(f"{field_name} must not be whitespace-only")
+        raise BoundedTextViolation(
+            f"{field_name} must not be whitespace-only",
+            kind=BoundedTextViolationKind.WHITESPACE_ONLY, field=field)
     if len(value) > max_chars:
-        raise ValueError(
-            f"{field_name} exceeds max length {max_chars} (got {len(value)})")
+        raise BoundedTextViolation(
+            f"{field_name} exceeds max length {max_chars} (got {len(value)})",
+            kind=BoundedTextViolationKind.TOO_LONG, field=field)
 
 
 def _require_row_id(value: int, *, field_name: str) -> None:
@@ -145,17 +213,20 @@ class EvidenceSpanCandidate:
         _require_bounded_text(
             self.exact_source_span,
             field_name="EvidenceSpanCandidate.exact_source_span",
-            max_chars=EVIDENCE_CANDIDATE_MAX_CHARS)
+            max_chars=EVIDENCE_CANDIDATE_MAX_CHARS,
+            field=BoundedTextField.EXACT_SOURCE_SPAN)
         if self.context_before is not None:
             _require_bounded_text(
                 self.context_before,
                 field_name="EvidenceSpanCandidate.context_before",
-                max_chars=CONTEXT_BEFORE_MAX_CHARS)
+                max_chars=CONTEXT_BEFORE_MAX_CHARS,
+                field=BoundedTextField.CONTEXT_BEFORE)
         if self.context_after is not None:
             _require_bounded_text(
                 self.context_after,
                 field_name="EvidenceSpanCandidate.context_after",
-                max_chars=CONTEXT_AFTER_MAX_CHARS)
+                max_chars=CONTEXT_AFTER_MAX_CHARS,
+                field=BoundedTextField.CONTEXT_AFTER)
 
 
 @dataclass(frozen=True)
@@ -172,17 +243,20 @@ class InteractionSpanCandidate:
         _require_bounded_text(
             self.exact_source_span,
             field_name="InteractionSpanCandidate.exact_source_span",
-            max_chars=INTERACTION_CANDIDATE_MAX_CHARS)
+            max_chars=INTERACTION_CANDIDATE_MAX_CHARS,
+            field=BoundedTextField.EXACT_SOURCE_SPAN)
         if self.context_before is not None:
             _require_bounded_text(
                 self.context_before,
                 field_name="InteractionSpanCandidate.context_before",
-                max_chars=CONTEXT_BEFORE_MAX_CHARS)
+                max_chars=CONTEXT_BEFORE_MAX_CHARS,
+                field=BoundedTextField.CONTEXT_BEFORE)
         if self.context_after is not None:
             _require_bounded_text(
                 self.context_after,
                 field_name="InteractionSpanCandidate.context_after",
-                max_chars=CONTEXT_AFTER_MAX_CHARS)
+                max_chars=CONTEXT_AFTER_MAX_CHARS,
+                field=BoundedTextField.CONTEXT_AFTER)
 
 
 # -- Deterministic located tier (code-owned offsets, produced by

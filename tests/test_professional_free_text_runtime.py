@@ -299,8 +299,8 @@ def test_analyzer_structurally_invalid_accepts_exact_detail():
         status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
         failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
         failure_reason=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
-        failure_detail=TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS)
-    assert result.failure_detail is TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS
+        failure_detail=TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_TOO_LONG)
+    assert result.failure_detail is TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_TOO_LONG
 
 
 def test_failure_detail_must_be_exact_enum_member_not_a_raw_string():
@@ -581,6 +581,34 @@ def test_chain_analyzer_structurally_invalid_propagates_exact_detail(monkeypatch
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
     assert result.failure_reason is TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE
     assert result.failure_detail is TurnAnalyzerStructuralFailureReason.WRONG_REQUIRED_KEY_SET
+
+
+# ── Candidate Text Bounds Detail V2 -- representative granular details
+# flow end-to-end through the real orchestrator unchanged. Proves this
+# slice required zero changes to professional_free_text_runtime.py itself
+# (the existing failure_detail contract already handles any member of
+# TurnAnalyzerStructuralFailureReason -- adding new members to that same
+# closed enum needed no propagation-layer change). ═══════════════════════
+
+@pytest.mark.parametrize("detail", [
+    TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_TOO_LONG,
+    TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_TOO_LONG,
+    TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_TOO_LONG,
+    TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_EMPTY,
+    TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_WHITESPACE_ONLY,
+])
+def test_chain_propagates_granular_candidate_text_bounds_detail(monkeypatch, detail):
+    _monkeypatch_chain(
+        monkeypatch, analyzer_failed=True,
+        analyzer_failure_category=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
+        analyzer_structural_failure_reason=detail)
+    result = run(pftr.run_professional_free_text_turn(
+        client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
+        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+    assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
+    assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
+    assert result.failure_reason is TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE
+    assert result.failure_detail is detail
 
 
 def test_chain_analyzer_provider_failure_has_no_detail(monkeypatch):
@@ -1029,6 +1057,42 @@ def test_professional_failed_dispatch_log_includes_bounded_detail_when_present(t
     assert "detail=WRONG_REQUIRED_KEY_SET" in line
     for c in calls:
         assert user_text not in c
+
+
+def test_professional_failed_dispatch_log_includes_granular_candidate_bounds_detail(tmp_db, monkeypatch):
+    """Candidate Text Bounds Detail V2: proves the NEW granular member
+    (not just the pre-existing WRONG_REQUIRED_KEY_SET example above)
+    reaches the bot dispatch log unchanged, and that no raw field value,
+    candidate text, or exception text leaks alongside it."""
+    run(_seed_user(OWNER))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    real_field_value_that_must_never_leak = "y" * 61  # an actual too-long context value
+    structural_result = pftr.ProfessionalFreeTextRuntimeResult(
+        status=pftr.ProfessionalFreeTextRuntimeStatus.FAILED, reply_text=None,
+        failure_stage=pftr.ProfessionalFreeTextFailureStage.ANALYZER,
+        failure_reason=TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE,
+        failure_detail=TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_TOO_LONG)
+    _stub_runtime_result(monkeypatch, structural_result)
+    calls = _capture_dispatch_log(monkeypatch)
+
+    user_text = "У меня очень длинная и деликатная тема, сложно уложить в пару слов."
+    msg = FakeMessage(FakeUser(OWNER), user_text)
+    run(bot.pipeline(msg, msg.text))
+
+    failed_lines = [c for c in calls if "stage=professional_failed" in c and "pro_stage=" in c]
+    assert failed_lines, calls
+    line = failed_lines[0]
+    assert "pro_stage=ANALYZER" in line
+    assert "reason=STRUCTURALLY_INVALID_RESPONSE" in line
+    assert "detail=EVIDENCE_SPAN_TOO_LONG" in line
+    for c in calls:
+        assert user_text not in c
+        assert real_field_value_that_must_never_leak not in c
+        assert "exact_source_span" not in c
+        assert "context_before" not in c
+        assert "context_after" not in c
 
 
 def test_professional_rejected_dispatch_log_includes_bounded_stage_and_reason(tmp_db, monkeypatch):

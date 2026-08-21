@@ -109,6 +109,9 @@ from professional_turn_analysis import (
     CONTEXT_BEFORE_MAX_CHARS,
     EVIDENCE_CANDIDATE_MAX_CHARS,
     INTERACTION_CANDIDATE_MAX_CHARS,
+    BoundedTextField,
+    BoundedTextViolation,
+    BoundedTextViolationKind,
     EvidenceSpanCandidate,
     InteractionApplicability,
     InteractionOccurrenceProposal,
@@ -148,7 +151,17 @@ class TurnAnalyzerStructuralFailureReason(str, Enum):
     check across top-level/evidence-wrapper/interaction-wrapper/proposal
     objects). This is the runtime observability contract: bounded, closed,
     privacy-safe -- never a free-form string, never str(exc), never any
-    model-supplied key name or value."""
+    model-supplied key name or value.
+
+    The eighteen EVIDENCE_*/INTERACTION_* members replace the earlier,
+    coarser CANDIDATE_TEXT_BOUNDS member (V2 -- removed, not deprecated:
+    grep confirmed it was referenced only inside this module and its own
+    tests, nowhere else in the repository, so no legacy-compatibility
+    member was needed). Every one of the 2 candidate families x 3 bounded-
+    text fields x 3 violation kinds is represented -- see
+    _CANDIDATE_TEXT_VIOLATION_REASON below for the exhaustive closed
+    mapping from (family, BoundedTextField, BoundedTextViolationKind) to
+    the exact member."""
     RAW_CONTENT_NOT_A_STRING = "RAW_CONTENT_NOT_A_STRING"
     RAW_RESPONSE_TOO_LARGE = "RAW_RESPONSE_TOO_LARGE"
     MALFORMED_JSON = "MALFORMED_JSON"
@@ -158,7 +171,94 @@ class TurnAnalyzerStructuralFailureReason(str, Enum):
     WRONG_CONTAINER_TYPE = "WRONG_CONTAINER_TYPE"
     WRONG_REQUIRED_KEY_SET = "WRONG_REQUIRED_KEY_SET"
     WRONG_FIELD_TYPE = "WRONG_FIELD_TYPE"
-    CANDIDATE_TEXT_BOUNDS = "CANDIDATE_TEXT_BOUNDS"
+    EVIDENCE_SPAN_EMPTY = "EVIDENCE_SPAN_EMPTY"
+    EVIDENCE_SPAN_WHITESPACE_ONLY = "EVIDENCE_SPAN_WHITESPACE_ONLY"
+    EVIDENCE_SPAN_TOO_LONG = "EVIDENCE_SPAN_TOO_LONG"
+    EVIDENCE_CONTEXT_BEFORE_EMPTY = "EVIDENCE_CONTEXT_BEFORE_EMPTY"
+    EVIDENCE_CONTEXT_BEFORE_WHITESPACE_ONLY = "EVIDENCE_CONTEXT_BEFORE_WHITESPACE_ONLY"
+    EVIDENCE_CONTEXT_BEFORE_TOO_LONG = "EVIDENCE_CONTEXT_BEFORE_TOO_LONG"
+    EVIDENCE_CONTEXT_AFTER_EMPTY = "EVIDENCE_CONTEXT_AFTER_EMPTY"
+    EVIDENCE_CONTEXT_AFTER_WHITESPACE_ONLY = "EVIDENCE_CONTEXT_AFTER_WHITESPACE_ONLY"
+    EVIDENCE_CONTEXT_AFTER_TOO_LONG = "EVIDENCE_CONTEXT_AFTER_TOO_LONG"
+    INTERACTION_SPAN_EMPTY = "INTERACTION_SPAN_EMPTY"
+    INTERACTION_SPAN_WHITESPACE_ONLY = "INTERACTION_SPAN_WHITESPACE_ONLY"
+    INTERACTION_SPAN_TOO_LONG = "INTERACTION_SPAN_TOO_LONG"
+    INTERACTION_CONTEXT_BEFORE_EMPTY = "INTERACTION_CONTEXT_BEFORE_EMPTY"
+    INTERACTION_CONTEXT_BEFORE_WHITESPACE_ONLY = "INTERACTION_CONTEXT_BEFORE_WHITESPACE_ONLY"
+    INTERACTION_CONTEXT_BEFORE_TOO_LONG = "INTERACTION_CONTEXT_BEFORE_TOO_LONG"
+    INTERACTION_CONTEXT_AFTER_EMPTY = "INTERACTION_CONTEXT_AFTER_EMPTY"
+    INTERACTION_CONTEXT_AFTER_WHITESPACE_ONLY = "INTERACTION_CONTEXT_AFTER_WHITESPACE_ONLY"
+    INTERACTION_CONTEXT_AFTER_TOO_LONG = "INTERACTION_CONTEXT_AFTER_TOO_LONG"
+
+
+class _CandidateFamily(str, Enum):
+    """Module-private: which candidate dataclass raised a
+    BoundedTextViolation. Not part of the public observability contract --
+    only used as a key component for _CANDIDATE_TEXT_VIOLATION_REASON."""
+    EVIDENCE = "EVIDENCE"
+    INTERACTION = "INTERACTION"
+
+
+# Exhaustive, closed mapping: every one of the 2 (family) x 3 (field) x 3
+# (kind) = 18 real combinations maps to exactly one TurnAnalyzerStructural
+# FailureReason member. Deliberately a plain dict literal (not a formula
+# string-joining the three key parts) so the exact closed key set is
+# testable directly, and so a typo in a member name is a KeyError at
+# import time via the exhaustiveness self-test below, not a silent gap.
+_CANDIDATE_TEXT_VIOLATION_REASON: dict[
+    tuple[_CandidateFamily, BoundedTextField, BoundedTextViolationKind],
+    TurnAnalyzerStructuralFailureReason,
+] = {
+    (_CandidateFamily.EVIDENCE, BoundedTextField.EXACT_SOURCE_SPAN, BoundedTextViolationKind.EMPTY):
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_EMPTY,
+    (_CandidateFamily.EVIDENCE, BoundedTextField.EXACT_SOURCE_SPAN, BoundedTextViolationKind.WHITESPACE_ONLY):
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_WHITESPACE_ONLY,
+    (_CandidateFamily.EVIDENCE, BoundedTextField.EXACT_SOURCE_SPAN, BoundedTextViolationKind.TOO_LONG):
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_TOO_LONG,
+    (_CandidateFamily.EVIDENCE, BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.EMPTY):
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_EMPTY,
+    (_CandidateFamily.EVIDENCE, BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.WHITESPACE_ONLY):
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_WHITESPACE_ONLY,
+    (_CandidateFamily.EVIDENCE, BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.TOO_LONG):
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_TOO_LONG,
+    (_CandidateFamily.EVIDENCE, BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.EMPTY):
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_AFTER_EMPTY,
+    (_CandidateFamily.EVIDENCE, BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.WHITESPACE_ONLY):
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_AFTER_WHITESPACE_ONLY,
+    (_CandidateFamily.EVIDENCE, BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.TOO_LONG):
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_AFTER_TOO_LONG,
+    (_CandidateFamily.INTERACTION, BoundedTextField.EXACT_SOURCE_SPAN, BoundedTextViolationKind.EMPTY):
+        TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_EMPTY,
+    (_CandidateFamily.INTERACTION, BoundedTextField.EXACT_SOURCE_SPAN, BoundedTextViolationKind.WHITESPACE_ONLY):
+        TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_WHITESPACE_ONLY,
+    (_CandidateFamily.INTERACTION, BoundedTextField.EXACT_SOURCE_SPAN, BoundedTextViolationKind.TOO_LONG):
+        TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_TOO_LONG,
+    (_CandidateFamily.INTERACTION, BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.EMPTY):
+        TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_BEFORE_EMPTY,
+    (_CandidateFamily.INTERACTION, BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.WHITESPACE_ONLY):
+        TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_BEFORE_WHITESPACE_ONLY,
+    (_CandidateFamily.INTERACTION, BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.TOO_LONG):
+        TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_BEFORE_TOO_LONG,
+    (_CandidateFamily.INTERACTION, BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.EMPTY):
+        TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_EMPTY,
+    (_CandidateFamily.INTERACTION, BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.WHITESPACE_ONLY):
+        TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_WHITESPACE_ONLY,
+    (_CandidateFamily.INTERACTION, BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.TOO_LONG):
+        TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_TOO_LONG,
+}
+assert len(_CANDIDATE_TEXT_VIOLATION_REASON) == 18, "must cover exactly 2x3x3 combinations"
+
+
+def _candidate_text_violation_reason(
+        family: _CandidateFamily, exc: BoundedTextViolation,
+) -> TurnAnalyzerStructuralFailureReason:
+    """Deterministic, closed lookup -- never parses exc's message. Raises
+    KeyError (a genuine programming defect, not swallowed) if exc.field is
+    None or the (family, field, kind) triple is somehow outside the
+    exhaustive 18-entry table; both should be structurally impossible for
+    a BoundedTextViolation raised by EvidenceSpanCandidate/
+    InteractionSpanCandidate, which always pass a field."""
+    return _CANDIDATE_TEXT_VIOLATION_REASON[(family, exc.field, exc.kind)]
 
 
 class TurnAnalyzerParseError(Exception):
@@ -302,10 +402,26 @@ def _build_evidence_span_candidate(candidate_obj):
     try:
         return EvidenceSpanCandidate(
             exact_source_span=span, context_before=before, context_after=after)
-    except ValueError:
+    except BoundedTextViolation as exc:
+        # The only classification this code has actual evidence for.
         raise _StructuralDefect(
-            TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS,
+            _candidate_text_violation_reason(_CandidateFamily.EVIDENCE, exc),
             "evidence candidate text violates length/emptiness bounds") from None
+    # Deliberately no `except ValueError:` fallback here. _parse_candidate_
+    # fields (via _require_string_or_none, above) already guarantees span/
+    # before/after are str/None before EvidenceSpanCandidate is ever
+    # constructed, so its own type check is structurally unreachable --
+    # there is no evidence a plain ValueError from this constructor would
+    # ever mean "wrong field type", and no other classification is
+    # justified by what this code has actually established. An
+    # unanticipated ValueError is therefore left to propagate as a genuine
+    # exception (the same discipline run_professional_free_text_turn's own
+    # docstring already applies: "a genuine caller/adapter type defect...
+    # must not be silently absorbed into a bounded [] result") --
+    # bot.py's outer exception handler already turns any such propagated
+    # exception into the same bounded neutral technical fallback the user
+    # sees, logging only a bounded error_type, never a false specific
+    # structural claim.
 
 
 def _build_interaction_span_candidate(candidate_obj):
@@ -313,10 +429,12 @@ def _build_interaction_span_candidate(candidate_obj):
     try:
         return InteractionSpanCandidate(
             exact_source_span=span, context_before=before, context_after=after)
-    except ValueError:
+    except BoundedTextViolation as exc:
         raise _StructuralDefect(
-            TurnAnalyzerStructuralFailureReason.CANDIDATE_TEXT_BOUNDS,
+            _candidate_text_violation_reason(_CandidateFamily.INTERACTION, exc),
             "interaction candidate text violates length/emptiness bounds") from None
+    # Same discipline as _build_evidence_span_candidate above -- no generic
+    # `except ValueError:` fallback.
 
 
 def _parse_evidence_candidates(raw_list):
