@@ -255,6 +255,101 @@ def test_interaction_span_candidate_no_silent_stripping_or_truncation():
     assert len(c.exact_source_span) == len(text)
 
 
+# ── C2/D2. BoundedTextViolation exactness (Candidate Text Bounds Detail
+# V2) -- the validation authority itself, one level below Analyzer's own
+# family+field+kind lookup table. Proves the exact typed (field, kind)
+# pair the exception carries, for every field x kind combination on both
+# dataclasses -- 3 fields x 3 kinds x 2 dataclasses = 18 cases, matching
+# the exhaustive mapping Analyzer relies on. Every raise above already
+# proves *that* a ValueError-family exception fires; these prove exactly
+# *which* typed BoundedTextViolation. ═══════════════════════════════════
+
+from professional_turn_analysis import BoundedTextField, BoundedTextViolation, BoundedTextViolationKind
+
+
+@pytest.mark.parametrize("kwargs,field,kind", [
+    (dict(exact_source_span=""), BoundedTextField.EXACT_SOURCE_SPAN, BoundedTextViolationKind.EMPTY),
+    (dict(exact_source_span="   "), BoundedTextField.EXACT_SOURCE_SPAN,
+     BoundedTextViolationKind.WHITESPACE_ONLY),
+    (dict(exact_source_span="a" * (EVIDENCE_CANDIDATE_MAX_CHARS + 1)), BoundedTextField.EXACT_SOURCE_SPAN,
+     BoundedTextViolationKind.TOO_LONG),
+    (dict(exact_source_span="ok", context_before=""), BoundedTextField.CONTEXT_BEFORE,
+     BoundedTextViolationKind.EMPTY),
+    (dict(exact_source_span="ok", context_before="  "), BoundedTextField.CONTEXT_BEFORE,
+     BoundedTextViolationKind.WHITESPACE_ONLY),
+    (dict(exact_source_span="ok", context_before="y" * (CONTEXT_BEFORE_MAX_CHARS + 1)),
+     BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.TOO_LONG),
+    (dict(exact_source_span="ok", context_after=""), BoundedTextField.CONTEXT_AFTER,
+     BoundedTextViolationKind.EMPTY),
+    (dict(exact_source_span="ok", context_after="  "), BoundedTextField.CONTEXT_AFTER,
+     BoundedTextViolationKind.WHITESPACE_ONLY),
+    (dict(exact_source_span="ok", context_after="y" * (CONTEXT_AFTER_MAX_CHARS + 1)),
+     BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.TOO_LONG),
+])
+def test_evidence_span_candidate_bounded_text_violation_exact_field_and_kind(kwargs, field, kind):
+    with pytest.raises(BoundedTextViolation) as exc_info:
+        EvidenceSpanCandidate(**kwargs)
+    assert exc_info.value.field is field
+    assert exc_info.value.kind is kind
+
+
+@pytest.mark.parametrize("kwargs,field,kind", [
+    (dict(exact_source_span=""), BoundedTextField.EXACT_SOURCE_SPAN, BoundedTextViolationKind.EMPTY),
+    (dict(exact_source_span="   "), BoundedTextField.EXACT_SOURCE_SPAN,
+     BoundedTextViolationKind.WHITESPACE_ONLY),
+    (dict(exact_source_span="a" * (INTERACTION_CANDIDATE_MAX_CHARS + 1)), BoundedTextField.EXACT_SOURCE_SPAN,
+     BoundedTextViolationKind.TOO_LONG),
+    (dict(exact_source_span="ok", context_before=""), BoundedTextField.CONTEXT_BEFORE,
+     BoundedTextViolationKind.EMPTY),
+    (dict(exact_source_span="ok", context_before="  "), BoundedTextField.CONTEXT_BEFORE,
+     BoundedTextViolationKind.WHITESPACE_ONLY),
+    (dict(exact_source_span="ok", context_before="z" * (CONTEXT_BEFORE_MAX_CHARS + 1)),
+     BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.TOO_LONG),
+    (dict(exact_source_span="ok", context_after=""), BoundedTextField.CONTEXT_AFTER,
+     BoundedTextViolationKind.EMPTY),
+    (dict(exact_source_span="ok", context_after="  "), BoundedTextField.CONTEXT_AFTER,
+     BoundedTextViolationKind.WHITESPACE_ONLY),
+    (dict(exact_source_span="ok", context_after="z" * (CONTEXT_AFTER_MAX_CHARS + 1)),
+     BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.TOO_LONG),
+])
+def test_interaction_span_candidate_bounded_text_violation_exact_field_and_kind(kwargs, field, kind):
+    with pytest.raises(BoundedTextViolation) as exc_info:
+        InteractionSpanCandidate(**kwargs)
+    assert exc_info.value.field is field
+    assert exc_info.value.kind is kind
+
+
+def test_evidence_span_candidate_wrong_type_is_plain_valueerror_not_bounded_text_violation():
+    """The type check is a separate defect class from the three content
+    checks -- it must remain a plain ValueError, never BoundedTextViolation
+    (WRONG_TYPE has no place in a text-content violation taxonomy)."""
+    with pytest.raises(ValueError) as exc_info:
+        EvidenceSpanCandidate(exact_source_span=12345)
+    assert not isinstance(exc_info.value, BoundedTextViolation)
+
+
+def test_bounded_text_violation_message_unchanged_from_plain_valueerror():
+    """Diagnostic-only: str(exc) is byte-identical to what the pre-V2
+    plain ValueError would have said -- no existing caller that merely
+    logs/displays the message sees any behavior change."""
+    with pytest.raises(BoundedTextViolation) as exc_info:
+        EvidenceSpanCandidate(exact_source_span="")
+    assert str(exc_info.value) == "EvidenceSpanCandidate.exact_source_span must be non-empty"
+
+
+def test_located_tier_bounded_text_violations_leave_field_none():
+    """LocatedEvidenceSpan/LocatedInteractionSpan/InteractionSignalOccurrence
+    are not part of the Analyzer's untrusted-candidate classification --
+    this slice must not alter their behavior. They still raise
+    BoundedTextViolation (a ValueError subclass, so every existing
+    `except ValueError` caller is unaffected) but never identify a field,
+    since Analyzer never classifies failures from this tier."""
+    with pytest.raises(BoundedTextViolation) as exc_info:
+        LocatedEvidenceSpan(source_message_row_id=1, span_start=0, span_end=1, exact_source_span="")
+    assert exc_info.value.field is None
+    assert exc_info.value.kind is BoundedTextViolationKind.EMPTY
+
+
 # ── E. LocatedEvidenceSpan ───────────────────────────────────────────────
 
 def test_located_evidence_span_valid():
