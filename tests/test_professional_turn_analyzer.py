@@ -1141,6 +1141,7 @@ from professional_turn_analysis import (
     CONTEXT_BEFORE_MAX_CHARS as _CTX_BEFORE_MAX,
     CONTEXT_AFTER_MAX_CHARS as _CTX_AFTER_MAX,
     BoundedTextField,
+    BoundedTextViolation,
     BoundedTextViolationKind,
 )
 
@@ -1181,38 +1182,169 @@ def _doc_interaction_context_after(value):
         "proposal": None}])
 
 
+# ── Optional Context Recovery V1 -- SPAN defects remain response-fatal
+# with their exact pre-existing granular reason (section 13's fail-closed
+# lock); only the 12 CONTEXT_BEFORE/CONTEXT_AFTER cases now recover
+# instead of raising -- see test_optional_context_recovery_matrix below,
+# which is where those 12 cases moved to (they are deliberately absent
+# from this parametrize; their previous "still raises" assertion would
+# now be actively wrong). ═══════════════════════════════════════════════
+
 @pytest.mark.parametrize("doc_fn,value,expected", [
     (_doc_evidence_span, "", TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_EMPTY),
     (_doc_evidence_span, "   ", TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_WHITESPACE_ONLY),
     (_doc_evidence_span, "x" * (_EVID_MAX + 1), TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_TOO_LONG),
-    (_doc_evidence_context_before, "", TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_EMPTY),
-    (_doc_evidence_context_before, "  ",
-     TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_WHITESPACE_ONLY),
-    (_doc_evidence_context_before, "x" * (_CTX_BEFORE_MAX + 1),
-     TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_BEFORE_TOO_LONG),
-    (_doc_evidence_context_after, "", TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_AFTER_EMPTY),
-    (_doc_evidence_context_after, "\t",
-     TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_AFTER_WHITESPACE_ONLY),
-    (_doc_evidence_context_after, "x" * (_CTX_AFTER_MAX + 1),
-     TurnAnalyzerStructuralFailureReason.EVIDENCE_CONTEXT_AFTER_TOO_LONG),
     (_doc_interaction_span, "", TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_EMPTY),
     (_doc_interaction_span, " ", TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_WHITESPACE_ONLY),
     (_doc_interaction_span, "x" * (_INT_MAX + 1), TurnAnalyzerStructuralFailureReason.INTERACTION_SPAN_TOO_LONG),
-    (_doc_interaction_context_before, "", TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_BEFORE_EMPTY),
-    (_doc_interaction_context_before, "  ",
-     TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_BEFORE_WHITESPACE_ONLY),
-    (_doc_interaction_context_before, "x" * (_CTX_BEFORE_MAX + 1),
-     TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_BEFORE_TOO_LONG),
-    (_doc_interaction_context_after, "", TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_EMPTY),
-    (_doc_interaction_context_after, "\n",
-     TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_WHITESPACE_ONLY),
-    (_doc_interaction_context_after, "x" * (_CTX_AFTER_MAX + 1),
-     TurnAnalyzerStructuralFailureReason.INTERACTION_CONTEXT_AFTER_TOO_LONG),
 ])
-def test_reason_candidate_text_bounds_granular(doc_fn, value, expected):
+def test_span_defects_remain_fatal_with_exact_reason(doc_fn, value, expected):
+    """The mandatory fail-closed lock (section 13): all six exact_source_span
+    violations must still raise TurnAnalyzerParseError with their exact
+    pre-existing granular reason, byte-for-byte unchanged by this slice --
+    exact_source_span is never field-locally recovered, never dropped as
+    part of a whole-candidate recovery (that's a different, unauthorized
+    scope), never truncated, never normalized."""
     with pytest.raises(TurnAnalyzerParseError) as exc_info:
         parse_model_response(_dumps(doc_fn(value)))
     assert exc_info.value.reason is expected
+
+
+_RECOVERY_SPAN = "valid span for recovery test"
+_SIBLING_CONTEXT = "a valid sibling context value"  # well within every cap
+
+
+@pytest.mark.parametrize("evidence,context_before,context_after,expect_before,expect_after", [
+    # EVIDENCE_CONTEXT_BEFORE_*
+    (True, "", _SIBLING_CONTEXT, None, _SIBLING_CONTEXT),
+    (True, "  ", _SIBLING_CONTEXT, None, _SIBLING_CONTEXT),
+    (True, "x" * (_CTX_BEFORE_MAX + 1), _SIBLING_CONTEXT, None, _SIBLING_CONTEXT),
+    # EVIDENCE_CONTEXT_AFTER_*
+    (True, _SIBLING_CONTEXT, "", _SIBLING_CONTEXT, None),
+    (True, _SIBLING_CONTEXT, "\t", _SIBLING_CONTEXT, None),
+    (True, _SIBLING_CONTEXT, "x" * (_CTX_AFTER_MAX + 1), _SIBLING_CONTEXT, None),
+    # INTERACTION_CONTEXT_BEFORE_*
+    (False, "", _SIBLING_CONTEXT, None, _SIBLING_CONTEXT),
+    (False, "  ", _SIBLING_CONTEXT, None, _SIBLING_CONTEXT),
+    (False, "x" * (_CTX_BEFORE_MAX + 1), _SIBLING_CONTEXT, None, _SIBLING_CONTEXT),
+    # INTERACTION_CONTEXT_AFTER_*
+    (False, _SIBLING_CONTEXT, "", _SIBLING_CONTEXT, None),
+    (False, _SIBLING_CONTEXT, "\n", _SIBLING_CONTEXT, None),
+    (False, _SIBLING_CONTEXT, "x" * (_CTX_AFTER_MAX + 1), _SIBLING_CONTEXT, None),
+])
+def test_optional_context_recovery_matrix(evidence, context_before, context_after, expect_before, expect_after):
+    """The required 12-case recovery matrix (section 10): for every
+    (family, field, kind) combination, parse_model_response must succeed,
+    the candidate must survive, the violating context field must become
+    exactly None, the non-violating sibling context must remain
+    byte-identical, and exact_source_span must remain byte-identical."""
+    if evidence:
+        doc = _document(evidence=[{
+            "candidate": {"exact_source_span": _RECOVERY_SPAN,
+                          "context_before": context_before, "context_after": context_after},
+            "proposed_kind": None}])
+    else:
+        doc = _document(interaction=[{
+            "candidate": {"exact_source_span": _RECOVERY_SPAN,
+                          "context_before": context_before, "context_after": context_after},
+            "proposal": None}])
+    output = parse_model_response(_dumps(doc))
+    candidates = output.evidence_candidates if evidence else output.interaction_candidates
+    assert len(candidates) == 1
+    candidate = candidates[0].candidate
+    assert candidate.exact_source_span == _RECOVERY_SPAN
+    assert candidate.context_before == expect_before
+    assert candidate.context_after == expect_after
+
+
+@pytest.mark.parametrize("evidence", [True, False])
+def test_both_optional_contexts_invalid_recovers_both(evidence):
+    """Section 11: both context_before AND context_after invalid on the
+    same candidate -- both must become None, the candidate must survive,
+    exact_source_span must remain byte-identical."""
+    context_before = ""
+    context_after = "y" * (_CTX_AFTER_MAX + 1)
+    if evidence:
+        doc = _document(evidence=[{
+            "candidate": {"exact_source_span": _RECOVERY_SPAN,
+                          "context_before": context_before, "context_after": context_after},
+            "proposed_kind": None}])
+    else:
+        doc = _document(interaction=[{
+            "candidate": {"exact_source_span": _RECOVERY_SPAN,
+                          "context_before": context_before, "context_after": context_after},
+            "proposal": None}])
+    output = parse_model_response(_dumps(doc))
+    candidates = output.evidence_candidates if evidence else output.interaction_candidates
+    assert len(candidates) == 1
+    candidate = candidates[0].candidate
+    assert candidate.exact_source_span == _RECOVERY_SPAN
+    assert candidate.context_before is None
+    assert candidate.context_after is None
+
+
+@pytest.mark.parametrize("evidence", [True, False])
+def test_multi_candidate_isolation_only_defective_field_changes(evidence):
+    """Section 12: a valid candidate, a candidate with an invalid optional
+    context, and another valid candidate -- all three must survive in
+    original order; only the defective optional field on the middle
+    candidate may change; neither neighbor may be altered at all."""
+    if evidence:
+        doc = _document(evidence=[
+            {"candidate": {"exact_source_span": "first span", "context_before": "before-1",
+                           "context_after": "after-1"}, "proposed_kind": None},
+            {"candidate": {"exact_source_span": "second span", "context_before": "before-2",
+                           "context_after": "y" * (_CTX_AFTER_MAX + 1)}, "proposed_kind": None},
+            {"candidate": {"exact_source_span": "third span", "context_before": "before-3",
+                           "context_after": "after-3"}, "proposed_kind": None},
+        ])
+        output = parse_model_response(_dumps(doc))
+        candidates = [c.candidate for c in output.evidence_candidates]
+    else:
+        doc = _document(interaction=[
+            {"candidate": {"exact_source_span": "first span", "context_before": "before-1",
+                           "context_after": "after-1"}, "proposal": None},
+            {"candidate": {"exact_source_span": "second span", "context_before": "before-2",
+                           "context_after": "y" * (_CTX_AFTER_MAX + 1)}, "proposal": None},
+            {"candidate": {"exact_source_span": "third span", "context_before": "before-3",
+                           "context_after": "after-3"}, "proposal": None},
+        ])
+        output = parse_model_response(_dumps(doc))
+        candidates = [c.candidate for c in output.interaction_candidates]
+
+    assert len(candidates) == 3
+    assert candidates[0].exact_source_span == "first span"
+    assert candidates[0].context_before == "before-1"
+    assert candidates[0].context_after == "after-1"
+    assert candidates[1].exact_source_span == "second span"
+    assert candidates[1].context_before == "before-2"
+    assert candidates[1].context_after is None  # only this field was recovered
+    assert candidates[2].exact_source_span == "third span"
+    assert candidates[2].context_before == "before-3"
+    assert candidates[2].context_after == "after-3"
+
+
+def test_production_regression_evidence_context_after_too_long():
+    """Named regression test freezing the exact production fix: the
+    2026-08-21 owner canary on deployed commit 09d4c929 produced
+    pro_stage=ANALYZER reason=STRUCTURALLY_INVALID_RESPONSE
+    detail=EVIDENCE_CONTEXT_AFTER_TOO_LONG, rejecting the entire
+    Professional turn. This test uses synthetic fixture text (never the
+    owner's real Telegram message) reproducing only the structural shape
+    that mattered: a valid exact_source_span with a context_after exactly
+    one character over CONTEXT_AFTER_MAX_CHARS. Must now recover instead
+    of failing the whole response."""
+    doc = _document(evidence=[{
+        "candidate": {
+            "exact_source_span": "a synthetic evidence span, not real user content",
+            "context_before": None,
+            "context_after": "z" * (_CTX_AFTER_MAX + 1)},
+        "proposed_kind": None}])
+    output = parse_model_response(_dumps(doc))
+    assert len(output.evidence_candidates) == 1
+    candidate = output.evidence_candidates[0].candidate
+    assert candidate.exact_source_span == "a synthetic evidence span, not real user content"
+    assert candidate.context_after is None
 
 
 @pytest.mark.parametrize("doc_fn,value", [
@@ -1348,6 +1480,147 @@ def test_structural_defect_rejects_non_enum_reason():
 def test_parse_error_rejects_non_enum_reason():
     with pytest.raises(ValueError):
         TurnAnalyzerParseError("not an enum member", "message")
+
+
+# ── R3. Optional Context Recovery V1 -- no silent generalization ───────────
+# Section 14's contract lock: the recovery policy must accept ONLY the two
+# optional context field identities, never exact_source_span, never any
+# other exception, and never generalize by accident.
+
+def test_recoverable_context_fields_is_exactly_the_two_optional_fields():
+    import professional_turn_analyzer as analyzer_module
+    assert set(analyzer_module._RECOVERABLE_CONTEXT_FIELDS) == {
+        BoundedTextField.CONTEXT_BEFORE, BoundedTextField.CONTEXT_AFTER}
+    assert BoundedTextField.EXACT_SOURCE_SPAN not in analyzer_module._RECOVERABLE_CONTEXT_FIELDS
+
+
+def test_recoverable_context_violation_kinds_is_exactly_the_three_current_kinds():
+    """Section 5.B: the recoverable KIND axis, independently of field,
+    must be exactly the three currently-defined BoundedTextViolationKind
+    members -- not merely "whatever kinds happen to appear in the
+    matrix", but a real equality against the full current enum."""
+    import professional_turn_analyzer as analyzer_module
+    assert set(analyzer_module._RECOVERABLE_CONTEXT_VIOLATION_KINDS) == set(BoundedTextViolationKind)
+    assert set(analyzer_module._RECOVERABLE_CONTEXT_VIOLATION_KINDS) == {
+        BoundedTextViolationKind.EMPTY, BoundedTextViolationKind.WHITESPACE_ONLY,
+        BoundedTextViolationKind.TOO_LONG}
+
+
+def test_recoverable_context_violations_matrix_is_exactly_six_combinations():
+    """Section 5.C: the authorized recovery matrix -- the single
+    authoritative (field, kind) policy the helper actually consults --
+    contains exactly the 6 combinations CONTEXT_BEFORE/CONTEXT_AFTER x
+    EMPTY/WHITESPACE_ONLY/TOO_LONG, no more, no fewer."""
+    import professional_turn_analyzer as analyzer_module
+    assert analyzer_module._RECOVERABLE_CONTEXT_VIOLATIONS == frozenset({
+        (BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.EMPTY),
+        (BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.WHITESPACE_ONLY),
+        (BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.TOO_LONG),
+        (BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.EMPTY),
+        (BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.WHITESPACE_ONLY),
+        (BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.TOO_LONG),
+    })
+
+
+def test_exact_source_span_never_recoverable_for_any_current_kind():
+    """Section 5.D: EXACT_SOURCE_SPAN paired with every currently-defined
+    BoundedTextViolationKind must be absent from the recovery matrix --
+    checked exhaustively over the real, current enum, not just the one
+    kind a single production example happens to exercise."""
+    import professional_turn_analyzer as analyzer_module
+    for kind in BoundedTextViolationKind:
+        assert (BoundedTextField.EXACT_SOURCE_SPAN, kind) not in analyzer_module._RECOVERABLE_CONTEXT_VIOLATIONS
+
+
+def test_construct_with_context_recovery_consults_kind_not_just_field(monkeypatch):
+    """Section 5.E, and the core fix this correction makes: proves the
+    helper's gate is genuinely keyed on the (field, kind) PAIR, not field
+    alone. The current BoundedTextViolationKind enum has only the three
+    already-authorized kinds (professional_turn_analysis.py, off-limits
+    this turn, is not touched to manufacture a fake fourth kind) -- so
+    this test instead narrows the real policy set by monkeypatching
+    _RECOVERABLE_CONTEXT_VIOLATIONS to remove exactly one currently-
+    authorized pair, (CONTEXT_AFTER, TOO_LONG), while leaving
+    CONTEXT_AFTER itself still present in the derived field set (via the
+    OTHER two kinds). A real, unmodified BoundedTextViolation carrying
+    exactly that excluded pair -- raised for real by EvidenceSpanCandidate
+    given a genuinely too-long context_after -- must now propagate rather
+    than recover. If the helper only checked `field`, this would still
+    incorrectly recover (CONTEXT_AFTER is still "an authorized field");
+    it does not, which is the proof."""
+    import professional_turn_analyzer as analyzer_module
+    narrowed = frozenset(
+        pair for pair in analyzer_module._RECOVERABLE_CONTEXT_VIOLATIONS
+        if pair != (BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.TOO_LONG))
+    assert len(narrowed) == 5
+    assert BoundedTextField.CONTEXT_AFTER in {field for field, _kind in narrowed}
+    monkeypatch.setattr(analyzer_module, "_RECOVERABLE_CONTEXT_VIOLATIONS", narrowed)
+
+    with pytest.raises(BoundedTextViolation) as exc_info:
+        analyzer_module._construct_with_context_recovery(
+            analyzer_module.EvidenceSpanCandidate,
+            exact_source_span="valid span", context_before=None,
+            context_after="y" * (_CTX_AFTER_MAX + 1))
+    assert exc_info.value.field is BoundedTextField.CONTEXT_AFTER
+    assert exc_info.value.kind is BoundedTextViolationKind.TOO_LONG
+
+
+def test_construct_with_context_recovery_never_recovers_exact_source_span():
+    """Direct unit-level proof at the helper itself (not just observed
+    through parse_model_response): a BoundedTextViolation whose field is
+    EXACT_SOURCE_SPAN must propagate immediately from the first
+    construction attempt, never triggering any recovery."""
+    import professional_turn_analyzer as analyzer_module
+    with pytest.raises(BoundedTextViolation) as exc_info:
+        analyzer_module._construct_with_context_recovery(
+            analyzer_module.EvidenceSpanCandidate,
+            exact_source_span="", context_before=None, context_after=None)
+    assert exc_info.value.field is BoundedTextField.EXACT_SOURCE_SPAN
+
+
+def test_construct_with_context_recovery_does_not_catch_plain_exceptions(monkeypatch):
+    """A non-BoundedTextViolation exception from candidate_cls must never
+    be caught or reinterpreted -- proves the helper's except clause is
+    exactly `except BoundedTextViolation`, not a broader catch that could
+    silently swallow an unrelated future defect."""
+    import professional_turn_analyzer as analyzer_module
+
+    class _Boom(Exception):
+        pass
+
+    def _raise(**kwargs):
+        raise _Boom("unrelated internal defect")
+
+    with pytest.raises(_Boom):
+        analyzer_module._construct_with_context_recovery(
+            _raise, exact_source_span="valid span", context_before=None, context_after=None)
+
+
+def test_construct_with_context_recovery_at_most_three_construction_attempts(monkeypatch):
+    """Bounded-reconstruction proof: even in the worst case (both optional
+    context fields invalid), candidate_cls is called at most three times
+    -- never an unbounded/looping retry."""
+    import professional_turn_analyzer as analyzer_module
+
+    calls = {"n": 0}
+
+    def _always_both_invalid(*, exact_source_span, context_before, context_after):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise AssertionError("candidate_cls called more than 3 times")
+        if context_before is not None:
+            raise BoundedTextViolation(
+                "before", kind=BoundedTextViolationKind.EMPTY, field=BoundedTextField.CONTEXT_BEFORE)
+        if context_after is not None:
+            raise BoundedTextViolation(
+                "after", kind=BoundedTextViolationKind.EMPTY, field=BoundedTextField.CONTEXT_AFTER)
+        return "constructed"
+
+    result = analyzer_module._construct_with_context_recovery(
+        _always_both_invalid, exact_source_span="valid span",
+        context_before="bad", context_after="bad")
+    assert result == "constructed"
+    assert calls["n"] == 3
 
 
 def test_structural_failure_reason_is_closed_and_exhaustive_over_current_classes():

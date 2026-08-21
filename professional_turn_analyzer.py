@@ -11,11 +11,32 @@ never built or read from environment/config here.
 Two failure classes are kept structurally distinct, exactly mirroring
 professional_turn_producer.py's own discipline: a structurally malformed
 model response (wrong JSON shape, missing/extra keys, wrong field types,
-invalid candidate text, duplicate JSON keys, non-standard numeric
-constants) rejects the WHOLE response -- there is no per-candidate
-structural salvage, since a silently-dropped malformed candidate could
-starve the Producer's own duplicate-conflict detection of a sibling it
-needs to see. A structurally valid but semantically untrustworthy value
+duplicate JSON keys, non-standard numeric constants) rejects the WHOLE
+response -- there is no per-candidate structural salvage for these, since
+a silently-dropped malformed candidate could starve the Producer's own
+duplicate-conflict detection of a sibling it needs to see. A candidate's
+own exact_source_span violating its length/emptiness bound is the same:
+response-fatal, no salvage, no truncation, no candidate-local drop --
+exact_source_span is the provenance-bearing search key
+locate_evidence_candidate/locate_interaction_candidate (professional_turn_
+analysis.py) resolve location from, so it is never repaired or discarded.
+
+OPTIONAL CONTEXT RECOVERY (V1 addition) -- the one narrow exception to
+"no per-candidate structural salvage" above: when only an OPTIONAL
+context_before/context_after value violates its own bound (empty,
+whitespace-only, too long), _construct_with_context_recovery discards
+just that one field (replacing it with None, the same value the type
+already treats as "no context supplied") and keeps the candidate --
+exact_source_span, the other context field if valid, and every other
+candidate are untouched, never truncated, never normalized. This is safe
+specifically because context_before/context_after are consumed only as
+an exact-adjacency disambiguation filter inside professional_turn_
+analysis.py's location search and are never carried into the located
+result at all (LocatedEvidenceSpan/LocatedInteractionSpan have no context
+fields) -- discarding one can only weaken that filter (fewer candidate
+locations excluded), which can only turn a unique match into an
+ambiguous, fail-closed non-match, never silently select a different
+match in its place. A structurally valid but semantically untrustworthy value
 (an unknown EvidenceKind/InteractionSignal/InteractionApplicability/
 InteractionOccurrenceState/Intent string) is never inspected, normalized,
 or coerced here -- it passes through unchanged, exactly as
@@ -397,13 +418,104 @@ def _parse_candidate_fields(candidate_obj):
     return span, before, after
 
 
+# Optional Context Recovery V1 -- the closed, exhaustive set of exactly
+# six (BoundedTextField, BoundedTextViolationKind) combinations this
+# module will ever discard-and-retry for. A BoundedTextViolation is
+# recoverable if and only if its (field, kind) PAIR is a member of this
+# set -- checking field alone would silently authorize recovery for any
+# future BoundedTextViolationKind sharing an already-approved field,
+# which is exactly the "no silent generalization" gap this table closes.
+# EXACT_SOURCE_SPAN never appears here for any kind: it is the
+# provenance-bearing search key for locate_evidence_candidate/
+# locate_interaction_candidate (professional_turn_analysis.py) and is
+# never field-locally recoverable -- a violation on it must always remain
+# response-fatal, exactly as before this slice. _RECOVERABLE_CONTEXT_
+# FIELDS/_RECOVERABLE_CONTEXT_VIOLATION_KINDS below are DERIVED views of
+# this one authoritative matrix (never separately hand-maintained), kept
+# only because the two individual axes are independently useful to test.
+_RECOVERABLE_CONTEXT_VIOLATIONS = frozenset({
+    (BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.EMPTY),
+    (BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.WHITESPACE_ONLY),
+    (BoundedTextField.CONTEXT_BEFORE, BoundedTextViolationKind.TOO_LONG),
+    (BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.EMPTY),
+    (BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.WHITESPACE_ONLY),
+    (BoundedTextField.CONTEXT_AFTER, BoundedTextViolationKind.TOO_LONG),
+})
+assert len(_RECOVERABLE_CONTEXT_VIOLATIONS) == 6, "must cover exactly 2 fields x 3 kinds"
+_RECOVERABLE_CONTEXT_FIELDS = frozenset(field for field, _kind in _RECOVERABLE_CONTEXT_VIOLATIONS)
+_RECOVERABLE_CONTEXT_VIOLATION_KINDS = frozenset(kind for _field, kind in _RECOVERABLE_CONTEXT_VIOLATIONS)
+
+
+def _construct_with_context_recovery(candidate_cls, *, exact_source_span, context_before, context_after):
+    """Deterministically construct candidate_cls (EvidenceSpanCandidate or
+    InteractionSpanCandidate), discarding ONLY an optional context_before/
+    context_after value whose (field, kind) pair is a member of
+    _RECOVERABLE_CONTEXT_VIOLATIONS, by replacing that one field with None
+    and reconstructing -- exact_source_span and any non-violating context
+    field are never touched, never stripped, never truncated. This is a
+    fixed-size deterministic reconstruction over a closed 2-element field
+    set, not a retry loop: at most two fields can ever be neutralized (one
+    each for context_before/context_after), so there are exactly three
+    textually-present construction attempts below, never a loop that could
+    spin. A BoundedTextViolation whose (field, kind) pair is NOT in
+    _RECOVERABLE_CONTEXT_VIOLATIONS -- an EXACT_SOURCE_SPAN violation of
+    any kind, or a CONTEXT_BEFORE/CONTEXT_AFTER violation of a kind this
+    table does not list -- is never caught here and propagates immediately
+    from the first attempt it is raised on, before any further recovery is
+    attempted. Any exception that is not a BoundedTextViolation at all is
+    likewise never caught. Source-span defects, and any future violation
+    kind this table has not been deliberately extended to cover, remain
+    exactly as fatal as before this slice."""
+    try:
+        return candidate_cls(
+            exact_source_span=exact_source_span,
+            context_before=context_before, context_after=context_after)
+    except BoundedTextViolation as exc:
+        if (exc.field, exc.kind) not in _RECOVERABLE_CONTEXT_VIOLATIONS:
+            raise
+        if exc.field is BoundedTextField.CONTEXT_BEFORE:
+            context_before = None
+        else:
+            context_after = None
+
+    # At most one field was neutralized above (whichever __post_init__
+    # happened to check first); attempt exactly once more in case the
+    # other optional field is also invalid.
+    try:
+        return candidate_cls(
+            exact_source_span=exact_source_span,
+            context_before=context_before, context_after=context_after)
+    except BoundedTextViolation as exc:
+        if (exc.field, exc.kind) not in _RECOVERABLE_CONTEXT_VIOLATIONS:
+            raise
+        if exc.field is BoundedTextField.CONTEXT_BEFORE:
+            context_before = None
+        else:
+            context_after = None
+
+    # Both optional fields have now been neutralized at most once each, and
+    # exact_source_span was already proven valid by the first attempt (a
+    # violation on it would have propagated immediately, above). This final
+    # attempt is therefore guaranteed to succeed -- left unwrapped so a
+    # violation here (which should be structurally impossible) surfaces as
+    # a genuine, visible defect rather than being silently absorbed.
+    return candidate_cls(
+        exact_source_span=exact_source_span,
+        context_before=context_before, context_after=context_after)
+
+
 def _build_evidence_span_candidate(candidate_obj):
     span, before, after = _parse_candidate_fields(candidate_obj)
     try:
-        return EvidenceSpanCandidate(
+        return _construct_with_context_recovery(
+            EvidenceSpanCandidate,
             exact_source_span=span, context_before=before, context_after=after)
     except BoundedTextViolation as exc:
-        # The only classification this code has actual evidence for.
+        # Only reachable for an EXACT_SOURCE_SPAN violation -- any
+        # CONTEXT_BEFORE/CONTEXT_AFTER violation was already recovered
+        # inside _construct_with_context_recovery above and never reaches
+        # this except clause at all. This is the only classification this
+        # code has actual evidence for.
         raise _StructuralDefect(
             _candidate_text_violation_reason(_CandidateFamily.EVIDENCE, exc),
             "evidence candidate text violates length/emptiness bounds") from None
@@ -427,7 +539,8 @@ def _build_evidence_span_candidate(candidate_obj):
 def _build_interaction_span_candidate(candidate_obj):
     span, before, after = _parse_candidate_fields(candidate_obj)
     try:
-        return InteractionSpanCandidate(
+        return _construct_with_context_recovery(
+            InteractionSpanCandidate,
             exact_source_span=span, context_before=before, context_after=after)
     except BoundedTextViolation as exc:
         raise _StructuralDefect(
