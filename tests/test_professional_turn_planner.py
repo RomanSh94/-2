@@ -616,29 +616,61 @@ def test_clarify_validated_no_questions_blocked_when_non_question_objective_elig
         ProfessionalPlanAbstentionReason.NO_QUESTIONS_BLOCKS_QUESTION_OBJECTIVE)
 
 
-def test_clarify_degraded_interaction_blocked_when_non_question_objective_eligible():
+def test_clarify_degraded_interaction_with_unique_eligible_alternative_returns_alternative_plan():
+    """V1 addition: RELATIONSHIP_SUPPORT's eligible set, after removing the
+    question objectives that DEGRADED blocks, is exactly {ESTABLISH_CONTACT}
+    -- the sole unique V1 alternative -- so govern_turn_plan now returns that
+    deterministic plan instead of abstaining."""
     result_analysis = _turn_analysis_result(
         intent=Intent.RELATIONSHIP_SUPPORT, interaction_status=AnalysisComponentStatus.DEGRADED)
     proposal = UntrustedTurnPlanProposal(
         objective=ProfessionalObjective.CLARIFY, move=PrimaryResponseMove.FOCUSED_QUESTION,
         clarification_target=ClarificationTarget.EVENT)
     result = govern_turn_plan(result_analysis, proposal)
-    assert result.abstention_reason is (
-        ProfessionalPlanAbstentionReason.INTERACTION_NOT_VALIDATED_FOR_QUESTION_MOVE)
+    assert result.abstention_reason is None
+    assert result.plan.objective is ProfessionalObjective.ESTABLISH_CONTACT
+    assert result.plan.move is PrimaryResponseMove.OPEN_INVITATION
+    assert result.plan.clarification_target is None
+    assert result.plan.question_allowed is False
 
 
-def test_clarify_unavailable_interaction_blocked_when_non_question_objective_eligible():
+def test_clarify_unavailable_interaction_with_unique_eligible_alternative_returns_alternative_plan():
     result_analysis = _turn_analysis_result(
         intent=Intent.RELATIONSHIP_SUPPORT, interaction_status=AnalysisComponentStatus.UNAVAILABLE)
     proposal = UntrustedTurnPlanProposal(
         objective=ProfessionalObjective.CLARIFY, move=PrimaryResponseMove.FOCUSED_QUESTION,
         clarification_target=ClarificationTarget.EVENT)
     result = govern_turn_plan(result_analysis, proposal)
-    assert result.abstention_reason is (
-        ProfessionalPlanAbstentionReason.INTERACTION_NOT_VALIDATED_FOR_QUESTION_MOVE)
+    assert result.abstention_reason is None
+    assert result.plan.objective is ProfessionalObjective.ESTABLISH_CONTACT
+    assert result.plan.move is PrimaryResponseMove.OPEN_INVITATION
+    assert result.plan.clarification_target is None
+    assert result.plan.question_allowed is False
 
 
-def test_clarify_degraded_with_preserved_no_questions_signal_still_not_validated_reason():
+def test_planner_bounded_alternative_production_regression():
+    """Reproduces the exact bounded structural class of the 2026-08-21
+    production canary (cid=45ded09e): interaction not validated, a proposer
+    that still asks a FOCUSED_QUESTION, and exactly one eligible V1
+    alternative. Old behavior: abstain with
+    INTERACTION_NOT_VALIDATED_FOR_QUESTION_MOVE, forcing the bounded
+    technical fallback. New behavior: return the unique deterministic
+    non-question plan instead. Uses only synthetic structural state -- no
+    raw owner text."""
+    for interaction_status in (AnalysisComponentStatus.DEGRADED, AnalysisComponentStatus.UNAVAILABLE):
+        for intent in (Intent.VENT, Intent.RELATIONSHIP_SUPPORT, Intent.UNKNOWN):
+            result_analysis = _turn_analysis_result(
+                intent=intent, interaction_status=interaction_status)
+            proposal = UntrustedTurnPlanProposal(
+                objective=ProfessionalObjective.CLARIFY, move=PrimaryResponseMove.FOCUSED_QUESTION,
+                clarification_target=ClarificationTarget.EVENT)
+            result = govern_turn_plan(result_analysis, proposal)
+            assert result.abstention_reason is None, (interaction_status, intent)
+            assert result.plan.objective is ProfessionalObjective.ESTABLISH_CONTACT
+            assert result.plan.move is PrimaryResponseMove.OPEN_INVITATION
+
+
+def test_clarify_degraded_with_preserved_no_questions_signal_takes_alternative_not_no_questions_reason():
     result_analysis = _turn_analysis_result(
         intent=Intent.RELATIONSHIP_SUPPORT,
         interaction_status=AnalysisComponentStatus.DEGRADED,
@@ -647,9 +679,13 @@ def test_clarify_degraded_with_preserved_no_questions_signal_still_not_validated
         objective=ProfessionalObjective.CLARIFY, move=PrimaryResponseMove.FOCUSED_QUESTION,
         clarification_target=ClarificationTarget.EVENT)
     result = govern_turn_plan(result_analysis, proposal)
-    # Status precedence: DEGRADED wins over the preserved NO_QUESTIONS occurrence.
-    assert result.abstention_reason is (
-        ProfessionalPlanAbstentionReason.INTERACTION_NOT_VALIDATED_FOR_QUESTION_MOVE)
+    # Status precedence unchanged: the interaction-status branch is still
+    # checked before the NO_QUESTIONS branch -- it now resolves to the
+    # unique alternative plan rather than the NO_QUESTIONS abstention
+    # reason, and the plan it returns never contains FOCUSED_QUESTION.
+    assert result.abstention_reason is None
+    assert result.plan.objective is ProfessionalObjective.ESTABLISH_CONTACT
+    assert result.plan.move is not PrimaryResponseMove.FOCUSED_QUESTION
 
 
 def test_clarify_goal_follows_same_question_capability_rule():
@@ -659,8 +695,82 @@ def test_clarify_goal_follows_same_question_capability_rule():
         objective=ProfessionalObjective.CLARIFY_GOAL, move=PrimaryResponseMove.FOCUSED_QUESTION,
         clarification_target=None)
     result = govern_turn_plan(result_analysis, proposal)
-    assert result.abstention_reason is (
-        ProfessionalPlanAbstentionReason.INTERACTION_NOT_VALIDATED_FOR_QUESTION_MOVE)
+    # CLARIFY_GOAL shares the same question-capability rule as CLARIFY,
+    # including the bounded-alternative outcome, not just the abstention.
+    assert result.abstention_reason is None
+    assert result.plan.objective is ProfessionalObjective.ESTABLISH_CONTACT
+
+
+# ── _unique_safe_alternative_plan: closed-contract unit tests ──────────────
+# The current V1 Intent matrix never actually produces a multi-objective or
+# zero-move-after-narrowing `eligible` set at this call site (RELATIONSHIP_
+# SUPPORT/VENT/UNKNOWN all collapse to exactly {ESTABLISH_CONTACT}; every
+# other Intent that permits CLARIFY/CLARIFY_GOAL collapses to the empty set,
+# caught earlier by NO_ELIGIBLE_OBJECTIVE_REMAINS). These synthetic-input
+# unit tests are therefore the only way to prove the helper itself -- not
+# merely its one reachable real-world shape -- refuses to guess.
+
+def test_unique_safe_alternative_plan_none_for_multiple_eligible():
+    result = professional_turn_planner._unique_safe_alternative_plan(
+        frozenset({ProfessionalObjective.ESTABLISH_CONTACT, ProfessionalObjective.REPAIR}))
+    assert result is None
+
+
+def test_unique_safe_alternative_plan_none_for_empty_eligible():
+    assert professional_turn_planner._unique_safe_alternative_plan(frozenset()) is None
+
+
+def test_unique_safe_alternative_plan_none_when_sole_objective_has_multiple_v1_moves():
+    # REPAIR has three raw compatibility-matrix moves; even after the
+    # STRUCTURED_SUMMARY narrowing removes one, two remain (REFLECTIVE_
+    # STATEMENT, OPEN_INVITATION) -- not unique, so no guess is made.
+    result = professional_turn_planner._unique_safe_alternative_plan(
+        frozenset({ProfessionalObjective.REPAIR}))
+    assert result is None
+
+
+def test_unique_safe_alternative_plan_none_when_sole_objective_is_clarify():
+    # The helper rejects CLARIFY by its own explicit local contract --
+    # real callers never pass CLARIFY in `eligible` here (Step 2 already
+    # removed it), but this proves the helper does not merely rely on
+    # that upstream filtering to stay safe.
+    result = professional_turn_planner._unique_safe_alternative_plan(
+        frozenset({ProfessionalObjective.CLARIFY}))
+    assert result is None
+
+
+def test_unique_safe_alternative_plan_none_when_sole_objective_is_clarify_goal():
+    # Contract-lock correction: CLARIFY_GOAL must be explicitly rejected by
+    # the helper itself, not merely excluded because current callers always
+    # filter question objectives out of `eligible` first. This calls the
+    # helper directly with CLARIFY_GOAL as the sole member, bypassing any
+    # caller-side filtering entirely.
+    result = professional_turn_planner._unique_safe_alternative_plan(
+        frozenset({ProfessionalObjective.CLARIFY_GOAL}))
+    assert result is None
+
+
+def test_unique_safe_alternative_plan_returns_establish_contact_for_current_v1_tables():
+    result = professional_turn_planner._unique_safe_alternative_plan(
+        frozenset({ProfessionalObjective.ESTABLISH_CONTACT}))
+    assert result.objective is ProfessionalObjective.ESTABLISH_CONTACT
+    assert result.move is PrimaryResponseMove.OPEN_INVITATION
+    assert result.clarification_target is None
+    assert result.question_allowed is False
+
+
+def test_alternative_plan_never_contains_focused_question_even_with_no_questions_signal():
+    """Combines DEGRADED interaction with an explicit NO_QUESTIONS signal --
+    both individually block FOCUSED_QUESTION -- and confirms the resulting
+    alternative plan still never carries FOCUSED_QUESTION as its move."""
+    result_analysis = _turn_analysis_result(
+        intent=Intent.VENT, interaction_status=AnalysisComponentStatus.UNAVAILABLE)
+    proposal = UntrustedTurnPlanProposal(
+        objective=ProfessionalObjective.CLARIFY, move=PrimaryResponseMove.FOCUSED_QUESTION,
+        clarification_target=ClarificationTarget.EVENT)
+    result = govern_turn_plan(result_analysis, proposal)
+    assert result.plan is not None
+    assert result.plan.move is not PrimaryResponseMove.FOCUSED_QUESTION
 
 
 # ── Trusted question_allowed handoff for accepted non-question plans ───────
