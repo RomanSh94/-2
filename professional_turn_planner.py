@@ -219,9 +219,19 @@ class ProfessionalTurnPlan:
 class ProfessionalTurnPlanResult:
     """The outcome envelope for one govern_turn_plan call: either a trusted
     ProfessionalTurnPlan, or an explicit abstention reason -- never both,
-    never neither."""
+    never neither.
+
+    bounded_alternative_used (V1 addition) is True if and only if `plan`
+    was constructed via the Bounded Alternative branch inside Step 10
+    (_unique_safe_alternative_plan returning non-None), set authoritatively
+    at that exact branch -- never inferred elsewhere from plan shape (the
+    same objective/move pair can also be reached through the ordinary,
+    non-alternative path, e.g. a proposer directly proposing ESTABLISH_
+    CONTACT + OPEN_INVITATION with question_allowed irrelevant, and that
+    path must report False). Always False when plan is None."""
     plan: ProfessionalTurnPlan | None
     abstention_reason: ProfessionalPlanAbstentionReason | None
+    bounded_alternative_used: bool = False
 
     def __post_init__(self):
         if self.plan is not None and not isinstance(self.plan, ProfessionalTurnPlan):
@@ -238,6 +248,14 @@ class ProfessionalTurnPlanResult:
             raise ValueError(
                 "ProfessionalTurnPlanResult requires exactly one of plan/"
                 "abstention_reason to be set")
+        if type(self.bounded_alternative_used) is not bool:
+            raise ValueError(
+                "ProfessionalTurnPlanResult.bounded_alternative_used must be "
+                f"exactly bool, got {type(self.bounded_alternative_used)!r}")
+        if self.bounded_alternative_used and self.plan is None:
+            raise ValueError(
+                "ProfessionalTurnPlanResult: bounded_alternative_used=True "
+                "requires a plan to be set")
 
 
 # -- Governor ---------------------------------------------------------------
@@ -398,7 +416,8 @@ def govern_turn_plan(
         if analysis.interaction.status is not AnalysisComponentStatus.VALIDATED:
             alternative = _unique_safe_alternative_plan(eligible)
             if alternative is not None:
-                return ProfessionalTurnPlanResult(plan=alternative, abstention_reason=None)
+                return ProfessionalTurnPlanResult(
+                    plan=alternative, abstention_reason=None, bounded_alternative_used=True)
             return ProfessionalTurnPlanResult(
                 plan=None,
                 abstention_reason=(
@@ -420,5 +439,11 @@ def govern_turn_plan(
         question_allowed=question_allowed,
     )
 
-    # STEP 12 -- result.
-    return ProfessionalTurnPlanResult(plan=plan, abstention_reason=None)
+    # STEP 12 -- result. Reached only via the ordinary path above, never via
+    # the Bounded Alternative branch (which already returned at Step 10) --
+    # bounded_alternative_used is explicitly False here so a plan shape
+    # that happens to match the bounded alternative's own output (e.g. a
+    # proposer directly proposing ESTABLISH_CONTACT + OPEN_INVITATION) is
+    # never mislabeled as having used it.
+    return ProfessionalTurnPlanResult(
+        plan=plan, abstention_reason=None, bounded_alternative_used=False)

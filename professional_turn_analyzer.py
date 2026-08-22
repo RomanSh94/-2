@@ -43,6 +43,16 @@ or coerced here -- it passes through unchanged, exactly as
 professional_turn_analysis.py's own InteractionOccurrenceProposal contract
 already anticipates; classifying it remains the Producer's job.
 
+SUCCESS-PATH RECOVERY OBSERVABILITY (V1 addition) -- TurnAnalyzerCallResult
+carries one additional bounded field, optional_context_recovery_used: bool,
+set authoritatively at the exact point _construct_with_context_recovery
+neutralizes a recoverable violation (via the small, explicitly-passed,
+call-scoped _OptionalContextRecoveryRecorder -- never a module-level
+global, never inferred from output shape or success/failure alone). It
+carries no field name, no candidate identity, and no text -- only whether
+recovery happened anywhere in this one parse. This does not change what
+gets recovered, when, or the closed (field, kind) policy above in any way.
+
 Prompt-injection resistance at the model layer is best-effort only. What
 this module actually guarantees deterministically is: strict response
 structure, bounded response transport, no model-owned offsets, and call
@@ -345,13 +355,33 @@ class TurnAnalyzerCallResult:
     STRUCTURALLY_INVALID_RESPONSE -- PROVIDER_FAILURE and NO_USABLE_CONTENT
     never reached the deterministic parser at all, so they can never carry
     a parser-originated detail; SUCCESS (output set) never carries one
-    either."""
+    either.
+
+    optional_context_recovery_used (V1 addition) is True if and only if
+    Optional Context Recovery actually neutralized a recoverable context
+    violation somewhere while parsing this response into `output` --
+    authoritative because it is set only by _construct_with_context_
+    recovery itself via the recorder threaded through parse_model_response,
+    never inferred here from output shape or from the absence of a
+    failure. Defaults to False and is only ever True when output is set:
+    every failure path returns before a recorder could ever observe
+    anything."""
     output: UntrustedTurnAnalyzerOutput | None
     failure_category: TurnAnalyzerFailureCategory | None
     model: str
     structural_failure_reason: TurnAnalyzerStructuralFailureReason | None
+    optional_context_recovery_used: bool = False
 
     def __post_init__(self):
+        if type(self.optional_context_recovery_used) is not bool:
+            raise ValueError(
+                "TurnAnalyzerCallResult.optional_context_recovery_used must be "
+                f"exactly bool, got {type(self.optional_context_recovery_used)!r}")
+        if self.output is None and self.optional_context_recovery_used:
+            raise ValueError(
+                "TurnAnalyzerCallResult: optional_context_recovery_used=True "
+                "requires output to be set -- recovery is only ever observed "
+                "while successfully constructing output")
         if (self.output is None) == (self.failure_category is None):
             raise ValueError(
                 "TurnAnalyzerCallResult: exactly one of output/failure_category "
@@ -446,7 +476,20 @@ _RECOVERABLE_CONTEXT_FIELDS = frozenset(field for field, _kind in _RECOVERABLE_C
 _RECOVERABLE_CONTEXT_VIOLATION_KINDS = frozenset(kind for _field, kind in _RECOVERABLE_CONTEXT_VIOLATIONS)
 
 
-def _construct_with_context_recovery(candidate_cls, *, exact_source_span, context_before, context_after):
+class _OptionalContextRecoveryRecorder:
+    """Tiny, explicitly-passed, call-scoped mutable accumulator -- never a
+    module-level global. Exactly one instance is created per call_turn_
+    analyzer invocation and threaded down through the parse call chain;
+    nothing else ever holds a reference to it. Records only the fact that
+    a recoverable context violation was neutralized somewhere during this
+    one parse -- never which field, which candidate, or any text."""
+    def __init__(self):
+        self.used = False
+
+
+def _construct_with_context_recovery(
+        candidate_cls, *, exact_source_span, context_before, context_after,
+        recorder: "_OptionalContextRecoveryRecorder | None" = None):
     """Deterministically construct candidate_cls (EvidenceSpanCandidate or
     InteractionSpanCandidate), discarding ONLY an optional context_before/
     context_after value whose (field, kind) pair is a member of
@@ -465,7 +508,14 @@ def _construct_with_context_recovery(candidate_cls, *, exact_source_span, contex
     attempted. Any exception that is not a BoundedTextViolation at all is
     likewise never caught. Source-span defects, and any future violation
     kind this table has not been deliberately extended to cover, remain
-    exactly as fatal as before this slice."""
+    exactly as fatal as before this slice.
+
+    recorder is an OPTIONAL, purely-observational collaborator (V1
+    addition): when supplied, its .used flag is set to True at the exact
+    point a recoverable violation is neutralized, and never touched
+    otherwise. It carries no text, exists only for the caller's own
+    aggregation across a whole parse, and never changes which branch this
+    function takes or what it returns."""
     try:
         return candidate_cls(
             exact_source_span=exact_source_span,
@@ -477,6 +527,8 @@ def _construct_with_context_recovery(candidate_cls, *, exact_source_span, contex
             context_before = None
         else:
             context_after = None
+        if recorder is not None:
+            recorder.used = True
 
     # At most one field was neutralized above (whichever __post_init__
     # happened to check first); attempt exactly once more in case the
@@ -492,6 +544,8 @@ def _construct_with_context_recovery(candidate_cls, *, exact_source_span, contex
             context_before = None
         else:
             context_after = None
+        if recorder is not None:
+            recorder.used = True
 
     # Both optional fields have now been neutralized at most once each, and
     # exact_source_span was already proven valid by the first attempt (a
@@ -504,12 +558,13 @@ def _construct_with_context_recovery(candidate_cls, *, exact_source_span, contex
         context_before=context_before, context_after=context_after)
 
 
-def _build_evidence_span_candidate(candidate_obj):
+def _build_evidence_span_candidate(candidate_obj, *, recorder=None):
     span, before, after = _parse_candidate_fields(candidate_obj)
     try:
         return _construct_with_context_recovery(
             EvidenceSpanCandidate,
-            exact_source_span=span, context_before=before, context_after=after)
+            exact_source_span=span, context_before=before, context_after=after,
+            recorder=recorder)
     except BoundedTextViolation as exc:
         # Only reachable for an EXACT_SOURCE_SPAN violation -- any
         # CONTEXT_BEFORE/CONTEXT_AFTER violation was already recovered
@@ -536,12 +591,13 @@ def _build_evidence_span_candidate(candidate_obj):
     # structural claim.
 
 
-def _build_interaction_span_candidate(candidate_obj):
+def _build_interaction_span_candidate(candidate_obj, *, recorder=None):
     span, before, after = _parse_candidate_fields(candidate_obj)
     try:
         return _construct_with_context_recovery(
             InteractionSpanCandidate,
-            exact_source_span=span, context_before=before, context_after=after)
+            exact_source_span=span, context_before=before, context_after=after,
+            recorder=recorder)
     except BoundedTextViolation as exc:
         raise _StructuralDefect(
             _candidate_text_violation_reason(_CandidateFamily.INTERACTION, exc),
@@ -550,7 +606,7 @@ def _build_interaction_span_candidate(candidate_obj):
     # `except ValueError:` fallback.
 
 
-def _parse_evidence_candidates(raw_list):
+def _parse_evidence_candidates(raw_list, *, recorder=None):
     if type(raw_list) is not list:
         raise _StructuralDefect(
             TurnAnalyzerStructuralFailureReason.WRONG_CONTAINER_TYPE,
@@ -558,7 +614,7 @@ def _parse_evidence_candidates(raw_list):
     proposals = []
     for item in raw_list:
         _require_exact_keys(item, _EVIDENCE_WRAPPER_KEYS)
-        candidate = _build_evidence_span_candidate(item["candidate"])
+        candidate = _build_evidence_span_candidate(item["candidate"], recorder=recorder)
         proposed_kind = _require_string_or_none(item["proposed_kind"], allow_none=True)
         proposals.append(EvidenceCandidateProposal(
             candidate=candidate, proposed_kind=proposed_kind))
@@ -576,7 +632,7 @@ def _parse_interaction_proposal(proposal_obj):
         signal=signal, applicability=applicability, state=state)
 
 
-def _parse_interaction_candidates(raw_list):
+def _parse_interaction_candidates(raw_list, *, recorder=None):
     if type(raw_list) is not list:
         raise _StructuralDefect(
             TurnAnalyzerStructuralFailureReason.WRONG_CONTAINER_TYPE,
@@ -584,7 +640,7 @@ def _parse_interaction_candidates(raw_list):
     proposals = []
     for item in raw_list:
         _require_exact_keys(item, _INTERACTION_WRAPPER_KEYS)
-        candidate = _build_interaction_span_candidate(item["candidate"])
+        candidate = _build_interaction_span_candidate(item["candidate"], recorder=recorder)
         proposal = _parse_interaction_proposal(item["proposal"])
         proposals.append(InteractionCandidateProposal(
             candidate=candidate, proposal=proposal))
@@ -595,10 +651,12 @@ def _parse_intent(value):
     return _require_string_or_none(value, allow_none=True)
 
 
-def _parse_top_level(document) -> UntrustedTurnAnalyzerOutput:
+def _parse_top_level(document, *, recorder=None) -> UntrustedTurnAnalyzerOutput:
     _require_exact_keys(document, _TOP_LEVEL_KEYS)
-    evidence_candidates = _parse_evidence_candidates(document["evidence_candidates"])
-    interaction_candidates = _parse_interaction_candidates(document["interaction_candidates"])
+    evidence_candidates = _parse_evidence_candidates(
+        document["evidence_candidates"], recorder=recorder)
+    interaction_candidates = _parse_interaction_candidates(
+        document["interaction_candidates"], recorder=recorder)
     intent_proposal = _parse_intent(document["intent"])
     return UntrustedTurnAnalyzerOutput(
         evidence_candidates=evidence_candidates,
@@ -638,7 +696,9 @@ def _reject_json_number(_number_string):
         "JSON numeric values are not permitted")
 
 
-def parse_model_response(raw_content: str) -> UntrustedTurnAnalyzerOutput:
+def parse_model_response(
+        raw_content: str, *, recorder: "_OptionalContextRecoveryRecorder | None" = None,
+) -> UntrustedTurnAnalyzerOutput:
     """Pure, offline, deterministic. Raises TurnAnalyzerParseError only for
     whole-response structural failure -- there is no per-candidate
     structural recovery. Never validates semantic enum membership (no
@@ -648,7 +708,11 @@ def parse_model_response(raw_content: str) -> UntrustedTurnAnalyzerOutput:
     Producer to judge. Every raised TurnAnalyzerParseError carries a typed
     `.reason` assigned at the exact point the defect originates (either
     directly here, or propagated from a caught _StructuralDefect's own
-    `.reason`) -- never derived from str(exc) after the fact."""
+    `.reason`) -- never derived from str(exc) after the fact.
+
+    recorder is an OPTIONAL, purely-observational V1 addition forwarded
+    unchanged to _parse_top_level -- see _construct_with_context_recovery's
+    own docstring. It never affects parsing/acceptance behavior."""
     if type(raw_content) is not str:
         raise TurnAnalyzerParseError(
             TurnAnalyzerStructuralFailureReason.RAW_CONTENT_NOT_A_STRING,
@@ -680,7 +744,7 @@ def parse_model_response(raw_content: str) -> UntrustedTurnAnalyzerOutput:
 
     structural_failure = None
     try:
-        output = _parse_top_level(document)
+        output = _parse_top_level(document, recorder=recorder)
     except _StructuralDefect as exc:
         structural_failure = (exc.reason, str(exc))
     if structural_failure is not None:
@@ -966,8 +1030,9 @@ async def call_turn_analyzer(
             output=None, failure_category=TurnAnalyzerFailureCategory.NO_USABLE_CONTENT,
             model=model, structural_failure_reason=None)
 
+    recorder = _OptionalContextRecoveryRecorder()
     try:
-        output = parse_model_response(content)
+        output = parse_model_response(content, recorder=recorder)
     except TurnAnalyzerParseError as exc:
         return TurnAnalyzerCallResult(
             output=None,
@@ -975,4 +1040,5 @@ async def call_turn_analyzer(
             model=model, structural_failure_reason=exc.reason)
 
     return TurnAnalyzerCallResult(
-        output=output, failure_category=None, model=model, structural_failure_reason=None)
+        output=output, failure_category=None, model=model, structural_failure_reason=None,
+        optional_context_recovery_used=recorder.used)

@@ -1347,6 +1347,78 @@ def test_production_regression_evidence_context_after_too_long():
     assert candidate.context_after is None
 
 
+# ── Success-path recovery observability (Planner Bounded Alternative V1 follow-up) ──
+
+def test_call_turn_analyzer_reports_recovery_used_true_end_to_end():
+    """A full call_turn_analyzer invocation whose model response contains a
+    recoverable context violation must report
+    optional_context_recovery_used=True on the returned TurnAnalyzerCallResult
+    -- authoritative propagation from the recorder, not inferred from
+    success/failure alone."""
+    doc = _document(evidence=[{
+        "candidate": {
+            "exact_source_span": _RECOVERY_SPAN,
+            "context_before": None, "context_after": ""},
+        "proposed_kind": None}])
+    client = _client_returning(_dumps(doc))
+    result = _call(client, model="gpt-4o-mini", source_text="hi")
+    assert result.output is not None
+    assert result.failure_category is None
+    assert result.optional_context_recovery_used is True
+
+
+def test_call_turn_analyzer_reports_recovery_used_false_for_clean_response():
+    """A fully valid response with no context violations at all must report
+    optional_context_recovery_used=False."""
+    client = _client_returning(_VALID_JSON)
+    result = _call(client, model="gpt-4o-mini", source_text="hi")
+    assert result.output is not None
+    assert result.optional_context_recovery_used is False
+
+
+def test_call_turn_analyzer_recovery_flag_false_on_every_failure_path():
+    """optional_context_recovery_used must be False (the dataclass default)
+    on every failure category, including STRUCTURALLY_INVALID_RESPONSE
+    caused by a fatal EXACT_SOURCE_SPAN violation that occurs AFTER a
+    sibling candidate already recovered a context field -- recovering one
+    candidate must never retroactively "save" a response a later candidate
+    fatally invalidates, and the failed result must never claim recovery
+    was used."""
+    doc = _document(evidence=[
+        {"candidate": {"exact_source_span": _RECOVERY_SPAN,
+                       "context_before": None, "context_after": ""},
+         "proposed_kind": None},
+        {"candidate": {"exact_source_span": "", "context_before": None, "context_after": None},
+         "proposed_kind": None},
+    ])
+    client = _client_returning(_dumps(doc))
+    result = _call(client, model="gpt-4o-mini", source_text="hi")
+    assert result.output is None
+    assert result.failure_category is TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE
+    assert result.structural_failure_reason is (
+        TurnAnalyzerStructuralFailureReason.EVIDENCE_SPAN_EMPTY)
+    assert result.optional_context_recovery_used is False
+
+
+def test_call_turn_analyzer_recovery_flag_itself_carries_no_text():
+    """optional_context_recovery_used is a plain bool by construction
+    (enforced by TurnAnalyzerCallResult.__post_init__'s own type check) --
+    unlike `output` (which legitimately carries real untrusted candidate
+    text onward to Producer, by design, unrelated to this field), the new
+    field itself can never carry text. This locks that it stays a bool
+    even alongside a candidate containing a distinctive sentinel."""
+    doc = _document(evidence=[{
+        "candidate": {
+            "exact_source_span": "SENTINEL_ANALYZER_SPAN_7c31e0", "context_before": None,
+            "context_after": ""},
+        "proposed_kind": None}])
+    client = _client_returning(_dumps(doc))
+    result = _call(client, model="gpt-4o-mini", source_text="hi")
+    assert result.optional_context_recovery_used is True
+    assert type(result.optional_context_recovery_used) is bool
+    assert "SENTINEL_ANALYZER_SPAN_7c31e0" not in repr(result.optional_context_recovery_used)
+
+
 @pytest.mark.parametrize("doc_fn,value", [
     (_doc_evidence_span, "x" * _EVID_MAX),
     (_doc_evidence_context_before, "x" * _CTX_BEFORE_MAX),
