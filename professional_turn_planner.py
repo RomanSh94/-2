@@ -18,6 +18,19 @@ Pure, offline, no I/O: this module owns no runtime wiring, no response
 rendering, no persistence, and no model call. Production of the untrusted
 proposal itself belongs to a later, separately authorized slice.
 
+BOUNDED ALTERNATIVE (V1 addition): a FOCUSED_QUESTION proposal blocked
+specifically by INTERACTION_NOT_VALIDATED_FOR_QUESTION_MOVE no longer
+always abstains. If the already-computed, question-filtered `eligible`
+objective set contains exactly one V1 objective, and that objective has
+exactly one V1-permitted move with an unambiguous (always-None)
+clarification target, govern_turn_plan returns that one deterministic
+alternative plan instead of abstaining. This never weakens interaction
+validation, never allows FOCUSED_QUESTION without a validated interaction
+component, and never guesses among multiple candidates -- see
+_unique_safe_alternative_plan. Every other abstention reason, including
+the sibling NO_QUESTIONS_BLOCKS_QUESTION_OBJECTIVE, is unchanged by this
+addition.
+
 Only imports: __future__, dataclasses, enum, professional_turn_analysis,
 and therapeutic_domain. Python 3.10 target (prod 3.10.12).
 """
@@ -229,6 +242,61 @@ class ProfessionalTurnPlanResult:
 
 # -- Governor ---------------------------------------------------------------
 
+def _unique_safe_alternative_plan(
+        eligible: frozenset[ProfessionalObjective],
+) -> ProfessionalTurnPlan | None:
+    """Closed, deterministic derivation of the sole safe V1 alternative
+    plan from an already question-filtered `eligible` objective set. Used
+    only when a proposer's FOCUSED_QUESTION move was blocked because the
+    interaction component is not validated, to avoid turning a safe
+    Planner abstention into a user-visible technical failure when exactly
+    one deterministic V1 alternative is already available.
+
+    Returns a plan only when ALL of the following hold, otherwise returns
+    None and the caller must abstain -- there is no ranking heuristic and
+    no best-guess fallback:
+
+    - eligible contains exactly one ProfessionalObjective;
+    - that objective has exactly one V1-permitted move, after applying the
+      same REPAIR+STRUCTURED_SUMMARY narrowing govern_turn_plan itself
+      applies (never a raw PROFESSIONAL_OBJECTIVE_MOVE_COMPATIBILITY
+      lookup alone);
+    - that move is not itself FOCUSED_QUESTION (a question move can never
+      be the safe alternative to a blocked question move -- eligible is
+      already question-filtered by the caller, so this is a defensive
+      invariant, not a case expected to occur);
+    - the objective is not itself question-oriented (CLARIFY or
+      CLARIFY_GOAL) -- rejected explicitly here, by the helper's own
+      local contract, never merely because current caller construction
+      happens to have already filtered them out of eligible;
+    - the objective's clarification_target is unambiguous, i.e. always
+      None.
+
+    Reads only `eligible` and the frozen V1 compatibility matrix -- never
+    raw user text, never a model, never legacy state, never a new
+    objective/move outside the V1 contract. Callers must never invoke this
+    with an `eligible` set that has not already had question objectives
+    removed."""
+    if len(eligible) != 1:
+        return None
+    (objective,) = eligible
+    moves = {
+        move for (obj, move) in PROFESSIONAL_OBJECTIVE_MOVE_COMPATIBILITY
+        if obj is objective
+        and not (obj is ProfessionalObjective.REPAIR
+                  and move is PrimaryResponseMove.STRUCTURED_SUMMARY)}
+    if len(moves) != 1:
+        return None
+    (move,) = moves
+    if move is PrimaryResponseMove.FOCUSED_QUESTION:
+        return None
+    if objective in _QUESTION_OBJECTIVES:
+        return None
+    return ProfessionalTurnPlan(
+        objective=objective, move=move, clarification_target=None,
+        question_allowed=False)
+
+
 def govern_turn_plan(
         analysis_result: TurnAnalysisResult,
         proposal: UntrustedTurnPlanProposal | None,
@@ -328,6 +396,9 @@ def govern_turn_plan(
     # happens to carry a preserved NO_QUESTIONS occurrence.
     if move is PrimaryResponseMove.FOCUSED_QUESTION:
         if analysis.interaction.status is not AnalysisComponentStatus.VALIDATED:
+            alternative = _unique_safe_alternative_plan(eligible)
+            if alternative is not None:
+                return ProfessionalTurnPlanResult(plan=alternative, abstention_reason=None)
             return ProfessionalTurnPlanResult(
                 plan=None,
                 abstention_reason=(
