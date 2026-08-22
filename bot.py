@@ -1822,7 +1822,17 @@ async def _run_professional_free_text_and_deliver(
     if result is None:
         reply_text = _professional_technical_fallback_text(lang)
     elif result.status is ProfessionalFreeTextRuntimeStatus.SUCCESS:
-        _dispatch_log(f"cid={cid} stage=professional_success")
+        t = result.success_trace
+        _dispatch_log(
+            f"cid={cid} stage=professional_success "
+            f"analyzer_status={t.analysis_status.value} "
+            f"interaction_status={t.interaction_status.value} "
+            f"optional_context_recovery_used={t.optional_context_recovery_used} "
+            f"objective={t.objective.value} move={t.primary_response_move.value} "
+            f"question_allowed={t.question_allowed} "
+            f"clarification_target_present={t.clarification_target_present} "
+            f"bounded_alternative_used={t.bounded_alternative_used} "
+            f"acceptance={t.acceptance.value}")
         reply_text = result.reply_text
     elif result.status is ProfessionalFreeTextRuntimeStatus.REJECTED:
         _detail_part = f" detail={result.failure_detail.value}" if result.failure_detail is not None else ""

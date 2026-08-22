@@ -930,7 +930,7 @@ def test_trusted_plan_field_surface_is_exact():
 
 def test_plan_result_field_surface_is_exact():
     assert tuple(f.name for f in fields(ProfessionalTurnPlanResult)) == (
-        "plan", "abstention_reason")
+        "plan", "abstention_reason", "bounded_alternative_used")
 
 
 # ── Purity / import boundary ─────────────────────────────────────────────────

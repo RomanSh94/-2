@@ -68,6 +68,25 @@ rejected the response). Every other (stage, reason) pair has
 failure_detail=None, enforced structurally by
 _validate_failure_detail_for_stage_and_reason.
 
+SUCCESS-PATH DECISION TRACE (V1 addition) -- a SUCCESS result now also
+carries success_trace: ProfessionalTurnSuccessTrace, bounded structural
+metadata (analysis/interaction status, whether Optional Context Recovery
+fired, the accepted objective/move/question_allowed/clarification-target-
+presence, whether the Planner Bounded Alternative branch was used, and the
+real acceptance_result.status) sourced directly from each stage's own
+already-existing result -- never re-derived from candidate/response text,
+never a second validator run, never raw content of any kind. The trace
+carries only what this module actually, independently observes: it does
+NOT expose separate Fidelity/Policy outcomes, since accept_professional_
+response composes those internally and never surfaces them as distinct
+results across this module's boundary -- deducing "Fidelity PASS, Policy
+PASS" from one ACCEPT and presenting that as independently observed
+telemetry would misrepresent a deduction as a direct observation, so V1
+deliberately does not do that. REJECTED/FAILED results never carry a
+success_trace; that observability gap is unchanged by this addition (see
+ProfessionalFreeTextFailureStage/reason/detail above, which remain this
+module's only failure-path observability).
+
 Only imports: __future__, dataclasses, enum, and the already-merged
 Professional Core V2 modules (professional_turn_analyzer,
 professional_turn_producer, professional_turn_analysis,
@@ -87,10 +106,15 @@ from professional_turn_analyzer import (
     TurnAnalyzerFailureCategory,
     TurnAnalyzerStructuralFailureReason,
 )
-from professional_turn_analysis import TurnAnalysisStatus
+from professional_turn_analysis import TurnAnalysisStatus, AnalysisComponentStatus
 from professional_turn_producer import produce_turn_analysis
 from professional_turn_plan_proposer import call_turn_plan_proposer, TurnPlanProposerCallStatus
-from professional_turn_planner import govern_turn_plan, ProfessionalPlanAbstentionReason
+from professional_turn_planner import (
+    govern_turn_plan,
+    ProfessionalPlanAbstentionReason,
+    ProfessionalObjective,
+    PrimaryResponseMove,
+)
 from professional_turn_response_renderer import render_turn_response, TurnResponseRenderStatus
 from professional_turn_response_acceptance import (
     accept_professional_response,
@@ -250,6 +274,85 @@ def _validate_failure_detail_for_stage_and_reason(
 
 
 @dataclass(frozen=True)
+class ProfessionalTurnSuccessTrace:
+    """Privacy-safe, bounded structural decision metadata for exactly one
+    SUCCESS outcome -- never constructed for REJECTED/FAILED. Every field
+    is sourced directly from the stage that actually decided it (analysis_
+    result, plan_result, or acceptance_result), never re-derived by
+    inspecting candidate/response text and never inferred from final plan
+    shape. Contains no source_text, no conversation_context text, no
+    evidence/interaction span text, no clarification_target value (only
+    its presence as a bool), no rendered/candidate text, and no raw model
+    output -- every field is a closed enum member or bool.
+
+    acceptance is the REAL, independently-observed acceptance_result.status
+    (ProfessionalResponseAcceptanceStatus.ACCEPT, the only value reachable
+    here) -- not a stand-in for Fidelity/Policy. accept_professional_
+    response's own documented contract composes Fidelity -> Policy -> Safety
+    internally in strict first-fail order, but that composition exposes only
+    ONE outcome across this module boundary; this module never independently
+    observes Fidelity or Policy passing, and V1 deliberately does not
+    manufacture separate fidelity/policy fields by deducing them from
+    acceptance alone -- that would misrepresent a deduction as directly
+    observed telemetry. Re-running Fidelity/Policy here merely to expose
+    them as distinct fields is explicitly NOT authorized (would duplicate
+    accept_professional_response's own internal validator calls)."""
+    analysis_status: TurnAnalysisStatus
+    interaction_status: AnalysisComponentStatus
+    optional_context_recovery_used: bool
+    objective: ProfessionalObjective
+    primary_response_move: PrimaryResponseMove
+    question_allowed: bool
+    clarification_target_present: bool
+    bounded_alternative_used: bool
+    acceptance: ProfessionalResponseAcceptanceStatus
+
+    def __post_init__(self):
+        if type(self.analysis_status) is not TurnAnalysisStatus:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.analysis_status must be exactly "
+                f"a TurnAnalysisStatus, got {type(self.analysis_status)!r}")
+        if type(self.interaction_status) is not AnalysisComponentStatus:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.interaction_status must be "
+                f"exactly an AnalysisComponentStatus, got {type(self.interaction_status)!r}")
+        if type(self.optional_context_recovery_used) is not bool:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.optional_context_recovery_used "
+                f"must be exactly bool, got {type(self.optional_context_recovery_used)!r}")
+        if type(self.objective) is not ProfessionalObjective:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.objective must be exactly a "
+                f"ProfessionalObjective, got {type(self.objective)!r}")
+        if type(self.primary_response_move) is not PrimaryResponseMove:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.primary_response_move must be "
+                f"exactly a PrimaryResponseMove, got {type(self.primary_response_move)!r}")
+        if type(self.question_allowed) is not bool:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.question_allowed must be "
+                f"exactly bool, got {type(self.question_allowed)!r}")
+        if type(self.clarification_target_present) is not bool:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.clarification_target_present "
+                f"must be exactly bool, got {type(self.clarification_target_present)!r}")
+        if type(self.bounded_alternative_used) is not bool:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.bounded_alternative_used must "
+                f"be exactly bool, got {type(self.bounded_alternative_used)!r}")
+        if type(self.acceptance) is not ProfessionalResponseAcceptanceStatus:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.acceptance must be exactly a "
+                f"ProfessionalResponseAcceptanceStatus, got {type(self.acceptance)!r}")
+        if self.acceptance is not ProfessionalResponseAcceptanceStatus.ACCEPT:
+            raise ValueError(
+                "ProfessionalTurnSuccessTrace.acceptance must be ACCEPT -- a "
+                "trace is only ever constructed on the SUCCESS branch, which "
+                f"is reachable only after acceptance_result.status is ACCEPT, "
+                f"got {self.acceptance!r}")
+
+
+@dataclass(frozen=True)
 class ProfessionalFreeTextRuntimeResult:
     """The outcome envelope for one run_professional_free_text_turn call.
     reply_text is set if and only if status is SUCCESS; failure_stage and
@@ -259,12 +362,18 @@ class ProfessionalFreeTextRuntimeResult:
     impossible to construct. failure_reason is always exactly one member of
     the originating stage's own already-bounded status/reason enum -- never
     raw user text, candidate text, model output, provider response body,
-    prompt, or exception message."""
+    prompt, or exception message.
+
+    success_trace (V1 addition) is set if and only if status is SUCCESS --
+    a ProfessionalTurnSuccessTrace carrying only bounded structural
+    decision metadata, enforced with the same never-both-never-neither
+    discipline as reply_text/failure_stage above."""
     status: ProfessionalFreeTextRuntimeStatus
     reply_text: str | None
     failure_stage: ProfessionalFreeTextFailureStage | None
     failure_reason: ProfessionalFreeTextFailureReason | None
     failure_detail: ProfessionalFreeTextFailureDetail | None
+    success_trace: ProfessionalTurnSuccessTrace | None = None
 
     def __post_init__(self):
         if type(self.status) is not ProfessionalFreeTextRuntimeStatus:
@@ -288,11 +397,20 @@ class ProfessionalFreeTextRuntimeResult:
                 raise ValueError(
                     "ProfessionalFreeTextRuntimeResult: SUCCESS must not carry "
                     "a failure_detail")
+            if type(self.success_trace) is not ProfessionalTurnSuccessTrace:
+                raise ValueError(
+                    "ProfessionalFreeTextRuntimeResult: SUCCESS requires a "
+                    "success_trace that is exactly a ProfessionalTurnSuccessTrace, "
+                    f"got {type(self.success_trace)!r}")
         else:
             if self.reply_text is not None:
                 raise ValueError(
                     "ProfessionalFreeTextRuntimeResult: a non-SUCCESS status "
                     "must never carry a reply_text")
+            if self.success_trace is not None:
+                raise ValueError(
+                    "ProfessionalFreeTextRuntimeResult: a non-SUCCESS status "
+                    "must never carry a success_trace")
             if type(self.failure_stage) is not ProfessionalFreeTextFailureStage:
                 raise ValueError(
                     "ProfessionalFreeTextRuntimeResult: a non-SUCCESS status "
@@ -430,7 +548,23 @@ async def run_professional_free_text_turn(
             failure_stage=ProfessionalFreeTextFailureStage.ACCEPTANCE,
             failure_reason=acceptance_result.reason, failure_detail=None)
 
+    # acceptance_result.status is the real, independently-observed outcome
+    # -- ACCEPT here (the REJECT branch already returned above). This trace
+    # reports that actual observed value, not a deduced/synthetic stand-in
+    # for Fidelity/Policy, which accept_professional_response never exposes
+    # as separate outcomes across this module boundary.
+    success_trace = ProfessionalTurnSuccessTrace(
+        analysis_status=analysis_result.status,
+        interaction_status=analysis_result.analysis.interaction.status,
+        optional_context_recovery_used=analyzer_result.optional_context_recovery_used,
+        objective=plan_result.plan.objective,
+        primary_response_move=plan_result.plan.move,
+        question_allowed=plan_result.plan.question_allowed,
+        clarification_target_present=plan_result.plan.clarification_target is not None,
+        bounded_alternative_used=plan_result.bounded_alternative_used,
+        acceptance=acceptance_result.status,
+    )
     return ProfessionalFreeTextRuntimeResult(
         status=ProfessionalFreeTextRuntimeStatus.SUCCESS,
         reply_text=render_result.candidate_text, failure_stage=None, failure_reason=None,
-        failure_detail=None)
+        failure_detail=None, success_trace=success_trace)
