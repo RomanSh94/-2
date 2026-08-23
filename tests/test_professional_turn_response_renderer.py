@@ -869,3 +869,354 @@ def test_system_instruction_never_freezes_exact_banned_phrases():
     assert "Это нормально" not in text
     assert "убери одно место" not in text
     assert "выпей стакан" not in text
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# J. Renderer Grounded Specificity V1
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_system_instruction_encodes_meaningful_relationship_principle():
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "MEANINGFUL RELATIONSHIP OVER CATEGORY LIST" in text
+    assert "flat, disconnected list" in text
+    assert "not a fixed catalogue of relationship types" in text
+    assert "not a checklist" in text
+
+
+def test_meaningful_relationship_principle_defers_to_unknown_remains_unknown():
+    """The new relationship-preservation instruction must not create a
+    competing, weaker permission to invent a link/cause -- it must
+    explicitly defer to the existing UNKNOWN REMAINS UNKNOWN principle,
+    which this slice leaves completely unchanged."""
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "governed by UNKNOWN REMAINS UNKNOWN below" in text
+    # The pre-existing principle itself is untouched.
+    assert "UNKNOWN REMAINS UNKNOWN" in text
+    assert "a cause" in text and "a diagnosis" in text
+
+
+def test_relationship_must_already_be_expressed_by_user_material():
+    """Contract-lock correction: the instruction must require the
+    relationship/sequence/contrast/cycle to already be EXPRESSED by the
+    user's own material -- semantic paraphrase of their wording is
+    allowed, but the Renderer must never be given authority to create a
+    relationship that is merely plausible."""
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "already expresses a relationship, sequence, contrast, " in text
+    assert "DO NOT CREATE THE RELATIONSHIP YOURSELF" in text
+    assert "Preserve a relationship only when the user's own material already expresses it" in text
+    assert "semantic paraphrase of their wording is fine" in text
+
+
+def test_relationship_principle_forbids_upgrading_proximity_into_causation():
+    """Contract-lock correction: temporal proximity, co-occurrence, or two
+    merely-adjacent facts must never be upgraded into a causal claim the
+    user did not make -- e.g. two separate emotion/behavior statements
+    with no connector must be reflected as two things the user said, not
+    as one causing the other."""
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "Do not turn temporal proximity into causation" in text
+    assert "do not turn two adjacent facts into a mechanism" in text
+    assert "do not decide that a feeling caused a behavior" in text
+    assert ("unless the user's own words actually say so -- directly, or with an "
+            "equivalent connector") in text
+    assert "reflect them as two things the user said, not as one causing the other" in text
+
+
+def test_relationship_principle_no_longer_grants_independent_causal_inference_authority():
+    """Negative regression: the pre-correction wording that created
+    independent interpretive authority ("explicit or very clearly
+    implied", "produces the next") must be fully gone -- the corrected
+    contract only ever allows semantic paraphrase of an already-expressed
+    relationship, never inference of a plausible-but-unstated one."""
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "very clearly implied" not in text
+    assert "produces the next" not in text
+
+
+def test_system_instruction_permits_proportionate_sparse_replies():
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "a plain, honestly proportionate reply is correct for plain material, not a defect" in text
+    # Pre-existing analogous permission (GROUNDING paragraph) also untouched.
+    assert "an honestly general, low-pressure reply is correct in that case, not a defect" in text
+
+
+def test_system_instruction_open_invitation_forbids_disguised_question():
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "never smuggle a hidden request for detail" in text
+    assert "question in disguise" in text
+    assert "declaratively, not interrogatively" in text
+
+
+def test_system_instruction_open_invitation_still_forbids_questions_when_not_allowed():
+    """Regression lock: the strengthened OPEN_INVITATION bullet still
+    carries the original, unconditional question_allowed=False
+    prohibition -- this slice only narrows HOW OPEN_INVITATION may be
+    grounded, never whether question_allowed is obeyed."""
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert ("must never end in, or otherwise contain, a question of any kind when "
+            "question_allowed is false") in text
+    assert "must contain no question of any kind" in text  # original global rule, unchanged
+
+
+def test_system_instruction_natural_language_forbids_mechanical_shape():
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "Do not apply the same shape to every reply" in text
+    assert "habitual pattern" in text
+
+
+def test_system_instruction_no_premature_advice_unaffected_by_open_invitation_change():
+    """Section G: NO PREMATURE ADVICE remains fully intact and unconditional
+    -- the strengthened OPEN_INVITATION guidance introduces no exercise,
+    technique, or behavioral-recommendation language of its own."""
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "NO PREMATURE ADVICE" in text
+    assert "breathing or grounding exercise" in text
+    assert "small next step" in text
+    open_invitation_bullet = text[text.index("- OPEN_INVITATION:"):text.index("- CLOSING:")]
+    for forbidden in ("exercise", "breathing", "technique", "practice", "step you can take"):
+        assert forbidden not in open_invitation_bullet.lower()
+
+
+def test_system_instruction_still_does_not_require_literal_quotation():
+    """Section H: grounded specificity must never become a lexical/exact-
+    copy requirement -- the pre-existing explicit permission not to quote
+    remains, and the new relationship paragraph adds no contradicting
+    requirement."""
+    text = professional_turn_response_renderer._build_system_instruction()
+    assert "You do not need to quote the user's own words" in text
+    assert "must not force literal repetition of them" in text
+    assert "quote" not in text[text.index("MEANINGFUL RELATIONSHIP"):text.index("UNKNOWN REMAINS UNKNOWN")]
+
+
+def test_system_instruction_never_freezes_the_design_review_example_wording():
+    """Section 3's illustrative example is explicitly NOT approved literal
+    production copy and must never be hardcoded -- mirrors the sibling
+    banned-phrase-freeze test above for this slice's own example."""
+    text = professional_turn_response_renderer._build_system_instruction()
+    for frozen_example_fragment in (
+            "Похоже, больше всего выматывает",
+            "не помогает собраться",
+            "Можно пока не искать решение",
+            "а, наоборот, ещё сильнее отталкивает"):
+        assert frozen_example_fragment not in text
+
+
+def test_no_regex_or_blacklist_machinery_in_renderer_module():
+    """Direct proof (not merely reliance on the import-allowlist test)
+    that no phrase-blacklist/regex quality mechanism was introduced: the
+    only string-membership checks in this file are the existing exact-key
+    JSON transport checks, never a moderation/quality wordlist."""
+    source = pathlib.Path(professional_turn_response_renderer.__file__).read_text(encoding="utf-8")
+    assert "import re" not in source
+    assert "re.compile" not in source
+    assert "re.search" not in source
+    assert "re.match" not in source
+    assert "BANNED_PHRASE" not in source
+    assert "FORBIDDEN_PHRASE" not in source
+    assert "_BLACKLIST" not in source
+    assert "_WHITELIST" not in source
+
+
+# ── Grounded-specificity payload/behavior contract (fake-model boundary) ────
+
+_RU_EXPLICIT_SEQUENCE_SOURCE = (
+    "Последнюю неделю я почти каждый вечер думаю, что ничего толком не "
+    "успеваю, хотя весь день занят. Из-за этого начинаю злиться на себя "
+    "и ещё дольше откладываю самые важные дела.")
+
+_RU_GROUNDED_FIXTURE_REPLY = (
+    "Похоже, тяжелее всего не сама занятость, а то, что вечером остаётся "
+    "ощущение недосделанного, и злость на себя после этого не помогает "
+    "вернуться к делам, а только больше от них отталкивает.")
+
+_EN_EXPLICIT_SEQUENCE_SOURCE = (
+    "Every time I miss a deadline at work I start telling myself I'm "
+    "incompetent, and then I avoid opening my laptop for the rest of the "
+    "day because I don't want to face it.")
+
+_EN_GROUNDED_FIXTURE_REPLY = (
+    "It sounds like once you tell yourself you're incompetent after a "
+    "missed deadline, that's exactly what makes it harder to open your "
+    "laptop again for the rest of the day.")
+
+_SPARSE_SOURCE = "Мне сегодня грустно."
+_SPARSE_FIXTURE_REPLY = "Понимаю. Хочешь рассказать, что сегодня было?"
+
+_NO_CAUSE_SOURCE = (
+    "Я не хочу начинать новый проект и постоянно откладываю первый шаг.")
+_NO_CAUSE_GROUNDED_FIXTURE_REPLY = (
+    "Похоже, самое сложное -- именно сделать первый шаг к новому проекту.")
+
+
+def test_ru_explicit_sequence_source_reaches_the_model_unaltered():
+    """A: the explicit RU event/thought/behavior sequence must reach the
+    model as complete, unmodified source_text, together with the new
+    grounding instruction. This proves only transport/instruction
+    delivery and that a structurally valid grounded candidate is
+    accepted -- it does NOT and cannot prove that a real model will
+    actually generate grounded specificity in production; that remains
+    unverifiable offline (see module docstring) and will be assessed by a
+    fresh real owner Telegram canary after merge/deploy, not by this
+    fake-client test."""
+    client = _client_returning(_dumps(_document(_RU_GROUNDED_FIXTURE_REPLY)))
+    plan = _establish_contact_plan(question_allowed=False)
+    result = _call(
+        client, model="gpt-4o-mini", plan=plan, source_text=_RU_EXPLICIT_SEQUENCE_SOURCE)
+    assert result.status is TurnResponseRenderStatus.CANDIDATE
+    assert result.candidate_text == _RU_GROUNDED_FIXTURE_REPLY
+    sent = client.chat.completions.calls[0]
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["source_text"] == _RU_EXPLICIT_SEQUENCE_SOURCE
+    system_message = [m for m in sent["messages"] if m["role"] == "system"][0]["content"]
+    assert "MEANINGFUL RELATIONSHIP OVER CATEGORY LIST" in system_message
+
+
+def test_en_explicit_sequence_source_reaches_the_model_unaltered():
+    """B: unrelated English material with its own explicit relationship,
+    proving the transport/instruction-delivery behavior above is not
+    RU-specific or canary-specific. Same limitation as test A: this
+    proves delivery and structural acceptance, never real-model semantic
+    generation quality."""
+    client = _client_returning(_dumps(_document(_EN_GROUNDED_FIXTURE_REPLY)))
+    plan = _establish_contact_plan(question_allowed=False)
+    result = _call(
+        client, model="gpt-4o-mini", plan=plan, source_text=_EN_EXPLICIT_SEQUENCE_SOURCE)
+    assert result.status is TurnResponseRenderStatus.CANDIDATE
+    assert result.candidate_text == _EN_GROUNDED_FIXTURE_REPLY
+    sent = client.chat.completions.calls[0]
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["source_text"] == _EN_EXPLICIT_SEQUENCE_SOURCE
+
+
+def test_no_invented_mechanism_instruction_present_for_ambiguous_cause():
+    """C: source states behavior (avoidance/postponement) without stating
+    why. The instruction sent must forbid inventing fear-of-failure,
+    perfectionism, burnout, or any other unsupported mechanism -- proven
+    via the actual sent system instruction, not live model output (which
+    this offline test cannot observe)."""
+    client = _client_returning(_dumps(_document(_NO_CAUSE_GROUNDED_FIXTURE_REPLY)))
+    plan = _establish_contact_plan(question_allowed=False)
+    result = _call(client, model="gpt-4o-mini", plan=plan, source_text=_NO_CAUSE_SOURCE)
+    assert result.status is TurnResponseRenderStatus.CANDIDATE
+    sent = client.chat.completions.calls[0]
+    system_message = [m for m in sent["messages"] if m["role"] == "system"][0]["content"]
+    assert "UNKNOWN REMAINS UNKNOWN" in system_message
+    assert "a cause" in system_message
+    assert "psychological mechanism" in system_message
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["source_text"] == _NO_CAUSE_SOURCE
+
+
+def test_sparse_material_does_not_require_manufactured_depth():
+    """D: sparse source_text ("Мне сегодня грустно.") must render normally
+    to CANDIDATE without the Renderer's own code requiring any richer
+    output -- this module has no length/relationship/specificity check of
+    its own, so a plain fixture reply must be accepted exactly as any
+    other valid candidate."""
+    client = _client_returning(_dumps(_document(_SPARSE_FIXTURE_REPLY)))
+    plan = _establish_contact_plan(question_allowed=True)
+    result = _call(client, model="gpt-4o-mini", plan=plan, source_text=_SPARSE_SOURCE)
+    assert result.status is TurnResponseRenderStatus.CANDIDATE
+    assert result.candidate_text == _SPARSE_FIXTURE_REPLY
+    sent = client.chat.completions.calls[0]
+    system_message = [m for m in sent["messages"] if m["role"] == "system"][0]["content"]
+    assert "a plain, honestly proportionate reply is correct for plain material" in system_message
+
+
+def test_question_allowed_false_payload_and_instruction_preserved_compliant_candidate_accepted():
+    """E: proves what is actually true for this generation-guidance slice
+    -- question_allowed=False reaches the trusted payload unchanged, the
+    system instruction explicitly forbids any question for this case, and
+    an already-compliant (question-free) fixture candidate is accepted
+    structurally. This does NOT prove the Renderer deterministically
+    rejects a model output that contains a question -- no such
+    enforcement exists in this module (see module docstring: "this module
+    still performs no semantic validation of its own output whatsoever");
+    see the companion boundary-honesty test directly below, which proves
+    the absence of that enforcement rather than merely asserting it.
+    Deterministic question-mark rejection remains Fidelity Validator's
+    separate, already-existing responsibility, untouched by this slice."""
+    non_question_reply = "Похоже, вечера в последнее время особенно тяжёлые."
+    assert "?" not in non_question_reply
+    client = _client_returning(_dumps(_document(non_question_reply)))
+    plan = _establish_contact_plan(question_allowed=False)
+    result = _call(
+        client, model="gpt-4o-mini", plan=plan, source_text=_RU_EXPLICIT_SEQUENCE_SOURCE)
+    assert result.status is TurnResponseRenderStatus.CANDIDATE
+    assert result.candidate_text == non_question_reply
+    sent = client.chat.completions.calls[0]
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["question_allowed"] is False
+    assert payload["move"] == "OPEN_INVITATION"
+    system_message = [m for m in sent["messages"] if m["role"] == "system"][0]["content"]
+    assert "must contain no question of any kind" in system_message
+
+
+def test_renderer_has_no_deterministic_question_allowed_enforcement_of_its_own():
+    """Boundary-honesty proof, not merely an assertion: a fixture
+    candidate that VIOLATES question_allowed=False (it contains a
+    question mark) is still accepted as CANDIDATE by this module. This
+    demonstrates, rather than claims, that the Renderer performs no
+    semantic/structural enforcement of question_allowed on its own
+    output -- the existing, unchanged architecture (see module
+    docstring), not a gap introduced by this slice. Do NOT "fix" this by
+    adding a question-mark check here: that would add a new, unauthorized
+    semantic validator to the Renderer, duplicating Fidelity Validator's
+    separate, already-existing responsibility."""
+    non_compliant_reply = "Что именно сегодня было особенно тяжёлым?"
+    assert "?" in non_compliant_reply
+    client = _client_returning(_dumps(_document(non_compliant_reply)))
+    plan = _establish_contact_plan(question_allowed=False)
+    result = _call(
+        client, model="gpt-4o-mini", plan=plan, source_text=_RU_EXPLICIT_SEQUENCE_SOURCE)
+    assert result.status is TurnResponseRenderStatus.CANDIDATE
+    assert result.candidate_text == non_compliant_reply
+
+
+def test_question_allowed_true_focused_question_regression_unaffected():
+    """F: this slice must not accidentally suppress questions globally --
+    a normal CLARIFY + FOCUSED_QUESTION plan with question_allowed=True
+    still renders to CANDIDATE exactly as before, and the payload still
+    carries question_allowed=True."""
+    question_reply = "Что именно в этот момент показалось самым трудным?"
+    client = _client_returning(_dumps(_document(question_reply)))
+    plan = _sample_plan(question_allowed=True)
+    result = _call(client, model="gpt-4o-mini", plan=plan, source_text=_RU_EXPLICIT_SEQUENCE_SOURCE)
+    assert result.status is TurnResponseRenderStatus.CANDIDATE
+    assert result.candidate_text == question_reply
+    sent = client.chat.completions.calls[0]
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["question_allowed"] is True
+
+
+def test_establish_contact_open_invitation_no_premature_advice_instruction_sent():
+    """G: for the exact ESTABLISH_CONTACT + OPEN_INVITATION shape from the
+    production canary, the sent system instruction must still carry the
+    full, unconditional NO PREMATURE ADVICE prohibition -- proving this
+    slice did not weaken or bypass it for this specific move."""
+    client = _client_returning(_dumps(_document(_RU_GROUNDED_FIXTURE_REPLY)))
+    plan = _establish_contact_plan(question_allowed=False)
+    result = _call(
+        client, model="gpt-4o-mini", plan=plan, source_text=_RU_EXPLICIT_SEQUENCE_SOURCE)
+    assert result.status is TurnResponseRenderStatus.CANDIDATE
+    sent = client.chat.completions.calls[0]
+    system_message = [m for m in sent["messages"] if m["role"] == "system"][0]["content"]
+    assert "NO PREMATURE ADVICE" in system_message
+    assert "breathing or grounding exercise" in system_message
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["objective"] == "ESTABLISH_CONTACT"
+    assert payload["move"] == "OPEN_INVITATION"
+
+
+def test_no_exact_copy_requirement_fixture_reply_need_not_quote_source():
+    """H: a fixture reply sharing zero words with source_text must still
+    render successfully -- proving the Renderer imposes no lexical-
+    overlap or quotation requirement of its own."""
+    non_overlapping_reply = "It seems the anger afterward makes it harder to return to them."
+    client = _client_returning(_dumps(_document(non_overlapping_reply)))
+    plan = _establish_contact_plan(question_allowed=False)
+    result = _call(
+        client, model="gpt-4o-mini", plan=plan, source_text=_EN_EXPLICIT_SEQUENCE_SOURCE)
+    assert result.status is TurnResponseRenderStatus.CANDIDATE
+    assert result.candidate_text == non_overlapping_reply
