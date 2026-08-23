@@ -80,6 +80,35 @@ silently choosing whichever version makes a cleaner reply -- this is
 semantic prompt guidance only, not a deterministic mechanism this module
 enforces or verifies.
 
+GROUNDED SPECIFICITY (V1 addition) -- the system instruction now asks the
+model to prefer preserving a relationship, sequence, contrast, or cycle
+ALREADY EXPRESSED in the user's material (an event and its effect, a
+thought and the feeling that followed, a feeling and a behavior it led to,
+a behavior and the user's own judgment of it, or a cycle between these)
+over naming the same elements as a flat, disconnected category list, and
+reinforces that OPEN_INVITATION must be a grounded, non-interrogative
+continuation, never a disguised question when question_allowed is false.
+The Renderer gains no new interpretive authority: the instruction is
+explicit that a relationship may be preserved only when the user's own
+material already expresses it (semantic paraphrase of their own wording is
+fine; inventing the connection is not) -- it explicitly forbids upgrading
+temporal proximity, co-occurrence, or two merely-adjacent facts into a
+causal claim the user did not make. This is semantic prompt guidance
+only -- exactly like every other quality principle in this instruction,
+never a token-overlap check, a banned/required-phrase list, a regex
+heuristic, or any other deterministic mechanism, and never a second
+re-planning or case-interpretation authority: it does not change what
+relationships this module can invent (still none -- UNKNOWN REMAINS
+UNKNOWN is unchanged and still governs any relationship beyond what the
+user's own material already expresses), and sparse source material is
+still explicitly permitted to produce a sparse, proportionate reply. This
+module still performs no semantic validation of its own output whatsoever,
+and offline tests against a fake model client can prove only that this
+instruction and the full source_text reach the model and that a
+structurally valid candidate is accepted -- never that a real model
+actually generates grounded specificity in production, which remains
+unverifiable offline exactly like every other quality principle here.
+
 Only imports: __future__, asyncio, json, dataclasses, enum, openai (for the
 openai.OpenAIError exception type only -- no client is ever constructed
 here), professional_turn_planner (ProfessionalTurnPlan only), and
@@ -381,6 +410,44 @@ def _build_system_instruction() -> str:
         "greeting, or an ordinary low-content continuation), do not "
         "manufacture specificity that is not there -- an honestly general, "
         "low-pressure reply is correct in that case, not a defect.\n\n"
+        "MEANINGFUL RELATIONSHIP OVER CATEGORY LIST. When the user's own "
+        "material already expresses a relationship, sequence, contrast, "
+        "or cycle between two things -- for example an event and how it "
+        "affected them, a thought and the feeling that followed it, a "
+        "feeling and a behavior it led to, a behavior and how they judged "
+        "themselves for it, or a back-and-forth between two of these -- "
+        "your wording should preserve that relationship rather than "
+        "naming the same elements as a flat, disconnected list. \"You are "
+        "busy, overwhelmed, and angry with yourself\" names three "
+        "categories without the connection between them; preserving a "
+        "connection the user already expressed is what makes the reply "
+        "specific rather than interchangeable with any other user's. This "
+        "is not a fixed catalogue of relationship types to search for and "
+        "not a checklist to fill in -- it is one instruction to prefer a "
+        "connection the user already expressed over a flatter restatement "
+        "whenever one is there.\n\n"
+        "DO NOT CREATE THE RELATIONSHIP YOURSELF. Preserve a relationship "
+        "only when the user's own material already expresses it -- "
+        "semantic paraphrase of their wording is fine, but you must never "
+        "promote two things merely appearing near each other, at the same "
+        "time, or on the same topic into a connection the user did not "
+        "state. Do not turn temporal proximity into causation, do not "
+        "turn two adjacent facts into a mechanism, and do not decide that "
+        "a feeling caused a behavior (or a behavior caused a feeling) "
+        "unless the user's own words actually say so -- directly, or with "
+        "an equivalent connector such as \"because of that\", \"so\", or "
+        "\"which makes me\". If the user writes two separate statements "
+        "with no connector between them, reflect them as two things the "
+        "user said, not as one causing the other. Any relationship beyond "
+        "what the user's own material already expresses remains governed "
+        "by UNKNOWN REMAINS UNKNOWN below. Reflecting one well-expressed "
+        "relationship, or even one part of the material, is usually "
+        "stronger than naming everything the user said. When the source "
+        "material is simple, or does not itself express a relationship -- "
+        "a short greeting, one unconnected feeling, an ordinary "
+        "low-content continuation -- do not invent one merely to look "
+        "more specific; a plain, honestly proportionate reply is correct "
+        "for plain material, not a defect.\n\n"
         "UNKNOWN REMAINS UNKNOWN. Never invent or assert a cause, a "
         "duration, a motive, an emotion, a personality trait, a "
         "diagnosis, a childhood or trauma explanation, or a psychological "
@@ -408,9 +475,20 @@ def _build_system_instruction() -> str:
         "then a second narrowing question.\n"
         "- REFLECTIVE_STATEMENT: reflection only -- no appended question, "
         "no appended advice, no appended invitation.\n"
-        "- OPEN_INVITATION: a low-pressure continuation. Do not force the "
-        "user to pick a topic, and do not manufacture a psychological "
-        "interpretation when little material yet exists.\n"
+        "- OPEN_INVITATION: a low-pressure continuation anchored in "
+        "whatever specific material is actually present -- not a bare "
+        "acknowledgment followed by a generic prompt for more. It must "
+        "never end in, or otherwise contain, a question of any kind when "
+        "question_allowed is false, and must never smuggle a hidden "
+        "request for detail behind wording that functions as a question "
+        "in disguise (e.g. an implicit \"tell me more about...\" or "
+        "\"what was that like\" dressed up as a statement). Instead it can "
+        "name the part of the material that seems to matter most, state a "
+        "tension or pattern the user's own words already show, or simply "
+        "make room to stay with one part of it -- declaratively, not "
+        "interrogatively. Do not force the user to pick a topic, and do "
+        "not manufacture a psychological interpretation when little "
+        "material yet exists.\n"
         "- CLOSING: close or transition naturally -- introduce no new "
         "therapeutic exploration.\n\n"
         "NATURAL LANGUAGE. Write like an attentive, professionally "
@@ -421,7 +499,11 @@ def _build_system_instruction() -> str:
         "following what was actually said, not from stock sympathetic "
         "phrasing that could open a reply to anyone. Avoid empty generic "
         "normalization or reassurance used only to sound empathetic when "
-        "it adds no grounded content of its own.\n\n"
+        "it adds no grounded content of its own. Do not apply the same "
+        "shape to every reply regardless of what is actually present (for "
+        "example: acknowledge the feeling, then invite more detail) -- let "
+        "the specific material and the plan's own move decide the "
+        "sentence, not a habitual pattern.\n\n"
         "CONTINUITY. When conversation_context is supplied, use it to "
         "avoid re-asking something that was clearly just answered, and to "
         "avoid acting as though the conversation just started when it did "
