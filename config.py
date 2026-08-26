@@ -4,6 +4,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _bounded_positive_int_env(name: str, default: int, upper_bound: int) -> int:
+    """Read a required-positive, explicitly bounded integer setting."""
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{name} must be an integer from 1 to {upper_bound}") from None
+    if not 1 <= value <= upper_bound:
+        raise ValueError(f"{name} must be an integer from 1 to {upper_bound}")
+    return value
+
 BOT_TOKEN         = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 ADMIN_PASSWORD    = os.getenv("ADMIN_PASSWORD", "change_me")
@@ -73,10 +86,11 @@ DASS21_DEFINITION_PATH = os.getenv(
     "private_questionnaires/dass21_ru_fattakhov_2024.json").strip()
 DASS21_DEFINITION_SHA256 = os.getenv("DASS21_DEFINITION_SHA256", "").strip().lower()
 
-# PR #59 — controlled invited-user DASS access. Default OFF. This is the ONLY
-# switch that can admit non-owner users to DASS (an active user_access row is
-# additionally required per user); DASS21_OWNER_ONLY=false never opens access
-# (it fails closed for everyone -- see dass21_runtime/dass21_access).
+# PR #59 — controlled invited-user DASS access. Default OFF. In non-public
+# modes this is the only switch that can admit non-owner users (an active
+# user_access row is additionally required per user). Public ordinary access
+# is separately composed in dass21_access after the same integrity gate.
+# DASS21_OWNER_ONLY=false never opens access in any mode; it fails closed.
 DASS21_INVITED_USERS_ENABLED = (
     os.getenv("DASS21_INVITED_USERS_ENABLED", "false").strip().lower()
     in ("1", "true", "yes", "on")
@@ -232,6 +246,42 @@ PROFESSIONAL_FREE_TEXT_RUNTIME_ENABLED = (
     os.getenv("PROFESSIONAL_FREE_TEXT_RUNTIME_ENABLED", "false").strip().lower()
     in ("1", "true", "yes", "on")
 )
+
+# Public-beta Therapist Core V1.  Both values are required before the Core can
+# claim a turn; an empty model deliberately disables it and is never replaced
+# with a legacy/default model in code.
+THERAPIST_CORE_V1_ENABLED = (
+    os.getenv("THERAPIST_CORE_V1_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+THERAPIST_CORE_V1_MODEL = os.getenv("THERAPIST_CORE_V1_MODEL", "").strip()
+THERAPIST_CORE_V1_MAX_COMPLETION_TOKENS = _bounded_positive_int_env(
+    "THERAPIST_CORE_V1_MAX_COMPLETION_TOKENS", 1200, 8192)
+
+
+def _validate_feedback_chat_url(raw: str) -> str:
+    """Return a renderable HTTPS/TG feedback URL, or hide it as empty."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme == "https" and parsed.netloc:
+        return raw
+    if parsed.scheme == "tg" and parsed.netloc:
+        return raw
+    return ""
+
+
+FEEDBACK_CHAT_URL = _validate_feedback_chat_url(
+    os.getenv("FEEDBACK_CHAT_URL", ""))
+
+
+def feedback_chat_url() -> str:
+    """Return the currently configured validated feedback destination."""
+    return _validate_feedback_chat_url(FEEDBACK_CHAT_URL)
 
 # ── Voice and Adaptive Response UX — both default OFF ───────────────────────
 # VOICE_REPLIES_ENABLED gates: the /format selector, the "🔊 Прослушать"

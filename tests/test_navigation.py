@@ -97,9 +97,11 @@ def _common(monkeypatch):
 
 
 NAV_CALLBACKS = {
+    "talk:hub": bot.cb_talk_hub,
     "tests:hub": bot.cb_tests_hub,
     "journals:hub": bot.cb_journals_hub,
     "results:hub": bot.cb_results_hub,
+    "settings:hub": bot.cb_settings_hub,
     "privacy:hub": bot.cb_privacy_hub,
     "about:hub": bot.cb_about_hub,
     "menu:back": bot.cb_menu_back,
@@ -121,12 +123,13 @@ def test_menu_renders_main_menu_with_all_sections():
     # Navigation Hub placeholder) -- was
     # ["tests:hub", "journals:hub", "results:hub", "privacy:hub", "about:hub"].
     # The other 4 entries are unchanged.
-    assert callback_datas == ["q:l", "journals:hub", "results:hub", "privacy:hub", "about:hub"]
+    assert callback_datas == [
+        "talk:hub", "q:l", "journals:hub", "results:hub",
+        "settings:hub", "privacy:hub", "about:hub",
+    ]
 
 
-def test_other_four_menu_buttons_keep_original_hub_pattern():
-    """The fix only special-cases "tests" -- journals/results/privacy/about
-    must keep their original generic f"{key}:hub" callback_data, unchanged."""
+def test_non_questionnaire_menu_buttons_use_hub_pattern():
     user = FakeUser(1)
     msg = FakeMessage(user)
     asyncio.run(bot.cmd_menu(msg))
@@ -136,6 +139,28 @@ def test_other_four_menu_buttons_keep_original_hub_pattern():
         if key == "tests":
             continue
         assert f"{key}:hub" in callback_datas
+
+
+@pytest.mark.parametrize("value", ["", "http://example.com", "javascript:alert(1)"])
+def test_feedback_hidden_when_unset_or_invalid(monkeypatch, value):
+    monkeypatch.setattr(bot.config, "FEEDBACK_CHAT_URL", value)
+    callback_datas = [
+        btn.callback_data
+        for row in bot._menu_keyboard("ru").inline_keyboard
+        for btn in row
+    ]
+    assert "feedback:hub" not in callback_datas
+
+
+def test_feedback_warning_precedes_valid_external_link(monkeypatch):
+    monkeypatch.setattr(bot.config, "FEEDBACK_CHAT_URL", "https://t.me/x20_feedback")
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="feedback:hub")
+    asyncio.run(bot.cb_feedback_hub(cb))
+    text, kw = msg.answers[-1]
+    assert "личного чата" in text
+    assert kw["reply_markup"].inline_keyboard[0][0].url == "https://t.me/x20_feedback"
 
 
 def test_menu_tests_button_reaches_real_questionnaire_core():
@@ -188,12 +213,13 @@ def test_results_hub_does_not_show_scores_or_diagnosis():
     for forbidden in ("результат выше нормы", "лёгкая депрессия", "умеренная депрессия",
                       "тяжёлая депрессия", "у тебя депрессия", "высокая тревожность"):
         assert forbidden not in text.lower()
-    assert "не показываем оценки" in text   # explicit denial present, as intended
+    assert "не ставит диагнозы" in text
 
 
 def test_navigation_text_has_no_dependency_wording():
     all_text = "\n".join([
         navigation.menu_text("ru"), navigation.menu_text("en"),
+        navigation.talk_hub_text("ru"), navigation.talk_hub_text("en"),
         navigation.tests_hub_text("ru"), navigation.tests_hub_text("en"),
         navigation.journals_hub_text("ru"), navigation.journals_hub_text("en"),
         navigation.privacy_hub_text("ru"), navigation.privacy_hub_text("en"),
@@ -231,7 +257,8 @@ def test_nav_callback_requires_product_gate(data, handler):
     asyncio.run(handler(cb))
     assert msg.answers
     assert "Главное меню" not in msg.answers[0][0]
-    for hub_text in (navigation.tests_hub_text("ru"), navigation.journals_hub_text("ru"),
+    for hub_text in (navigation.talk_hub_text("ru"), navigation.tests_hub_text("ru"),
+                     navigation.journals_hub_text("ru"),
                      navigation.results_hub_text("ru"), navigation.privacy_hub_text("ru"),
                      navigation.about_hub_text("ru")):
         assert msg.answers[0][0] != hub_text

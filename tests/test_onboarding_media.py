@@ -353,6 +353,10 @@ def test_default_asset_reader_finds_real_file_after_cwd_change(monkeypatch, tmp_
         d = os.path.dirname(d)
     os.makedirs(parent, exist_ok=True)
     pre_existing = os.path.isfile(real_path)
+    pre_existing_bytes = None
+    if pre_existing:
+        with open(real_path, "rb") as f:
+            pre_existing_bytes = f.read()
     with open(real_path, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
     try:
@@ -360,7 +364,10 @@ def test_default_asset_reader_finds_real_file_after_cwd_change(monkeypatch, tmp_
         got = onboarding.default_asset_reader(1)
         assert isinstance(got, FSInputFile)
     finally:
-        if not pre_existing:
+        if pre_existing:
+            with open(real_path, "wb") as f:
+                f.write(pre_existing_bytes)
+        else:
             os.remove(real_path)
         for d in sorted(created_dirs, key=len, reverse=True):
             try:

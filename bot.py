@@ -30,13 +30,14 @@ from html import escape as _he
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, FSInputFile, ReactionTypeEmoji,
+    CallbackQuery, FSInputFile, ReactionTypeEmoji, BotCommand,
 )
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from collections import OrderedDict
 from aiogram.filters import Command
 from aiogram.exceptions import (
-    TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter,
+    TelegramAPIError, TelegramBadRequest, TelegramForbiddenError,
+    TelegramNetworkError, TelegramRetryAfter,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -199,6 +200,7 @@ from professional_free_text_runtime import (
     ProfessionalFreeTextRuntimeStatus,
     ProfessionalFreeTextFailureStage,
 )
+from therapist_core_v1 import generate_therapist_core_v1
 import conversation_controller as controller
 from therapeutic_domain import (
     Intent, RepairConstraint, LifecycleStatus, ConsentState, PracticeProposalStatus,
@@ -788,19 +790,17 @@ async def _answer_evicting_legacy_kb(message: Message, uid: int, text: str) -> M
     return sent
 
 
-def _voice_ux_enabled_for(uid: int) -> bool:
+async def _voice_ux_enabled_for(uid: int) -> bool:
     return (
         config.VOICE_REPLIES_ENABLED
-        and access_control.OWNER_USER_ID is not None
-        and uid == access_control.OWNER_USER_ID
+        and await access_control.has_full_access(uid)
     )
 
 
-def _reactions_enabled_for(uid: int) -> bool:
+async def _reactions_enabled_for(uid: int) -> bool:
     return (
         config.EMOTIONAL_REACTIONS_ENABLED
-        and access_control.OWNER_USER_ID is not None
-        and uid == access_control.OWNER_USER_ID
+        and await access_control.has_full_access(uid)
     )
 
 
@@ -882,7 +882,7 @@ async def _synthesize_and_send_voice(target, uid: int, text: str, lang: str) -> 
     voice message via `target` (a Message, exposing .answer_voice). Returns
     True on success, False on ANY failure (TTS or Telegram send) -- never
     raises, and the temporary audio file is always removed."""
-    if not _voice_ux_enabled_for(uid):
+    if not await _voice_ux_enabled_for(uid):
         return False
     path = None
     try:
@@ -942,7 +942,7 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
     is_private = getattr(message.chat, "type", "private") == "private"
     if reply_markup is not None:
         return await message.answer(answer, reply_markup=reply_markup)
-    if not _voice_ux_enabled_for(uid) or not is_private:
+    if not await _voice_ux_enabled_for(uid) or not is_private:
         return await _answer_evicting_legacy_kb(message, uid, answer)
 
     prefs = await get_response_preferences(uid)
@@ -986,7 +986,7 @@ async def _maybe_react(message: Message, uid: int, category: ReactionCategory,
         except Exception:
             pass
 
-    if not _reactions_enabled_for(uid):
+    if not await _reactions_enabled_for(uid):
         _log("skipped", "not_authorized")
         return
     if category == ReactionCategory.NONE:
@@ -1038,6 +1038,11 @@ _CLOSED_TEST_TEXT = {
           "still works for everyone.",
 }
 
+_REVIEW_ONLY_TEXT = {
+    "ru": "Для этой учётной записи доступен только контур клинического ревью; обычный продукт не открыт.",
+    "en": "This account is limited to the clinical-review surface; ordinary product access is unavailable.",
+}
+
 _TESTER_WAITING_TEXT = {
     "ru": "Спасибо, отмечено. Доступ откроется, как только за тобой закрепят "
           "куратора-ревьюера.",
@@ -1072,9 +1077,8 @@ async def ensure_full_access_or_closed_test(entity, uid: int) -> bool:
     Returns False (after sending the appropriate screen) otherwise:
       - CLINICIAN_TESTER in controlled_clinical_test, not yet acknowledged ->
         the tester-acknowledgment notice + an inline "I agree" button.
-      - anything else without full access (UNKNOWN, CLINICIAN_REVIEWER, an
-        acknowledged tester with no reviewer mapping, an invalid/public mode,
-        etc.) -> the generic closed-test message.
+      - a review-only account in public mode -> a review-only notice;
+      - anything else without full access -> the generic closed-test message.
 
     `entity` is a Message or a CallbackQuery — both are used as real bot
     entrypoints. This function never touches the crisis path; callers are
@@ -1092,6 +1096,8 @@ async def ensure_full_access_or_closed_test(entity, uid: int) -> bool:
     elif role == access_control.CLINICIAN_TESTER:
         # Acknowledged already, but no (valid) reviewer mapping yet.
         await target.answer(_TESTER_WAITING_TEXT[lang if lang in _TESTER_WAITING_TEXT else "ru"])
+    elif access_control.DEPLOYMENT_MODE == "public":
+        await target.answer(_REVIEW_ONLY_TEXT[lang if lang in _REVIEW_ONLY_TEXT else "ru"])
     else:
         await target.answer(_CLOSED_TEST_TEXT[lang if lang in _CLOSED_TEST_TEXT else "ru"])
     if isinstance(entity, CallbackQuery):
@@ -1782,6 +1788,68 @@ def _professional_technical_fallback_text(lang: str) -> str:
     return _PROFESSIONAL_TECHNICAL_FALLBACK_TEXT.get(lang, _PROFESSIONAL_TECHNICAL_FALLBACK_TEXT["en"])
 
 
+async def _run_therapist_core_v1_and_deliver(
+        message: Message, uid: int, current_row_id: int, user_text: str,
+        risk: dict, lang: str, turn_gen: int, cid: str,
+        reaction_category: ReactionCategory, reaction_confidence: float,
+        one_shot_voice: bool = False, one_shot_concise: bool = False) -> None:
+    """Final lifecycle for a Core-owned turn: one call, one safety decision."""
+    _dispatch_log(f"cid={cid} stage=therapist_core_v1_claimed")
+    await _maybe_react(message, uid, reaction_category, reaction_confidence)
+    try:
+        rows = await get_professional_conversation_history_rows(uid, current_row_id)
+        context = build_conversation_context_from_history_rows(rows)
+        candidate = await generate_therapist_core_v1(
+            client=client,
+            model=config.THERAPIST_CORE_V1_MODEL,
+            source_text=user_text,
+            conversation_context=context,
+            risk_result=risk,
+            lang=lang,
+            max_completion_tokens=config.THERAPIST_CORE_V1_MAX_COMPLETION_TOKENS,
+        )
+        accepted, reason = validate_response_with_context(candidate, user_text, risk, lang)
+        if accepted:
+            reply_text = candidate
+            _dispatch_log(f"cid={cid} stage=therapist_core_v1_accepted")
+        else:
+            reply_text = select_fallback(risk, lang)
+            _dispatch_log(
+                f"cid={cid} stage=therapist_core_v1_rejected "
+                f"reason_type={type(reason).__name__}")
+    except Exception as exc:
+        reply_text = _professional_technical_fallback_text(lang)
+        _dispatch_log(
+            f"cid={cid} stage=therapist_core_v1_failed "
+            f"error_type={type(exc).__name__}")
+
+    if _user_generation_superseded(uid, turn_gen):
+        _dispatch_log(f"cid={cid} stage=therapist_core_v1_stale_dropped")
+        return
+    try:
+        await deliver_response(
+            message, uid, reply_text, lang,
+            one_shot_voice=one_shot_voice,
+            one_shot_concise=one_shot_concise,
+            preserve_exact_text=True,
+        )
+    except Exception as exc:
+        _dispatch_log(
+            f"cid={cid} stage=therapist_core_v1_send_failed "
+            f"error_type={type(exc).__name__}")
+        return
+    try:
+        await save_message(
+            uid, "assistant", reply_text, "therapist_core_v1", lang,
+            source=MessageSource.ASSISTANT_DELIVERED,
+        )
+    except Exception as exc:
+        _dispatch_log(
+            f"cid={cid} stage=therapist_core_v1_persist_failed "
+            f"error_type={type(exc).__name__}")
+        return
+
+
 async def _run_professional_free_text_and_deliver(
         message: Message, uid: int, current_row_id: int, user_text: str,
         risk: dict, lang: str, turn_gen: int, cid: str,
@@ -2093,7 +2161,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # answer is affected. A PURE command never enters therapeutic routing.
         one_shot_voice = False
         one_shot_concise = False
-        voice_ux_active = _voice_ux_enabled_for(uid) and is_private_chat
+        voice_ux_active = await _voice_ux_enabled_for(uid) and is_private_chat
 
         # Consume a one-shot voice override armed by a PRIOR Telegram update (see
         # the "no previous response yet" branch below) -- a plain local variable
@@ -2207,16 +2275,26 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # initialized here (not only inside the else: branch below) because
         # they are read again after the `finally` releases the lock,
         # regardless of which branch ran this turn.
-        professional_claimed = False
+        psychological_owner = "current"
         current_row_id = None
         controller_claim = None
         ft_claimed = False
         claim_token = None
-        if await access_control.professional_free_text_allowed_for(uid):
+        core_reaction_category = ReactionCategory.NONE
+        core_reaction_confidence = 0.0
+        if await access_control.therapist_core_v1_allowed_for(uid):
+            current_row_id = await save_message(
+                uid, "user", user_text, "therapist_core_v1", lang,
+                risk["score"], risk["categories"], source=MessageSource.USER_AUTHORED)
+            psychological_owner = "therapist_core_v1"
+            core_reaction_category, core_reaction_confidence = select_reaction_category(
+                user_text, risk["categories"], detect_stage(user_text, lang), lang,
+                is_meta_command=False, is_dependency_redirect=False)
+        elif await access_control.professional_free_text_allowed_for(uid):
             current_row_id = await save_message(
                 uid, "user", user_text, "professional", lang,
                 risk["score"], risk["categories"], source=MessageSource.USER_AUTHORED)
-            professional_claimed = True
+            psychological_owner = "professional"
         else:
             # 5. Update state
             state = await load_state(uid) or dict(DEFAULT_STATE)
@@ -2324,7 +2402,14 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # memory/LLM/delivery code below ever runs for a Professional-claimed
     # turn (no second reply surface, no silent legacy fallback -- see
     # _run_professional_free_text_and_deliver's own docstring).
-    if professional_claimed:
+    if psychological_owner == "therapist_core_v1":
+        await _run_therapist_core_v1_and_deliver(
+            message, uid, current_row_id, user_text, risk, lang, _turn_gen, _cid,
+            core_reaction_category, core_reaction_confidence,
+            one_shot_voice, one_shot_concise)
+        return
+
+    if psychological_owner == "professional":
         await _run_professional_free_text_and_deliver(
             message, uid, current_row_id, user_text, risk, lang, _turn_gen, _cid,
             one_shot_voice, one_shot_concise)
@@ -4076,10 +4161,7 @@ async def cb_universal_continuation(callback: CallbackQuery):
 async def cmd_format(message: Message):
     uid = message.from_user.id
     lang = await get_user_language(uid)
-    if not _voice_ux_enabled_for(uid):
-        # Flag off, OR flag on but not the owner: behave as if this command
-        # does not exist -- no selector, nothing saved, previous behavior
-        # preserved exactly for everyone but the owner during canary.
+    if not await _voice_ux_enabled_for(uid):
         return
     if getattr(message.chat, "type", "private") != "private":
         # §4: private-chat-only in V1 -- a short neutral notice, never the
@@ -4097,7 +4179,7 @@ async def cmd_format(message: Message):
 @dp.callback_query(F.data.startswith(f"{_FMT_KB_VERSION}:"))
 async def cb_format_select(callback: CallbackQuery):
     uid = callback.from_user.id
-    if not _voice_ux_enabled_for(uid):
+    if not await _voice_ux_enabled_for(uid):
         # Flag off, OR flag on but not the owner: fail closed -- a stale
         # button from before rollback, or a non-owner during canary, must
         # never silently save anything.
@@ -4134,7 +4216,7 @@ async def cb_listen(callback: CallbackQuery):
     in callback_data (a stateless action, unlike cb_before's FSM-scoped
     flow) -- a forged/cross-user/malformed callback all fail closed."""
     uid = callback.from_user.id
-    if not _voice_ux_enabled_for(uid):
+    if not await _voice_ux_enabled_for(uid):
         # Flag off, OR flag on but not the owner -- defense in depth: the
         # listen button is only ever attached by deliver_response for an
         # eligible owner turn, but a forged/replayed callback_data must
@@ -5422,13 +5504,13 @@ async def cmd_help(message: Message):
     Reviewers are briefed out-of-band. Role-aware /help can be revisited
     later if that stops being sufficient.
 
-    /menu IS listed (unlike /questionnaire, which stays hidden because it has
-    no configured content yet) -- /menu is the discoverable navigation hub
-    and hiding it would defeat its purpose."""
+    Public-beta product commands are listed; privileged maintenance/review
+    commands remain deliberately absent."""
     lang = await get_user_language(message.from_user.id)
     await message.answer(
-        ("/start • /menu • /checkin • /time • /memory • /profile • /forget_all • "
-         "/privacy_export_all • /privacy_delete_all • /mute • /unmute • /help"),
+        ("/start • /menu • /questionnaire • /journal • /format • /checkin • "
+         "/time • /profile • /forget_all • /privacy_export_all • "
+         "/privacy_delete_all • /help"),
         reply_markup=ReplyKeyboardRemove())
 
 @dp.message(Command("checkin"))
@@ -5979,16 +6061,21 @@ def _dass21_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMar
     # config.DASS21_DISCUSSION_ENABLED at the _send_dass21_result call site
     # (default off -- the plain _questionnaire_completion_keyboard is used
     # instead, byte-for-byte unchanged from before this PR).
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text=("🧾 Отчёт специалисту" if lang == "ru" else "🧾 Specialist report"),
                               callback_data=f"q:o:{session_id}")],
-        [InlineKeyboardButton(text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss the result"),
-                              callback_data=f"q:m:{session_id}")],
+    ]
+    if access_control.DEPLOYMENT_MODE != "public":
+        rows.append([InlineKeyboardButton(
+            text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss the result"),
+            callback_data=f"q:m:{session_id}")])
+    rows.extend([
         [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
                               callback_data="q:l")],
         [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
                               callback_data="menu:back")],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ── PR B — result / calculations / explanation screens (dormant unless
@@ -5999,20 +6086,25 @@ def _dass21_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMar
 # keyboard only -- see cb_questionnaire_discuss_menu, unchanged from C2.
 
 def _questionnaire_result_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text=("📊 Расчёты" if lang == "ru" else "📊 Calculations"),
                               callback_data=f"q:k:{session_id}"),
          InlineKeyboardButton(text=("🧠 Что значат шкалы" if lang == "ru" else "🧠 What scales mean"),
                               callback_data=f"q:e:{session_id}")],
         [InlineKeyboardButton(text=("🧾 Отчёт специалисту" if lang == "ru" else "🧾 Specialist report"),
                               callback_data=f"q:o:{session_id}")],
-        [InlineKeyboardButton(text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss result"),
-                              callback_data=f"q:m:{session_id}")],
+    ]
+    if access_control.DEPLOYMENT_MODE != "public":
+        rows.append([InlineKeyboardButton(
+            text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss result"),
+            callback_data=f"q:m:{session_id}")])
+    rows.extend([
         [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
                               callback_data="q:l")],
         [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
                               callback_data="menu:back")],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _questionnaire_back_to_result_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
@@ -6308,13 +6400,15 @@ async def cb_questionnaire_category(callback: CallbackQuery):
         instruments = (
             clinical_instrument_catalog.catalog_instruments_by_category(document, category)
             if document is not None else ())
-        # PR #59 — PER-USER conditional DASS entry under "Стресс". Shown ONLY
-        # when the invited rollout flag is on AND this exact user is
-        # authorized (owner or active invited). DASS never becomes globally
-        # public: public_catalog_visible stays false, unknown/blocked users
-        # see nothing, and the q:d/q:s/q:a/q:b gates re-authorize anyway.
+        # PER-USER conditional DASS entry under "Стресс". In non-public modes
+        # the existing invited rollout flag controls listing; in public mode
+        # the fresh ordinary-product authorization controls it. DASS remains
+        # outside the generic public catalog and every downstream gate
+        # re-authorizes against integrity and current user access.
         extra_rows = []
-        if (category == "stress" and config.DASS21_INVITED_USERS_ENABLED):
+        if (category == "stress"
+                and (config.DASS21_INVITED_USERS_ENABLED
+                     or access_control.DEPLOYMENT_MODE == "public")):
             decision = await dass21_access.authorize_dass21_user(uid)
             if decision.allowed:
                 extra_rows.append([InlineKeyboardButton(
@@ -7611,6 +7705,10 @@ def _menu_keyboard(lang: str) -> InlineKeyboardMarkup:
         text=(ru if lang == "ru" else en),
         callback_data=("q:l" if key == "tests" else f"{key}:hub"),
     )] for key, ru, en in navigation.MENU_SECTIONS]
+    if config.feedback_chat_url():
+        rows.append([InlineKeyboardButton(
+            text=("💬 Обратная связь" if lang == "ru" else "💬 Feedback"),
+            callback_data="feedback:hub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -7624,6 +7722,25 @@ async def _answer_target(entity, text: str, **kw) -> None:
     await target.answer(text, **kw)
 
 
+def _response_settings_keyboard(lang: str) -> InlineKeyboardMarkup:
+    rows = [list(row) for row in format_selector_kb(lang).inline_keyboard]
+    rows.append([InlineKeyboardButton(
+        text=("⬅️ В меню" if lang == "ru" else "⬅️ Back to menu"),
+        callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _feedback_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("Открыть пространство обратной связи" if lang == "ru" else "Open feedback space"),
+            url=config.feedback_chat_url())],
+        [InlineKeyboardButton(
+            text=("⬅️ В меню" if lang == "ru" else "⬅️ Back to menu"),
+            callback_data="menu:back")],
+    ])
+
+
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message):
     uid = message.from_user.id
@@ -7631,6 +7748,45 @@ async def cmd_menu(message: Message):
     if not await _nav_gate(message, uid, lang):
         return
     await message.answer(navigation.menu_text(lang), reply_markup=_menu_keyboard(lang))
+
+
+@dp.callback_query(F.data == "talk:hub")
+async def cb_talk_hub(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await _answer_target(callback, navigation.talk_hub_text(lang),
+                         reply_markup=_hub_back_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings:hub")
+async def cb_settings_hub(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    available = await _voice_ux_enabled_for(uid)
+    keyboard = (_response_settings_keyboard(lang) if available
+                else _hub_back_keyboard(lang))
+    await _answer_target(callback, navigation.response_settings_text(
+        lang, available=available), reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "feedback:hub")
+async def cb_feedback_hub(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    if not config.feedback_chat_url():
+        await callback.answer()
+        return
+    await _answer_target(callback, navigation.feedback_hub_text(lang),
+                         reply_markup=_feedback_keyboard(lang))
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "tests:hub")
@@ -7728,7 +7884,7 @@ async def handle_voice(message: Message, state: FSMContext):
     # Gated the same way as every other Voice UX action -- defense in depth
     # in case a preference row ever existed for a non-owner uid.
     stt_lang = lang
-    if _voice_ux_enabled_for(uid):
+    if await _voice_ux_enabled_for(uid):
         prefs = await get_response_preferences(uid)
         if prefs["voice_language"] in ("ru", "en"):
             stt_lang = prefs["voice_language"]
@@ -7749,6 +7905,19 @@ async def handle_text(message: Message, state: FSMContext):
 
 async def main():
     await init_db()
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Start X20"),
+            BotCommand(command="menu", description="Open main menu"),
+            BotCommand(command="questionnaire", description="Questionnaires"),
+            BotCommand(command="journal", description="Journals"),
+            BotCommand(command="format", description="Response settings"),
+            BotCommand(command="help", description="Help"),
+        ])
+    except TelegramAPIError as exc:
+        logging.warning(
+            "bot command registration failed; continuing startup "
+            "(error_type=%s)", type(exc).__name__)
     start_dashboard()
     scheduler = setup_scheduler(bot)
     scheduler.start()

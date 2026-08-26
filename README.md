@@ -1,14 +1,17 @@
 # X20 — AI Emotional Support System
 
-**Версия:** Production 2.0  
+**Версия:** Public Beta V1
 **Язык:** Python 3.12+  
-**Архитектура:** Aiogram 3.7 + OpenAI GPT-4o-mini + SQLite + Flask Dashboard
+**Архитектура:** Aiogram 3.7 + OpenAI-compatible API + SQLite + Flask Dashboard
 
 ---
 
 ## 📋 Описание
 
-X20 — безопасная система AI поддержки эмоционального состояния пользователей.
+X20 — публичная beta-система для психологического разговора, самонаблюдения,
+опросников и дневников. Обычный пользователь может войти без приглашения, когда
+`DEPLOYMENT_MODE=public`; привилегированные роли и чужие данные остаются отдельно
+защищёнными.
 
 **Что X20 делает:**
 - 🎯 Распознаёт эмоциональное состояние (риск, паника, одиночество, выгорание)
@@ -26,43 +29,26 @@ X20 — безопасная система AI поддержки эмоцион
 
 ---
 
-## 🏗️ Архитектура
+## 🏗️ Архитектура ответа
 
 ```
-Сообщение пользователя
+Детерминированные crisis/safety/product gates
     ↓
-[1. Risk Detector] — детерминированное определение рисков (explicit + implicit сигналы)
+Therapist Core V1 (если явно включён и задана модель)
+    ↓ иначе
+Professional runtime (если независимо включён) или текущий rollback-путь
     ↓
-[2. Language Detector] — определение языка (RU/EN)
+Один context-aware Safety Validator
     ↓
-[3. Stage Detector] — определение стадии (ACUTE_DISTRESS / REFLECTION / PROBLEM_SOLVING / GROWTH)
-    ↓
-[4. State Engine] — отслеживание эмоциональной траектории (anxiety, panic, energy, etc.)
-    ↓
-[5. Readiness Engine] — оценка готовности к структурированной работе
-    ↓
-[6. Cognitive Capacity] — определение когнитивной нагрузки
-    ↓
-[7. Scenario Router] — выбор психологического сценария
-    ↓
-[8. Relationship Monitor] — проверка признаков зависимости от бота
-    ↓
-[9. Practice Selector] — выбор конкретной практики из реестра
-    ↓
-[10. Memory Builder] — получение контекста из истории + summary
-    ↓
-[11. LLM Call] — генерация ответа OpenAI (GPT-4o-mini)
-    ↓
-[12. Safety Validator] — проверка ответа перед отправкой
-    ↓
-[13. Push Notifications] — отправка alerts при критических событиях
-    ↓
-[14. Outcome Tracking] — просьба оценить до/после эффект
-    ↓
-Пользователь получает ответ
+stale-response guard → доставка → provenance persistence
 ```
 
 **Ключевой принцип:** LLM НИКОГДА не принимает решения о безопасности. Только код.
+
+Therapist Core V1 использует точное текущее сообщение и ограниченный доверенный
+`ProfessionalConversationContext`, делает один видимый model call и не делает
+retry после safety rejection. Один входящий ход принадлежит только одному
+психологическому генератору.
 
 ---
 
@@ -138,6 +124,17 @@ BOT_TOKEN=123456:ABC-DEF...
 
 # OpenAI
 OPENAI_API_KEY=sk-...
+
+# Public beta and feature kill switches
+DEPLOYMENT_MODE=public
+FIRST_USER_ONBOARDING_ENABLED=true
+QUESTIONNAIRE_INTERPRETATION_ENABLED=true
+VOICE_REPLIES_ENABLED=true
+EMOTIONAL_REACTIONS_ENABLED=true
+THERAPIST_CORE_V1_ENABLED=true
+THERAPIST_CORE_V1_MODEL=<explicit-compatible-model>
+THERAPIST_CORE_V1_MAX_COMPLETION_TOKENS=1200
+FEEDBACK_CHAT_URL=https://t.me/<community>
 
 # Admin Dashboard
 ADMIN_PASSWORD=super_secure_password

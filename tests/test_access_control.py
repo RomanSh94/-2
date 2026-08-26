@@ -1,5 +1,5 @@
-"""PR 1B-1 checkpoint — access_control.py unit tests (roles, modes, alert routing,
-reviewer-mapping validation, public-mode fail-closed, A1 own-context check).
+"""Access-control unit tests (roles, modes, alert routing, reviewer mapping,
+public ordinary access, and the independently closed A1 boundary).
 
 Bot-integration tests (trigger_crisis role behavior, cmd_start gate, dashboard
 filtering) live in their own dedicated test files once those pieces land; this
@@ -10,6 +10,8 @@ import asyncio
 import pytest
 
 import access_control as ac
+import config
+import scoped_access
 
 
 @pytest.fixture(autouse=True)
@@ -85,10 +87,33 @@ def test_has_full_access_acknowledged_tester_with_valid_mapping_allowed(monkeypa
     assert asyncio.run(ac.has_full_access(10)) is True
 
 
-# ── item 5: public mode fails closed for full access, including OWNER ─────────
-def test_public_mode_denies_full_access_for_owner(monkeypatch):
+# ── public mode: ordinary product access, no role/A1 broadening ───────────────
+def test_public_mode_grants_ordinary_access_without_invite(monkeypatch):
     monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
-    assert asyncio.run(ac.has_full_access(1)) is False       # OWNER, still denied
+    assert asyncio.run(ac.has_full_access(999999)) is True
+    assert ac.resolve_role_safe(999999) == ac.UNKNOWN
+
+
+def test_public_mode_preserves_owner_access_and_reviewer_product_boundary(monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    assert asyncio.run(ac.has_full_access(1)) is True
+    assert asyncio.run(ac.has_full_access(20)) is False
+
+
+def test_public_mode_does_not_broaden_cross_user_or_review_pack_access(monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    assert scoped_access.can_read_user_data(999, 1000, "privacy_export") is False
+    assert scoped_access.can_read_user_data(999, 1000, "review_pack") is False
+
+
+def test_therapist_core_requires_flag_model_and_ordinary_access(monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_ENABLED", True)
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_MODEL", "")
+    assert asyncio.run(ac.therapist_core_v1_allowed_for(999)) is False
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_MODEL", "gpt-core-compatible")
+    assert asyncio.run(ac.therapist_core_v1_allowed_for(999)) is True
+    assert asyncio.run(ac.therapist_core_v1_allowed_for(20)) is False
 
 
 def test_public_mode_denies_a1_for_owner(monkeypatch):
