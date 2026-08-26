@@ -152,6 +152,21 @@ async def professional_free_text_allowed_for(uid: int) -> bool:
     return await core_rollout_allowed(uid)
 
 
+async def therapist_core_v1_allowed_for(uid: int) -> bool:
+    """Whether Therapist Core V1 may own this ordinary product turn.
+
+    The feature switch and an explicitly configured model are both required;
+    there is no implicit model fallback.  Ordinary product access is checked
+    fresh so a role/access change takes effect before the turn is claimed.
+    """
+    import config
+    if not config.THERAPIST_CORE_V1_ENABLED:
+        return False
+    if not config.THERAPIST_CORE_V1_MODEL:
+        return False
+    return await has_full_access(uid)
+
+
 def resolved_reviewers_for(tester_uid: int) -> list[int]:
     """Reviewers explicitly mapped to this tester.
 
@@ -176,12 +191,10 @@ def resolved_reviewers_for(tester_uid: int) -> list[int]:
 async def has_full_access(uid: int) -> bool:
     """Whether this uid may use ordinary product features right now.
 
-    `public` mode: False for EVERYONE, including OWNER — public is unsupported
-    and must not silently become "owner still gets full access, everyone else
-    blocked" without a separate governing PR/approval (checkpoint item 5). RED
-    still gets the full crisis screen regardless — that check happens
-    structurally earlier in bot.py's pipeline, before this function is ever
-    consulted, so this restriction cannot affect crisis delivery.
+    `public` mode: ordinary product access is available without an invite.
+    OWNER keeps ordinary access without changing role; CLINICIAN_REVIEWER stays
+    review-only and receives no ordinary product access.  No branch here grants
+    a role, cross-user access, review-pack access, or A1 access.
 
     OWNER (personal_use / controlled_clinical_test): always True.
     CLINICIAN_TESTER: True only if ALL of: mode is controlled_clinical_test, the
@@ -196,9 +209,11 @@ async def has_full_access(uid: int) -> bool:
     CLINICIAN_REVIEWER / UNKNOWN: always False (reviewers get the review-pack
       path only, never ordinary bot product access; see can_request_review_pack).
     """
-    if not _mode_is_valid() or DEPLOYMENT_MODE == "public":
+    if not _mode_is_valid():
         return False
     role = resolve_role_safe(uid)
+    if DEPLOYMENT_MODE == "public":
+        return role != CLINICIAN_REVIEWER
     if role == OWNER:
         return True
     if role == CLINICIAN_TESTER:

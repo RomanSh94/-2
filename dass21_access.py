@@ -1,4 +1,4 @@
-"""DASS-21 product authorization (PR #59) — owner OR invited, fail-closed.
+"""DASS-21 product authorization — owner, invited, or public ordinary access.
 
 Separated from dass21_runtime by design: the runtime module answers the pure,
 user-independent question "is the DASS feature/definition intact?" (flags,
@@ -13,12 +13,17 @@ Authorization model (exact, never inferred):
                   false)
               AND database.user_has_active_access(user_id)  (existing
                   user_access table -- active row, not blocked)
+    PUBLIC:   DASS integrity valid
+              AND access_control.DEPLOYMENT_MODE == "public"
+              AND access_control.has_full_access(user_id) (fresh ordinary
+                  product authorization; reviewers remain excluded)
     ANYONE ELSE: denied.
 
 Notes:
 - Calling /dass21 NEVER creates access; there is no auto-grant path here.
-- DASS21_OWNER_ONLY=false never broadens access (integrity fails closed) --
-  the ONLY way to admit non-owners is the explicit invited rollout flag.
+- DASS21_OWNER_ONLY=false never broadens access (integrity fails closed).
+- Public access is admitted only through the existing ordinary-product gate;
+  non-public invited behavior remains behind its explicit rollout flag.
 - Decisions are FRESH on every call (no cache): revoking a user_access row
   mid-session blocks the very next answer/back/result.
 - reason_code is internal-only; callers show the same neutral unavailable
@@ -45,6 +50,14 @@ async def authorize_dass21_user(user_id) -> Dass21AccessDecision:
     if (access_control.OWNER_USER_ID is not None
             and user_id == access_control.OWNER_USER_ID):
         return Dass21AccessDecision(True, "owner")
+    if access_control.DEPLOYMENT_MODE == "public":
+        try:
+            ordinary_access = await access_control.has_full_access(user_id)
+        except Exception:
+            ordinary_access = False
+        if ordinary_access:
+            return Dass21AccessDecision(True, "public-ordinary-access")
+        return Dass21AccessDecision(False, "public-product-access-denied")
     if config.DASS21_INVITED_USERS_ENABLED:
         if await database.user_has_active_access(user_id):
             return Dass21AccessDecision(True, "invited")

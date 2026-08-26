@@ -104,6 +104,8 @@ def _flags_default(monkeypatch):
     monkeypatch.setattr(config, "DEPRESSION_DISCLOSURE_GATE_ENABLED", False)
     monkeypatch.setattr(config, "PROFESSIONAL_FREE_TEXT_RUNTIME_ENABLED", False)
     monkeypatch.setattr(config, "THERAPEUTIC_CORE_ROLLOUT_MODE", "off")
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_ENABLED", False)
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_MODEL", "")
 
 
 async def _seed_user(uid: int):
@@ -1108,6 +1110,100 @@ def test_flag_true_rollout_all_matches_existing_contract(monkeypatch, tmp_db):
 # ══════════════════════════════════════════════════════════════════════════
 
 OWNER = 1
+
+
+def test_public_crisis_still_precedes_product_and_core_routing(tmp_db, monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    monkeypatch.setattr(bot, "get_active_crisis", _async(None))
+    called = {"crisis": 0}
+
+    async def fake_crisis(*args, **kwargs):
+        called["crisis"] += 1
+
+    monkeypatch.setattr(bot, "trigger_crisis", fake_crisis)
+    monkeypatch.setattr(
+        ac, "therapist_core_v1_allowed_for",
+        _raise_if_called("therapist_core_v1_allowed_for"))
+    msg = FakeMessage(FakeUser(999), "Я хочу покончить с собой.")
+    run(bot.pipeline(msg, msg.text))
+    assert called["crisis"] == 1
+
+
+def test_therapist_core_claims_once_precedes_professional_and_validates_once(
+        tmp_db, monkeypatch):
+    run(_seed_user(OWNER))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_history(monkeypatch, rows=())
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_MODEL", "gpt-core-compatible")
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_MAX_COMPLETION_TOKENS", 1200)
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", _async(True))
+    monkeypatch.setattr(
+        ac, "professional_free_text_allowed_for",
+        _raise_if_called("professional_free_text_allowed_for"))
+    calls = {"generation": 0, "validation": 0}
+
+    async def fake_generate(**kwargs):
+        calls["generation"] += 1
+        assert kwargs["model"] == "gpt-core-compatible"
+        assert kwargs["max_completion_tokens"] == 1200
+        assert kwargs["source_text"] == "Мне трудно понять, чего я хочу."
+        return "Можно начать с конкретного эпизода, где эта неопределённость ощущалась сильнее."
+
+    def fake_validate(candidate, source_text, risk, lang):
+        calls["validation"] += 1
+        return True, None
+
+    monkeypatch.setattr(bot, "generate_therapist_core_v1", fake_generate)
+    monkeypatch.setattr(bot, "validate_response_with_context", fake_validate)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне трудно понять, чего я хочу.")
+    run(bot.pipeline(msg, msg.text))
+    assert calls == {"generation": 1, "validation": 1}
+    assert len(msg.answers) == 1
+
+
+def test_therapist_core_provider_failure_is_final_no_professional_or_legacy(
+        tmp_db, monkeypatch):
+    run(_seed_user(OWNER))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_history(monkeypatch, rows=())
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_MODEL", "gpt-core-compatible")
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", _async(True))
+    monkeypatch.setattr(
+        ac, "professional_free_text_allowed_for",
+        _raise_if_called("professional_free_text_allowed_for"))
+
+    async def fail_generation(**kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(bot, "generate_therapist_core_v1", fail_generation)
+    monkeypatch.setattr(
+        bot, "validate_response_with_context",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("provider failure has no candidate to validate")))
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне тяжело.")
+    run(bot.pipeline(msg, msg.text))
+    assert [answer[0] for answer in msg.answers] == [
+        bot._professional_technical_fallback_text("ru")]
+
+
+def test_stale_therapist_core_response_is_not_delivered(tmp_db, monkeypatch):
+    run(_seed_user(OWNER))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_history(monkeypatch, rows=())
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_MODEL", "gpt-core-compatible")
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", _async(True))
+
+    async def stale_generation(**kwargs):
+        bot._bump_user_generation(OWNER)
+        return "Этот ответ уже устарел."
+
+    monkeypatch.setattr(bot, "generate_therapist_core_v1", stale_generation)
+    monkeypatch.setattr(bot, "validate_response_with_context", lambda *a: (True, None))
+    msg = FakeMessage(FakeUser(OWNER), "Первое сообщение.")
+    run(bot.pipeline(msg, msg.text))
+    assert msg.answers == []
 
 
 def test_owner_eligible_turn_persists_professional_row_and_delivers_success(tmp_db, monkeypatch):

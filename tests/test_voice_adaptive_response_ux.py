@@ -1075,22 +1075,15 @@ def test_crisis_text_transcribed_from_voice_triggers_the_same_crisis_path(tmp_db
     assert calls["n"] == 1  # the identical deterministic crisis path fires regardless of input source
 
 
-# ── Product correction: incoming voice/STT is for ALL users with normal ────
-# product access -- the owner-only gate applies ONLY to OUTGOING Voice UX
-# (TTS, /format, listen button, reactions), never to receiving/transcribing
-# an incoming voice message. handle_voice itself (registered via
-# @dp.message(F.voice), see above) was already, and remains, completely
-# unconditional -- the owner gate only narrows the voice_language STT-hint
-# lookup (defense in depth), never whether transcription/pipeline entry
-# happens at all. These two tests lock that in end to end for a non-owner.
+# ── Incoming voice and outgoing Voice UX for ordinary product users ────────
 
 @pytest.mark.parametrize("voice_flag", [True, False])
-def test_non_owner_incoming_voice_still_transcribes_and_replies_text_only(tmp_db, monkeypatch, voice_flag):
+def test_non_owner_incoming_voice_uses_public_voice_setting(tmp_db, monkeypatch, voice_flag):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", voice_flag)
     run(database.upsert_user(2, "u", "U"))
     run(_consume_first_turn(2))
     run(database.grant_user_access(2))  # "normal product access", non-owner
-    run(database.set_response_preference(2, response_format="voice"))  # must have zero effect
+    run(database.set_response_preference(2, response_format="voice"))
 
     transcribe_calls = {"n": 0}
     async def fake_transcribe(voice, bot_, client_, lang):
@@ -1113,11 +1106,14 @@ def test_non_owner_incoming_voice_still_transcribes_and_replies_text_only(tmp_db
 
     assert transcribe_calls["n"] == 1
     assert msg.answers[0][0] == "🎤 <i>мне грустно сегодня</i>"  # exact transcript, unaltered
-    assert msg.answers[-1][0] == "ordinary text reply"  # ordinary pipeline ran through to a text reply
-    assert tts_calls["n"] == 0
-    assert msg.voices == []
-    data = run(fsm.get_data())
-    assert not data.get("last_delivered_response")  # no owner-only replay state written/exposed
+    if voice_flag:
+        assert tts_calls["n"] == 1
+        assert len(msg.voices) == 1
+        assert all(answer[0] != "ordinary text reply" for answer in msg.answers)
+    else:
+        assert msg.answers[-1][0] == "ordinary text reply"
+        assert tts_calls["n"] == 0
+        assert msg.voices == []
 
 
 def test_non_owner_incoming_voice_crisis_reaches_visible_crisis_text(tmp_db, monkeypatch):
@@ -2379,16 +2375,19 @@ def test_owner_gate_non_owner_listen_callback_fails_closed(tmp_db, monkeypatch):
     assert calls["n"] == 0
 
 
-def test_owner_gate_reactions_non_owner_zero_calls(tmp_db, monkeypatch):
-    # Reactions #13: flag=true + non-owner -> zero Telegram reaction calls.
+def test_public_reactions_non_owner_one_call(tmp_db, monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
     monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
-    calls = {"n": 0}
+    async def fake_get_chat(chat_id):
+        return types.SimpleNamespace(available_reactions=None)
+    calls = []
     async def spy_react(**kw):
-        calls["n"] += 1
+        calls.append(kw)
+    monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
     monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
     msg = FakeMessage(FakeUser(2), "x")
     run(bot._maybe_react(msg, 2, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))
-    assert calls["n"] == 0
+    assert len(calls) == 1
 
 
 def test_owner_gate_reactions_missing_owner_id_disables_for_everyone(tmp_db, monkeypatch):

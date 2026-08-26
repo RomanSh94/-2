@@ -179,6 +179,14 @@ def _start(uid, text="/start", language_code="ru"):
     return msg
 
 
+def test_public_new_user_enters_onboarding_without_invite(tmp_db, fake_bot, monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    msg = _start(404)
+    assert msg.answers == []
+    assert fake_bot.sent
+    assert "X20" in fake_bot.rendered_texts()[0]
+
+
 def _tap(uid, data):
     import bot
     # cb_onboarding no longer reads the tapped card off callback.message --

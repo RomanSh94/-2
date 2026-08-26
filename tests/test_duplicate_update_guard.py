@@ -160,3 +160,48 @@ def test_normal_startup_does_not_drop_pending_updates():
     # with no extra arguments, so nothing requests a pending-update drop.
     assert "start_polling(bot)" in src
     assert "start_polling(bot," not in src
+
+
+def test_command_registration_failure_does_not_block_startup(monkeypatch, caplog):
+    events = []
+
+    class FakeBot:
+        async def set_my_commands(self, commands):
+            events.append(("commands", [c.command for c in commands]))
+            raise bot.TelegramNetworkError(method=None, message="sensitive detail")
+
+    class FakeDispatcher:
+        async def start_polling(self, polling_bot):
+            events.append(("polling", polling_bot))
+
+    class FakeScheduler:
+        def start(self):
+            events.append(("scheduler-start", None))
+
+    async def fake_init_db():
+        events.append(("init-db", None))
+
+    fake_bot = FakeBot()
+    monkeypatch.setattr(bot, "bot", fake_bot)
+    monkeypatch.setattr(bot, "dp", FakeDispatcher())
+    monkeypatch.setattr(bot, "init_db", fake_init_db)
+    monkeypatch.setattr(bot, "start_dashboard",
+                        lambda: events.append(("dashboard", None)))
+    monkeypatch.setattr(
+        bot, "setup_scheduler",
+        lambda scheduler_bot: (
+            events.append(("scheduler-setup", scheduler_bot)) or FakeScheduler()))
+
+    with caplog.at_level("WARNING"):
+        run(bot.main())
+
+    assert events == [
+        ("init-db", None),
+        ("commands", ["start", "menu", "questionnaire", "journal", "format", "help"]),
+        ("dashboard", None),
+        ("scheduler-setup", fake_bot),
+        ("scheduler-start", None),
+        ("polling", fake_bot),
+    ]
+    assert "TelegramNetworkError" in caplog.text
+    assert "sensitive detail" not in caplog.text

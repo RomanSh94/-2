@@ -91,11 +91,11 @@ async def _sessions_for(uid):
     return rows
 
 
-# ── /help must not expose it ──────────────────────────────────────────────────
-def test_questionnaire_not_in_help():
+# ── /help exposes the real public Questionnaire Core command ─────────────────
+def test_questionnaire_is_in_help():
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_help(msg))
-    assert "/questionnaire" not in msg.answers[0][0]
+    assert "/questionnaire" in msg.answers[0][0]
 
 
 # ── product gate ─────────────────────────────────────────────────────────────
@@ -107,6 +107,26 @@ def test_questionnaire_requires_product_gate():
     assert "Опросники" not in msg.answers[0][0]
     rows = asyncio.run(_sessions_for(424242))
     assert rows == []
+
+
+def test_public_ordinary_user_reaches_questionnaire_core(monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    msg = FakeMessage(FakeUser(424242))
+    asyncio.run(bot.cmd_questionnaire(msg))
+    assert msg.answers[-1][0] == bot.questionnaire_ux.list_text("ru")
+
+
+def test_public_result_keyboard_hides_a1_discussion(monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    for keyboard in (
+            bot._questionnaire_result_keyboard(7, "ru"),
+            bot._dass21_completion_keyboard(7, "ru")):
+        callback_data = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        assert "q:m:7" not in callback_data
 
 
 # ── active-crisis gate ────────────────────────────────────────────────────────
@@ -323,7 +343,8 @@ def test_full_flow_reaches_completion_screen_with_no_score():
 
 
 # ── session ownership ─────────────────────────────────────────────────────────
-def test_answer_callback_rejects_wrong_user():
+def test_answer_callback_rejects_wrong_user_in_public_mode(monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
     owner = FakeUser(1)
     msg = FakeMessage(owner)
     asyncio.run(bot.cb_questionnaire_start(FakeCallback(owner, msg, data="q:s:demo_anxiety_v1")))

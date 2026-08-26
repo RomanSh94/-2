@@ -108,6 +108,7 @@ def flow(tmp_path, monkeypatch):
     # gate (which is covered by its own suite): everyone passes product access
     monkeypatch.setattr(bot, "ensure_full_access_or_closed_test", _async(True))
     monkeypatch.setattr(ac, "OWNER_USER_ID", OWNER)
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "controlled_clinical_test")
     monkeypatch.setattr(bot, "CallbackQuery", FakeCallback)
     priv = tmp_path / "p.json"
     shutil.copyfile(FIXTURE, priv)
@@ -209,6 +210,26 @@ def test_unknown_user_denied(flow):
     assert not _auth(UNKNOWN).allowed
 
 
+def test_public_ordinary_user_allowed_after_integrity_gate(flow, monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    monkeypatch.setattr(config, "DASS21_INVITED_USERS_ENABLED", False)
+    decision = _auth(UNKNOWN)
+    assert decision.allowed
+    assert decision.reason_code == "public-ordinary-access"
+
+
+def test_public_reviewer_remains_denied(flow, monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", {UNKNOWN})
+    assert not _auth(UNKNOWN).allowed
+
+
+def test_public_dass_requires_fresh_ordinary_product_access(flow, monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    monkeypatch.setattr(ac, "has_full_access", _async(False))
+    assert not _auth(UNKNOWN).allowed
+
+
 def test_dass_command_does_not_grant_access(flow):
     _cmd(UNKNOWN)
     assert not _auth(UNKNOWN).allowed  # calling the command grants nothing
@@ -242,6 +263,12 @@ def test_dass_hidden_from_blocked(flow):
 
 def test_dass_hidden_from_unknown_not_globally_public(flow):
     assert f"q:d:{QID}" not in _stress_datas(UNKNOWN)
+
+
+def test_dass_visible_to_public_ordinary_user(flow, monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    monkeypatch.setattr(config, "DASS21_INVITED_USERS_ENABLED", False)
+    assert f"q:d:{QID}" in _stress_datas(UNKNOWN)
 
 
 def test_dass_hidden_when_integrity_invalid(flow, monkeypatch):

@@ -14,13 +14,16 @@ adds real (non-copyrighted, licensed) definitions.
 """
 from crisis_protocol import get_hotline
 
-# (callback key, RU label, EN label) -- callback_data becomes f"{key}:hub".
+# (callback key, RU label, EN label) -- bot.py maps the questionnaire entry to
+# q:l and all other entries to their existing hub callbacks.
 MENU_SECTIONS = [
+    ("talk", "💬 Поговорить", "💬 Talk"),
     ("tests", "🧪 Тесты и опросники", "🧪 Tests and questionnaires"),
     ("journals", "📝 Дневники", "📝 Diaries"),
     ("results", "📊 Мои результаты", "📊 My results"),
-    ("privacy", "🔒 Приватность", "🔒 Privacy"),
-    ("about", "ℹ️ О боте", "ℹ️ About the bot"),
+    ("settings", "⚙️ Настройки ответа", "⚙️ Response settings"),
+    ("privacy", "🔒 Данные и приватность", "🔒 Data and privacy"),
+    ("about", "ℹ️ О X20", "ℹ️ About X20"),
 ]
 
 # Placeholder catalog only -- no real scale/questionnaire content or links yet.
@@ -37,6 +40,33 @@ def menu_text(lang: str = "ru") -> str:
     if lang == "ru":
         return "Главное меню\n\nВыберите раздел:"
     return "Main menu\n\nChoose a section:"
+
+
+def talk_hub_text(lang: str = "ru") -> str:
+    if lang == "ru":
+        return "Напиши сообщением, что сейчас происходит или о чём хочется поговорить."
+    return "Send a message about what is happening now or what you want to talk about."
+
+
+def response_settings_text(lang: str = "ru", *, available: bool = True) -> str:
+    if lang == "ru":
+        return ("Как тебе удобнее получать ответы?" if available else
+                "Настройки озвучивания сейчас выключены. Ответы будут приходить текстом.")
+    return ("How would you like to receive replies?" if available else
+            "Voice settings are currently off. Replies will arrive as text.")
+
+
+def feedback_hub_text(lang: str = "ru") -> str:
+    if lang == "ru":
+        return (
+            "Обратная связь откроется во внешнем публичном или общественном пространстве. "
+            "Не публикуй там фрагменты личного чата и чувствительные персональные данные, "
+            "если только ты осознанно не хочешь ими поделиться."
+        )
+    return (
+        "Feedback opens an external public or community space. Do not post private chat "
+        "excerpts or sensitive personal information unless you consciously want to share it."
+    )
 
 
 def tests_hub_text(lang: str = "ru") -> str:
@@ -69,6 +99,8 @@ def journals_hub_text(lang: str = "ru") -> str:
             "Дневники\n\n"
             "📝 Дневник эмоций → /emotion\n"
             "🧠 КПТ-дневник → /cbt\n"
+            "📊 Недельный отчёт → /report\n"
+            "⏰ Настройки напоминаний → /journal_settings\n"
             "📤 Экспорт дневников → /journal_export\n"
             "🗑 Удаление дневников → /journal_delete"
         )
@@ -76,6 +108,8 @@ def journals_hub_text(lang: str = "ru") -> str:
         "Diaries\n\n"
         "📝 Emotion journal → /emotion\n"
         "🧠 CBT journal → /cbt\n"
+        "📊 Weekly report → /report\n"
+        "⏰ Reminder settings → /journal_settings\n"
         "📤 Export journals → /journal_export\n"
         "🗑 Delete journals → /journal_delete"
     )
@@ -100,16 +134,18 @@ def privacy_hub_text(lang: str = "ru") -> str:
 def results_hub_text(lang: str = "ru") -> str:
     if lang == "ru":
         return (
-            "Раздел результатов пока не активен.\n\n"
-            "Мы не показываем оценки, диагнозы или уровни выраженности.\n"
-            "Позже здесь могут появиться только безопасные данные "
-            "самонаблюдения после отдельного решения."
+            "Мои результаты\n\n"
+            "📊 Недельный отчёт дневника → /report\n"
+            "🧭 Мой профиль самонаблюдения → /profile\n\n"
+            "Опросники показывают только те результаты, которые разрешены их "
+            "проверенным контрактом. X20 не ставит диагнозы."
         )
     return (
-        "The results section is not active yet.\n\n"
-        "We don't show scores, diagnoses, or severity levels.\n"
-        "Later, only safe self-observation data may appear here, after a "
-        "separate decision."
+        "My results\n\n"
+        "📊 Weekly journal report → /report\n"
+        "🧭 My self-observation profile → /profile\n\n"
+        "Questionnaires show only results allowed by their validated contract. "
+        "X20 does not diagnose."
     )
 
 
