@@ -28,6 +28,8 @@ import access_control as ac
 import bot
 import config
 import database
+import safety_validator
+from interaction_preference import detect_interaction_preference
 import professional_free_text_runtime as pftr
 from professional_turn_analysis import TurnAnalysisStatus, AnalysisComponentStatus
 from professional_turn_analyzer import TurnAnalyzerFailureCategory, TurnAnalyzerStructuralFailureReason
@@ -1161,6 +1163,180 @@ def test_therapist_core_claims_once_precedes_professional_and_validates_once(
     run(bot.pipeline(msg, msg.text))
     assert calls == {"generation": 1, "validation": 1}
     assert len(msg.answers) == 1
+
+
+def test_therapist_core_v1_strips_leaked_bold_markdown_delimiters():
+    # Pure unit test of the presentation-layer cleanup itself.
+    raw = ("Что сейчас ближе: **рядом почти нет людей** или "
+           "**с ними нет ощущения близости**?")
+    expected = ("Что сейчас ближе: рядом почти нет людей или "
+                "с ними нет ощущения близости?")
+    assert bot._strip_leaked_bold_markdown(raw) == expected
+    assert "**" not in bot._strip_leaked_bold_markdown(raw)
+
+
+def test_therapist_core_v1_unpaired_asterisks_left_alone():
+    assert bot._strip_leaked_bold_markdown("stray ** with no pair") == \
+        "stray ** with no pair"
+
+
+def test_therapist_core_v1_no_markdown_is_a_no_op():
+    plain = "Обычный текст без разметки."
+    assert bot._strip_leaked_bold_markdown(plain) == plain
+
+
+def test_therapist_core_v1_leaked_markdown_cleaned_in_delivery_and_persistence(
+        tmp_db, monkeypatch):
+    run(_seed_user(OWNER))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_history(monkeypatch, rows=())
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_MODEL", "gpt-core-compatible")
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", _async(True))
+    monkeypatch.setattr(
+        ac, "professional_free_text_allowed_for",
+        _raise_if_called("professional_free_text_allowed_for"))
+
+    raw = ("Что сейчас ближе: **рядом почти нет людей** или "
+           "**с ними нет ощущения близости**?")
+    clean = ("Что сейчас ближе: рядом почти нет людей или "
+             "с ними нет ощущения близости?")
+
+    async def fake_generate(**kwargs):
+        return raw
+
+    def fake_validate(candidate, source_text, risk, lang):
+        return True, None
+
+    monkeypatch.setattr(bot, "generate_therapist_core_v1", fake_generate)
+    monkeypatch.setattr(bot, "validate_response_with_context", fake_validate)
+
+    msg = FakeMessage(FakeUser(OWNER), "Что сейчас ближе?")
+    run(bot.pipeline(msg, msg.text))
+
+    assert msg.answers[0][0] == clean
+    assert "**" not in msg.answers[0][0]
+
+    # The persisted ASSISTANT_DELIVERED content must equal what was actually
+    # shown -- never a second, ungoverned wording after the safety decision.
+    # (therapist_core_v1 persists with scenario="therapist_core_v1", not
+    # "professional", so this reads it directly rather than reusing
+    # _read_persisted_assistant_content, which is scoped to scenario='professional'.)
+    async def _read_therapist_core_v1_content():
+        async with database.aiosqlite.connect(database.DB) as conn:
+            cur = await conn.execute(
+                "SELECT content FROM messages WHERE user_id=? AND role='assistant' "
+                "AND scenario='therapist_core_v1' ORDER BY id DESC LIMIT 1", (OWNER,))
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    assert run(_read_therapist_core_v1_content()) == clean
+
+
+# ── context-respecting low-risk fallback (owner-review live-smoke round 2) ───
+# The live incident: a detailed user message, a rejected candidate, and the
+# OLD neutral fallback ("Давай проще. Что сейчас в этой ситуации самое
+# тяжёлое?") asking the user to repeat what they had just written. Fixed by
+# scoping a new fallback to Therapist Core's own reject branch only --
+# safety_validator.select_fallback/FALLBACK_RU (shared with the legacy
+# pipeline) is untouched, verified by test_select_fallback_* in
+# tests/test_safety_validator.py still passing unchanged.
+_OLD_BAD_FALLBACK = "Давай проще. Что сейчас в этой ситуации самое тяжёлое?"
+
+
+@pytest.mark.parametrize("contract,expected_ru", [
+    ("UNDERSTAND", "Я прочитал то, что ты написал. Не буду просить повторять. "
+                   "Давай разбираться из того, что уже есть и попробуем связать это в одну картину."),
+    ("JUST_TALK", "Я прочитал то, что ты написал. Не буду просить повторять. "
+                  "Можешь продолжить с этого места — я буду держать нить разговора."),
+    ("ACTION", "Я прочитал то, что ты написал. Не буду просить повторять. "
+               "Давай опираться на уже сказанное и выберем следующий шаг."),
+    ("NONE", "Я прочитал то, что ты написал. Не буду просить повторять. "
+             "Давай продолжим оттуда и опираться на уже сказанное."),
+    ("SOME_UNKNOWN_FUTURE_CONTRACT", "Я прочитал то, что ты написал. Не буду просить повторять. "
+                                     "Давай продолжим оттуда и опираться на уже сказанное."),
+])
+def test_therapist_core_fallback_low_risk_ru_by_contract(contract, expected_ru):
+    text = bot._therapist_core_fallback({"level": "low"}, contract, "ru")
+    assert text == expected_ru
+    assert text != _OLD_BAD_FALLBACK
+    assert "повторять" in text.lower()  # never asks the user to repeat themselves
+
+
+@pytest.mark.parametrize("contract,expected_en", [
+    ("UNDERSTAND", "I've read what you wrote. I won't ask you to repeat it. "
+                   "Let's work with what's already here and try to connect it into one picture."),
+    ("JUST_TALK", "I've read what you wrote. I won't ask you to repeat it. "
+                  "You can continue from here — I'll keep track of the thread."),
+    ("ACTION", "I've read what you wrote. I won't ask you to repeat it. "
+               "Let's build on what's already been said and choose a next step."),
+    ("NONE", "I've read what you wrote. I won't ask you to repeat it. "
+             "Let's continue from there, building on what's already been said."),
+])
+def test_therapist_core_fallback_low_risk_en_by_contract(contract, expected_en):
+    assert bot._therapist_core_fallback({"level": "low"}, contract, "en") == expected_en
+
+
+def test_therapist_core_fallback_elevated_risk_unchanged():
+    # Elevated risk / ambiguous phrasing must fall straight through to the
+    # EXISTING high-risk fallback (hotline-carrying), completely unchanged,
+    # regardless of interaction_contract.
+    for contract in ("UNDERSTAND", "JUST_TALK", "ACTION", "NONE"):
+        for risk in (
+            {"level": "medium"}, {"level": "high"}, {"level": "critical"},
+            {"level": "low", "ambiguous_phrases": ["выйти в окно"]},
+        ):
+            assert bot._therapist_core_fallback(risk, contract, "ru") == \
+                safety_validator.get_safe_fallback_high_risk("ru")
+            assert bot._therapist_core_fallback(risk, contract, "en") == \
+                safety_validator.get_safe_fallback_high_risk("en")
+
+
+def test_therapist_core_fallback_empty_risk_defaults_low(monkeypatch):
+    assert bot._therapist_core_fallback({}, "NONE", "ru") == \
+        bot._therapist_core_fallback({"level": "low"}, "NONE", "ru")
+    assert bot._therapist_core_fallback(None, "NONE", "ru") == \
+        bot._therapist_core_fallback({"level": "low"}, "NONE", "ru")
+
+
+def test_exact_live_incident_no_longer_produces_the_old_bad_fallback(
+        tmp_db, monkeypatch):
+    """Reproduces the reported failure exactly: the detailed user message
+    that triggered it, a rejected candidate, low risk (as evidenced by the
+    original incident itself producing the NEUTRAL, not high-risk, fallback).
+    detect_interaction_preference finds no explicit UNDERSTAND/JUST_TALK/
+    ACTION signal in this text, so it resolves to NONE -- proving the exact
+    default-branch text replaces the old one, not just some other contract."""
+    run(_seed_user(OWNER))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_history(monkeypatch, rows=())
+    monkeypatch.setattr(config, "THERAPIST_CORE_V1_MODEL", "gpt-core-compatible")
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", _async(True))
+    monkeypatch.setattr(
+        ac, "professional_free_text_allowed_for",
+        _raise_if_called("professional_free_text_allowed_for"))
+
+    live_message = (
+        "Оно со мной очень давно,\n"
+        "После расставания, хотя и в отношениях я был не счастлив, как мне "
+        "казалось, я не понимал своих чувств и не выражал эмоций")
+    assert detect_interaction_preference(live_message, "ru") == "NONE"
+
+    async def fake_generate(**kwargs):
+        return "some candidate that gets rejected"
+
+    def fake_validate(candidate, source_text, risk, lang):
+        return False, "toxic validation: confirmed distortion 'x'"
+
+    monkeypatch.setattr(bot, "generate_therapist_core_v1", fake_generate)
+    monkeypatch.setattr(bot, "validate_response_with_context", fake_validate)
+
+    msg = FakeMessage(FakeUser(OWNER), live_message)
+    run(bot.pipeline(msg, msg.text))
+
+    delivered = msg.answers[0][0]
+    assert delivered != _OLD_BAD_FALLBACK
+    assert "повторять" not in _OLD_BAD_FALLBACK  # sanity: old text really lacks this word
+    assert delivered == bot._therapist_core_fallback({"level": "low"}, "NONE", "ru")
 
 
 def test_therapist_core_provider_failure_is_final_no_professional_or_legacy(

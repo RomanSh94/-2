@@ -51,9 +51,9 @@ def talk_hub_text(lang: str = "ru") -> str:
 def response_settings_text(lang: str = "ru", *, available: bool = True) -> str:
     if lang == "ru":
         return ("Кстати, вот как я звучу 🎧\n\nКак тебе удобнее получать ответы?" if available else
-                "Настройки озвучивания сейчас выключены. Ответы будут приходить текстом.")
+                "Сейчас ответы доступны только текстом. Голосовые ответы временно недоступны.")
     return ("By the way, this is how I sound 🎧\n\nHow would you like to receive replies?" if available else
-            "Voice settings are currently off. Replies will arrive as text.")
+            "Right now replies are text-only. Voice replies are temporarily unavailable.")
 
 
 def feedback_hub_text(lang: str = "ru") -> str:

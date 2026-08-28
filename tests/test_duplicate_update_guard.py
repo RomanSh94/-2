@@ -197,7 +197,7 @@ def test_command_registration_failure_does_not_block_startup(monkeypatch, caplog
 
     assert events == [
         ("init-db", None),
-        ("commands", ["start", "menu", "questionnaire", "journal", "format", "help"]),
+        ("commands", ["start", "help"]),
         ("dashboard", None),
         ("scheduler-setup", fake_bot),
         ("scheduler-start", None),
@@ -205,3 +205,48 @@ def test_command_registration_failure_does_not_block_startup(monkeypatch, caplog
     ]
     assert "TelegramNetworkError" in caplog.text
     assert "sensitive detail" not in caplog.text
+
+
+def test_visible_command_list_is_trimmed_to_start_and_help(monkeypatch):
+    """Public-beta: the persistent lower ReplyKeyboard is the one primary
+    navigation surface, so Telegram's own command list/autocomplete must not
+    duplicate it with /menu, /questionnaire, /journal, /format -- those
+    handlers stay registered and callable manually (see tests/test_navigation.py),
+    this only trims what Telegram's UI shows. A default (language-agnostic)
+    list is set, then a RU-localized one via language_code="ru"."""
+    calls = []
+
+    class FakeBot:
+        async def set_my_commands(self, commands, language_code=None):
+            calls.append((language_code, [(c.command, c.description) for c in commands]))
+
+    class FakeDispatcher:
+        async def start_polling(self, polling_bot):
+            pass
+
+    class FakeScheduler:
+        def start(self):
+            pass
+
+    async def fake_init_db():
+        pass
+
+    monkeypatch.setattr(bot, "bot", FakeBot())
+    monkeypatch.setattr(bot, "dp", FakeDispatcher())
+    monkeypatch.setattr(bot, "init_db", fake_init_db)
+    monkeypatch.setattr(bot, "start_dashboard", lambda: None)
+    monkeypatch.setattr(bot, "setup_scheduler", lambda scheduler_bot: FakeScheduler())
+
+    run(bot.main())
+
+    assert len(calls) == 2
+    default_lang, default_commands = calls[0]
+    ru_lang, ru_commands = calls[1]
+    assert default_lang is None
+    assert [c for c, _ in default_commands] == ["start", "help"]
+    assert ru_lang == "ru"
+    assert [c for c, _ in ru_commands] == ["start", "help"]
+    # Legacy handlers must still be registered and callable manually.
+    for cmd in ("menu", "questionnaire", "journal", "format"):
+        assert cmd not in [c for c, _ in default_commands]
+        assert cmd not in [c for c, _ in ru_commands]
