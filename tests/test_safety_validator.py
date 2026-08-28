@@ -1,6 +1,7 @@
 """Regression tests for the deterministic safety validator (Priority 2/3)."""
 from safety_validator import (
     validate_response, get_fallback, get_safe_fallback_high_risk, select_fallback,
+    is_elevated_risk, classify_rejection_reason, REJECTION_CATEGORIES,
 )
 from humanization import has_robotic_phrase
 
@@ -66,3 +67,68 @@ def test_select_fallback_empty_risk_defaults_to_neutral():
     # Runs on failure paths — empty/None risk must NOT crash; safe neutral default.
     assert select_fallback({}, "ru") == get_fallback("ru")
     assert select_fallback(None, "ru") == get_fallback("ru")
+
+
+# ── is_elevated_risk: extracted, single-sourced predicate (round 2) ───────────
+def test_is_elevated_risk_matches_select_fallback_high_risk_condition():
+    for lvl in ("medium", "high", "critical"):
+        assert is_elevated_risk({"level": lvl}) is True
+    assert is_elevated_risk({"level": "low"}) is False
+    assert is_elevated_risk({"level": "low", "ambiguous_phrases": ["x"]}) is True
+    assert is_elevated_risk({}) is False
+    assert is_elevated_risk(None) is False
+
+
+# ── classify_rejection_reason: bounded, loggable categories (round 2) ─────────
+def test_classify_forbidden_phrase():
+    assert classify_rejection_reason("Forbidden phrase: похоже, у тебя депрессия") \
+        == "FORBIDDEN_PHRASE"
+
+
+def test_classify_too_long():
+    assert classify_rejection_reason("Response too long (>150 words)") == "TOO_LONG"
+
+
+def test_classify_certainty_claim():
+    assert classify_rejection_reason("Certainty claim detected") == "CERTAINTY_CLAIM"
+
+
+def test_classify_toxic_validation():
+    assert classify_rejection_reason(
+        "toxic validation: confirmed distortion 'никто'") == "TOXIC_VALIDATION"
+
+
+def test_classify_ambiguous_approval():
+    assert classify_rejection_reason(
+        "approval phrase 'это хорошая идея' after ambiguous user message") \
+        == "AMBIGUOUS_APPROVAL"
+
+
+def test_classify_risky_suggestion():
+    assert classify_rejection_reason(
+        "risky suggestion 'выйти на улицу' at risk level medium") == "RISKY_SUGGESTION"
+
+
+def test_classify_unknown_or_missing_reason_is_other():
+    assert classify_rejection_reason("some future reason string") == "OTHER_VALIDATOR_REJECTION"
+    assert classify_rejection_reason(None) == "OTHER_VALIDATOR_REJECTION"
+
+
+def test_classify_never_returns_outside_bounded_set():
+    samples = [
+        "Forbidden phrase: x", "Response too long (>150 words)",
+        "Certainty claim detected", "toxic validation: confirmed distortion 'y'",
+        "approval phrase 'z' after ambiguous user message",
+        "risky suggestion 'w' at risk level high",
+        None, "", "unrelated",
+    ]
+    for reason in samples:
+        assert classify_rejection_reason(reason) in REJECTION_CATEGORIES
+
+
+def test_classify_never_echoes_the_matched_phrase_itself():
+    # The category is fixed vocabulary -- the matched substring from the
+    # reason string must never leak into the returned category value.
+    category = classify_rejection_reason(
+        "Forbidden phrase: секретная-фраза-которая-не-должна-логироваться")
+    assert "секретная-фраза" not in category

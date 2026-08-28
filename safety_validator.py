@@ -166,6 +166,17 @@ def get_safe_fallback_high_risk(lang: str = "ru") -> str:
     return SAFE_FALLBACK_HIGH_RISK_EN if lang == "en" else SAFE_FALLBACK_HIGH_RISK_RU
 
 
+def is_elevated_risk(risk: dict) -> bool:
+    """True at medium/high/critical risk, or after an ambiguous user phrase --
+    the exact condition select_fallback uses to choose the high-risk
+    (hotline-carrying) fallback over the neutral one. Extracted so other
+    callers (e.g. a runtime picking its OWN low-risk fallback wording) can
+    reuse the identical, single-sourced predicate instead of re-deriving it,
+    which would risk the two silently drifting apart over time."""
+    risk = risk or {}
+    return risk.get("level") in ("medium", "high", "critical") or bool(risk.get("ambiguous_phrases"))
+
+
 def select_fallback(risk: dict, lang: str = "ru") -> str:
     """Pick the right fallback for the risk, so EVERY block path (incl. the
     toxic-validation regen-failure path) stays risk-aware instead of always
@@ -177,10 +188,40 @@ def select_fallback(risk: dict, lang: str = "ru") -> str:
     `risk` is defensively coerced to {} — this helper runs on FAILURE paths
     (regen failed / exception), where receiving an empty/None risk must yield the
     safe neutral default, never a crash on top of an already-failed turn."""
-    risk = risk or {}
-    if risk.get("level") in ("medium", "high", "critical") or risk.get("ambiguous_phrases"):
+    if is_elevated_risk(risk):
         return get_safe_fallback_high_risk(lang)
     return get_fallback(lang)
+
+
+# ── Bounded, loggable rejection categories ─────────────────────────────────
+# validate_response_with_context's `reason` strings embed a matched phrase
+# from our OWN fixed vocabularies (never user/candidate text) -- but a log
+# line should still never carry free-form text, so this maps each reason
+# shape to one small fixed category instead.
+REJECTION_CATEGORIES = frozenset({
+    "FORBIDDEN_PHRASE", "TOO_LONG", "CERTAINTY_CLAIM", "TOXIC_VALIDATION",
+    "AMBIGUOUS_APPROVAL", "RISKY_SUGGESTION", "OTHER_VALIDATOR_REJECTION",
+})
+
+
+def classify_rejection_reason(reason: str | None) -> str:
+    """Map a validate_response_with_context reason string to one of
+    REJECTION_CATEGORIES -- never logs the raw reason itself."""
+    if not isinstance(reason, str):
+        return "OTHER_VALIDATOR_REJECTION"
+    if reason.startswith("Forbidden phrase:"):
+        return "FORBIDDEN_PHRASE"
+    if reason == "Response too long (>150 words)":
+        return "TOO_LONG"
+    if reason == "Certainty claim detected":
+        return "CERTAINTY_CLAIM"
+    if reason.startswith("toxic validation:"):
+        return "TOXIC_VALIDATION"
+    if reason.startswith("approval phrase"):
+        return "AMBIGUOUS_APPROVAL"
+    if reason.startswith("risky suggestion"):
+        return "RISKY_SUGGESTION"
+    return "OTHER_VALIDATOR_REJECTION"
 
 
 # ── Epic C: anti-toxic-validation ─────────────────────────────────────────────

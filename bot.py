@@ -94,6 +94,7 @@ from practice_registry import select_practice, get_production_practice_by_id
 from safety_validator import (
     validate_response,
     validate_response_with_context, select_fallback,
+    is_elevated_risk, classify_rejection_reason,
     validate_first_turn_response, get_first_turn_fallback,
     validate_continuation_response,
 )
@@ -840,8 +841,9 @@ def _response_format_setup_text(lang: str) -> str:
 
 async def _send_persistent_lower_menu(target, lang: str) -> None:
     await target.answer(
-        "Основные разделы всегда доступны ниже." if lang == "ru"
-        else "The main sections are always available below.",
+        "Готово. Можешь написать, что сейчас происходит, или выбрать раздел ниже."
+        if lang == "ru" else
+        "All set. You can write what's going on right now, or choose a section below.",
         reply_markup=persistent_lower_menu_kb(lang),
     )
 
@@ -1805,6 +1807,69 @@ def _professional_technical_fallback_text(lang: str) -> str:
     return _PROFESSIONAL_TECHNICAL_FALLBACK_TEXT.get(lang, _PROFESSIONAL_TECHNICAL_FALLBACK_TEXT["en"])
 
 
+# Telegram delivery in this path is plain text (no parse_mode), so a model
+# candidate that used **bold** markdown leaks the literal asterisks to the
+# user. This is a pure, deterministic presentation-layer cleanup: it removes
+# only a matched, paired **...** delimiter, keeping the exact text between
+# them untouched -- an unpaired/stray "**" is left alone rather than guessed
+# at. Not a Markdown renderer (no parse_mode is ever enabled), so there is no
+# broader formatting-injection surface to introduce.
+_LEAKED_BOLD_MARKDOWN_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+
+
+def _strip_leaked_bold_markdown(text: str) -> str:
+    return _LEAKED_BOLD_MARKDOWN_RE.sub(r"\1", text)
+
+
+# Therapist Core V1's own low-risk validator-rejection fallback (owner-review
+# live-smoke round 2). safety_validator.FALLBACK_RU/get_fallback() is shared
+# with the legacy pipeline (see bot.py's other select_fallback call sites), so
+# it is intentionally NOT changed here -- this is a Therapist-Core-scoped
+# override, selected by the already-known, already-deterministic
+# interaction_contract, that never asks the user to repeat what they already
+# wrote this turn. Elevated risk / an ambiguous user message is UNCHANGED:
+# is_elevated_risk() reuses safety_validator's own single-sourced predicate,
+# so the two can never silently drift apart, and falls straight through to
+# select_fallback's existing high-risk (hotline-carrying) text.
+_THERAPIST_CORE_LOW_RISK_FALLBACK = {
+    "ru": {
+        "UNDERSTAND": (
+            "Я прочитал то, что ты написал. Не буду просить повторять. "
+            "Давай разбираться из того, что уже есть и попробуем связать это в одну картину."),
+        "JUST_TALK": (
+            "Я прочитал то, что ты написал. Не буду просить повторять. "
+            "Можешь продолжить с этого места — я буду держать нить разговора."),
+        "ACTION": (
+            "Я прочитал то, что ты написал. Не буду просить повторять. "
+            "Давай опираться на уже сказанное и выберем следующий шаг."),
+        "NONE": (
+            "Я прочитал то, что ты написал. Не буду просить повторять. "
+            "Давай продолжим оттуда и опираться на уже сказанное."),
+    },
+    "en": {
+        "UNDERSTAND": (
+            "I've read what you wrote. I won't ask you to repeat it. "
+            "Let's work with what's already here and try to connect it into one picture."),
+        "JUST_TALK": (
+            "I've read what you wrote. I won't ask you to repeat it. "
+            "You can continue from here — I'll keep track of the thread."),
+        "ACTION": (
+            "I've read what you wrote. I won't ask you to repeat it. "
+            "Let's build on what's already been said and choose a next step."),
+        "NONE": (
+            "I've read what you wrote. I won't ask you to repeat it. "
+            "Let's continue from there, building on what's already been said."),
+    },
+}
+
+
+def _therapist_core_fallback(risk: dict, interaction_contract: str, lang: str) -> str:
+    if is_elevated_risk(risk):
+        return select_fallback(risk, lang)
+    by_lang = _THERAPIST_CORE_LOW_RISK_FALLBACK.get(lang, _THERAPIST_CORE_LOW_RISK_FALLBACK["en"])
+    return by_lang.get(interaction_contract, by_lang["NONE"])
+
+
 async def _run_therapist_core_v1_and_deliver(
         message: Message, uid: int, current_row_id: int, user_text: str,
         risk: dict, lang: str, interaction_contract: str,
@@ -1832,15 +1897,22 @@ async def _run_therapist_core_v1_and_deliver(
             reply_text = candidate
             _dispatch_log(f"cid={cid} stage=therapist_core_v1_accepted")
         else:
-            reply_text = select_fallback(risk, lang)
+            reply_text = _therapist_core_fallback(risk, interaction_contract, lang)
             _dispatch_log(
                 f"cid={cid} stage=therapist_core_v1_rejected "
-                f"reason_type={type(reason).__name__}")
+                f"validator_rejection={classify_rejection_reason(reason)}")
     except Exception as exc:
         reply_text = _professional_technical_fallback_text(lang)
         _dispatch_log(
             f"cid={cid} stage=therapist_core_v1_failed "
             f"error_type={type(exc).__name__}")
+
+    # Applied to every reply_text source (accepted candidate, validator
+    # fallback, technical fallback) uniformly -- a no-op on the static
+    # fallback/crisis copy that never contains "**", so it is safe regardless
+    # of source. Runs BEFORE delivery and persistence so the persisted
+    # ASSISTANT_DELIVERED content always equals what the user actually saw.
+    reply_text = _strip_leaked_bold_markdown(reply_text)
 
     if _user_generation_superseded(uid, turn_gen):
         _dispatch_log(f"cid={cid} stage=therapist_core_v1_stale_dropped")
@@ -7798,11 +7870,19 @@ def _feedback_keyboard(lang: str) -> InlineKeyboardMarkup:
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message):
+    """Legacy compatibility only: /menu no longer renders its own inline
+    navigation hierarchy (that duplicated the persistent lower ReplyKeyboard,
+    the one primary menu). It now just re-attaches that same keyboard with a
+    single short neutral line."""
     uid = message.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(message, uid, lang):
         return
-    await message.answer(navigation.menu_text(lang), reply_markup=_menu_keyboard(lang))
+    await message.answer(
+        "Основные разделы — ниже 👇" if lang == "ru"
+        else "The main sections are below 👇",
+        reply_markup=persistent_lower_menu_kb(lang),
+    )
 
 
 @dp.message(F.text.in_({"🧠 Психологические тесты", "🧠 Psychological tests"}))
@@ -8038,14 +8118,20 @@ async def handle_text(message: Message, state: FSMContext):
 async def main():
     await init_db()
     try:
+        # Public-beta visible command list: the persistent lower ReplyKeyboard
+        # is the one primary navigation surface, so the Telegram slash-command
+        # list is trimmed to /start and /help only -- it must not duplicate
+        # that menu. /menu, /questionnaire, /journal, /format handlers stay
+        # fully registered below and remain callable if typed manually; this
+        # only changes what Telegram's command autocomplete/side list shows.
         await bot.set_my_commands([
             BotCommand(command="start", description="Start X20"),
-            BotCommand(command="menu", description="Open main menu"),
-            BotCommand(command="questionnaire", description="Questionnaires"),
-            BotCommand(command="journal", description="Journals"),
-            BotCommand(command="format", description="Response settings"),
             BotCommand(command="help", description="Help"),
         ])
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Начать"),
+            BotCommand(command="help", description="Помощь"),
+        ], language_code="ru")
     except TelegramAPIError as exc:
         logging.warning(
             "bot command registration failed; continuing startup "

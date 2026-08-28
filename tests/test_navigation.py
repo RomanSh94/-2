@@ -108,32 +108,52 @@ NAV_CALLBACKS = {
 }
 
 
-# ── /menu renders the hub ────────────────────────────────────────────────────
-def test_menu_renders_main_menu_with_all_sections():
+# ── /menu — public-beta compatibility (owner-review round 2) ──────────────────
+# /menu no longer renders its own inline hub -- that duplicated the persistent
+# lower ReplyKeyboard, the one primary menu. It now just re-attaches that
+# keyboard with a single short neutral line. _menu_keyboard/navigation.menu_text
+# themselves are retained (unreachable from any live handler now, kept for
+# cb_*_hub backward compatibility -- see test_cb_tests_hub_still_works_if_reached_directly)
+# and are still tested directly below for their own internal correctness.
+def test_menu_reattaches_persistent_lower_menu_with_one_short_line():
     user = FakeUser(1)
     msg = FakeMessage(user)
     asyncio.run(bot.cmd_menu(msg))
-    assert msg.answers
+    assert len(msg.answers) == 1
     text, kw = msg.answers[0]
-    assert "Главное меню" in text
+    assert text == "Основные разделы — ниже 👇"
     kb = kw["reply_markup"]
+    assert kb.is_persistent is True
+    assert "Главное меню" not in text
+
+
+def test_menu_no_longer_exposes_legacy_hub_buttons():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cmd_menu(msg))
+    # No inline hub buttons of any kind survive in the /menu response --
+    # only the persistent lower ReplyKeyboard (a plain ReplyKeyboardMarkup,
+    # never an InlineKeyboardMarkup) is attached.
+    kb = msg.answers[0][1]["reply_markup"]
+    assert isinstance(kb, bot.ReplyKeyboardMarkup)
+    assert not isinstance(kb, bot.InlineKeyboardMarkup)
+
+
+def test_underlying_menu_keyboard_still_has_all_sections():
+    """_menu_keyboard itself is unchanged and still correct -- only its
+    reachability from /menu was removed (see test_cb_tests_hub_still_works_if_reached_directly
+    for the still-live cb_*_hub backward-compat path)."""
+    kb = bot._menu_keyboard("ru")
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    # fix/menu-tests-button-routes-to-questionnaire-core: "tests" now routes
-    # directly to "q:l" (the real Questionnaire Core), not "tests:hub" (the old
-    # Navigation Hub placeholder) -- was
-    # ["tests:hub", "journals:hub", "results:hub", "privacy:hub", "about:hub"].
-    # The other 4 entries are unchanged.
     assert callback_datas == [
         "talk:hub", "q:l", "journals:hub", "results:hub",
         "settings:hub", "privacy:hub", "about:hub",
     ]
+    assert "Главное меню" in navigation.menu_text("ru")
 
 
 def test_non_questionnaire_menu_buttons_use_hub_pattern():
-    user = FakeUser(1)
-    msg = FakeMessage(user)
-    asyncio.run(bot.cmd_menu(msg))
-    kb = msg.answers[0][1]["reply_markup"]
+    kb = bot._menu_keyboard("ru")
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
     for key, _, _ in navigation.MENU_SECTIONS:
         if key == "tests":
@@ -164,19 +184,20 @@ def test_feedback_warning_precedes_valid_external_link(monkeypatch):
 
 
 def test_menu_tests_button_reaches_real_questionnaire_core():
-    """Simulating a press of the menu's "tests" button (callback_data "q:l")
-    must reach the real cb_questionnaire_list handler and render
+    """The underlying _menu_keyboard "tests" button (callback_data "q:l",
+    same target the persistent lower menu's "Психологические тесты" button
+    uses) must reach the real cb_questionnaire_list handler and render
     questionnaire_ux.list_text/_questionnaire_list_keyboard -- the same
     content /questionnaire produces -- not navigation.tests_hub_text /
-    _hub_back_keyboard (the old placeholder)."""
-    user = FakeUser(1)
-    msg = FakeMessage(user)
-    asyncio.run(bot.cmd_menu(msg))
-    kb = msg.answers[0][1]["reply_markup"]
+    _hub_back_keyboard (the old placeholder). /menu itself no longer exposes
+    this button (see test_menu_no_longer_exposes_legacy_hub_buttons)."""
+    kb = bot._menu_keyboard("ru")
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
     assert "q:l" in callback_datas
     assert "tests:hub" not in callback_datas
 
+    user = FakeUser(1)
+    msg = FakeMessage(user)
     cb = FakeCallback(user, msg, data="q:l")
     asyncio.run(bot.cb_questionnaire_list(cb))
     text, kw = msg.answers[-1]
@@ -246,7 +267,7 @@ def test_menu_requires_product_gate():
     msg = FakeMessage(user)
     asyncio.run(bot.cmd_menu(msg))
     assert msg.answers
-    assert "Главное меню" not in msg.answers[0][0]
+    assert msg.answers[0][0] != "Основные разделы — ниже 👇"
 
 
 @pytest.mark.parametrize("data,handler", list(NAV_CALLBACKS.items()))
@@ -272,7 +293,7 @@ def test_menu_respects_active_crisis_gate(monkeypatch):
     asyncio.run(bot.cmd_menu(msg))
     assert len(msg.answers) == 1
     assert get_hotline("ru")["primary"] in msg.answers[0][0]
-    assert "Главное меню" not in msg.answers[0][0]
+    assert msg.answers[0][0] != "Основные разделы — ниже 👇"
 
 
 @pytest.mark.parametrize("data,handler", list(NAV_CALLBACKS.items()))
@@ -358,3 +379,48 @@ def test_cbt_step_sends_prompt_exactly_once_for_emotion_field(monkeypatch):
     buttons = [btn for row in markup.inline_keyboard for btn in row]
     assert any(btn.callback_data == "emotion:map" for btn in buttons)
     assert any("Карта эмоций" in btn.text or "Emotion map" in btn.text for btn in buttons)
+
+
+# ── persistent lower menu re-attach copy (owner-review round 2) ────────────
+def test_send_persistent_lower_menu_uses_updated_transition_copy():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot._send_persistent_lower_menu(msg, "ru"))
+    assert len(msg.answers) == 1
+    text, kw = msg.answers[0]
+    assert text == "Готово. Можешь написать, что сейчас происходит, или выбрать раздел ниже."
+    assert text != "Основные разделы всегда доступны ниже."
+    kb = kw["reply_markup"]
+    assert isinstance(kb, bot.ReplyKeyboardMarkup)
+    assert kb.is_persistent is True
+
+
+def test_send_persistent_lower_menu_en_transition_copy():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot._send_persistent_lower_menu(msg, "en"))
+    text, _ = msg.answers[0]
+    assert text == "All set. You can write what's going on right now, or choose a section below."
+
+
+# ── voice-off UX copy (owner-review round 2) ────────────────────────────────
+def test_voice_off_copy_is_product_facing_not_technical():
+    ru = navigation.response_settings_text("ru", available=False)
+    en = navigation.response_settings_text("en", available=False)
+    assert ru == "Сейчас ответы доступны только текстом. Голосовые ответы временно недоступны."
+    assert en == "Right now replies are text-only. Voice replies are temporarily unavailable."
+    assert "Настройки озвучивания" not in ru
+    assert "settings" not in en.lower()
+
+
+def test_voice_off_copy_does_not_promise_a_return_date():
+    ru = navigation.response_settings_text("ru", available=False)
+    en = navigation.response_settings_text("en", available=False)
+    for forbidden in ("скоро", "wait", "soon", "coming"):
+        assert forbidden not in ru.lower()
+        assert forbidden not in en.lower()
+
+
+def test_voice_available_copy_unchanged():
+    assert navigation.response_settings_text("ru", available=True) == \
+        "Кстати, вот как я звучу 🎧\n\nКак тебе удобнее получать ответы?"
