@@ -49,15 +49,94 @@ def test_hard_no_advice_wins_over_soft_talk():
 
 def test_soft_talk_does_not_suppress_explicit_advice_request():
     assert detect_interaction_preference(
-        "поговори со мной и подскажи, что мне делать", "ru") == "ADVICE_REQUEST"
+        "поговори со мной и подскажи, что мне делать", "ru") == "ACTION"
 
 
 def test_advice_request_dai_sovet():
-    assert detect_interaction_preference("дай совет, как мне разгрузить голову", "ru") == "ADVICE_REQUEST"
+    assert detect_interaction_preference("дай совет, как мне разгрузить голову", "ru") == "ACTION"
 
 
 def test_exact_a3_is_advice_request():
-    assert detect_interaction_preference(A3_TEXT, "ru") == "ADVICE_REQUEST"
+    assert detect_interaction_preference(A3_TEXT, "ru") == "ACTION"
+
+
+@pytest.mark.parametrize("text", [
+    "Хочу понять, почему я так делаю, а не просто получить совет.",
+    "Мне важно разобраться в причине этого сопротивления.",
+    "Почему это происходит почти каждый день?",
+    "Не хочу просто совет — хочу понять причину.",
+])
+def test_understand_ru_natural_requests(text):
+    assert detect_interaction_preference(text, "ru") == "UNDERSTAND"
+
+
+@pytest.mark.parametrize("text", [
+    "I want to understand why I do this.",
+    "Why does this happen almost every day?",
+    "I don't just want advice; I want to figure out the reason.",
+])
+def test_understand_en_natural_requests(text):
+    assert detect_interaction_preference(text, "en") == "UNDERSTAND"
+
+
+# ── Negation-aware UNDERSTAND (owner-review correction) ────────────────────
+def test_negated_understand_resolves_to_just_talk():
+    # "не хочу понять" must NOT match the "хочу понять" UNDERSTAND signal --
+    # the negation is directly attached to it, so this is a JUST_TALK request.
+    assert detect_interaction_preference(
+        "Я не хочу понять почему, просто хочу выговориться", "ru") == "JUST_TALK"
+
+
+def test_negated_advice_with_unrelated_understand_still_wins():
+    # The negation here attaches to "хочу советов", not to "хочу понять" --
+    # an unrelated negation elsewhere in the message must never suppress a
+    # genuinely unnegated UNDERSTAND request later in the same text.
+    assert detect_interaction_preference(
+        "Не хочу советов, хочу понять почему я так делаю", "ru") == "UNDERSTAND"
+
+
+def test_understand_with_trailing_no_advice_clause():
+    assert detect_interaction_preference(
+        "Я хочу разобраться, но без советов", "ru") == "UNDERSTAND"
+
+
+def test_negated_understand_en_resolves_to_just_talk():
+    assert detect_interaction_preference(
+        "I don't want to understand why, I just want to vent.", "en") == "JUST_TALK"
+
+
+def test_negated_understand_en_headless_signal_resolves_to_just_talk():
+    # "understand the reason" has no leading pronoun, so it is only protected
+    # by the negation-adjacency check itself, not by signal shape.
+    assert detect_interaction_preference(
+        "I just want to vent, not understand the reason for it.", "en") == "JUST_TALK"
+
+
+def test_negated_advice_with_unrelated_understand_still_wins_en():
+    assert detect_interaction_preference(
+        "I don't want advice, I want to understand why I do this.", "en") == "UNDERSTAND"
+
+
+# ── Apostrophe-normalized EN signal matching (owner-review correction) ─────
+# _normalize() strips apostrophes ("don't" -> "don t" in the normalized user
+# text), so authored contraction signals must be normalized the same way
+# before comparison, or they silently never match.
+def test_contraction_hard_no_advice_dont_want():
+    assert detect_interaction_preference("I don't want advice", "en") == "JUST_TALK"
+
+
+def test_contraction_hard_no_advice_dont_need():
+    assert detect_interaction_preference("I don't need advice", "en") == "JUST_TALK"
+
+
+def test_contraction_understand_its_important():
+    assert detect_interaction_preference(
+        "It's important for me to understand why this happens", "en") == "UNDERSTAND"
+
+
+def test_contraction_negated_advice_with_unrelated_understand():
+    assert detect_interaction_preference(
+        "I don't want advice, I want to understand why I do this", "en") == "UNDERSTAND"
 
 
 def test_soft_just_talk_alone():
@@ -90,7 +169,7 @@ def test_bare_kak_mne_is_not_a_trigger():
     assert detect_interaction_preference("как мне сегодня грустно", "ru") == "NONE"
 
 
-def test_detector_output_always_one_of_three_values():
+def test_detector_output_always_one_of_four_values():
     samples = [
         "", "   ", "???", "asdkjhasd 1234 !!!", "Привет как дела",
         "Hello, how are you doing today?", "😀😀😀", "не хочу", "подскажи",
@@ -100,14 +179,14 @@ def test_detector_output_always_one_of_three_values():
     for s in samples:
         for lang in ("ru", "en"):
             result = detect_interaction_preference(s, lang)
-            assert result in {"NONE", "JUST_TALK", "ADVICE_REQUEST"}
+            assert result in {"NONE", "JUST_TALK", "UNDERSTAND", "ACTION"}
 
 
 def test_turn_isolation_no_stickiness():
     first = detect_interaction_preference(A1_TEXT, "ru")
     second = detect_interaction_preference("Дай совет, как мне быть", "ru")
     assert first == "JUST_TALK"
-    assert second == "ADVICE_REQUEST"
+    assert second == "ACTION"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -136,7 +215,7 @@ def test_exact_forensic_a3_advice_request_reaches_open_chat():
              "dissociation": 0.0, "hopelessness": 0.0, "loneliness": 0.0, "openness": 0.5}
     result = choose_scenario(state, [], "PROBLEM_SOLVING", "MEDIUM", 0.6,
                               trajectory=_deteriorating_trajectory(),
-                              interaction_preference="ADVICE_REQUEST")
+                              interaction_preference="ACTION")
     assert result == "open_chat"
 
 
@@ -166,7 +245,14 @@ def test_stale_loneliness_suppressed_by_just_talk():
 def test_stale_hopelessness_suppressed_by_advice_request():
     state = {"hopelessness": 0.7, "openness": 0.6, "energy": 0.5}
     result = choose_scenario(state, [], "OPEN", "MEDIUM", 0.9,
-                              interaction_preference="ADVICE_REQUEST")
+                              interaction_preference="ACTION")
+    assert result == "open_chat"
+
+
+def test_understand_suppresses_stale_non_acute_routing():
+    state = {"anxiety": 0.7, "energy": 0.5}
+    result = choose_scenario(state, [], "OPEN", "MEDIUM", 0.9,
+                              interaction_preference="UNDERSTAND")
     assert result == "open_chat"
 
 

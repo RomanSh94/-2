@@ -115,8 +115,8 @@ def test_export_caption_labels_retained_categories(tmp_db):
 
     assert msg.documents
     caption = msg.documents[0][1]["caption"]
-    assert "crisis_events" in caption
-    assert "/privacy_delete_all" in caption or "/forget_all" in caption
+    assert "безопасност" in caption.lower()
+    assert "crisis_events" not in caption
 
 
 def test_export_only_ever_reads_the_callers_own_uid(tmp_db):
@@ -150,7 +150,7 @@ def test_delete_preview_shown_before_any_deletion(tmp_db):
 
     assert msg.answers
     text, kw = msg.answers[0]
-    assert "продолжить" in text.lower() or "continue" in text.lower()
+    assert "удалить данные аккаунта" in text.lower()
     assert kw["reply_markup"] is not None
     # Nothing deleted yet.
     rows = asyncio.run(tmp_db.export_all_personal_data(1))
@@ -192,7 +192,8 @@ def test_forget_all_preview_also_uses_real_counts(tmp_db):
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_forget_all(msg))
     text = msg.answers[0][0]
-    assert "crisis_events" in text
+    assert "записей безопасности" in text.lower()
+    assert "crisis_events" not in text
     assert "1" in text   # the one retained crisis_events row
 
 
@@ -252,7 +253,8 @@ def test_delete_retains_crisis_events_and_says_so(tmp_db):
 
     final_text = msg.answers[-1][0]
     assert "все данные удалены" not in final_text.lower()
-    assert "crisis_events" in final_text
+    assert "критическими ситуациями" in final_text.lower()
+    assert "crisis_events" not in final_text
 
 
 def test_delete_confirm_callback_uid_mismatch_rejected(tmp_db):

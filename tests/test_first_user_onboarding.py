@@ -179,12 +179,16 @@ def _start(uid, text="/start", language_code="ru"):
     return msg
 
 
+def _welcome(lang: str, first_name: str = "U") -> str:
+    return oc.caption(1, lang, first_name=first_name)
+
+
 def test_public_new_user_enters_onboarding_without_invite(tmp_db, fake_bot, monkeypatch):
     monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
     msg = _start(404)
     assert msg.answers == []
     assert fake_bot.sent
-    assert "X20" in fake_bot.rendered_texts()[0]
+    assert fake_bot.rendered_texts()[0] == _welcome("ru")
 
 
 def _tap(uid, data):
@@ -210,7 +214,7 @@ def test_new_authorized_user_sees_step1(tmp_db, fake_bot):
     st = run(database.get_onboarding_state(uid))
     assert st is not None and st["status"] == "active" and st["current_step"] == 1
     assert st["onboarding_version"] == V
-    assert any(oc.caption(1, "ru") == t for t in fake_bot.rendered_texts())
+    assert any(_welcome("ru") == t for t in fake_bot.rendered_texts())
 
 
 def test_returning_user_without_notice_ack_sees_privacy_only_screen(tmp_db, fake_bot):
@@ -226,7 +230,7 @@ def test_returning_user_without_notice_ack_sees_privacy_only_screen(tmp_db, fake
     _start(uid)
     assert run(database.get_onboarding_state(uid)) is None  # no fake row
     assert any(oc.caption(oc.LAST_STEP, "ru") == t for t in fake_bot.rendered_texts())
-    assert not any(oc.caption(1, "ru") == t for t in fake_bot.rendered_texts())
+    assert not any(_welcome("ru") == t for t in fake_bot.rendered_texts())
 
 
 def test_legacy_user_privacy_ack_settles_no_reprompt_on_next_start(tmp_db, fake_bot):
@@ -300,7 +304,7 @@ def test_start_during_active_onboarding_resumes_current_step(tmp_db, fake_bot):
     # Resumes at step 3, does NOT restart at 1.
     assert run(database.get_onboarding_state(uid))["current_step"] == 3
     assert any(oc.caption(3, "ru") == t for t in fake_bot.rendered_texts())
-    assert not any(oc.caption(1, "ru") == t for t in fake_bot.rendered_texts())
+    assert not any(_welcome("ru") == t for t in fake_bot.rendered_texts())
 
 
 def test_completed_onboarding_does_not_restart(tmp_db, fake_bot):
@@ -319,7 +323,7 @@ def test_completed_onboarding_does_not_restart(tmp_db, fake_bot):
     assert run(database.get_onboarding_state(uid))["status"] == "completed"
     # Mood entry, not the welcome card.
     assert any("Я не терапевт" in t for t in msg.rendered_texts())
-    assert not any(oc.caption(1, "ru") == t for t in fake_bot.rendered_texts())
+    assert not any(_welcome("ru") == t for t in fake_bot.rendered_texts())
 
 
 # ── C: richer legacy signals (not just messages.count > 0) ────────────────────
@@ -418,9 +422,9 @@ def test_start_language_policy_matrix(tmp_db, fake_bot, uid, language_code, expe
     _authorized(uid)
     _start(uid, language_code=language_code)
     assert run(database.get_user_language(uid)) == expected
-    assert any(oc.caption(1, expected) == t for t in fake_bot.rendered_texts())
+    assert any(_welcome(expected) == t for t in fake_bot.rendered_texts())
     other = "en" if expected == "ru" else "ru"
-    assert not any(oc.caption(1, other) == t for t in fake_bot.rendered_texts())
+    assert not any(_welcome(other) == t for t in fake_bot.rendered_texts())
 
 
 def test_new_dutch_user_does_not_receive_russian_onboarding(tmp_db, fake_bot):
@@ -430,8 +434,8 @@ def test_new_dutch_user_does_not_receive_russian_onboarding(tmp_db, fake_bot):
     _authorized(uid)
     _start(uid, language_code="nl-NL")
     assert run(database.get_user_language(uid)) == "en"
-    assert any(oc.caption(1, "en") == t for t in fake_bot.rendered_texts())
-    assert not any(oc.caption(1, "ru") == t for t in fake_bot.rendered_texts())
+    assert any(_welcome("en") == t for t in fake_bot.rendered_texts())
+    assert not any(_welcome("ru") == t for t in fake_bot.rendered_texts())
 
 
 # ── Stored-language preservation (fixed gap) ─────────────────────────────────
@@ -591,7 +595,7 @@ def test_active_older_version_after_deployment_is_superseded_and_restarted(tmp_d
     assert new_state["onboarding_version"] == V and new_state["current_step"] == 1
     # The mandatory current version's step-1 card was rendered, NOT the
     # ordinary mood entry -- the bump must actually reach this user.
-    assert any(oc.caption(1, "ru") == t for t in fake_bot.rendered_texts())
+    assert any(_welcome("ru") == t for t in fake_bot.rendered_texts())
     assert not any("Я не терапевт" in t for t in msg.rendered_texts())
 
 
@@ -926,15 +930,24 @@ def test_next_advances_and_edits_same_card(tmp_db, fake_bot):
               for kind, _, _, cap, _ in fake_bot.edits)
 
 
-def test_start_opens_mood_entry_and_clears_keyboard(tmp_db, fake_bot):
+def test_start_opens_response_format_setup_and_lower_menu(
+        tmp_db, fake_bot, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
     uid = 3002
     _authorized(uid)
     _start(uid)
     _tap(uid, oc.CB_SKIP)
     cb = _tap(uid, oc.CB_START)
-    # Keyboard of the final card was removed, mood entry opened.
+    # Keyboard of the final card is removed; setup is optional and the lower
+    # menu remains available without blocking free text.
     assert len(fake_bot.markup_clears) >= 1
-    assert any("Я не терапевт" in t for t in cb.message.rendered_texts())
+    assert cb.message.rendered_texts()[0] == (
+        "Кстати, вот как я звучу 🎧\n\nКак тебе удобнее получать ответы?")
+    selector, lower = cb.message.keyboards()
+    assert [[b.text for b in row] for row in selector.inline_keyboard] == [
+        ["💬 Текстом", "🎙 Голосом"], ["🎧 Текст + голос"]]
+    assert lower.is_persistent is True
 
 
 def test_privacy_button_shows_summary_without_completing(tmp_db, fake_bot):
@@ -948,7 +961,9 @@ def test_privacy_button_shows_summary_without_completing(tmp_db, fake_bot):
     # State unchanged, not completed; a summary message was sent.
     assert after["status"] == "active" and after["current_step"] == 5
     assert before == after
-    assert any("/privacy_export_all" in t for t in cb.message.rendered_texts())
+    summary = "\n".join(cb.message.rendered_texts())
+    assert "получить копию" in summary
+    assert "/privacy_export_all" not in summary
 
 
 def test_start_before_privacy_step_does_nothing(tmp_db, fake_bot):
@@ -981,9 +996,10 @@ def test_out_of_range_next_target_ignored(tmp_db, fake_bot):
 
 # ── Copy & safety ─────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("lang", ["ru", "en"])
-def test_welcome_states_no_diagnosis(lang):
-    c = oc.caption(1, lang).lower()
-    assert ("не ставлю диагнозы" in c) if lang == "ru" else ("do not diagnose" in c)
+def test_onboarding_does_not_expose_provider_or_model_internals(lang):
+    copy = " ".join(oc.caption(step, lang).lower() for step in oc.STEPS)
+    for internal in ("openai", "gpt", "ai provider", "model name", "модель gpt"):
+        assert internal not in copy
 
 
 @pytest.mark.parametrize("lang", ["ru", "en"])
@@ -995,14 +1011,15 @@ def test_no_screen_claims_replaces_therapist(lang):
 
 
 def test_ru_crisis_screen_includes_emergency_route():
-    c = oc.caption(2, "ru")
-    assert "кризисн" in c.lower()
+    c = oc.caption(4, "ru").lower()
+    assert "местную экстренную" in c
+    assert "кризисную" in c
 
 
 def test_en_crisis_screen_does_not_treat_112_as_universal():
-    c = oc.caption(2, "en")
+    c = oc.caption(4, "en")
     assert "112" not in c
-    assert "local emergency number" in c.lower()
+    assert "local emergency or crisis service" in c.lower()
 
 
 # ── B (this correction round): onboarding NEVER infers a country/number from
@@ -1013,19 +1030,17 @@ def test_neither_language_crisis_screen_contains_a_specific_number(lang):
     specific emergency/hotline number would show up as one. Catches "112",
     "988", "911", "8-800-2000-122", or any other number, in EITHER language."""
     import re
-    c = oc.caption(2, lang)
+    c = oc.caption(4, lang)
     assert re.search(r"(?<![A-Za-z])\d{2,}", c) is None, (lang, c)
 
 
 @pytest.mark.parametrize("lang", ["ru", "en"])
 def test_crisis_screen_wording_is_neutral_local_service(lang):
-    c = oc.caption(2, lang).lower()
+    c = oc.caption(4, lang).lower()
     if lang == "ru":
-        assert "местную экстренную службу" in c
-        assert "местную кризисную службу" in c
+        assert "местную экстренную или кризисную службу" in c
     else:
-        assert "local emergency number" in c
-        assert "local crisis service" in c
+        assert "local emergency or crisis service" in c
 
 
 def test_onboarding_content_never_imports_crisis_protocol():
@@ -1054,15 +1069,18 @@ def test_ru_and_en_crisis_screens_have_matching_neutral_structure():
     emergency service AND a local crisis service -- proves neither language
     is treated as carrying more/better country information than the other."""
     import re
-    ru, en = oc.caption(2, "ru"), oc.caption(2, "en")
+    ru, en = oc.caption(4, "ru"), oc.caption(4, "en")
     assert re.search(r"(?<![A-Za-z])\d{2,}", ru) is None
     assert re.search(r"(?<![A-Za-z])\d{2,}", en) is None
 
 
 @pytest.mark.parametrize("lang", ["ru", "en"])
 def test_no_unsupported_modalities_advertised(lang):
+    import re
     joined = " ".join(oc.caption(s, lang) for s in oc.STEPS).lower()
-    for term in ("emdr", "ifs", "schema therapy", "схема-терапи", "eft", "десенсибилиз"):
+    for term in ("emdr", "ifs", "schema therapy", "eft"):
+        assert re.search(rf"\b{re.escape(term)}\b", joined) is None, (lang, term)
+    for term in ("схема-терапи", "десенсибилиз"):
         assert term not in joined, (lang, term)
 
 
@@ -1084,21 +1102,24 @@ def test_flag_off_preserves_old_start_behavior(tmp_db, fake_bot, monkeypatch):
     assert any("Я не терапевт" in t for t in msg.rendered_texts())
 
 
-def test_mood_buttons_and_emotion_map_present_after_completion(tmp_db, fake_bot):
+def test_response_format_and_lower_menu_present_after_completion(
+        tmp_db, fake_bot, monkeypatch):
+    import bot
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
     uid = 4002
     _authorized(uid)
     _start(uid)
     _tap(uid, oc.CB_SKIP)
     cb = _tap(uid, oc.CB_START)
-    # The mood-entry keyboard has mood:N buttons + the emotion-map row.
-    datas = []
-    for kb in cb.message.keyboards():
-        for row in kb.inline_keyboard:
-            for b in row:
-                if b.callback_data:
-                    datas.append(b.callback_data)
-    assert any(d.startswith("mood:") for d in datas)
-    assert "emotion:map" in datas
+    selector, lower = cb.message.keyboards()
+    callbacks = [b.callback_data for row in selector.inline_keyboard for b in row]
+    assert callbacks == [
+        f"{bot._FMT_KB_VERSION}:format:text",
+        f"{bot._FMT_KB_VERSION}:format:voice",
+        f"{bot._FMT_KB_VERSION}:format:voice_and_concise_text",
+    ]
+    assert isinstance(lower, bot.ReplyKeyboardMarkup)
 
 
 def test_questionnaire_discuss_button_still_qm(tmp_db):

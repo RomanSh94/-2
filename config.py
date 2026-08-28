@@ -302,21 +302,25 @@ EMOTIONAL_REACTIONS_ENABLED = (
     in ("1", "true", "yes", "on")
 )
 
-# TTS configuration (not rollout flags -- inert while VOICE_REPLIES_ENABLED
-# is false). tts-1 is OpenAI's low-latency TTS model; opus is the format
-# Telegram voice messages actually want (see tts.py).
-TTS_MODEL              = os.getenv("TTS_MODEL", "tts-1")
-TTS_VOICE_RU           = os.getenv("TTS_VOICE_RU", "alloy")
-TTS_VOICE_EN           = os.getenv("TTS_VOICE_EN", "alloy")
-TTS_RESPONSE_FORMAT    = os.getenv("TTS_RESPONSE_FORMAT", "opus")
+# ElevenLabs TTS transport. Both gates must be true before any user text can
+# leave X20 for speech synthesis. The key is environment-only; the selected
+# voice is an opaque owner-approved ID with no invented public metadata.
+ELEVENLABS_TTS_ENABLED = (
+    os.getenv("ELEVENLABS_TTS_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+ELEVENLABS_API_KEY      = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE_ID     = "N8lIVPsFkvOoqev5Csxo"
+ELEVENLABS_MODEL_ID     = "eleven_multilingual_v2"
+ELEVENLABS_OUTPUT_FORMAT = "opus_48000_32"
 TTS_TIMEOUT_SECONDS    = int(os.getenv("TTS_TIMEOUT_SECONDS", "20"))
-TTS_MAX_INPUT_CHARS    = int(os.getenv("TTS_MAX_INPUT_CHARS", "600"))
+TTS_MAX_INPUT_CHARS    = int(os.getenv("TTS_MAX_INPUT_CHARS", "10000"))
 TTS_MAX_AUDIO_SECONDS  = int(os.getenv("TTS_MAX_AUDIO_SECONDS", "90"))
 
 # Reaction configuration (not rollout flags -- inert while
 # EMOTIONAL_REACTIONS_ENABLED is false).
 EMOTIONAL_REACTION_COOLDOWN_SECONDS = int(
-    os.getenv("EMOTIONAL_REACTION_COOLDOWN_SECONDS", "120"))
+    os.getenv("EMOTIONAL_REACTION_COOLDOWN_SECONDS", "60"))
 EMOTIONAL_REACTION_MIN_CONFIDENCE = float(
     os.getenv("EMOTIONAL_REACTION_MIN_CONFIDENCE", "0.6"))
 

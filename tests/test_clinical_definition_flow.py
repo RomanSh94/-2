@@ -427,9 +427,10 @@ def test_clinical_metadata_definition_hidden_from_self_observation_even_if_selfo
     assert not any("synthetic_ready_v1" in cd for cd in datas)
 
 
-def test_ordinary_synthetic_selfobs_definition_still_visible(flow, tmp_path):
+def test_ordinary_synthetic_selfobs_definition_without_manifest_provenance_hidden(
+        flow, tmp_path):
     flow["registry_dir"] = _selfobs_registry_dir(tmp_path)
     flow["registry"] = None
     msg = _press(bot.cb_questionnaire_category, 1, "q:c:self_observation")
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
-    assert any("ordinary_selfobs_v1" in cd for cd in datas)
+    assert not any("ordinary_selfobs_v1" in cd for cd in datas)

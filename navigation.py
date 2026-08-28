@@ -18,10 +18,10 @@ from crisis_protocol import get_hotline
 # q:l and all other entries to their existing hub callbacks.
 MENU_SECTIONS = [
     ("talk", "💬 Поговорить", "💬 Talk"),
-    ("tests", "🧪 Тесты и опросники", "🧪 Tests and questionnaires"),
+    ("tests", "🧠 Психологические тесты", "🧠 Psychological tests"),
     ("journals", "📝 Дневники", "📝 Diaries"),
     ("results", "📊 Мои результаты", "📊 My results"),
-    ("settings", "⚙️ Настройки ответа", "⚙️ Response settings"),
+    ("settings", "🎛 Как отвечать", "🎛 How to reply"),
     ("privacy", "🔒 Данные и приватность", "🔒 Data and privacy"),
     ("about", "ℹ️ О X20", "ℹ️ About X20"),
 ]
@@ -50,9 +50,9 @@ def talk_hub_text(lang: str = "ru") -> str:
 
 def response_settings_text(lang: str = "ru", *, available: bool = True) -> str:
     if lang == "ru":
-        return ("Как тебе удобнее получать ответы?" if available else
+        return ("Кстати, вот как я звучу 🎧\n\nКак тебе удобнее получать ответы?" if available else
                 "Настройки озвучивания сейчас выключены. Ответы будут приходить текстом.")
-    return ("How would you like to receive replies?" if available else
+    return ("By the way, this is how I sound 🎧\n\nHow would you like to receive replies?" if available else
             "Voice settings are currently off. Replies will arrive as text.")
 
 
@@ -118,16 +118,37 @@ def journals_hub_text(lang: str = "ru") -> str:
 def privacy_hub_text(lang: str = "ru") -> str:
     if lang == "ru":
         return (
-            "🔒 Приватность\n\n"
-            "📤 Экспорт всех данных → /privacy_export_all\n"
-            "🗑 Удаление всех данных → /privacy_delete_all\n"
-            "🧹 Забыть всё → /forget_all"
+            "🔒 Данные и приватность\n\n"
+            "Здесь можно посмотреть, какие данные сохраняются, получить их копию "
+            "или удалить данные аккаунта."
         )
     return (
-        "🔒 Privacy\n\n"
-        "📤 Export all data → /privacy_export_all\n"
-        "🗑 Delete all data → /privacy_delete_all\n"
-        "🧹 Forget everything → /forget_all"
+        "🔒 Data and privacy\n\n"
+        "Here you can see what data is stored, get a copy, or delete your account data."
+    )
+
+
+def privacy_stored_data_text(lang: str = "ru") -> str:
+    if lang == "ru":
+        return (
+            "ℹ️ Какие данные хранятся\n\n"
+            "В зависимости от того, какими функциями ты пользуешься, могут сохраняться:\n\n"
+            "• история разговоров и контекст;\n"
+            "• настройки и предпочтения;\n"
+            "• записи дневников;\n"
+            "• ответы и результаты психологических тестов;\n"
+            "• технические данные, необходимые для работы сервиса и обеспечения безопасности.\n\n"
+            "В этом разделе можно получить копию своих данных или удалить данные аккаунта."
+        )
+    return (
+        "ℹ️ What data is stored\n\n"
+        "Depending on the features you use, stored data may include:\n\n"
+        "• conversation history and context;\n"
+        "• settings and preferences;\n"
+        "• diary entries;\n"
+        "• questionnaire answers and results;\n"
+        "• technical data needed to operate and secure the service.\n\n"
+        "You can get a copy of your data or delete account data from this section."
     )
 
 

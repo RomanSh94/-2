@@ -520,3 +520,85 @@ def catalog_start_definition_id(item: dict, registry, manifest_document) -> str 
     except Exception:
         return None
     return None
+
+
+# Public-beta product categories are intentionally separate from the older
+# governance-research placement. A single canonical ready instrument may opt
+# into several product entry points through ``public_category_ids``; missing,
+# malformed, unknown, or duplicated values fail closed to no public entry.
+PUBLIC_BETA_CATEGORY_IDS = (
+    "depression",
+    "anxiety",
+    "stress_burnout",
+    "trauma_ptsd",
+    "self_esteem",
+    "adhd_attention",
+    "other",
+)
+_PUBLIC_BETA_CATEGORY_ID_SET = frozenset(PUBLIC_BETA_CATEGORY_IDS)
+_LEGACY_PUBLIC_CATEGORY_MAP = {
+    "depression_mood_energy": ("depression",),
+    "anxiety": ("anxiety",),
+    "stress": ("stress_burnout",),
+    "specialized": ("other",),
+}
+
+
+@dataclass(frozen=True)
+class AvailablePublicInstrument:
+    """A genuinely startable public catalog entity, never an info placeholder."""
+
+    instrument_id: str
+    title_ru: str
+    title_en: str
+    definition_id: str
+    category_ids: tuple[str, ...]
+
+
+def _public_beta_category_ids(item: dict) -> tuple[str, ...]:
+    explicit = item.get("public_category_ids")
+    if explicit is None:
+        return _LEGACY_PUBLIC_CATEGORY_MAP.get(item.get("catalog_category_id"), ())
+    if not isinstance(explicit, list) or not explicit:
+        return ()
+    if any(not isinstance(value, str) or value not in _PUBLIC_BETA_CATEGORY_ID_SET
+           for value in explicit):
+        return ()
+    if len(set(explicit)) != len(explicit):
+        return ()
+    return tuple(explicit)
+
+
+def available_public_instruments(document: dict, registry) -> tuple[AvailablePublicInstrument, ...]:
+    """Return only entries that pass every existing activation/start gate.
+
+    Blocked, information-only, hidden, missing-definition, malformed-category,
+    and linkage-mismatched entries are omitted. This function never creates a
+    session and never reads questionnaire wording.
+    """
+    available = []
+    for item in (document or {}).get("instruments", []):
+        if not is_public_catalog_visible(item):
+            continue
+        definition_id = catalog_start_definition_id(item, registry, document)
+        category_ids = _public_beta_category_ids(item)
+        if not definition_id or not category_ids:
+            continue
+        available.append(AvailablePublicInstrument(
+            instrument_id=item["instrument_id"],
+            title_ru=item.get("display_name_ru") or item.get("abbreviation") or item["instrument_id"],
+            title_en=item.get("display_name_en") or item.get("abbreviation") or item["instrument_id"],
+            definition_id=definition_id,
+            category_ids=category_ids,
+        ))
+    return tuple(available)
+
+
+def available_public_instruments_by_category(
+        document: dict, registry, category_id: str) -> tuple[AvailablePublicInstrument, ...]:
+    if category_id not in _PUBLIC_BETA_CATEGORY_ID_SET:
+        return ()
+    return tuple(
+        instrument for instrument in available_public_instruments(document, registry)
+        if category_id in instrument.category_ids
+    )

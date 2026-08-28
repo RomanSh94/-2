@@ -4335,18 +4335,19 @@ def test_stale_practhelp_yes_cannot_reopen_resolved_refinement(monkeypatch, tmp_
     assert reloaded.superseded_reason is None
 
 
-# §8 item 25 -- no ordinary conversational response receives an automatic
-# keyboard.
+# Public-beta lower menu remains available beside ordinary conversation while
+# the user can still type free text.
 @pytest.mark.progressive_ux
-def test_ordinary_conversational_reply_has_no_automatic_keyboard(monkeypatch, tmp_db):
+def test_ordinary_conversational_reply_has_persistent_lower_menu(monkeypatch, tmp_db):
     _full_pipeline_stub_set(monkeypatch, llm_reply="Расскажи мне об этом подробнее.")
     run(_seed_user(1))
     user = FakeUser(1)
     msg = FakeMessage(user, "Мне сегодня тяжело, хочу выговориться.")
     run(bot.pipeline(msg, msg.text, None, tg_user=user))
     assert msg.answers, "must still get an ordinary reply"
-    assert msg.answers[0][1].get("reply_markup") is None, \
-        "an ordinary conversational response must never carry an automatic keyboard"
+    markup = msg.answers[0][1].get("reply_markup")
+    assert isinstance(markup, bot.ReplyKeyboardMarkup)
+    assert markup.is_persistent is True and markup.resize_keyboard is True
 
 
 # EN-language coverage (the same code paths, driven with a persisted

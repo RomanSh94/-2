@@ -269,19 +269,20 @@ def _select_scenario(state: Dict, risk_cats: list, stage: str,
     risk-driven).
 
     `interaction_preference` (optional, current-turn only, never persisted):
-    "JUST_TALK" | "ADVICE_REQUEST" | "NONE". When the user has explicitly
+    "JUST_TALK" | "UNDERSTAND" | "ACTION" | "NONE". When the user has explicitly
     stated a preference THIS turn, the non-acute historical/state-threshold
     rules below are suppressed in favor of open_chat — but crisis and every
     mandatory acute-safety rule (ACUTE_DISTRESS stage, panic/dissociation,
     overwhelm) are never gated by this and always run unconditionally. Any
-    value other than the two recognized ones fails closed to "NONE" (no
+    value other than the three recognized ones fails closed to "NONE" (no
     suppression), so a malformed/unknown value can never bypass non-acute
     routing.
     """
     if "suicide" in risk_cats or "self_harm" in risk_cats:
         return "crisis"
 
-    explicit_interaction_preference = interaction_preference in {"JUST_TALK", "ADVICE_REQUEST"}
+    explicit_interaction_preference = interaction_preference in {
+        "JUST_TALK", "UNDERSTAND", "ACTION"}
 
     # §4 trajectory bias — applied before the state heuristics, but only for
     # non-acute stages (acute distress keeps its grounding/stabilization rules)

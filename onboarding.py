@@ -114,7 +114,7 @@ async def _send_new_card_or_none_if_forbidden(bot, chat_id, caption, keyboard, p
 async def send_or_edit_onboarding_card(bot, chat_id, step, lang, *, message_id=None,
                                        privacy_policy_url="",
                                        asset_reader=default_asset_reader,
-                                       keyboard=None):
+                                       keyboard=None, first_name=""):
     """Render onboarding `step` (localized `lang`) as one illustrated card in
     `chat_id`, addressed by (chat_id, message_id) instead of a live
     Message/CallbackQuery object.
@@ -159,7 +159,7 @@ async def send_or_edit_onboarding_card(bot, chat_id, step, lang, *, message_id=N
         corruption, and hiding it behind a blanket except would only turn a
         visible, retriable failure into a silent, invisible one.
     """
-    caption = oc.caption(step, lang, privacy_policy_url)
+    caption = oc.caption(step, lang, privacy_policy_url, first_name)
     keyboard = keyboard if keyboard is not None else build_keyboard(step, lang, privacy_policy_url)
     try:
         photo = asset_reader(step)

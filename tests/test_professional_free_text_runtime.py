@@ -1146,7 +1146,8 @@ def test_therapist_core_claims_once_precedes_professional_and_validates_once(
         calls["generation"] += 1
         assert kwargs["model"] == "gpt-core-compatible"
         assert kwargs["max_completion_tokens"] == 1200
-        assert kwargs["source_text"] == "Мне трудно понять, чего я хочу."
+        assert kwargs["source_text"] == "Я хочу понять, почему я так делаю."
+        assert kwargs["interaction_contract"] == "UNDERSTAND"
         return "Можно начать с конкретного эпизода, где эта неопределённость ощущалась сильнее."
 
     def fake_validate(candidate, source_text, risk, lang):
@@ -1156,7 +1157,7 @@ def test_therapist_core_claims_once_precedes_professional_and_validates_once(
     monkeypatch.setattr(bot, "generate_therapist_core_v1", fake_generate)
     monkeypatch.setattr(bot, "validate_response_with_context", fake_validate)
 
-    msg = FakeMessage(FakeUser(OWNER), "Мне трудно понять, чего я хочу.")
+    msg = FakeMessage(FakeUser(OWNER), "Я хочу понять, почему я так делаю.")
     run(bot.pipeline(msg, msg.text))
     assert calls == {"generation": 1, "validation": 1}
     assert len(msg.answers) == 1
@@ -1761,8 +1762,8 @@ def test_voice_transcript_reaches_professional_claim_point(tmp_db, monkeypatch):
 
     assert calls["n"] == 1
     assert calls["kwargs"]["source_text"] == "Голосовое сообщение о том, что мне тяжело."
-    # transcript echo + Professional reply
-    assert any(a[0] == SUCCESS_RESULT.reply_text for a in msg.answers)
+    assert [a[0] for a in msg.answers] == [SUCCESS_RESULT.reply_text]
+    assert not any("Голосовое сообщение" in a[0] for a in msg.answers)
 
 
 def test_entry_triage_button_action_not_claimed_as_free_text():
@@ -1870,6 +1871,8 @@ def test_professional_text_mode_delivered_and_persisted_exact(tmp_db, monkeypatc
 def test_professional_stored_voice_mode_tts_input_and_persisted_exact(tmp_db, monkeypatch):
     run(_seed_user(OWNER))
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "synthetic-test-key")
     run(database.set_response_preference(OWNER, response_format="voice"))
     _stub_legacy_machinery(monkeypatch)
     _stub_professional_eligible(monkeypatch, True)
@@ -1892,6 +1895,8 @@ def test_professional_stored_voice_mode_tts_input_and_persisted_exact(tmp_db, mo
 def test_professional_stored_voice_and_concise_text_mode_all_exact(tmp_db, monkeypatch):
     run(_seed_user(OWNER))
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "synthetic-test-key")
     run(database.set_response_preference(OWNER, response_format="voice_and_concise_text"))
     _stub_legacy_machinery(monkeypatch)
     _stub_professional_eligible(monkeypatch, True)
@@ -1908,7 +1913,10 @@ def test_professional_stored_voice_and_concise_text_mode_all_exact(tmp_db, monke
     run(bot.pipeline(msg, msg.text))
 
     assert msg.answers[0][0] == LONG_REPLY_TEXT  # visible text -- NOT a concise rewrite
-    assert tts_calls == [LONG_REPLY_TEXT]
+    # Public-beta contract: voice_and_concise_text delivers full text with an
+    # on-demand Listen button -- it must never auto-send a duplicate voice
+    # message every turn.
+    assert tts_calls == []
     assert run(_read_persisted_assistant_content(OWNER)) == LONG_REPLY_TEXT
 
 
@@ -1919,6 +1927,8 @@ def test_professional_stored_concise_preference_does_not_shorten(tmp_db, monkeyp
     preserve_exact_text=True call."""
     run(database.upsert_user(OWNER, "u", "U"))
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "synthetic-test-key")
     run(database.set_response_preference(
         OWNER, response_format="voice", response_length="concise"))
 
@@ -1938,6 +1948,8 @@ def test_professional_one_shot_concise_does_not_shorten(tmp_db, monkeypatch):
     shorten a preserve_exact_text=True call."""
     run(database.upsert_user(OWNER, "u", "U"))
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "synthetic-test-key")
     run(database.set_response_preference(OWNER, response_format="voice"))
 
     tts_calls = []
@@ -1960,6 +1972,8 @@ def test_professional_mixed_voice_command_still_selects_voice_transport(tmp_db, 
     is what gets voiced."""
     run(_seed_user(OWNER))
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "synthetic-test-key")
     _stub_legacy_machinery(monkeypatch)
     _stub_professional_eligible(monkeypatch, True)
     _stub_history(monkeypatch, rows=())
