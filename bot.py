@@ -29,7 +29,8 @@ for _stream in (sys.stdout, sys.stderr):
 from html import escape as _he
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton,
+    Message, ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, FSInputFile, ReactionTypeEmoji, BotCommand,
 )
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
@@ -767,32 +768,43 @@ _LEGACY_KB_MAX_TRACKED = 10_000
 _legacy_kb_cleared: set[int] = set()
 
 
-async def _answer_evicting_legacy_kb(message: Message, uid: int, text: str) -> Message:
-    """Send one ordinary reply, evicting the legacy reply keyboard the first
-    time we successfully reply to this user.
+_LOWER_MENU = {
+    "ru": (
+        ("🧠 Психологические тесты", "📊 Мои результаты"),
+        ("📝 Дневники", "🎛 Как отвечать"),
+        ("🔒 Данные и приватность",),
+    ),
+    "en": (
+        ("🧠 Psychological tests", "📊 My results"),
+        ("📝 Diaries", "🎛 How to reply"),
+        ("🔒 Data and privacy",),
+    ),
+}
 
-    Eviction is strictly best-effort and must never cost the user their
-    answer: if the send carrying the removal fails, the answer is retried
-    plain and the uid stays UNMARKED so the next reply tries again. The uid
-    is marked only AFTER a confirmed successful send -- marking first would
-    make a failed eviction permanent for that user."""
-    if uid in _legacy_kb_cleared:
-        return await message.answer(text)
-    try:
-        sent = await message.answer(text, reply_markup=ReplyKeyboardRemove())
-    except Exception:
-        # The removal never got through, so nothing was delivered either --
-        # retry the plain answer (not a duplicate) and leave uid unmarked.
-        return await message.answer(text)
+
+def persistent_lower_menu_kb(lang: str) -> ReplyKeyboardMarkup:
+    rows = _LOWER_MENU["ru" if lang == "ru" else "en"]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=label) for label in row] for row in rows],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder=("Напиши сообщение…" if lang == "ru" else "Type a message…"),
+    )
+
+
+async def _answer_evicting_legacy_kb(
+        message: Message, uid: int, text: str, lang: str) -> Message:
+    """Replace any legacy keyboard with the permanent public-beta lower menu."""
     if len(_legacy_kb_cleared) >= _LEGACY_KB_MAX_TRACKED:
         _legacy_kb_cleared.clear()
     _legacy_kb_cleared.add(uid)
-    return sent
+    return await message.answer(text, reply_markup=persistent_lower_menu_kb(lang))
 
 
 async def _voice_ux_enabled_for(uid: int) -> bool:
     return (
         config.VOICE_REPLIES_ENABLED
+        and config.ELEVENLABS_TTS_ENABLED
         and await access_control.has_full_access(uid)
     )
 
@@ -806,22 +818,41 @@ async def _reactions_enabled_for(uid: int) -> bool:
 
 def format_selector_kb(lang: str) -> InlineKeyboardMarkup:
     ru = [
-        [InlineKeyboardButton(text="📝 Текстом", callback_data=f"{_FMT_KB_VERSION}:format:text")],
-        [InlineKeyboardButton(text="🎙 Голосом", callback_data=f"{_FMT_KB_VERSION}:format:voice")],
-        [InlineKeyboardButton(text="🎙 Голосом + короткий текст",
+        [InlineKeyboardButton(text="💬 Текстом", callback_data=f"{_FMT_KB_VERSION}:format:text"),
+         InlineKeyboardButton(text="🎙 Голосом", callback_data=f"{_FMT_KB_VERSION}:format:voice")],
+        [InlineKeyboardButton(text="🎧 Текст + голос",
                               callback_data=f"{_FMT_KB_VERSION}:format:voice_and_concise_text")],
-        [InlineKeyboardButton(text="Кратко", callback_data=f"{_FMT_KB_VERSION}:length:concise")],
-        [InlineKeyboardButton(text="Обычно", callback_data=f"{_FMT_KB_VERSION}:length:normal")],
     ]
     en = [
-        [InlineKeyboardButton(text="📝 Text", callback_data=f"{_FMT_KB_VERSION}:format:text")],
-        [InlineKeyboardButton(text="🎙 Voice", callback_data=f"{_FMT_KB_VERSION}:format:voice")],
-        [InlineKeyboardButton(text="🎙 Voice + short text",
+        [InlineKeyboardButton(text="💬 Text", callback_data=f"{_FMT_KB_VERSION}:format:text"),
+         InlineKeyboardButton(text="🎙 Voice", callback_data=f"{_FMT_KB_VERSION}:format:voice")],
+        [InlineKeyboardButton(text="🎧 Text + voice",
                               callback_data=f"{_FMT_KB_VERSION}:format:voice_and_concise_text")],
-        [InlineKeyboardButton(text="Brief", callback_data=f"{_FMT_KB_VERSION}:length:concise")],
-        [InlineKeyboardButton(text="Normal", callback_data=f"{_FMT_KB_VERSION}:length:normal")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=(ru if lang == "ru" else en))
+
+
+def _response_format_setup_text(lang: str) -> str:
+    if lang == "ru":
+        return "Кстати, вот как я звучу 🎧\n\nКак тебе удобнее получать ответы?"
+    return "By the way, this is how I sound 🎧\n\nHow would you like to receive replies?"
+
+
+async def _send_persistent_lower_menu(target, lang: str) -> None:
+    await target.answer(
+        "Основные разделы всегда доступны ниже." if lang == "ru"
+        else "The main sections are always available below.",
+        reply_markup=persistent_lower_menu_kb(lang),
+    )
+
+
+async def _send_response_format_setup(target, uid: int, lang: str) -> None:
+    if await _voice_ux_enabled_for(uid):
+        await target.answer(
+            _response_format_setup_text(lang),
+            reply_markup=format_selector_kb(lang),
+        )
+    await _send_persistent_lower_menu(target, lang)
 
 
 def _listen_kb(uid: int, lang: str) -> InlineKeyboardMarkup:
@@ -924,46 +955,32 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
     other existing caller already ignored the previous None return, so this
     is additive, not a breaking change.
 
-    preserve_exact_text (PROFESSIONAL FREE-TEXT RUNTIME V1): default False,
-    so every existing caller's behavior is byte-for-byte unchanged -- with
-    it False, `not preserve_exact_text and (...)` reduces to exactly the
-    original `concise` expression, and the voice_and_concise_text `visible`
-    line reduces to exactly the original _safe_concise_version(...) call.
-    When True: the text/voice FORMAT choice still follows the stored
-    preference or one_shot_voice exactly as always (transport is
-    unaffected), but neither the stored response_length="concise"
-    preference nor one_shot_concise may shorten the CONTENT -- no
-    _safe_concise_version call is ever made, and voice_and_concise_text's
-    visible text is the exact `answer`, not a concise rewrite. This exists
-    because Professional Free-Text Runtime V1 must never let this
-    presentation layer create a second, ungoverned psychological wording
-    after Acceptance -- the persisted ASSISTANT_DELIVERED content must
-    always equal what the user actually received, for every format."""
+    ``preserve_exact_text`` remains accepted for call-site compatibility.
+    Public-beta delivery no longer shortens an already-approved answer in the
+    presentation layer: both full-text modes and voice synthesis receive the
+    exact complete answer."""
     is_private = getattr(message.chat, "type", "private") == "private"
     if reply_markup is not None:
         return await message.answer(answer, reply_markup=reply_markup)
     if not await _voice_ux_enabled_for(uid) or not is_private:
-        return await _answer_evicting_legacy_kb(message, uid, answer)
+        return await _answer_evicting_legacy_kb(message, uid, answer, lang)
 
     prefs = await get_response_preferences(uid)
     fmt = "voice" if one_shot_voice else prefs["response_format"]
-    concise = not preserve_exact_text and (one_shot_concise or prefs["response_length"] == "concise")
-
     if fmt == "text":
-        return await message.answer(answer, reply_markup=_listen_kb(uid, lang))
+        return await message.answer(answer, reply_markup=persistent_lower_menu_kb(lang))
 
     if fmt == "voice_and_concise_text":
-        visible = answer if preserve_exact_text else _safe_concise_version(answer, lang)
-        voice_text = visible if concise else answer
-        sent = await message.answer(visible)
-        await _synthesize_and_send_voice(message, uid, voice_text, lang)
-        return sent
+        # Historical DB value retained for migration compatibility; the
+        # public-beta meaning is now full text + an on-demand Listen button.
+        # Never auto-send a duplicate voice message in this mode.
+        return await message.answer(answer, reply_markup=_listen_kb(uid, lang))
 
     # fmt == "voice"
-    voice_text = _safe_concise_version(answer, lang) if concise else answer
-    ok = await _synthesize_and_send_voice(message, uid, voice_text, lang)
+    ok = await _synthesize_and_send_voice(message, uid, answer, lang)
     if not ok:
-        return await message.answer(answer)  # TTS failed -- never silent; full text stands in
+        return await message.answer(
+            answer, reply_markup=persistent_lower_menu_kb(lang))
     return None  # delivered as a voice message -- no text Message object to return
 
 
@@ -1790,7 +1807,8 @@ def _professional_technical_fallback_text(lang: str) -> str:
 
 async def _run_therapist_core_v1_and_deliver(
         message: Message, uid: int, current_row_id: int, user_text: str,
-        risk: dict, lang: str, turn_gen: int, cid: str,
+        risk: dict, lang: str, interaction_contract: str,
+        turn_gen: int, cid: str,
         reaction_category: ReactionCategory, reaction_confidence: float,
         one_shot_voice: bool = False, one_shot_concise: bool = False) -> None:
     """Final lifecycle for a Core-owned turn: one call, one safety decision."""
@@ -1806,6 +1824,7 @@ async def _run_therapist_core_v1_and_deliver(
             conversation_context=context,
             risk_result=risk,
             lang=lang,
+            interaction_contract=interaction_contract,
             max_completion_tokens=config.THERAPIST_CORE_V1_MAX_COMPLETION_TOKENS,
         )
         accepted, reason = validate_response_with_context(candidate, user_text, risk, lang)
@@ -2194,7 +2213,11 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # circuited with a neutral notice, never silently sent to the
         # therapeutic LLM just because chat.type != "private" made detection
         # itself unavailable (the earlier, narrower gate did exactly that).
-        fmt_cmd = parse_format_command(user_text, lang) if config.VOICE_REPLIES_ENABLED else None
+        fmt_cmd = (
+            parse_format_command(user_text, lang)
+            if config.VOICE_REPLIES_ENABLED and config.ELEVENLABS_TTS_ENABLED
+            else None
+        )
         if fmt_cmd:
             pure = is_pure_format_command(user_text, lang)
             if pure and not voice_ux_active:
@@ -2282,6 +2305,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         claim_token = None
         core_reaction_category = ReactionCategory.NONE
         core_reaction_confidence = 0.0
+        interaction_contract = detect_interaction_preference(user_text, lang)
         if await access_control.therapist_core_v1_allowed_for(uid):
             current_row_id = await save_message(
                 uid, "user", user_text, "therapist_core_v1", lang,
@@ -2312,10 +2336,9 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
 
             # 9. Select scenario
             variant = get_variant(uid)
-            interaction_pref = detect_interaction_preference(user_text, lang)
             scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
                                        variant, trajectory=trajectory,
-                                       interaction_preference=interaction_pref)
+                                       interaction_preference=interaction_contract)
 
             # 9.4 First-turn eligibility (spec item D) -- computed only now that
             # scenario/stage/capacity/risk are all known; no lexical/topic
@@ -2404,7 +2427,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # _run_professional_free_text_and_deliver's own docstring).
     if psychological_owner == "therapist_core_v1":
         await _run_therapist_core_v1_and_deliver(
-            message, uid, current_row_id, user_text, risk, lang, _turn_gen, _cid,
+            message, uid, current_row_id, user_text, risk, lang,
+            interaction_contract, _turn_gen, _cid,
             core_reaction_category, core_reaction_confidence,
             one_shot_voice, one_shot_concise)
         return
@@ -4171,8 +4195,7 @@ async def cmd_format(message: Message):
             else "This setting is only available in a private chat with me.")
         return
     await message.answer(
-        "Как тебе удобнее получать ответы?" if lang == "ru"
-        else "How would you like to receive replies?",
+        _response_format_setup_text(lang),
         reply_markup=format_selector_kb(lang))
 
 
@@ -4203,8 +4226,11 @@ async def cb_format_select(callback: CallbackQuery):
         await callback.answer()
         return
     lang = await get_user_language(uid)
-    await callback.message.answer(
-        "Сохранено ✅" if lang == "ru" else "Saved ✅")
+    await _edit_or_answer(callback.message)(
+        ("Сохранено ✅\n\n" if lang == "ru" else "Saved ✅\n\n")
+        + _response_format_setup_text(lang),
+        reply_markup=format_selector_kb(lang),
+    )
     await callback.answer()
 
 
@@ -4263,7 +4289,8 @@ async def cb_listen(callback: CallbackQuery):
 # ────────────────────────────────────────────────────────────────────────────
 
 async def _render_onboarding_card(uid: int, chat_id: int, step: int, lang: str, *,
-                                  message_id: int | None) -> None:
+                                  message_id: int | None,
+                                  first_name: str = "") -> None:
     """Render+persist ONE onboarding card (spec items G/H): delivers `step` by
     editing `message_id` if given (falls back to a fresh card on
     TelegramBadRequest — see onboarding.send_or_edit_onboarding_card), then
@@ -4277,7 +4304,8 @@ async def _render_onboarding_card(uid: int, chat_id: int, step: int, lang: str, 
     delivering the same already-decided step by editing the same old card."""
     ref = await onboarding.send_or_edit_onboarding_card(
         bot, chat_id, step, lang, message_id=message_id,
-        privacy_policy_url=config.PRIVACY_POLICY_URL)
+        privacy_policy_url=config.PRIVACY_POLICY_URL,
+        first_name=first_name)
     if ref is not None:
         await set_onboarding_card_ref(uid, ONBOARDING_VERSION, step, ref[0], ref[1])
 
@@ -4777,7 +4805,8 @@ async def cmd_start(message: Message):
                     # instead of always sending a fresh one.
                     await _render_onboarding_card(
                         uid, message.chat.id, active_state["current_step"], lang,
-                        message_id=active_state.get("card_message_id"))
+                        message_id=active_state.get("card_message_id"),
+                        first_name=message.from_user.first_name or "")
                     return
                 # An ACTIVE row for an OLDER version means a deployment bumped
                 # ONBOARDING_VERSION (a mandatory update) while this user's
@@ -4790,7 +4819,8 @@ async def cmd_start(message: Message):
                 await supersede_onboarding_version(uid, active_state["onboarding_version"])
             await start_or_get_onboarding(uid, ONBOARDING_VERSION)
             await _render_onboarding_card(
-                uid, message.chat.id, FIRST_STEP, lang, message_id=None)
+                uid, message.chat.id, FIRST_STEP, lang, message_id=None,
+                first_name=message.from_user.first_name or "")
             return
 
         if requirement == onboarding_content.PRIVACY_NOTICE_ONLY:
@@ -4822,6 +4852,7 @@ async def cmd_start(message: Message):
         local_hour = (datetime.now(timezone.utc).hour + effective_tz(tz_off, tz_set, ulang)) % 24
         text = pick_greeting(False, local_hour, lang)
     await _send_mood_entry(message, uid, lang, text)
+    await _send_persistent_lower_menu(message, lang)
 
 
 def _mood_entry_keyboard(lang: str, buttons: list) -> InlineKeyboardMarkup:
@@ -5118,10 +5149,10 @@ async def cb_onboarding(callback: CallbackQuery):
                                                 reply_markup=None)
         except TelegramBadRequest:
             pass
-        # Open the existing mood-selection entry (first-time greeting text). No
-        # therapeutic response is generated until the user chooses/writes.
-        text, _ = get_onboarding(lang)
-        await _send_mood_entry(callback.message, uid, lang, text)
+        # Public-beta setup is optional: the user may ignore the selector and
+        # type immediately; onboarding is already complete and text remains
+        # the persisted default until a format callback succeeds.
+        await _send_response_format_setup(callback.message, uid, lang)
         return
 
     if data.startswith(onboarding_content.CB_PREFIX + "next:"):
@@ -5240,48 +5271,53 @@ async def _privacy_delete_preview_text(uid: int, lang: str) -> str:
     not a static category list. No raw content, only counts/policy/reason."""
     preview = await preview_delete_all_personal_data(uid)
     to_delete = sum(v["row_count"] for v in preview.values() if v["policy"] != "RETAIN")
-    retained = [(t, v["row_count"]) for t, v in preview.items() if v["policy"] == "RETAIN"]
-    retained_names = ", ".join(t for t, _ in retained)
-    retained_rows = sum(n for _, n in retained)
+    retained_rows = sum(v["row_count"] for v in preview.values()
+                        if v["policy"] == "RETAIN")
     if lang == "ru":
-        lines = [
-            f"Будет удалено/анонимизировано записей: {to_delete} "
-            "(переписка, профиль, дневники, журнал влияния и др.)."]
-        if retained_rows:
-            lines.append(
-                f"\nЗаписи безопасности ({retained_names}): {retained_rows} шт. "
-                "СОХРАНЯЮТСЯ — это требование политики безопасности/аудита "
-                "кризисных событий, а не сбой удаления.")
-        lines.append("\nПродолжить?")
-        return "\n".join(lines)
-    lines = [
-        f"Rows to be deleted/anonymized: {to_delete} "
-        "(messages, profile, journals, influence trace, etc.)."]
-    if retained_rows:
-        lines.append(
-            f"\nSafety-audit records ({retained_names}): {retained_rows} row(s) are "
-            "RETAINED by policy — that's not a deletion failure.")
-    lines.append("\nContinue?")
-    return "\n".join(lines)
+        return (
+            f"Предварительный просмотр: будет удалено или обезличено записей — {to_delete}; "
+            f"отдельно сохраняемых записей безопасности — {retained_rows}.\n\n"
+            "🗑 Удалить данные аккаунта?\n\n"
+            "Будут удалены данные, которые можно удалить из аккаунта: история разговоров, "
+            "профиль, дневники, настройки, ответы и результаты тестов и другие связанные данные.\n\n"
+            "Некоторые записи, связанные с безопасностью и критическими ситуациями, не "
+            "удаляются этой операцией и хранятся отдельно в соответствии с правилами "
+            "хранения данных.\n\n"
+            "Это действие нельзя отменить."
+        )
+    return (
+        f"Preview: {to_delete} record(s) will be deleted or anonymized; "
+        f"{retained_rows} safety record(s) are retained separately.\n\n"
+        "🗑 Delete account data?\n\n"
+        "Data eligible for deletion will be removed, including conversation history, profile, "
+        "diaries, settings, questionnaire answers and results, and other related data.\n\n"
+        "Some safety- and crisis-related records are not deleted by this operation and are "
+        "stored separately under the applicable retention rules.\n\n"
+        "This action cannot be undone."
+    )
 
 
 def _privacy_delete_done_text(lang: str) -> str:
-    retained = ", ".join(_privacy_retained_tables())
     if lang == "ru":
         return (
-            "Готово. Личные данные удалены согласно политике конфиденциальности.\n"
-            f"Записи безопасности ({retained}) сохранены — это требование политики "
-            "безопасности, а не сбой удаления.")
+            "Данные аккаунта удалены\n\n"
+            "Данные, подлежащие удалению, были удалены или обезличены.\n\n"
+            "Некоторые записи, связанные с безопасностью и критическими ситуациями, "
+            "не удаляются этой операцией и могут сохраняться в соответствии с правилами "
+            "хранения данных."
+        )
     return (
-        "Done. Personal data deleted per the privacy policy.\n"
-        f"Safety-audit records ({retained}) are retained by policy — not a deletion "
-        "failure.")
+        "Account data deleted\n\n"
+        "Data eligible for deletion was deleted or anonymized.\n\n"
+        "Some safety- and crisis-related records are not deleted by this operation and may "
+        "be retained under the applicable retention rules."
+    )
 
 
 def _privacy_delete_kb(prefix: str, lang: str, uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text=("🗑 Да, стереть всё" if lang == "ru" else "🗑 Yes, erase everything"),
+            text=("🗑 Да, удалить" if lang == "ru" else "🗑 Yes, delete"),
             callback_data=f"{prefix}:yes:{uid}"),
         InlineKeyboardButton(
             text=("Отмена" if lang == "ru" else "Cancel"),
@@ -5311,10 +5347,14 @@ async def _handle_privacy_delete_callback(callback: CallbackQuery) -> None:
     if action == "yes":
         scoped_access.assert_can_read_user_data(uid, uid, "privacy_delete")
         await delete_all_personal_data(uid)
-        msg = _privacy_delete_done_text(lang)
+        await callback.message.answer(_privacy_delete_done_text(lang))
+    elif action == "no":
+        await _edit_or_answer(callback.message)(
+            navigation.privacy_hub_text(lang),
+            reply_markup=_privacy_hub_keyboard(lang))
     else:
-        msg = "Отменено." if lang == "ru" else "Cancelled."
-    await callback.message.answer(msg)
+        await callback.answer()
+        return
     await callback.answer()
 
 
@@ -5343,29 +5383,36 @@ async def cmd_privacy_export_all(message: Message):
     they currently have product access. No target-uid argument exists; the
     scoped_access call below is requester==target by construction, kept for a
     single explicit/auditable enforcement point."""
-    import json, io
-    from aiogram.types import BufferedInputFile
     uid = message.from_user.id
     scoped_access.assert_can_read_user_data(uid, uid, "privacy_export")
     lang = await get_user_language(uid)
+    await _send_privacy_export(message, uid, lang)
+
+
+async def _send_privacy_export(message: Message, uid: int, lang: str) -> None:
+    """One authoritative export delivery used by command and privacy UI."""
+    import json, io
+    from aiogram.types import BufferedInputFile
     data = await export_all_personal_data(uid)
     if not any(data.values()):
         await message.answer(
             "Персональных данных пока нет." if lang == "ru" else "No personal data yet.")
         return
-    retained = ", ".join(_privacy_retained_tables())
     note = (
-        f"\n\nПримечание: записи безопасности ({retained}) включены в этот экспорт, "
-        "но сохраняются по политике безопасности и НЕ удаляются командой "
-        "/privacy_delete_all или /forget_all." if lang == "ru" else
-        f"\n\nNote: safety-audit records ({retained}) are included in this export but "
-        "are RETAINED by policy — they are NOT removed by /privacy_delete_all or "
-        "/forget_all.")
+        "\n\nНекоторые записи, связанные с безопасностью и критическими ситуациями, "
+        "могут храниться отдельно по правилам хранения данных." if lang == "ru" else
+        "\n\nSome safety- and crisis-related records may be retained separately under "
+        "the applicable retention rules.")
+    await message.answer(
+        "📥 Копия твоих данных готова\n\nВ файле собраны данные, связанные с твоим "
+        "аккаунтом и использованием сервиса." if lang == "ru" else
+        "📥 Your data copy is ready\n\nThe file contains data associated with your "
+        "account and use of the service.")
     buf = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
     await message.answer_document(
         BufferedInputFile(buf.getvalue(), filename="x20_privacy_export.json"),
-        caption=("Полный экспорт твоих данных (JSON)." if lang == "ru" else
-                 "Full export of your data (JSON).") + note)
+        caption=("Копия данных аккаунта (JSON)." if lang == "ru" else
+                 "Account data copy (JSON).") + note)
 
 
 @dp.message(Command("privacy_delete_all"))
@@ -5707,8 +5754,11 @@ async def cbt_step(message: Message, state: FSMContext):
 # ── Epic 8: weekly report (deterministic), settings, GDPR ─────────────────────
 
 @dp.message(Command("report"))
-async def cmd_report(message: Message, state: FSMContext):
-    uid = message.from_user.id
+async def cmd_report(message: Message, state: FSMContext, tg_user=None):
+    # tg_user: when reached via a callback (cb_jhub) message.from_user is the
+    # BOT -- the real user must be passed explicitly (same tg_user contract
+    # as cmd_emotion/cmd_cbt/cmd_journal_settings).
+    uid = (tg_user or message.from_user).id
     if not await ensure_full_access_or_closed_test(message, uid):
         return
     lang = await get_user_language(uid)
@@ -5742,9 +5792,10 @@ async def cb_jhub(callback: CallbackQuery, state: FSMContext):
     elif action == "cbt":
         await cmd_cbt(callback.message, state, tg_user=callback.from_user)
     elif action == "report":
-        await cmd_report(callback.message, state)
+        await cmd_report(callback.message, state, tg_user=callback.from_user)
     elif action == "settings":
-        await cmd_journal_settings(callback.message, state)
+        await cmd_journal_settings(callback.message, state, tg_user=callback.from_user,
+                                   send=_edit_or_answer(callback.message))
     elif action == "crisis":
         lang = await get_user_language(callback.from_user.id)
         # Legacy manual-crisis screen (no staged event → eid=None).
@@ -5754,8 +5805,14 @@ async def cb_jhub(callback: CallbackQuery, state: FSMContext):
 
 
 @dp.message(Command("journal_settings"))
-async def cmd_journal_settings(message: Message, state: FSMContext):
-    uid = message.from_user.id
+async def cmd_journal_settings(message: Message, state: FSMContext, tg_user=None, send=None):
+    """`tg_user`/`send`: when reached via a callback (cb_jhub / cb_jset)
+    message.from_user is the BOT -- the real user must be passed explicitly
+    (same tg_user contract as cmd_emotion/cmd_cbt) -- and the existing
+    navigation card must be edited in place rather than appended to. A plain
+    /journal_settings command entry has no existing card to edit, so both
+    default to the direct-message behavior unchanged."""
+    uid = (tg_user or message.from_user).id
     if not await ensure_full_access_or_closed_test(message, uid):
         return
     lang = await get_user_language(uid)
@@ -5767,7 +5824,7 @@ async def cmd_journal_settings(message: Message, state: FSMContext):
         [InlineKeyboardButton(text=f"{e} Вечер ({s['evening_hour']}:00)", callback_data="jset:evening")],
         [InlineKeyboardButton(text="🌍 Часовой пояс", callback_data="jset:tz")],
     ])
-    await message.answer(
+    await (send or message.answer)(
         ("Напоминания приходят в твоём местном времени. По умолчанию выключены — "
          "включай что нужно. Это не обязаловка, выключить можно одной кнопкой."
          if lang == "ru" else
@@ -5786,10 +5843,11 @@ async def cb_jset(callback: CallbackQuery, state: FSMContext):
         key = f"{what}_enabled"
         await set_journal_settings(uid, **{key: 0 if s[key] else 1})
         await callback.answer("Готово")
-        await cmd_journal_settings(callback.message, state)
+        await cmd_journal_settings(callback.message, state, tg_user=callback.from_user,
+                                   send=_edit_or_answer(callback.message))
     elif what == "tz":
-        await callback.message.answer("Выбери свой часовой пояс:",
-                                      reply_markup=tz_picker_keyboard())
+        await _edit_or_answer(callback.message)(
+            "Выбери свой часовой пояс:", reply_markup=tz_picker_keyboard())
         await callback.answer()
 
 
@@ -5813,7 +5871,7 @@ async def cb_jtz(callback: CallbackQuery):
     offset = int(callback.data.split(":")[1])
     await set_tz_offset(callback.from_user.id, offset)
     await callback.answer("Часовой пояс сохранён")
-    await callback.message.answer(f"Ок, твой пояс: UTC{offset:+d}.")
+    await _edit_or_answer(callback.message)(f"Ок, твой пояс: UTC{offset:+d}.")
 
 
 @dp.callback_query(F.data.startswith("checkin:"))
@@ -5907,6 +5965,53 @@ def _load_registry_fresh() -> questionnaires.Registry:
     return questionnaires.load_registry()
 
 
+async def _available_questionnaire_catalog(uid: int) -> dict[str, list[dict]]:
+    """Build the per-user public catalog from fresh, executable evidence.
+
+    Generic instruments must pass the existing manifest + definition linkage
+    gate. DASS-21 retains its pre-existing stress-only discovery rule and adds
+    a fresh definition/startability check so a missing private file never
+    renders a dead button.
+    """
+    catalog = {key: [] for key, _, _ in questionnaire_ux.CATALOG_CATEGORIES}
+    document = _load_catalog_document()
+    registry = _load_registry_fresh()
+
+    if document is not None:
+        for instrument in clinical_instrument_catalog.available_public_instruments(
+                document, registry):
+            entry = {
+                "instrument_id": instrument.instrument_id,
+                "title_ru": instrument.title_ru,
+                "title_en": instrument.title_en,
+                "definition_id": instrument.definition_id,
+            }
+            for category_id in instrument.category_ids:
+                catalog[category_id].append(entry)
+
+    # Preserve, but do not broaden, the existing DASS discovery contract: one
+    # entry under stress only, after the same per-user authorization plus the
+    # private-definition/combined-start gates.
+    if (document is not None
+            and (config.DASS21_INVITED_USERS_ENABLED
+                 or access_control.DEPLOYMENT_MODE == "public")):
+        decision = await dass21_access.authorize_dass21_user(uid)
+        qid = dass21_runtime.DASS21_DEFINITION_ID
+        try:
+            dass_startable = decision.allowed and registry.combined_can_start(qid, document)
+        except Exception:
+            dass_startable = False
+        if dass_startable:
+            catalog["stress_burnout"].append({
+                "instrument_id": "dass",
+                "title_ru": "DASS-21 — депрессия, тревога, стресс",
+                "title_en": "DASS-21 — depression, anxiety, stress",
+                "definition_id": qid,
+            })
+
+    return catalog
+
+
 # Telegram message text hard limit is 4096 chars; stay safely below it.
 _QUESTIONNAIRE_CARD_MAXLEN = 3900
 _COMPACT_BUTTON_MAXLEN = 16
@@ -5969,33 +6074,24 @@ def _questionnaire_item_keyboard(definition: dict, session_id: int, step: int, i
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _questionnaire_list_keyboard(lang: str) -> InlineKeyboardMarkup:
-    # Professional catalog root: 6 categories, one button per row, then a
-    # back-to-menu row. Category ids are short (well under 64 bytes).
+def _questionnaire_list_keyboard(lang: str, catalog: dict[str, list]) -> InlineKeyboardMarkup:
+    # Render only categories that currently contain at least one fully
+    # authorized, startable entity. Empty roadmap categories never become
+    # fake/dead buttons.
     rows = [[InlineKeyboardButton(text=questionnaire_ux.catalog_category_label(key, lang),
                                   callback_data=f"q:c:{key}")]
-            for key, _, _ in questionnaire_ux.CATALOG_CATEGORIES]
-    rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+            for key, _, _ in questionnaire_ux.CATALOG_CATEGORIES
+            if catalog.get(key)]
+    rows.append([InlineKeyboardButton(text=("🏠 В начало" if lang == "ru" else "🏠 Home"),
                                       callback_data="menu:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _questionnaire_category_keyboard(category: str, definitions: list, lang: str) -> InlineKeyboardMarkup:
-    # self_observation: synthetic registry demos -> real detail/start flow.
-    rows = [[InlineKeyboardButton(text=d["title"], callback_data=f"q:d:{d['id']}")]
-            for d in definitions]
-    rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
-                                      callback_data="q:l")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _catalog_manifest_category_keyboard(instruments, lang: str) -> InlineKeyboardMarkup:
-    # Manifest categories 1-4: each instrument is an INFO entry (q:i:<id>),
-    # never a start path. One button per row, then back to the catalog root.
+def _questionnaire_category_keyboard(entries: list[dict], lang: str) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
-                text=(ci.title_ru if lang == "ru" else ci.title_en) or ci.abbreviation,
-                callback_data=f"q:i:{ci.instrument_id}")]
-            for ci in instruments]
+                text=entry["title_ru"] if lang == "ru" else entry["title_en"],
+                callback_data=f"q:d:{entry['definition_id']}")]
+            for entry in entries]
     rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
                                       callback_data="q:l")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -6369,7 +6465,10 @@ async def cmd_questionnaire(message: Message):
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(message, uid, lang):
         return
-    await message.answer(questionnaire_ux.list_text(lang), reply_markup=_questionnaire_list_keyboard(lang))
+    catalog = await _available_questionnaire_catalog(uid)
+    await message.answer(
+        questionnaire_ux.list_text(lang),
+        reply_markup=_questionnaire_list_keyboard(lang, catalog))
 
 
 @dp.callback_query(F.data == "q:l")
@@ -6378,7 +6477,10 @@ async def cb_questionnaire_list(callback: CallbackQuery):
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(callback, uid, lang):
         return
-    await callback.message.answer(questionnaire_ux.list_text(lang), reply_markup=_questionnaire_list_keyboard(lang))
+    catalog = await _available_questionnaire_catalog(uid)
+    await _edit_or_answer(callback.message)(
+        questionnaire_ux.list_text(lang),
+        reply_markup=_questionnaire_list_keyboard(lang, catalog))
     await callback.answer()
 
 
@@ -6393,86 +6495,20 @@ async def cb_questionnaire_category(callback: CallbackQuery):
         await callback.answer()
         return
     category = parts[2]
-
-    # ── Categories 1-4: governance-manifest instruments as INFO entries ──
-    if category in questionnaire_ux.CATALOG_MANIFEST_CATEGORY_IDS:
-        document = _load_catalog_document()
-        instruments = (
-            clinical_instrument_catalog.catalog_instruments_by_category(document, category)
-            if document is not None else ())
-        # PER-USER conditional DASS entry under "Стресс". In non-public modes
-        # the existing invited rollout flag controls listing; in public mode
-        # the fresh ordinary-product authorization controls it. DASS remains
-        # outside the generic public catalog and every downstream gate
-        # re-authorizes against integrity and current user access.
-        extra_rows = []
-        if (category == "stress"
-                and (config.DASS21_INVITED_USERS_ENABLED
-                     or access_control.DEPLOYMENT_MODE == "public")):
-            decision = await dass21_access.authorize_dass21_user(uid)
-            if decision.allowed:
-                extra_rows.append([InlineKeyboardButton(
-                    text=("DASS-21 — депрессия, тревога, стресс" if lang == "ru"
-                          else "DASS-21 — depression, anxiety, stress"),
-                    callback_data=f"q:d:{dass21_runtime.DASS21_DEFINITION_ID}")])
-        if not instruments and not extra_rows:
-            await callback.message.answer(
-                questionnaire_ux.catalog_empty_text(category, lang),
-                reply_markup=_catalog_nav_only_keyboard(lang))
-            await callback.answer()
-            return
-        keyboard = _catalog_manifest_category_keyboard(instruments, lang)
-        if extra_rows:
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=extra_rows + keyboard.inline_keyboard)
-        await callback.message.answer(
-            questionnaire_ux.catalog_category_text(category, lang),
-            reply_markup=keyboard)
+    catalog = await _available_questionnaire_catalog(uid)
+    entries = catalog.get(category, [])
+    if category not in questionnaire_ux.CATALOG_CATEGORY_IDS or not entries:
+        # Stale/forged/now-empty category: return to the fresh root. Never
+        # render an empty category or disclose why an instrument disappeared.
+        await _edit_or_answer(callback.message)(
+            questionnaire_ux.list_text(lang),
+            reply_markup=_questionnaire_list_keyboard(lang, catalog))
         await callback.answer()
         return
 
-    # ── Category 6: consultation report (user-owned, never auto-sent) ──
-    if category == "consultation_report":
-        await callback.message.answer(
-            questionnaire_ux.consultation_report_text(lang),
-            reply_markup=_catalog_nav_only_keyboard(lang))
-        await callback.answer()
-        return
-
-    # ── Category 5: self_observation -> ONLY definitions explicitly assigned
-    # to the self-observation product surface (registry category "selfobs").
-    # Deliberately NOT unfiltered list_active(): a future real clinical
-    # definition (category anxiety/mood/depression/etc.) must never surface
-    # here and bypass the manifest catalog's availability double-gate via the
-    # old q:d/q:s route. "restricted" legal_status stays hidden from listings
-    # (blocked at start/answer time too).
-    if category == "self_observation":
-        registry = _load_registry_fresh()
-        # Ordinary nonclinical self-observation surface ONLY. A definition
-        # carrying clinical_instrument metadata must never appear here even if
-        # it is (accidentally or maliciously) tagged category="selfobs" -- it
-        # is reachable only through the manifest-driven clinical catalog after
-        # all combined gates pass. Exclude any clinical-metadata-bearing
-        # definition, in addition to the existing category + restricted filter.
-        definitions = [d for d in registry.list_active("selfobs")
-                       if d.get("legal_status") != "restricted"
-                       and not isinstance(d.get("clinical_instrument"), dict)]
-        if not definitions:
-            await callback.message.answer(
-                questionnaire_ux.catalog_empty_text(category, lang),
-                reply_markup=_catalog_nav_only_keyboard(lang))
-            await callback.answer()
-            return
-        await callback.message.answer(
-            questionnaire_ux.catalog_category_text(category, lang),
-            reply_markup=_questionnaire_category_keyboard(category, definitions, lang))
-        await callback.answer()
-        return
-
-    # Unknown/stale category id: neutral empty screen, never a dead end.
-    await callback.message.answer(
-        questionnaire_ux.catalog_empty_text(category, lang),
-        reply_markup=_catalog_nav_only_keyboard(lang))
+    await _edit_or_answer(callback.message)(
+        questionnaire_ux.catalog_category_text(category, lang),
+        reply_markup=_questionnaire_category_keyboard(entries, lang))
     await callback.answer()
 
 
@@ -6488,41 +6524,27 @@ async def cb_questionnaire_info(callback: CallbackQuery):
         return
     instrument_id = parts[2]
     document = _load_catalog_document()
+    registry = _load_registry_fresh()
+    available = next((entry for entry in
+                      clinical_instrument_catalog.available_public_instruments(
+                          document, registry)
+                      if entry.instrument_id == instrument_id), None)
     ci = (clinical_instrument_catalog.get_catalog_instrument(document, instrument_id)
           if document is not None else None)
-    if ci is None:
-        # Unknown id, or a hidden instrument (JAPS/STAS, identity incomplete/
-        # conflict) -- never rendered. Neutral fail-closed message.
-        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+    if ci is None or available is None:
+        # Old/stale info callbacks for blocked or removed methods fail closed;
+        # the public catalog never advertises unavailable instruments.
+        await _edit_or_answer(callback.message)(
+            questionnaire_ux.not_available_text(lang),
+            reply_markup=_catalog_nav_only_keyboard(lang))
         await callback.answer()
         return
 
-    # q:i is PERMANENTLY read-only: it NEVER creates a session, never saves
-    # answers, never calls start_questionnaire_session/_send_questionnaire_step.
-    # The availability double-gate only decides whether to render a "Пройти"
-    # button that routes into the EXISTING q:d:<definition_id> detail flow --
-    # those existing handlers remain the only code that creates sessions.
-    # catalog_start_definition_id returns None unless the manifest entry is
-    # fully activatable AND carries an explicit questionnaire_definition_id
-    # that the registry can start; no entry is 'ready' in this PR, so this is
-    # always None here.
-    start_definition_id = None
-    if ci.availability == clinical_instrument_catalog.AVAILABILITY_AVAILABLE:
-        raw = next((i for i in document.get("instruments", [])
-                    if i.get("instrument_id") == instrument_id), None)
-        if raw is not None:
-            # catalog_start_definition_id now performs the FULL combined gate
-            # (manifest activatable + Core can_start + clinical linkage VALID)
-            # against this same fresh manifest `document` -- no second
-            # authorization check is needed here. Fails closed to no button;
-            # q:i stays read-only regardless.
-            start_definition_id = clinical_instrument_catalog.catalog_start_definition_id(
-                raw, _load_registry_fresh(), document)
-
-    await callback.message.answer(
+    await _edit_or_answer(callback.message)(
         questionnaire_ux.instrument_info_text(ci, lang),
-        reply_markup=_catalog_info_keyboard(ci.category_id, lang,
-                                            start_definition_id=start_definition_id))
+        reply_markup=_catalog_info_keyboard(
+            available.category_ids[0], lang,
+            start_definition_id=available.definition_id))
     await callback.answer()
 
 
@@ -6540,7 +6562,7 @@ async def cb_questionnaire_detail(callback: CallbackQuery):
     registry = _load_registry_fresh()
     definition = registry.get(qid)
     if definition is None or definition.get("status") != "active" or definition.get("legal_status") == "restricted":
-        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
     # Clinical definitions (carrying clinical_instrument metadata OR mapped by a
@@ -6552,15 +6574,16 @@ async def cb_questionnaire_detail(callback: CallbackQuery):
     validation = registry.get_clinical_validation(qid, manifest_document)
     if (validation.status != clinical_definition_validator.ClinicalDefinitionStatus.NOT_CLINICAL
             and not registry.combined_can_start(qid, manifest_document)):
-        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
     if await _dass21_blocked(qid, uid):
-        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
-    await callback.message.answer(questionnaire_ux.detail_text(definition, lang),
-                                  reply_markup=_questionnaire_detail_keyboard(qid, lang))
+    await _edit_or_answer(callback.message)(
+        questionnaire_ux.detail_text(definition, lang),
+        reply_markup=_questionnaire_detail_keyboard(qid, lang))
     await callback.answer()
 
 
@@ -7717,9 +7740,41 @@ def _hub_back_keyboard(lang: str) -> InlineKeyboardMarkup:
         text=("⬅️ В меню" if lang == "ru" else "⬅️ Back to menu"), callback_data="menu:back")]])
 
 
+def _privacy_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            text=("📥 Получить копию данных" if lang == "ru" else "📥 Get a copy of data"),
+            callback_data="privacy:export")],
+        [InlineKeyboardButton(
+            text=("🗑 Удалить данные аккаунта" if lang == "ru" else "🗑 Delete account data"),
+            callback_data="privacy:delete")],
+        [InlineKeyboardButton(
+            text=("ℹ️ Какие данные хранятся" if lang == "ru" else "ℹ️ What data is stored"),
+            callback_data="privacy:stored")],
+    ]
+    if config.PRIVACY_POLICY_URL:
+        rows.append([InlineKeyboardButton(
+            text=("📄 Политика конфиденциальности" if lang == "ru" else
+                  "📄 Privacy Policy"),
+            url=config.PRIVACY_POLICY_URL)])
+    rows.append([InlineKeyboardButton(
+        text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+        callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _privacy_back_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+        callback_data="privacy:hub")]])
+
+
 async def _answer_target(entity, text: str, **kw) -> None:
     target = entity.message if isinstance(entity, CallbackQuery) else entity
-    await target.answer(text, **kw)
+    if isinstance(entity, CallbackQuery):
+        await _edit_or_answer(target)(text, **kw)
+    else:
+        await target.answer(text, **kw)
 
 
 def _response_settings_keyboard(lang: str) -> InlineKeyboardMarkup:
@@ -7748,6 +7803,50 @@ async def cmd_menu(message: Message):
     if not await _nav_gate(message, uid, lang):
         return
     await message.answer(navigation.menu_text(lang), reply_markup=_menu_keyboard(lang))
+
+
+@dp.message(F.text.in_({"🧠 Психологические тесты", "🧠 Psychological tests"}))
+async def lower_menu_tests(message: Message):
+    await cmd_questionnaire(message)
+
+
+@dp.message(F.text.in_({"📊 Мои результаты", "📊 My results"}))
+async def lower_menu_results(message: Message):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(message, uid, lang):
+        return
+    await message.answer(
+        navigation.results_hub_text(lang),
+        reply_markup=_hub_back_keyboard(lang))
+
+
+@dp.message(F.text.in_({"📝 Дневники", "📝 Diaries"}))
+async def lower_menu_journals(message: Message, state: FSMContext):
+    await cmd_journal(message, state)
+
+
+@dp.message(F.text.in_({"🎛 Как отвечать", "🎛 How to reply"}))
+async def lower_menu_response_settings(message: Message):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(message, uid, lang):
+        return
+    available = await _voice_ux_enabled_for(uid)
+    await message.answer(
+        navigation.response_settings_text(lang, available=available),
+        reply_markup=(format_selector_kb(lang) if available else None))
+
+
+@dp.message(F.text.in_({"🔒 Данные и приватность", "🔒 Data and privacy"}))
+async def lower_menu_privacy(message: Message):
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(message, uid, lang):
+        return
+    await message.answer(
+        navigation.privacy_hub_text(lang),
+        reply_markup=_privacy_hub_keyboard(lang))
 
 
 @dp.callback_query(F.data == "talk:hub")
@@ -7830,7 +7929,41 @@ async def cb_privacy_hub(callback: CallbackQuery):
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
-    await _answer_target(callback, navigation.privacy_hub_text(lang), reply_markup=_hub_back_keyboard(lang))
+    await _answer_target(
+        callback, navigation.privacy_hub_text(lang),
+        reply_markup=_privacy_hub_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "privacy:stored")
+async def cb_privacy_stored(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await _answer_target(
+        callback, navigation.privacy_stored_data_text(lang),
+        reply_markup=_privacy_back_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "privacy:export")
+async def cb_privacy_export(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    scoped_access.assert_can_read_user_data(uid, uid, "privacy_export")
+    await _send_privacy_export(callback.message, uid, lang)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "privacy:delete")
+async def cb_privacy_delete_open(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    scoped_access.assert_can_read_user_data(uid, uid, "privacy_delete")
+    await _answer_target(
+        callback, await _privacy_delete_preview_text(uid, lang),
+        reply_markup=_privacy_delete_kb("privacy_delete", lang, uid))
     await callback.answer()
 
 
@@ -7891,7 +8024,6 @@ async def handle_voice(message: Message, state: FSMContext):
     await bot.send_chat_action(message.chat.id, "typing")
     try:
         text = await transcribe_voice(message.voice, bot, client, stt_lang)
-        await message.answer(f"🎤 <i>{_he(text)}</i>", parse_mode="HTML")
         await pipeline(message, text, state)
     except Exception as e:
         print(f"[voice] {e}")

@@ -96,6 +96,17 @@ def test_every_caption_within_telegram_photo_caption_limit(lang):
             assert 0 < len(c) <= oc.TELEGRAM_CAPTION_LIMIT == 1024, (lang, step, url, len(c))
 
 
+def test_ru_welcome_uses_usable_telegram_first_name():
+    assert oc.caption(1, "ru", first_name=" Анна ").startswith("Привет, Анна 👋\n\n")
+
+
+@pytest.mark.parametrize("invalid", [None, "", "   ", "None", "123", "x" * 65])
+def test_ru_welcome_invalid_name_uses_safe_fallback(invalid):
+    rendered = oc.caption(1, "ru", first_name=invalid)
+    assert rendered.startswith("Привет 👋\n\n")
+    assert "None" not in rendered
+
+
 @pytest.mark.parametrize("lang", ["ru", "en"])
 def test_every_callback_within_telegram_callback_limit(lang):
     seen = set()

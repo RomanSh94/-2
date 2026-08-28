@@ -296,9 +296,7 @@ def test_start_requires_manifest_and_definition_both_ready():
 def test_blocked_instrument_does_not_create_session():
     msg = _press_info(1, "bdi_ii")
     assert _sessions_for(1) == []
-    assert questionnaire_ux.instrument_info_text(
-        cat.get_catalog_instrument(_document(), "bdi_ii"), "ru").split("\n")[0] \
-        in msg.answers[-1][0]
+    assert msg.answers[-1][0] == questionnaire_ux.not_available_text("ru")
 
 
 def test_information_only_instrument_does_not_create_session():
@@ -314,18 +312,23 @@ def test_metadata_only_instrument_does_not_create_session():
 
 
 # ── UX ───────────────────────────────────────────────────────────────────────
-def test_root_uses_professional_category_names():
+def test_root_uses_exact_public_beta_categories_and_hides_empty_ones():
     user = FakeUser(1)
     msg = FakeMessage(user)
     asyncio.run(bot.cmd_questionnaire(msg))
     text, kw = msg.answers[0]
     datas = [d for _, d in _buttons(kw)]
-    for cid in ("depression_mood_energy", "anxiety", "stress", "specialized",
-                "self_observation", "consultation_report"):
-        assert f"q:c:{cid}" in datas
-    # Old low-trust symptom labels are gone from the root.
-    assert "Сон / стресс" not in text
-    assert "Для специалиста" not in text
+    assert questionnaire_ux.CATALOG_CATEGORIES == [
+        ("depression", "Депрессия", "Depression"),
+        ("anxiety", "Тревога", "Anxiety"),
+        ("stress_burnout", "Стресс и выгорание", "Stress and burnout"),
+        ("trauma_ptsd", "Травма и ПТСР", "Trauma and PTSD"),
+        ("self_esteem", "Самооценка", "Self-esteem"),
+        ("adhd_attention", "СДВГ и внимание", "ADHD and attention"),
+        ("other", "Другие тесты", "Other tests"),
+    ]
+    assert datas == ["menu:back"]
+    assert "Сон" not in text
 
 
 def test_catalog_never_shows_bare_empty_category_dead_end(monkeypatch):
@@ -341,7 +344,7 @@ def test_catalog_never_shows_bare_empty_category_dead_end(monkeypatch):
     text, kw = msg.answers[-1]
     assert "нет доступных опросников" not in text   # old dead-end string gone
     datas = [d for _, d in _buttons(kw)]
-    assert "q:l" in datas and "menu:back" in datas
+    assert datas == ["menu:back"]
 
 
 def test_catalog_buttons_one_per_row():
@@ -372,13 +375,14 @@ def test_information_screen_has_non_diagnostic_disclaimer():
                 assert forbidden not in txt
 
 
-def test_report_label_is_consultation_report():
-    datas_root = questionnaire_ux.CATALOG_CATEGORIES
-    labels_ru = [ru for _, ru, _ in datas_root]
-    assert "Отчёт для консультации" in labels_ru
-    assert "Для специалиста" not in labels_ru
-    txt = questionnaire_ux.consultation_report_text("ru")
-    assert "Отчёт для консультации" in txt
+def test_one_canonical_ready_entity_can_use_multiple_category_entry_points():
+    item = _ready_item(public_category_ids=["depression", "anxiety"])
+    document = {"schema_version": 2, "instruments": [item]}
+    registry = _FakeRegistry({"synthetic_ready_def_v1"})
+    available = cat.available_public_instruments(document, registry)
+    assert len(available) == 1
+    assert available[0].definition_id == "synthetic_ready_def_v1"
+    assert available[0].category_ids == ("depression", "anxiety")
 
 
 def test_report_text_says_no_automatic_third_party_send():
@@ -388,7 +392,7 @@ def test_report_text_says_no_automatic_third_party_send():
 
 
 def test_english_copy_exists():
-    assert "Screening scales" in questionnaire_ux.list_text("en")
+    assert "Psychological tests" in questionnaire_ux.list_text("en")
     assert "Consultation report" in questionnaire_ux.consultation_report_text("en")
     ci = cat.get_catalog_instrument(_document(), "hdrs")
     assert "clinician-rated" in questionnaire_ux.instrument_info_text(ci, "en")
@@ -439,7 +443,7 @@ def test_catalog_info_has_no_llm_call(monkeypatch):
     monkeypatch.setattr(bot, "traced_response_builder", _boom)
     monkeypatch.setattr(bot, "persist_influence_trace", _boom)
     msg = _press_info(1, "bdi_ii")
-    assert "недоступно" in msg.answers[-1][0]
+    assert msg.answers[-1][0] == questionnaire_ux.not_available_text("ru")
 
 
 def test_catalog_info_has_no_db_write():
@@ -505,16 +509,13 @@ def test_available_item_renders_existing_q_d_start_button(monkeypatch):
     assert any("Пройти" in t or "Start" in t for t in texts)
 
 
-# ── §2.2 self_observation uses an explicit category filter ───────────────────
-def test_self_observation_uses_explicit_category_filter():
-    # The synthetic demos are tagged category=selfobs; they list under
-    # self_observation via registry.list_active("selfobs").
-    user = FakeUser(1)
-    msg = FakeMessage(user)
-    cb = FakeCallback(user, msg, data="q:c:self_observation")
-    asyncio.run(bot.cb_questionnaire_category(cb))
-    datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
-    assert "q:d:demo_anxiety_v1" in datas   # a selfobs-tagged active demo
+# ── §2.2 malformed product placement fails closed ────────────────────────────
+def test_unknown_or_duplicate_public_category_ids_fail_closed():
+    registry = _FakeRegistry({"synthetic_ready_def_v1"})
+    for category_ids in (["sleep"], ["anxiety", "anxiety"], []):
+        item = _ready_item(public_category_ids=category_ids)
+        document = {"schema_version": 2, "instruments": [item]}
+        assert cat.available_public_instruments(document, registry) == ()
 
 
 def test_active_non_self_observation_definition_not_listed_in_self_observation():
@@ -574,8 +575,7 @@ def test_no_second_reachable_questionnaire_category_source():
     msg = FakeMessage(user)
     asyncio.run(bot.cb_questionnaire_list(FakeCallback(user, msg, data="q:l")))
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
-    expected = [f"q:c:{key}" for key, _, _ in questionnaire_ux.CATALOG_CATEGORIES] + ["menu:back"]
-    assert datas == expected
+    assert datas == ["menu:back"]
 
 
 # ── §4.2 catalog_start_definition_id is the single combined gate ──────────────

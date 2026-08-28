@@ -244,7 +244,7 @@ def test_integrity_failure_denies_everyone_including_owner(flow, monkeypatch):
 
 # ── menu / catalog visibility ─────────────────────────────────────────────────
 def _stress_datas(uid):
-    msg = _press(bot.cb_questionnaire_category, uid, "q:c:stress")
+    msg = _press(bot.cb_questionnaire_category, uid, "q:c:stress_burnout")
     return [cd for _, cd in _buttons(msg.answers[-1][1])] if msg.answers else []
 
 
@@ -269,6 +269,13 @@ def test_dass_visible_to_public_ordinary_user(flow, monkeypatch):
     monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
     monkeypatch.setattr(config, "DASS21_INVITED_USERS_ENABLED", False)
     assert f"q:d:{QID}" in _stress_datas(UNKNOWN)
+
+
+def test_dass_discovery_is_not_broadened_to_depression_or_anxiety(flow):
+    for category in ("depression", "anxiety"):
+        msg = _press(bot.cb_questionnaire_category, INVITED, f"q:c:{category}")
+        datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
+        assert f"q:d:{QID}" not in datas
 
 
 def test_dass_hidden_when_integrity_invalid(flow, monkeypatch):
@@ -506,7 +513,7 @@ def test_direct_q_i_does_not_expose_dass(flow):
     for uid in (OWNER, INVITED, BLOCKED, UNKNOWN):
         msg = _press(bot.cb_questionnaire_info, uid, "q:i:dass")
         assert msg.answers[-1][0] == _neutral()
-        assert _buttons(msg.answers[-1][1]) == []
+        assert [cd for _, cd in _buttons(msg.answers[-1][1])] == ["q:l", "menu:back"]
 
 
 # ── A4 hardening: user_access semantics (real schema, no expiry column) ───────

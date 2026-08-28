@@ -126,157 +126,100 @@ def asset_path(step: int) -> str:
 # drift out of sync with crisis_contacts.json -- there is nothing to sync.
 
 
-def _caption_ru_5(has_policy_url: bool) -> str:
-    # F: the final line must NEVER claim the user read/opened a Privacy Policy
-    # document that isn't actually linked anywhere -- only when a verified
-    # PRIVACY_POLICY_URL is configured does "Начать" acknowledge the Policy
-    # too; otherwise it acknowledges only THIS notice (matches
-    # database.complete_onboarding's privacy_notice_acknowledged_at, which is
-    # deliberately named/scoped as notice acknowledgment, not policy consent).
-    #
-    # J (this correction round): the "we do not sell data / no ads" sentence
-    # was REMOVED entirely -- it is an organizational/legal claim that cannot
-    # be verified from source code, and framing it as "по нашей политике"
-    # (per our policy) was still presenting it as a fact to the user without
-    # owner sign-off. Only technically verified statements remain: history is
-    # stored; text may be processed by the AI provider; export/delete tools
-    # exist; safety-audit data may be retained under documented exceptions
-    # (see _PRIVACY_SUMMARY below). Do not re-add the removed claim without
-    # explicit owner approval.
-    ack = ("ты подтверждаешь ознакомление с этим уведомлением и Политикой "
-          "конфиденциальности." if has_policy_url else
-          "ты подтверждаешь, что ознакомился(-лась) с этим уведомлением.")
+def _caption_ru_5(_has_policy_url: bool) -> str:
     return (
-        "X20 сохраняет историю нашей переписки, чтобы поддерживать контекст "
-        "общения, продолжать работу между разговорами и формировать доступные "
-        "тебе материалы.\n\n"
-        "Для генерации ответов часть текста может обрабатываться "
-        "подключённым AI-провайдером — точные условия, сроки хранения и "
-        "исключения описаны в Политике конфиденциальности.\n\n"
-        "Ты можешь просматривать, экспортировать и удалять свои данные через "
-        "инструменты приватности бота.\n\n"
-        f"Нажимая «Начать», {ack}"
+        "🔒 О приватности\n\n"
+        "История переписки сохраняется, чтобы не терять контекст между разговорами "
+        "и продолжать с того места, где мы остановились.\n\n"
+        "Свои данные можно выгрузить или удалить.\n\n"
+        "Нажимая «Начать», ты подтверждаешь ознакомление с этим уведомлением."
     )
 
 
-def _caption_en_5(has_policy_url: bool) -> str:
-    # J: see the RU variant's comment -- the unverified "we do not sell data /
-    # no ads" claim was removed entirely, not merely reframed.
-    ack = ("you acknowledge that you have read this notice and the Privacy "
-          "Policy." if has_policy_url else
-          "you acknowledge that you have read this notice.")
+def _caption_en_5(_has_policy_url: bool) -> str:
     return (
-        "X20 stores the history of our conversation to maintain context, "
-        "continue work between conversations and create materials available "
-        "to you.\n\n"
-        "To generate replies, some text may be processed by the configured AI "
-        "provider. Exact conditions, retention periods and exceptions are "
-        "described in the Privacy Policy.\n\n"
-        "You can view, export and delete your data through the bot’s "
-        "privacy tools.\n\n"
-        f"By pressing “Start”, {ack}"
+        "🔒 About privacy\n\n"
+        "Conversation history is stored so context is not lost between conversations "
+        "and we can continue where we left off.\n\n"
+        "You can export or delete your data.\n\n"
+        "By pressing “Start”, you acknowledge that you have read this notice."
     )
 
 
 _CAPTIONS = {
     "ru": {
         1: (
-            "Привет! Я X20 — ИИ-помощник для психологической поддержки.\n\n"
-            "Я помогаю бережно разбирать мысли, чувства и сложные ситуации, "
-            "используя структурированные навыки самопомощи и научно обоснованные "
-            "подходы.\n\n"
-            "Я не заменяю психолога, психотерапевта или врача и не ставлю диагнозы."
+            "Здесь можно выговориться, разобраться в мыслях и чувствах или просто "
+            "поговорить о том, что сейчас не даёт покоя.\n\n"
+            "Без осуждения и необходимости подбирать «правильные» слова."
+        ),
+        2: (
+            "Можно говорить обо всём, что касается тебя 💭\n\n"
+            "• тревога, стресс и усталость;\n"
+            "• отношения и личные границы;\n"
+            "• самооценка и принятие себя;\n"
+            "• сложные решения, работа или учёба;\n"
+            "• одиночество, перемены или потеря мотивации.\n\n"
+            "А иногда можно просто поговорить. Необязательно заранее понимать, "
+            "что именно тебе нужно."
         ),
         3: (
-            "Ко мне можно обратиться, чтобы:\n\n"
-            "• справиться с тревогой и стрессом;\n"
-            "• разобрать конкретную ситуацию;\n"
-            "• понять, что поддерживает тяжёлое или подавленное состояние;\n"
-            "• бережнее относиться к себе;\n"
-            "• выстраивать личные границы;\n"
-            "• улучшать отношения с близкими;\n"
-            "• выбрать один реалистичный следующий шаг.\n\n"
-            "Здесь нет «глупых» вопросов. Можно начать с того, что сейчас "
-            "беспокоит больше всего."
+            "Не будем пытаться решить всё сразу.\n\n"
+            "Сначала разберёмся, что происходит и что сейчас для тебя важнее всего. "
+            "А дальше — в твоём темпе.\n\n"
+            "Можно просто выговориться. Можно попросить совета. А если захочется "
+            "разобраться глубже — сделаем это вместе 🌿"
         ),
         4: (
-            "Я умею:\n\n"
-            "• поддерживать разговор текстом и принимать голосовые сообщения;\n"
-            "• проводить доступные опросы и показывать их результаты;\n"
-            "• помогать обсуждать результат через кнопку «Обсудить результат»;\n"
-            "• вести дневник эмоций и КПТ-дневник;\n"
-            "• показывать доступные сводки о состоянии;\n"
-            "• выгружать и удалять сохранённые данные.\n\n"
-            "При необходимости выгруженные материалы можно показать специалисту.\n\n"
-            "В разговоре мы не будем делать всё сразу — выберем одну задачу и "
-            "один понятный следующий шаг."
+            "Иногда разговора здесь может быть недостаточно ❤️\n\n"
+            "Если прямо сейчас есть опасность причинить вред себе или другому человеку, "
+            "лучше сразу обратиться в местную экстренную или кризисную службу и, если "
+            "возможно, связаться с человеком, которому доверяешь.\n\n"
+            "Если непосредственной опасности нет, можно просто начать с того, что "
+            "происходит сейчас."
         ),
     },
     "en": {
         1: (
-            "Hi! I’m X20, an AI assistant for psychological support.\n\n"
-            "I can help you gently explore thoughts, feelings and difficult "
-            "situations using structured self-help skills and evidence-informed "
-            "approaches.\n\n"
-            "I do not replace a psychologist, psychotherapist or doctor, and I do "
-            "not diagnose."
+            "You can speak freely here, explore your thoughts and feelings, or simply "
+            "talk about what is weighing on you right now.\n\n"
+            "There is no judgment and no need to find the “right” words."
+        ),
+        2: (
+            "You can talk about anything that concerns you 💭\n\n"
+            "• anxiety, stress, and fatigue;\n"
+            "• relationships and personal boundaries;\n"
+            "• self-esteem and self-acceptance;\n"
+            "• difficult decisions, work, or study;\n"
+            "• loneliness, change, or loss of motivation.\n\n"
+            "Sometimes we can simply talk. You do not need to know in advance exactly "
+            "what you need."
         ),
         3: (
-            "You can talk to me to:\n\n"
-            "• cope with anxiety and stress;\n"
-            "• work through a specific situation;\n"
-            "• understand what may be maintaining a difficult or low state;\n"
-            "• relate to yourself more kindly;\n"
-            "• build personal boundaries;\n"
-            "• improve relationships with people close to you;\n"
-            "• choose one realistic next step.\n\n"
-            "There are no “stupid” questions here. You can begin with whatever is "
-            "bothering you most right now."
+            "We will not try to solve everything at once.\n\n"
+            "First we will understand what is happening and what matters most to you "
+            "right now. Then we will continue at your pace.\n\n"
+            "You can simply let things out, ask for advice, or explore the issue more "
+            "deeply together 🌿"
         ),
         4: (
-            "I can:\n\n"
-            "• support text conversations and accept voice messages;\n"
-            "• provide available questionnaires and show their results;\n"
-            "• help discuss a result through the “Discuss the result” button;\n"
-            "• provide an emotion journal and a CBT journal;\n"
-            "• show the summaries currently available to you;\n"
-            "• export and delete stored data.\n\n"
-            "Exported materials can be shared with a professional when useful.\n\n"
-            "We will not try to do everything at once — we will choose one task "
-            "and one clear next step."
+            "Sometimes a conversation here may not be enough ❤️\n\n"
+            "If there is an immediate danger of harming yourself or someone else, "
+            "contact your local emergency or crisis service now and, when possible, "
+            "reach out to someone you trust.\n\n"
+            "If there is no immediate danger, you can simply begin with what is "
+            "happening right now."
         ),
     },
 }
-
-# Screen 2 (crisis limitation): IDENTICAL neutral structure in both languages,
-# no specific number in either. Onboarding language (RU vs EN) is a UI/text
-# preference, not a country signal — treating it as one (in either direction)
-# was the exact bug corrected here. Neither caption calls
-# crisis_protocol.get_hotline or duplicates any number from crisis_contacts.json.
-_CAPTION_RU_2 = (
-    "Если тебе очень плохо или небезопасно прямо сейчас, пожалуйста, "
-    "не оставайся с этим в одиночку.\n\n"
-    "X20 не подходит для экстренных ситуаций. Если есть непосредственный "
-    "риск причинить вред себе или другому человеку — позвони в местную "
-    "экстренную службу или обратись в местную кризисную службу.\n\n"
-    "По возможности свяжись с человеком, которому доверяешь."
-)
-_CAPTION_EN_2 = (
-    "If you feel unsafe or at immediate risk right now, please do not face "
-    "it alone.\n\n"
-    "X20 is not suitable for emergencies. If there is an immediate risk of "
-    "harm to yourself or someone else, call your local emergency number or "
-    "contact a local crisis service.\n\n"
-    "When possible, contact someone you trust."
-)
 
 # ── Button labels ─────────────────────────────────────────────────────────────
 _PRIMARY = {
     "ru": {
         1: "Продолжить",
-        2: "С чем ко мне можно обратиться?",
-        3: "Что ты умеешь?",
-        4: "А в безопасности ли мои данные?",
+        2: "Как проходит разговор?",
+        3: "Продолжить",
+        4: "Продолжить",
         5: "Начать",
     },
     "en": {
@@ -303,16 +246,33 @@ def _lang(lang: str) -> str:
     return "en" if lang == "en" else "ru"
 
 
-def caption(step: int, lang: str = "ru", privacy_policy_url: str = "") -> str:
+def usable_first_name(first_name) -> str:
+    """Return a compact human name for screen 1, or an empty safe fallback."""
+    if type(first_name) is not str:
+        return ""
+    name = " ".join(first_name.split())
+    if (not name or len(name) > 64
+            or name.casefold() in {"none", "null", "undefined"}
+            or not any(char.isalpha() for char in name)
+            or any(ord(char) < 32 for char in name)):
+        return ""
+    return name
+
+
+def caption(step: int, lang: str = "ru", privacy_policy_url: str = "",
+            first_name: str = "") -> str:
     """`privacy_policy_url` only affects step 5's final acknowledgment line
     (see _caption_ru_5/_caption_en_5) -- whether "Начать"/"Start" acknowledges
     the notice alone, or the notice AND the real Privacy Policy."""
     L = _lang(lang)
-    if step == 2:
-        return _CAPTION_RU_2 if L == "ru" else _CAPTION_EN_2
     if step == LAST_STEP:
         has_url = bool(privacy_policy_url)
         return _caption_ru_5(has_url) if L == "ru" else _caption_en_5(has_url)
+    if step == FIRST_STEP:
+        name = usable_first_name(first_name)
+        greeting = ((f"Привет, {name} 👋" if name else "Привет 👋") if L == "ru"
+                    else (f"Hi, {name} 👋" if name else "Hi 👋"))
+        return greeting + "\n\n" + _CAPTIONS[L][step]
     return _CAPTIONS[L][step]
 
 
@@ -356,27 +316,20 @@ def button_spec(step: int, lang: str = "ru", privacy_policy_url: str = "") -> li
 # technically verified statements remain here.
 _PRIVACY_SUMMARY = {
     "ru": (
-        "Коротко о данных:\n\n"
-        "• X20 сохраняет историю переписки, чтобы поддерживать контекст и "
-        "продолжать работу между разговорами.\n"
-        "• Для генерации ответов часть текста обрабатывается подключённым "
-        "AI-провайдером.\n"
-        "• Записи, связанные с безопасностью, могут сохраняться дольше по "
-        "политике безопасности.\n\n"
-        "Твои данные под твоим контролем:\n"
-        "• /privacy_export_all — выгрузить все свои данные;\n"
-        "• /privacy_delete_all — удалить свои данные."
+        "🔒 Данные и приватность\n\n"
+        "История переписки сохраняется, чтобы не терять контекст между разговорами.\n\n"
+        "В разделе «Данные и приватность» можно получить копию своих данных, "
+        "посмотреть, какие данные хранятся, или удалить данные аккаунта.\n\n"
+        "Некоторые записи, связанные с безопасностью и критическими ситуациями, "
+        "могут храниться отдельно в соответствии с правилами хранения данных."
     ),
     "en": (
-        "About your data, in short:\n\n"
-        "• X20 stores the conversation history to keep context and continue work "
-        "between conversations.\n"
-        "• To generate replies, some text is processed by the configured AI "
-        "provider.\n"
-        "• Safety-related records may be kept longer under the safety policy.\n\n"
-        "Your data stays under your control:\n"
-        "• /privacy_export_all — export all your data;\n"
-        "• /privacy_delete_all — delete your data."
+        "🔒 Data and privacy\n\n"
+        "Conversation history is stored so context is not lost between conversations.\n\n"
+        "In Data and privacy you can get a copy of your data, see what is stored, or "
+        "delete account data.\n\n"
+        "Some safety- and crisis-related records may be retained separately under "
+        "the applicable retention rules."
     ),
 }
 

@@ -414,3 +414,135 @@ def test_callback_format_unchanged(flow):
     assert any(cd.startswith("q:b:") for cd in datas)
     assert any(cd.startswith("q:x:") for cd in datas)
     assert all(len(cd.encode("utf-8")) <= 64 for cd in datas)
+
+
+# ── Journal reminder settings — single-card navigation (owner-review
+# correction). Diary hub -> Reminder settings -> toggle morning/evening ->
+# timezone picker -> back must all edit the SAME Telegram card instead of
+# appending a fresh message at every step. A plain /journal_settings command
+# still creates the initial card, since there is no existing callback card to
+# edit yet.
+@pytest.fixture
+def journal_flow(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB", str(tmp_path / "t.db"))
+    asyncio.run(database.init_db())
+    asyncio.run(database.upsert_user(1, "u", "U"))
+    monkeypatch.setattr(bot, "get_user_language", _async("ru"))
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "personal_use")
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 1)
+    monkeypatch.setattr(ac, "CLINICIAN_TESTER_IDS", set())
+    monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", set())
+    monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
+    monkeypatch.setattr(bot, "CallbackQuery", FakeCallback)
+    return database
+
+
+def test_jhub_settings_edits_existing_card_no_new_message(journal_flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    asyncio.run(bot.cb_jhub(FakeCallback(user, msg, data="jhub:settings"), state=None))
+    assert msg.answers == []
+    assert len(msg.edits) == 1
+    assert "Напоминания" in msg.edits[-1][0]
+
+
+def test_toggle_morning_edits_existing_card_and_flips_real_users_setting(journal_flow):
+    # Also proves the tg_user fix: cb_jhub's callback.message.from_user is the
+    # BOT, so the redrawn card must be built for the real tapping user (1),
+    # not fall through to a wrong-uid access-denial screen.
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    asyncio.run(bot.cb_jhub(FakeCallback(user, msg, data="jhub:settings"), state=None))
+    asyncio.run(bot.cb_jset(FakeCallback(user, msg, data="jset:morning"), state=None))
+    assert msg.answers == []
+    assert len(msg.edits) == 2
+    _, kw = msg.edits[-1]
+    assert any(t.startswith("✅ Утро") for t, _ in _card_buttons(kw))
+    settings = asyncio.run(database.get_journal_settings(1))
+    assert settings["morning_enabled"] == 1
+
+
+def test_tz_picker_and_selection_edit_the_same_card(journal_flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    asyncio.run(bot.cb_jhub(FakeCallback(user, msg, data="jhub:settings"), state=None))
+    asyncio.run(bot.cb_jset(FakeCallback(user, msg, data="jset:tz"), state=None))
+    asyncio.run(bot.cb_jtz(FakeCallback(user, msg, data="jtz:3")))
+    assert msg.answers == []
+    assert len(msg.edits) == 3
+    assert "UTC+3" in msg.edits[-1][0]
+    offset, tz_set, _lang = asyncio.run(database.get_user_tz(1))
+    assert (offset, tz_set) == (3, 1)   # timezone persistence unaffected
+
+
+def test_direct_journal_settings_command_creates_fresh_card(journal_flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    asyncio.run(bot.cmd_journal_settings(msg, None))
+    assert msg.edits == []
+    assert len(msg.answers) == 1
+    assert "Напоминания" in msg.answers[-1][0]
+
+
+def test_journal_settings_edit_failure_falls_back_to_new_message(journal_flow):
+    user = FakeUser(1)
+    msg = FakeCardMessage(user)
+    asyncio.run(bot.cb_jhub(FakeCallback(user, msg, data="jhub:settings"), state=None))
+    msg.edit_exc = _bad_request("Bad Request: message can't be edited")
+    asyncio.run(bot.cb_jset(FakeCallback(user, msg, data="jset:morning"), state=None))
+    assert len(msg.answers) == 1  # same _edit_or_answer fallback contract as questionnaires
+    _, kw = msg.answers[-1]
+    assert any(t.startswith("✅ Утро") for t, _ in _card_buttons(kw))
+
+
+# ── jhub:report must resolve the REAL clicking user, not the bot-authored
+# card (owner-review correction). REAL_USER_ID and BOT_LIKE_ID are genuinely
+# distinct ids/objects -- callback.message.from_user is deliberately the
+# bot-like id, exactly like real Telegram, so this cannot pass by accident.
+REAL_USER_ID = 555
+BOT_LIKE_ID = 999
+
+
+@pytest.fixture
+def journal_report_flow(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB", str(tmp_path / "t.db"))
+    asyncio.run(database.init_db())
+    asyncio.run(database.upsert_user(REAL_USER_ID, "u", "U"))
+    monkeypatch.setattr(bot, "get_user_language", _async("ru"))
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")  # ordinary access without invite
+    monkeypatch.setattr(ac, "OWNER_USER_ID", 1)
+    monkeypatch.setattr(ac, "CLINICIAN_TESTER_IDS", set())
+    monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", set())
+    monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
+    monkeypatch.setattr(bot, "CallbackQuery", FakeCallback)
+    for i in range(3):
+        asyncio.run(database.save_emotion_entry(REAL_USER_ID, {
+            "event": f"событие {i}", "feeling": "радость", "intensity": 7,
+            "body": None, "need": "поддержка", "action": "погулял", "outcome": "легче"}))
+    return database
+
+
+def test_jhub_report_uses_real_clicking_user_not_bot_authored_message(journal_report_flow, monkeypatch):
+    calls = []
+    real_get = database.get_emotion_entries_since
+    async def spy_get_emotion(uid, days=7):
+        calls.append(uid)
+        return await real_get(uid, days)
+    monkeypatch.setattr(bot, "get_emotion_entries_since", spy_get_emotion)
+
+    bot_message_user = FakeUser(BOT_LIKE_ID)      # callback.message's author
+    real_clicking_user = FakeUser(REAL_USER_ID)   # callback.from_user
+    msg = FakeCardMessage(bot_message_user)
+    cb = FakeCallback(real_clicking_user, msg, data="jhub:report")
+    assert msg.from_user.id != cb.from_user.id  # genuinely distinct, not the same object
+
+    asyncio.run(bot.cb_jhub(cb, state=None))
+
+    assert calls == [REAL_USER_ID]  # data lookup used the real clicking user
+    assert BOT_LIKE_ID not in calls
+    text = msg.answers[-1][0]
+    # BOT_LIKE_ID has zero journal entries, so using it would always render the
+    # "not enough entries" placeholder; REAL_USER_ID has 3 seeded entries, so a
+    # genuine populated summary proves the report was built from real data.
+    assert "Пока мало записей" not in text
+    assert "радость" in text

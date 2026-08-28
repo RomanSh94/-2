@@ -1,7 +1,7 @@
 """Voice and Adaptive Response UX — flags, meta-commands, TTS/delivery,
 listen button, reactions, privacy, and safety-boundary tests.
 
-Both VOICE_REPLIES_ENABLED and EMOTIONAL_REACTIONS_ENABLED default false;
+VOICE_REPLIES_ENABLED, ELEVENLABS_TTS_ENABLED and EMOTIONAL_REACTIONS_ENABLED default false;
 most tests explicitly flip them on via monkeypatch to exercise the new
 code paths, then separately prove the flag-off path is byte-identical to
 prior behavior. No test calls a real paid API — TTS and Telegram calls are
@@ -89,10 +89,8 @@ def _async(value=None):
 def _no_voice_ux_markup(kw) -> bool:
     """No Voice-UX keyboard (listen button / format selector) was attached.
 
-    A plain ordinary reply may still legitimately carry a ReplyKeyboardRemove
-    -- the one-shot eviction of the pre-214ba15 legacy reply keyboard (see
-    bot._legacy_kb_removal), which adds no visible UI. Only an
-    InlineKeyboardMarkup would mean a Voice-UX control leaked in."""
+    A plain ordinary reply carries the permanent lower ReplyKeyboardMarkup.
+    Only an InlineKeyboardMarkup would mean a Voice-UX control leaked in."""
     return not isinstance(kw.get("reply_markup"), bot.InlineKeyboardMarkup)
 
 
@@ -107,6 +105,11 @@ def tmp_db(tmp_path, monkeypatch):
 def _voice_flags_off(monkeypatch):
     """Default state for every test unless a test explicitly flips a flag on."""
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", False)
+    # Existing voice-path tests opt in by setting VOICE_REPLIES_ENABLED. Keep
+    # the independent provider gate/key ready with synthetic values; dedicated
+    # tests below prove each fails closed when absent.
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "synthetic-test-key")
     monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", False)
     bot._reaction_last_sent.clear()
     bot._listen_last_tap.clear()
@@ -139,6 +142,8 @@ def _voice_flags_off(monkeypatch):
 
 def test_both_flags_default_false_from_env():
     assert os.environ.get("VOICE_REPLIES_ENABLED") is None
+    assert os.environ.get("ELEVENLABS_TTS_ENABLED") is None
+    assert os.environ.get("ELEVENLABS_API_KEY") is None
     assert os.environ.get("EMOTIONAL_REACTIONS_ENABLED") is None
     # config module already evaluated these at import time from a clean env
     # (conftest never sets them) -- re-import is unnecessary; the defaults
@@ -146,11 +151,9 @@ def test_both_flags_default_false_from_env():
 
 
 def test_deliver_response_flag_off_sends_plain_text_with_no_voice_ux_markup(tmp_db, monkeypatch):
-    # Formerly asserted a byte-identical empty kwargs dict. The ordinary
-    # reply now also carries a one-shot ReplyKeyboardRemove that evicts the
-    # pre-214ba15 legacy reply keyboard (an owner-requested UX fix; no
-    # visible UI). What this test exists to prove is unchanged and still
-    # asserted: flag off => plain text, no voice, no Voice-UX keyboard.
+    # The ordinary reply now carries the permanent lower menu. What this test
+    # proves is unchanged: voice flag off means plain text and no listen /
+    # response-format inline control.
     msg = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(msg, 1, "the answer", "ru"))
     assert [a[0] for a in msg.answers] == ["the answer"]
@@ -162,6 +165,27 @@ def test_format_command_not_exposed_when_flag_off(tmp_db):
     msg = FakeMessage(FakeUser(1), "/format")
     run(bot.cmd_format(msg))
     assert msg.answers == []  # no selector shown, behaves as if unknown
+
+
+def test_elevenlabs_gate_off_hides_voice_selector_and_never_calls_tts(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", False)
+    run(database.upsert_user(1, "u", "U"))
+    msg = FakeMessage(FakeUser(1), "/format")
+    run(bot.cmd_format(msg))
+    assert msg.answers == []
+
+    called = {"n": 0}
+    async def forbidden(*a, **kw):
+        called["n"] += 1
+        raise AssertionError("TTS must remain unreachable while provider gate is off")
+    monkeypatch.setattr(bot, "synthesize_speech", forbidden)
+    run(database.set_response_preference(1, response_format="voice"))
+    delivery = FakeMessage(FakeUser(1), "synthetic input")
+    run(bot.deliver_response(delivery, 1, "complete synthetic answer", "ru"))
+    assert called["n"] == 0
+    assert delivery.answers[0][0] == "complete synthetic answer"
+    assert isinstance(delivery.answers[0][1]["reply_markup"], bot.ReplyKeyboardMarkup)
 
 
 def test_format_select_callback_fails_closed_when_flag_off(tmp_db):
@@ -198,7 +222,14 @@ def test_env_example_keeps_both_new_flags_false():
     with open(os.path.join(repo_root, ".env.example"), encoding="utf-8") as f:
         content = f.read()
     assert "VOICE_REPLIES_ENABLED=false" in content
+    assert "ELEVENLABS_TTS_ENABLED=false" in content
+    assert "ELEVENLABS_API_KEY=" in content
     assert "EMOTIONAL_REACTIONS_ENABLED=false" in content
+    assert "EMOTIONAL_REACTION_COOLDOWN_SECONDS=60" in content
+
+
+def test_reaction_cooldown_default_is_sixty_seconds():
+    assert config.EMOTIONAL_REACTION_COOLDOWN_SECONDS == 60
 
 
 def test_existing_three_flags_still_false_and_unchanged():
@@ -336,7 +367,7 @@ def test_voice_mode_sends_exactly_one_voice_no_text(tmp_db, monkeypatch):
     assert msg.answers == []  # no text sent alongside a successful voice send
 
 
-def test_voice_and_concise_text_mode_sends_one_text_and_one_voice(tmp_db, monkeypatch):
+def test_text_and_voice_mode_sends_full_text_with_listen_button_only(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
     run(database.set_response_preference(1, response_format="voice_and_concise_text"))
@@ -348,8 +379,10 @@ def test_voice_and_concise_text_mode_sends_one_text_and_one_voice(tmp_db, monkey
     msg = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(msg, 1, long_answer, "ru"))
     assert len(msg.answers) == 1
-    assert len(msg.voices) == 1
-    assert len(msg.answers[0][0]) < len(long_answer)  # visible text is concise
+    assert msg.answers[0][0] == long_answer
+    assert len(msg.voices) == 0
+    markup = msg.answers[0][1]["reply_markup"]
+    assert markup.inline_keyboard[0][0].text == "🔊 Прослушать"
 
 
 def test_at_most_one_voice_message_ever_sent_per_delivery(tmp_db, monkeypatch):
@@ -375,7 +408,8 @@ def test_tts_timeout_falls_back_to_full_text(tmp_db, monkeypatch):
     msg = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(msg, 1, "full answer", "ru"))
     assert msg.voices == []
-    assert msg.answers == [("full answer", {})]  # honest fallback, never silent
+    assert [text for text, _ in msg.answers] == ["full answer"]
+    assert isinstance(msg.answers[0][1]["reply_markup"], bot.ReplyKeyboardMarkup)
 
 
 def test_tts_provider_error_falls_back_to_full_text(tmp_db, monkeypatch):
@@ -387,7 +421,8 @@ def test_tts_provider_error_falls_back_to_full_text(tmp_db, monkeypatch):
     monkeypatch.setattr(bot, "synthesize_speech", fake_synth)
     msg = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(msg, 1, "full answer", "ru"))
-    assert msg.answers == [("full answer", {})]
+    assert [text for text, _ in msg.answers] == ["full answer"]
+    assert isinstance(msg.answers[0][1]["reply_markup"], bot.ReplyKeyboardMarkup)
 
 
 def test_telegram_send_voice_error_still_cleans_temp_file(tmp_db, monkeypatch, tmp_path):
@@ -422,7 +457,7 @@ def test_temp_file_cleanup_on_success(tmp_db, monkeypatch, tmp_path):
     assert not os.path.exists(fake_path)
 
 
-def test_long_response_becomes_one_validated_concise_spoken_response(tmp_db, monkeypatch):
+def test_long_response_reaches_tts_complete_even_with_legacy_concise_preference(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
     run(database.set_response_preference(1, response_format="voice", response_length="concise"))
@@ -435,28 +470,80 @@ def test_long_response_becomes_one_validated_concise_spoken_response(tmp_db, mon
     long_answer = ("Одно предложение с важной мыслью. " * 20).strip()
     msg = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(msg, 1, long_answer, "ru"))
-    assert len(seen["text"]) < len(long_answer)
+    assert seen["text"] == long_answer
 
 
-def test_ru_and_en_voice_selection(tmp_db, monkeypatch):
-    seen = {}
-    async def fake_create(model, voice, input, response_format, **kw):
-        seen["voice"] = voice
-        class R:
-            def write_to_file(self, path):
-                open(path, "wb").write(b"x")
-        return R()
-    monkeypatch.setattr(bot.client.audio.speech, "create", fake_create)
-    run(tts_module.synthesize_speech(bot.client, "hello", "ru"))
-    assert seen["voice"] == config.TTS_VOICE_RU
-    run(tts_module.synthesize_speech(bot.client, "hello", "en"))
-    assert seen["voice"] == config.TTS_VOICE_EN
+def test_elevenlabs_request_uses_exact_voice_and_complete_synthetic_text(tmp_db, monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        content = b"OggS" + b"synthetic-audio"
+        def raise_for_status(self):
+            return None
+
+    class FakeTransport:
+        def __init__(self, **kw):
+            self.init = kw
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *exc):
+            return False
+        async def post(self, url, **kw):
+            calls.append((url, kw))
+            return FakeResponse()
+
+    monkeypatch.setattr(tts_module.httpx, "AsyncClient", FakeTransport)
+    synthetic = "Синтетический тестовый ответ длиннее шестисот символов. " * 15
+    path = run(tts_module.synthesize_speech(bot.client, synthetic, "ru"))
+    try:
+        assert len(synthetic) > 600
+        assert calls == [(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{config.ELEVENLABS_VOICE_ID}",
+            calls[0][1],
+        )]
+        request = calls[0][1]
+        assert request["json"]["text"] == synthetic.strip()
+        assert request["json"]["model_id"] == "eleven_multilingual_v2"
+        assert request["params"] == {
+            "output_format": "opus_48000_32", "enable_logging": "false"}
+        assert request["headers"]["xi-api-key"] == "synthetic-test-key"
+        with open(path, "rb") as audio:
+            assert audio.read().startswith(b"OggS")
+    finally:
+        os.remove(path)
 
 
-def test_concise_transform_is_validated_and_the_validated_text_is_what_reaches_tts(tmp_db, monkeypatch):
-    # Direct mock assertions on BOTH validate_response and synthesize_speech,
-    # recording the exact strings each receives -- a test that only checks
-    # "send_voice was called" cannot prove ordering or content.
+@pytest.mark.parametrize("gate,key", [(False, "synthetic-test-key"), (True, "")])
+def test_elevenlabs_requires_gate_and_environment_key(monkeypatch, gate, key):
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", gate)
+    monkeypatch.setattr(config, "ELEVENLABS_API_KEY", key)
+    called = {"n": 0}
+
+    class ForbiddenTransport:
+        def __init__(self, **kw):
+            called["n"] += 1
+
+    monkeypatch.setattr(tts_module.httpx, "AsyncClient", ForbiddenTransport)
+    with pytest.raises(tts_module.TTSError):
+        run(tts_module.synthesize_speech(bot.client, "synthetic text", "ru"))
+    assert called["n"] == 0
+
+
+def test_over_limit_tts_input_is_not_truncated_or_transmitted(monkeypatch):
+    monkeypatch.setattr(config, "TTS_MAX_INPUT_CHARS", 600)
+    called = {"n": 0}
+
+    class ForbiddenTransport:
+        def __init__(self, **kw):
+            called["n"] += 1
+
+    monkeypatch.setattr(tts_module.httpx, "AsyncClient", ForbiddenTransport)
+    with pytest.raises(tts_module.TTSError, match="complete-text fallback"):
+        run(tts_module.synthesize_speech(bot.client, "x" * 601, "ru"))
+    assert called["n"] == 0
+
+
+def test_legacy_concise_preference_never_shortens_approved_tts_text(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
     run(database.set_response_preference(1, response_format="voice", response_length="concise"))
@@ -477,10 +564,8 @@ def test_concise_transform_is_validated_and_the_validated_text_is_what_reaches_t
     msg = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(msg, 1, long_answer, "ru"))
 
-    assert len(validated_texts) == 1
-    concise_text = validated_texts[0]
-    assert concise_text != long_answer and len(concise_text) < len(long_answer)
-    assert synthesized_texts == [concise_text]  # exactly the VALIDATED text reaches TTS, nothing else
+    assert validated_texts == []
+    assert synthesized_texts == [long_answer]
 
 
 def test_unsafe_concise_transform_falls_back_to_original_and_never_reaches_tts(tmp_db, monkeypatch):
@@ -650,31 +735,31 @@ def test_listen_button_creates_no_database_row(tmp_db):
 
 # ── §23 Reactions ────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("category,expected_first", [
-    (rs.ReactionCategory.TEARS_WELLING, "🥹"),
-    (rs.ReactionCategory.HEARTBREAK_OR_LOSS, "💔"),
-    (rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, "😔"),
-    (rs.ReactionCategory.LONELINESS_OR_REJECTION, "🥹"),
-    (rs.ReactionCategory.ANXIETY_OR_WORRY, "😟"),
-    (rs.ReactionCategory.FEAR_OR_SHOCK, "😨"),
-    (rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM, "😮‍💨"),
-    (rs.ReactionCategory.CONFUSION_OR_UNCERTAINTY, "🤔"),
-    (rs.ReactionCategory.ANGER_OR_FRUSTRATION, "😤"),
-    (rs.ReactionCategory.RELIEF_OR_CALM, "😌"),
-    (rs.ReactionCategory.GRATITUDE_OR_WARMTH, "❤️"),
-    (rs.ReactionCategory.PROGRESS_OR_ACHIEVEMENT, "🔥"),
-    (rs.ReactionCategory.PRACTICE_COMPLETED, "👍"),
+@pytest.mark.parametrize("category,expected", [
+    (rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, ("🫂", "😔")),
+    (rs.ReactionCategory.TEARS_WELLING, ("🥹", "🫂")),
+    (rs.ReactionCategory.LONELINESS_OR_REJECTION, ("🫂", "🥹")),
+    (rs.ReactionCategory.ANXIETY_OR_WORRY, ("😟",)),
+    (rs.ReactionCategory.FEAR_OR_SHOCK, ("😨",)),
+    (rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM, ("😮‍💨",)),
+    (rs.ReactionCategory.HEARTBREAK_OR_LOSS, ("💔",)),
+    (rs.ReactionCategory.CONFUSION_OR_UNCERTAINTY, ("🤔",)),
+    (rs.ReactionCategory.ANGER_OR_FRUSTRATION, ("😤",)),
+    (rs.ReactionCategory.RELIEF_OR_CALM, ("😌",)),
+    (rs.ReactionCategory.GRATITUDE_OR_WARMTH, ("❤",)),
+    (rs.ReactionCategory.PROGRESS_OR_ACHIEVEMENT, ("🔥", "🎉")),
+    (rs.ReactionCategory.PRACTICE_COMPLETED, ("👍",)),
 ])
-def test_reaction_mapping_primary_emoji(category, expected_first):
-    assert rs.pick_supported_emoji(category, None) == expected_first
+def test_reaction_mapping_matches_approved_semantics(category, expected):
+    assert rs.REACTION_MAP[category] == expected
 
 
-def test_heavy_experience_uses_tears_welling_not_hugging_emoji():
+def test_near_tears_prefers_tears_then_explicitly_supported_hug_fallback():
     cat, _ = rs.select_reaction_category("мне так тяжело, слёзы наворачиваются",
                                           ["hopelessness"], "OPEN", "ru")
     assert cat == rs.ReactionCategory.TEARS_WELLING
-    assert rs.pick_supported_emoji(cat, None) == "🥹"
-    assert "🫂" not in rs.REACTION_MAP[rs.ReactionCategory.TEARS_WELLING]
+    assert rs.pick_supported_emoji(cat, ["🥹", "🫂"]) == "🥹"
+    assert rs.pick_supported_emoji(cat, ["🫂"]) == "🫂"
 
 
 def test_crisis_categories_never_react():
@@ -719,11 +804,11 @@ def test_cooldown_per_user_and_cross_user_isolation(tmp_db, monkeypatch):
     monkeypatch.setattr(bot.bot, "set_message_reaction", fake_set_reaction)
 
     msg_a = FakeMessage(FakeUser(1), "x")
-    run(bot._maybe_react(msg_a, 1, rs.ReactionCategory.RELIEF_OR_CALM, 0.9))
-    run(bot._maybe_react(msg_a, 1, rs.ReactionCategory.RELIEF_OR_CALM, 0.9))  # cooldown blocks
+    run(bot._maybe_react(msg_a, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
+    run(bot._maybe_react(msg_a, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))  # cooldown blocks
     monkeypatch.setattr(ac, "OWNER_USER_ID", 2)  # only one owner uid at a time -- re-patch for user 2
     msg_b = FakeMessage(FakeUser(2), "x")
-    run(bot._maybe_react(msg_b, 2, rs.ReactionCategory.RELIEF_OR_CALM, 0.9))  # different user, unaffected
+    run(bot._maybe_react(msg_b, 2, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))  # different user, unaffected
     assert len(calls) == 2  # user 1 once, user 2 once -- never blocked by user 1's cooldown
 
 
@@ -743,9 +828,10 @@ def test_at_most_one_reaction_per_call(tmp_db, monkeypatch):
     assert len(calls[0]["reaction"]) == 1
 
 
-def test_unsupported_preferred_emoji_uses_fallback():
-    emoji = rs.pick_supported_emoji(rs.ReactionCategory.HEARTBREAK_OR_LOSS, ["🥹", "😔"])
-    assert emoji == "🥹"  # 💔 unsupported here -> first supported fallback
+def test_unsupported_preferred_emoji_uses_approved_fallback():
+    emoji = rs.pick_supported_emoji(
+        rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, ["😔"])
+    assert emoji == "😔"  # 🫂 unsupported here -> approved fallback
 
 
 def test_no_supported_candidate_is_a_noop(tmp_db, monkeypatch):
@@ -781,7 +867,10 @@ def test_omitted_available_reactions_means_all_standard_allowed():
     # type (ChatFullInfo.available_reactions is Optional).
     from aiogram.types import ChatFullInfo
     assert ChatFullInfo.model_fields["available_reactions"].default is None
-    assert rs.pick_supported_emoji(rs.ReactionCategory.RELIEF_OR_CALM, None) == "😌"
+    assert rs.pick_supported_emoji(rs.ReactionCategory.HEARTBREAK_OR_LOSS, None) == "💔"
+    # Renderable is not the same as Bot-API-supported: never assume 🫂/😌.
+    assert rs.pick_supported_emoji(rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, None) is None
+    assert rs.pick_supported_emoji(rs.ReactionCategory.RELIEF_OR_CALM, None) is None
 
 
 def test_reaction_category_is_never_persisted():
@@ -1034,8 +1123,25 @@ def test_transcribed_text_enters_the_normal_pipeline_unaltered(tmp_db, monkeypat
     async def spy_pipeline(message, text, state, **kw):
         seen["text"] = text
     monkeypatch.setattr(bot, "pipeline", spy_pipeline)
-    run(bot.handle_voice(_voice_msg(FakeUser(1)), None))
+    msg = _voice_msg(FakeUser(1))
+    run(bot.handle_voice(msg, None))
     assert seen["text"] == "мне очень плохо"  # exact transcript, unaltered, reaches risk detection
+    assert msg.answers == []  # transcript is internal input, never a visible echo
+
+
+def test_long_voice_transcript_is_internal_only_and_not_echoed(tmp_db, monkeypatch):
+    transcript = "Мне нужно разобраться в этом. " * 200
+    async def fake_transcribe(voice, bot_, client_, lang):
+        return transcript
+    monkeypatch.setattr(bot, "transcribe_voice", fake_transcribe)
+    seen = {}
+    async def spy_pipeline(message, text, state, **kw):
+        seen["text"] = text
+    monkeypatch.setattr(bot, "pipeline", spy_pipeline)
+    msg = _voice_msg(FakeUser(1))
+    run(bot.handle_voice(msg, None))
+    assert seen["text"] == transcript
+    assert msg.answers == []
 
 
 def test_transcription_failure_sends_existing_safe_error_response(tmp_db, monkeypatch):
@@ -1105,11 +1211,11 @@ def test_non_owner_incoming_voice_uses_public_voice_setting(tmp_db, monkeypatch,
     run(bot.handle_voice(msg, fsm))
 
     assert transcribe_calls["n"] == 1
-    assert msg.answers[0][0] == "🎤 <i>мне грустно сегодня</i>"  # exact transcript, unaltered
+    assert not any("мне грустно сегодня" in answer[0] for answer in msg.answers)
     if voice_flag:
         assert tts_calls["n"] == 1
         assert len(msg.voices) == 1
-        assert all(answer[0] != "ordinary text reply" for answer in msg.answers)
+        assert msg.answers == []
     else:
         assert msg.answers[-1][0] == "ordinary text reply"
         assert tts_calls["n"] == 0
@@ -1710,7 +1816,9 @@ def test_voice_fails_text_fallback_succeeds_fallback_becomes_replay_source(tmp_d
     fsm = FakeFSM()
     msg = FakeMessage(FakeUser(1), "Мне тревожно")
     run(bot.pipeline(msg, "Мне тревожно", fsm))
-    assert msg.answers == [("the approved answer, delivered as text fallback", {})]
+    assert [text for text, _ in msg.answers] == [
+        "the approved answer, delivered as text fallback"]
+    assert isinstance(msg.answers[0][1]["reply_markup"], bot.ReplyKeyboardMarkup)
     data = run(fsm.get_data())
     assert data.get("last_delivered_response") == "the approved answer, delivered as text fallback"
 
@@ -1824,7 +1932,7 @@ def test_one_shot_voice_override_also_never_synthesizes_the_unsafe_draft(tmp_db,
     assert "an unsafe one-shot draft" not in synthesized
 
 
-def test_voice_and_concise_text_transformed_spoken_text_is_revalidated(tmp_db, monkeypatch):
+def test_text_and_voice_mode_keeps_full_text_and_does_not_auto_synthesize(tmp_db, monkeypatch):
     monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
     run(database.upsert_user(1, "u", "U"))
     run(_consume_first_turn(1))
@@ -1848,9 +1956,9 @@ def test_voice_and_concise_text_transformed_spoken_text_is_revalidated(tmp_db, m
     msg = FakeMessage(FakeUser(1), "Мне тревожно")
     run(bot.pipeline(msg, "Мне тревожно", fsm))
 
-    assert len(validated) >= 1
-    assert synthesized == [validated[-1]]  # the LAST (revalidated) transform is what reaches TTS
-    assert long_answer not in synthesized
+    assert synthesized == []
+    assert msg.answers[0][0] == long_answer
+    assert msg.answers[0][1]["reply_markup"].inline_keyboard[0][0].text == "🔊 Прослушать"
 
 
 # ── Direct crisis and dependency delivery proofs (voice+reactions enabled) ──
@@ -2428,33 +2536,35 @@ def test_owner_gate_reactions_owner_in_group_unaffected(tmp_db, monkeypatch):
 #   2. every ordinary phrase the owner sent selected NONE, so no reaction
 #      could ever appear (the flag and the owner gate were both correct).
 
-def test_first_ordinary_reply_carries_reply_keyboard_removal(tmp_db, monkeypatch):
-    # Covers the three required triggers at once: deliver_response is the
-    # single shared delivery point for a chosen emotion (cb_mood -> pipeline),
-    # ordinary free text, and an incoming voice message (handle_voice ->
-    # pipeline), so one removal here retracts the legacy keyboard for all.
+def test_first_ordinary_reply_carries_permanent_lower_menu(tmp_db, monkeypatch):
     bot._legacy_kb_cleared.clear()
     run(database.upsert_user(1, "u", "U"))
     msg = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(msg, 1, "an ordinary answer", "ru"))
     assert msg.answers[0][0] == "an ordinary answer"
-    assert isinstance(msg.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
+    markup = msg.answers[0][1].get("reply_markup")
+    assert isinstance(markup, bot.ReplyKeyboardMarkup)
+    assert [[button.text for button in row] for row in markup.keyboard] == [
+        ["🧠 Психологические тесты", "📊 Мои результаты"],
+        ["📝 Дневники", "🎛 Как отвечать"],
+        ["🔒 Данные и приватность"],
+    ]
+    assert markup.is_persistent is True
+    assert markup.resize_keyboard is True
 
 
-def test_reply_keyboard_removal_is_sent_only_once_per_user(tmp_db, monkeypatch):
-    # It must not ride on every answer -- once the client-side keyboard is
-    # gone, repeating the removal is pure noise.
+def test_permanent_lower_menu_remains_attached_on_later_replies(tmp_db, monkeypatch):
     bot._legacy_kb_cleared.clear()
     run(database.upsert_user(1, "u", "U"))
     first = FakeMessage(FakeUser(1), "hi")
     run(bot.deliver_response(first, 1, "first", "ru"))
     second = FakeMessage(FakeUser(1), "hi again")
     run(bot.deliver_response(second, 1, "second", "ru"))
-    assert isinstance(first.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
-    assert second.answers[0][1].get("reply_markup") is None
+    assert isinstance(first.answers[0][1].get("reply_markup"), bot.ReplyKeyboardMarkup)
+    assert isinstance(second.answers[0][1].get("reply_markup"), bot.ReplyKeyboardMarkup)
 
 
-def test_reply_keyboard_removal_is_per_user_not_global(tmp_db, monkeypatch):
+def test_permanent_lower_menu_is_available_for_each_user(tmp_db, monkeypatch):
     bot._legacy_kb_cleared.clear()
     run(database.upsert_user(1, "u", "U"))
     run(database.upsert_user(2, "u", "U"))
@@ -2462,33 +2572,23 @@ def test_reply_keyboard_removal_is_per_user_not_global(tmp_db, monkeypatch):
     run(bot.deliver_response(a, 1, "for a", "ru"))
     b = FakeMessage(FakeUser(2), "hi")
     run(bot.deliver_response(b, 2, "for b", "ru"))
-    assert isinstance(a.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
-    assert isinstance(b.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
+    assert isinstance(a.answers[0][1].get("reply_markup"), bot.ReplyKeyboardMarkup)
+    assert isinstance(b.answers[0][1].get("reply_markup"), bot.ReplyKeyboardMarkup)
 
 
-def test_failed_eviction_still_delivers_text_and_stays_retryable(tmp_db, monkeypatch):
-    # Review finding: marking the uid BEFORE a confirmed send made a failed
-    # eviction permanent for that user. The answer must still arrive, and the
-    # next reply must try the eviction again.
+def test_failed_lower_menu_send_does_not_mark_delivery_as_success(tmp_db, monkeypatch):
     bot._legacy_kb_cleared.clear()
     run(database.upsert_user(1, "u", "U"))
     sends = []
     class _FlakyMessage(FakeMessage):
         async def answer(self, text, **kw):
             sends.append(kw.get("reply_markup"))
-            if isinstance(kw.get("reply_markup"), bot.ReplyKeyboardRemove):
-                raise RuntimeError("telegram rejected the removal")
-            self.answers.append((text, kw))
+            raise RuntimeError("telegram rejected the message")
 
     first = _FlakyMessage(FakeUser(1), "hi")
-    run(bot.deliver_response(first, 1, "the answer", "ru"))
-    assert [a[0] for a in first.answers] == ["the answer"]  # text still arrived
-    assert 1 not in bot._legacy_kb_cleared                  # left retryable
-
-    second = FakeMessage(FakeUser(1), "hi again")
-    run(bot.deliver_response(second, 1, "second answer", "ru"))
-    assert isinstance(second.answers[0][1].get("reply_markup"), bot.ReplyKeyboardRemove)
-    assert 1 in bot._legacy_kb_cleared  # marked only after a successful send
+    with pytest.raises(RuntimeError, match="telegram rejected"):
+        run(bot.deliver_response(first, 1, "the answer", "ru"))
+    assert first.answers == []
 
 
 def test_eviction_tracking_is_bounded(tmp_db, monkeypatch):
@@ -2502,15 +2602,12 @@ def test_eviction_tracking_is_bounded(tmp_db, monkeypatch):
     assert len(bot._legacy_kb_cleared) <= 5
 
 
-def test_mood_entry_is_inline_and_reply_keyboard_never_reintroduced():
+def test_mood_entry_remains_inline_alongside_permanent_lower_menu():
     # The emotion choices must stay attached to their own message (inline) so
     # they can never occupy the user's text-input keyboard area again.
     kb = bot._mood_entry_keyboard("ru", ["a", "b"])
     assert isinstance(kb, bot.InlineKeyboardMarkup)
-    # bot.py must not even import ReplyKeyboardMarkup -- it cannot construct
-    # one it never bound. (Asserting on getsource would match this file's own
-    # explanatory comments about the legacy keyboard.)
-    assert not hasattr(bot, "ReplyKeyboardMarkup")
+    assert isinstance(bot.persistent_lower_menu_kb("ru"), bot.ReplyKeyboardMarkup)
 
 
 def test_emotion_selection_removes_menu_and_does_not_duplicate_it(tmp_db, monkeypatch):
@@ -2544,7 +2641,34 @@ def test_live_canary_phrases_now_select_an_eligible_reaction(phrase, expected):
     cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
     assert cat == expected
     assert conf >= config.EMOTIONAL_REACTION_MIN_CONFIDENCE
-    assert rs.pick_supported_emoji(cat, None) is not None
+
+
+@pytest.mark.parametrize("phrase,expected", [
+    ("Мне тяжело после этого разговора.", rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT),
+    ("На этой неделе всё навалилось.", rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM),
+    ("Я совсем не справляюсь с нагрузкой.", rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM),
+    ("Мне одиноко после переезда.", rs.ReactionCategory.LONELINESS_OR_REJECTION),
+    ("Я едва сдерживаю слёзы.", rs.ReactionCategory.TEARS_WELLING),
+    ("Я злюсь из-за этой ситуации.", rs.ReactionCategory.ANGER_OR_FRUSTRATION),
+])
+def test_conservative_natural_russian_coverage(phrase, expected):
+    category, confidence = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert category == expected
+    assert confidence >= config.EMOTIONAL_REACTION_MIN_CONFIDENCE
+
+
+def test_growth_stage_alone_does_not_force_progress_reaction():
+    assert rs.select_reaction_category(
+        "Обычное сообщение без явного достижения.", [], "GROWTH", "ru") == \
+        (rs.ReactionCategory.NONE, 0.0)
+
+
+def test_explicit_small_win_selects_high_confidence_progress_reaction():
+    category, confidence = rs.select_reaction_category(
+        "У меня получилось сделать первый шаг.", [], "GROWTH", "ru")
+    assert category == rs.ReactionCategory.PROGRESS_OR_ACHIEVEMENT
+    assert confidence == 0.9
+    assert rs.pick_supported_emoji(category, None) == "🔥"
 
 
 @pytest.mark.parametrize("phrase", [
@@ -2698,11 +2822,11 @@ def test_reaction_log_records_low_confidence_then_selected_then_cooldown(tmp_db,
     monkeypatch.setattr(bot.bot, "set_message_reaction", _async(None))
     lines = _capture_reaction_logs(monkeypatch)
     msg = FakeMessage(FakeUser(1), "x")
-    run(bot._maybe_react(msg, 1, rs.ReactionCategory.ANXIETY_OR_WORRY, 0.1))
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.1))
     assert any("reason=low_confidence" in l for l in lines)
-    run(bot._maybe_react(msg, 1, rs.ReactionCategory.ANXIETY_OR_WORRY, 0.9))
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
     assert any("decision=selected" in l for l in lines)
-    run(bot._maybe_react(msg, 1, rs.ReactionCategory.ANXIETY_OR_WORRY, 0.9))
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
     assert any("reason=cooldown" in l for l in lines)
 
 
@@ -2716,7 +2840,7 @@ def test_reaction_failure_never_blocks_and_records_error_class(tmp_db, monkeypat
     monkeypatch.setattr(bot.bot, "set_message_reaction", boom)
     lines = _capture_reaction_logs(monkeypatch)
     msg = FakeMessage(FakeUser(1), "x")
-    run(bot._maybe_react(msg, 1, rs.ReactionCategory.ANXIETY_OR_WORRY, 0.9))  # must not raise
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))  # must not raise
     assert any("decision=failed" in l and "RuntimeError" in l for l in lines)
 
 

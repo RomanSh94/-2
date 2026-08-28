@@ -12,23 +12,24 @@ discuss-with-bot. See CLAUDE.md / CLINICAL_BOUNDARY.md for why this is
 deliberately narrow.
 """
 
-# ── Professional, manifest-driven catalog (replaces the old symptom-label
-# category list). The 6 root categories below are the catalog root; categories
-# 1-4 render governance-manifest instruments as INFO entries (never startable
-# here), self_observation lists the synthetic registry demos (the only
-# startable path), consultation_report reframes the old "Для специалиста".
+# ── Public-beta catalog. These are potential entry points, not unconditional
+# buttons: bot.py renders a category only when at least one canonical
+# instrument passes every existing provenance, activation, definition, and
+# per-user authorization gate. Thus no empty or unavailable category appears.
 CATALOG_CATEGORIES = [
-    ("depression_mood_energy", "Депрессия, настроение и энергия", "Depression, mood & energy"),
+    ("depression", "Депрессия", "Depression"),
     ("anxiety", "Тревога", "Anxiety"),
-    ("stress", "Стресс", "Stress"),
-    ("specialized", "Специализированные шкалы", "Specialized scales"),
-    ("self_observation", "Самонаблюдение", "Self-observation"),
-    ("consultation_report", "Отчёт для консультации", "Consultation report"),
+    ("stress_burnout", "Стресс и выгорание", "Stress and burnout"),
+    ("trauma_ptsd", "Травма и ПТСР", "Trauma and PTSD"),
+    ("self_esteem", "Самооценка", "Self-esteem"),
+    ("adhd_attention", "СДВГ и внимание", "ADHD and attention"),
+    ("other", "Другие тесты", "Other tests"),
 ]
 
-# Categories 1-4 render manifest instruments; 5-6 are handled specially.
-CATALOG_MANIFEST_CATEGORY_IDS = frozenset(
-    {"depression_mood_energy", "anxiety", "stress", "specialized"})
+CATALOG_CATEGORY_IDS = frozenset(key for key, _, _ in CATALOG_CATEGORIES)
+# Compatibility alias for older callers/tests. Product rendering is now
+# uniformly availability-driven for all seven categories.
+CATALOG_MANIFEST_CATEGORY_IDS = CATALOG_CATEGORY_IDS
 
 _CATALOG_CATEGORY_LABELS = {key: (ru, en) for key, ru, en in CATALOG_CATEGORIES}
 
@@ -39,44 +40,24 @@ def catalog_category_label(key: str, lang: str) -> str:
 
 
 def list_text(lang: str = "ru") -> str:
-    # Professional catalog root. Honest and non-diagnostic: opting a screening
-    # instrument into the catalog is explicitly NOT a claim that the bot can
-    # run it.
     if lang == "ru":
-        return ("☑️ Скрининговые шкалы и опросники\n\n"
-                "Здесь собраны инструменты самонаблюдения и скрининга.\n\n"
-                "Опросники не ставят диагноз и не заменяют консультацию специалиста.\n"
-                "Доступность конкретной методики зависит от её версии и прав на "
-                "цифровое использование.\n\n"
-                "Выберите раздел:")
-    return ("☑️ Screening scales and questionnaires\n\n"
-            "This is a set of self-observation and screening instruments.\n\n"
-            "Questionnaires do not diagnose and do not replace a consultation "
-            "with a specialist.\n"
-            "Whether a given method is available depends on its version and "
-            "digital-use rights.\n\n"
-            "Choose a section:")
+        return ("🧠 Психологические тесты\n\n"
+                "Тесты помогут лучше оценить своё состояние и заметить изменения "
+                "со временем.\n\n"
+                "Они не ставят диагноз и не заменяют консультацию специалиста.\n\n"
+                "Выбери, что хочешь проверить:")
+    return ("🧠 Psychological tests\n\n"
+            "Tests can help you assess how you are feeling and notice changes "
+            "over time.\n\n"
+            "They do not diagnose or replace a consultation with a specialist.\n\n"
+            "Choose what you would like to check:")
 
 
 def catalog_category_text(category_id: str, lang: str = "ru") -> str:
     label = catalog_category_label(category_id, lang)
-    if category_id == "consultation_report":
-        return consultation_report_text(lang)
-    if category_id == "self_observation":
-        if lang == "ru":
-            return (f"{label}\n\n"
-                    "Небольшие опросники для самонаблюдения, которые можно пройти "
-                    "прямо в боте.\nЭто не диагноз.")
-        return (f"{label}\n\n"
-                "Short self-observation questionnaires you can take right here in "
-                "the bot.\nThis is not a diagnosis.")
     if lang == "ru":
-        return (f"{label}\n\n"
-                "Выберите методику, чтобы узнать о ней подробнее.\n"
-                "Активные опросники будут отдельно отмечены как доступные.")
-    return (f"{label}\n\n"
-            "Choose a method to learn more about it.\n"
-            "Active questionnaires will be marked separately as available.")
+        return f"{label}\n\nВыбери тест. Он не ставит диагноз."
+    return f"{label}\n\nChoose a test. It does not provide a diagnosis."
 
 
 def catalog_empty_text(category_id: str, lang: str = "ru") -> str:

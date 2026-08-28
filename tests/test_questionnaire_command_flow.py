@@ -151,15 +151,15 @@ def test_questionnaire_active_crisis_gate_runs_before_product_gate(monkeypatch):
 
 
 # ── list / category / detail screens ─────────────────────────────────────────
-def test_questionnaire_list_shows_categories():
+def test_questionnaire_list_hides_categories_without_proven_ready_instruments():
     user = FakeUser(1)
     msg = FakeMessage(user)
     asyncio.run(bot.cmd_questionnaire(msg))
     text, kw = msg.answers[0]
-    assert "Опросники" in text
+    assert "Психологические тесты" in text
     kb = kw["reply_markup"]
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    assert "q:c:anxiety" in callback_datas
+    assert callback_datas == ["menu:back"]
 
 
 # NOTE: synthetic registry demos now live under the professional catalog's
@@ -172,16 +172,16 @@ def _button_texts(kw):
     return [btn.text for row in kb.inline_keyboard for btn in row]
 
 
-def test_active_questionnaire_appears_in_category_list():
+def test_unproven_active_registry_questionnaire_is_not_publicly_catalogued():
     user = FakeUser(1)
     msg = FakeMessage(user)
-    cb = FakeCallback(user, msg, data="q:c:self_observation")
+    cb = FakeCallback(user, msg, data="q:c:anxiety")
     asyncio.run(bot.cb_questionnaire_category(cb))
-    text, kw = msg.answers[-1]
-    assert "Demo Anxiety Check" in _button_texts(kw)
+    _, kw = msg.answers[-1]
+    assert "Demo Anxiety Check" not in _button_texts(kw)
     kb = kw["reply_markup"]
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    assert "q:d:demo_anxiety_v1" in callback_datas
+    assert "q:d:demo_anxiety_v1" not in callback_datas
 
 
 def test_archived_questionnaire_hidden_from_category_list():

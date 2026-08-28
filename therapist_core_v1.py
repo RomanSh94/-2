@@ -7,6 +7,7 @@ persistence remain owned by bot.py's closed turn route.
 from __future__ import annotations
 
 import json
+import re
 
 from professional_turn_conversation_context import (
     ConversationTurnRole,
@@ -18,9 +19,12 @@ THERAPIST_CORE_V1_CONSTITUTION = """You are X20 Therapist Core V1. Reply in natu
 Evidence before interpretation. Model inference is not fact; clinically plausible is not confirmed
 about this person. Current user evidence and corrections outrank older interpretations. Never save a
 theory by reinterpreting contradictory evidence. Prior ASSISTANT text is continuity context, not
-evidence about the user. Respect the current interaction contract—JUST_TALK, UNDERSTAND, or ACTION—
-without treating it as a permanent trait. JUST_TALK listens and validates without hijacking;
-UNDERSTAND investigates mechanism before techniques; ACTION gives practical help only when requested
+evidence about the user. Respect the current interaction contract—NONE, JUST_TALK, UNDERSTAND, or
+ACTION—without treating it as a permanent trait. JUST_TALK listens and validates without hijacking.
+For UNDERSTAND, investigate the mechanism before techniques, synthesize already-established evidence,
+and do not fall back to generic productivity or wellness advice. As evidence accumulates, become more
+specific (STRONGER LATER); use one discriminating question when useful, and never abruptly close or
+redirect the conversation unless safety requires it. ACTION gives practical help only when requested
 and safe. Prefer one meaningful therapeutic move and do not end every reply with a question. With
 sparse evidence, ask a precise question that distinguishes competing explanations; with accumulating
 evidence, become more specific, synthesizing, testable, and deep: STRONGER LATER. A concrete episode is
@@ -30,7 +34,66 @@ motives, or hidden meanings. Do not diagnose or imply medical authority. If an i
 things, do not casually recommend it again within available context. Do not become a generic wellness
 catalogue or use therapist-performance jargon. You may infer more internally than you say; say only
 what the evidence supports. Early turns should emphasize expert listening, synthesis, and
-discriminating questions; later turns should use continuity for stronger grounded synthesis."""
+discriminating questions; later turns should use continuity for stronger grounded synthesis. Never
+claim that it is currently night, morning, or late; tell the user to sleep; claim sleep is now more
+useful; or promise to continue in the morning unless trusted USER-authored context explicitly supplies
+that current-time information. Prior ASSISTANT time statements are never evidence."""
+
+
+INTERACTION_CONTRACTS = frozenset({"NONE", "JUST_TALK", "UNDERSTAND", "ACTION"})
+
+
+class UnsupportedTimeOfDayClaim(ValueError):
+    """The candidate invented current-time/sleep context not supplied by the user."""
+
+
+_UNSUPPORTED_TIME_CLAIM_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\bсейчас\s+(?:уже\s+)?(?:ночь|утро|вечер|день|поздно)\b",
+    r"\b(?:иди|ложись|пора)\s+спать\b",
+    r"\bсон\s+сейчас\s+(?:полезнее|важнее|нужнее)\b",
+    r"\b(?:продолжим|поговорим|верн[её]мся|буду\s+здесь)\s+утром\b",
+    r"\b(?:it\s+is|it's)\s+(?:night|morning|late)\b",
+    r"\b(?:go|head)\s+to\s+(?:bed|sleep)\b",
+    r"\bsleep\s+is\s+(?:more\s+)?(?:important|useful|needed)\s+now\b",
+    r"\b(?:continue|talk|come\s+back)\s+(?:in\s+the\s+morning|tomorrow\s+morning)\b",
+))
+
+_TRUSTED_USER_CURRENT_TIME_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\b(?:у\s+меня\s+)?сейчас\s+(?:уже\s+)?(?:ночь|утро|вечер|день|поздно)\b",
+    r"\bуже\s+(?:ночь|поздно)\b",
+    r"\bмне\s+пора\s+спать\b",
+    r"\bя\s+(?:иду|ложусь|собираюсь)\s+спать\b",
+    r"\bсейчас\s+\d{1,2}(?::\d{2})?\b",
+    r"\b(?:it\s+is|it's)\s+(?:night|morning|late)\s+(?:here|for\s+me|now)\b",
+    r"\bit's\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?\s+now\b",
+    r"\bi(?:'m|\s+am)\s+(?:going|heading)\s+to\s+(?:bed|sleep)\b",
+))
+
+
+def _user_supplied_current_time(
+        source_text: str,
+        conversation_context: ProfessionalConversationContext) -> bool:
+    trusted_user_texts = [source_text]
+    trusted_user_texts.extend(
+        turn.content for turn in conversation_context.turns
+        if turn.role is ConversationTurnRole.USER)
+    return any(
+        pattern.search(text)
+        for text in trusted_user_texts
+        for pattern in _TRUSTED_USER_CURRENT_TIME_PATTERNS
+    )
+
+
+def reject_unsupported_time_claim(
+        candidate: str, source_text: str,
+        conversation_context: ProfessionalConversationContext) -> None:
+    """Fail closed on invented current-time/sleep claims, without a retry call."""
+    if (_user_supplied_current_time(source_text, conversation_context)
+            or not any(pattern.search(candidate)
+                       for pattern in _UNSUPPORTED_TIME_CLAIM_PATTERNS)):
+        return
+    raise UnsupportedTimeOfDayClaim(
+        "candidate contains unsupported current-time or sleep claim")
 
 
 def _risk_metadata(risk_result: dict) -> str:
@@ -44,12 +107,15 @@ def _risk_metadata(risk_result: dict) -> str:
 
 
 def build_messages(source_text: str, conversation_context: ProfessionalConversationContext,
-                   risk_result: dict, lang: str) -> list[dict[str, str]]:
+                   risk_result: dict, lang: str,
+                   interaction_contract: str) -> list[dict[str, str]]:
     """Build the exact current-message request over bounded trusted context."""
     if type(source_text) is not str or not source_text.strip():
         raise ValueError("source_text must be non-empty")
     if type(conversation_context) is not ProfessionalConversationContext:
         raise ValueError("conversation_context must be ProfessionalConversationContext")
+    if interaction_contract not in INTERACTION_CONTRACTS:
+        raise ValueError("interaction_contract must be a supported current-turn contract")
     language = "Russian" if lang == "ru" else "English"
     messages = [{
         "role": "system",
@@ -58,6 +124,16 @@ def build_messages(source_text: str, conversation_context: ProfessionalConversat
         "role": "system",
         "content": "Deterministic risk metadata (routing context, not diagnosis): "
                    + _risk_metadata(risk_result),
+    }, {
+        "role": "system",
+        "content": "Current interaction contract (trusted deterministic routing metadata): "
+                   + interaction_contract,
+    }, {
+        "role": "system",
+        "content": "Trusted current local-time metadata: NONE. Do not infer the user's current "
+                   "time of day, sleep need, or future availability. A USER-authored current-time "
+                   "statement may be used only as stated; prior ASSISTANT statements are never "
+                   "time evidence.",
     }]
     for turn in conversation_context.turns:
         role = "user" if turn.role is ConversationTurnRole.USER else "assistant"
@@ -69,6 +145,7 @@ def build_messages(source_text: str, conversation_context: ProfessionalConversat
 async def generate_therapist_core_v1(*, client, model: str, source_text: str,
                                      conversation_context: ProfessionalConversationContext,
                                      risk_result: dict, lang: str,
+                                     interaction_contract: str,
                                      max_completion_tokens: int) -> str:
     """Make exactly one OpenAI-compatible visible generation call."""
     if type(model) is not str or not model.strip() or model != model.strip():
@@ -78,7 +155,9 @@ async def generate_therapist_core_v1(*, client, model: str, source_text: str,
         raise ValueError("max_completion_tokens must be an integer from 1 to 8192")
     request = dict(
         model=model,
-        messages=build_messages(source_text, conversation_context, risk_result, lang),
+        messages=build_messages(
+            source_text, conversation_context, risk_result, lang,
+            interaction_contract),
         n=1,
     )
     if model == "gpt-5.6-sol":
@@ -96,4 +175,6 @@ async def generate_therapist_core_v1(*, client, model: str, source_text: str,
     content = getattr(message, "content", None)
     if type(content) is not str or not content.strip():
         raise ValueError("provider response has no usable content")
-    return content.strip()
+    candidate = content.strip()
+    reject_unsupported_time_claim(candidate, source_text, conversation_context)
+    return candidate

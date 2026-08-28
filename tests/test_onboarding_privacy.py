@@ -86,18 +86,16 @@ def test_delete_all_removes_only_current_user_onboarding(tmp_db):
 def test_privacy_copy_states_history_is_stored(lang):
     c = oc.caption(5, lang).lower()
     if lang == "ru":
-        assert "сохраняет историю" in c
+        assert "история переписки сохраняется" in c
     else:
-        assert "stores the history" in c
+        assert "conversation history is stored" in c
 
 
 @pytest.mark.parametrize("lang", ["ru", "en"])
-def test_privacy_copy_admits_ai_provider_processing(lang):
+def test_privacy_copy_omits_provider_and_model_internals(lang):
     c = oc.caption(5, lang).lower()
-    if lang == "ru":
-        assert "ai-провайдер" in c
-    else:
-        assert "ai provider" in c
+    for internal in ("ai-провайдер", "ai provider", "openai", "gpt", "model"):
+        assert internal not in c
 
 
 @pytest.mark.parametrize("lang", ["ru", "en"])
@@ -107,7 +105,7 @@ def test_privacy_copy_makes_no_forbidden_claims(lang):
     assert "end-to-end" not in c and "сквозное шифрование" not in c
     # No "only 100 messages stored" claim.
     assert "100" not in c
-    # No "no third party ever processes data" claim — we DO disclose a processor.
+    # No unsupported claim that third-party processing can never occur.
     assert "no third party" not in c
     # No GDPR-compliance or medical-confidentiality claim in the notice copy.
     assert "gdpr" not in c
@@ -118,17 +116,21 @@ def test_privacy_copy_makes_no_forbidden_claims(lang):
 def test_privacy_copy_mentions_view_export_delete(lang):
     c = oc.caption(5, lang).lower()
     if lang == "ru":
-        assert "экспортировать" in c and "удалять" in c
+        assert "выгрузить" in c and "удалить" in c
     else:
         assert "export" in c and "delete" in c
 
 
 # ── In-bot privacy summary (fallback when no PRIVACY_POLICY_URL) ──────────────
 @pytest.mark.parametrize("lang", ["ru", "en"])
-def test_privacy_summary_points_at_real_commands_no_invented_url(lang):
+def test_privacy_summary_points_at_real_ui_without_command_only_ux(lang):
     s = oc.privacy_summary(lang)
-    assert "/privacy_export_all" in s
-    assert "/privacy_delete_all" in s
+    assert "/privacy_export_all" not in s
+    assert "/privacy_delete_all" not in s
+    if lang == "ru":
+        assert "получить копию" in s and "удалить данные аккаунта" in s
+    else:
+        assert "get a copy" in s and "delete account data" in s
     # Never an invented public URL.
     assert "http://" not in s and "https://" not in s
 
@@ -147,12 +149,14 @@ def test_no_url_final_line_acknowledges_notice_only_not_policy(lang):
 
 
 @pytest.mark.parametrize("lang", ["ru", "en"])
-def test_real_url_final_line_acknowledges_notice_and_policy(lang):
+def test_real_url_keeps_owner_approved_notice_acknowledgment_copy(lang):
     c = oc.caption(5, lang, "https://example.org/privacy").lower()
     if lang == "ru":
-        assert "и политикой конфиденциальности" in c
+        assert "ознакомление с этим уведомлением" in c
+        assert "и политикой конфиденциальности" not in c
     else:
-        assert "and the privacy policy" in c
+        assert "read this notice" in c
+        assert "and the privacy policy" not in c
 
 
 # ── F: two distinct labels — "Privacy Policy" only for a REAL url= button ─────
@@ -171,9 +175,9 @@ def test_privacy_button_label_differs_by_url_presence():
 # Until the owner explicitly approves it, onboarding copy must not assert
 # "we do not sell data" / "we do not use data for advertising" in ANY framing
 # (a bare claim OR a "per our policy" / "по нашей политике" wrapper) -- only
-# technically verified statements remain: history is stored, the AI provider
-# may process text, export/delete tools exist, safety-audit data may have
-# disclosed retention exceptions.
+# approved statements remain: history is stored, export/delete tools exist,
+# and safety data may have disclosed retention exceptions. Provider/model
+# internals are intentionally excluded from onboarding.
 @pytest.mark.parametrize("lang", ["ru", "en"])
 def test_no_data_sale_or_advertising_claim_anywhere_in_privacy_copy(lang):
     for text in (oc.caption(5, lang, "").lower(),
@@ -193,18 +197,18 @@ def test_no_data_sale_or_advertising_claim_anywhere_in_privacy_copy(lang):
 def test_privacy_copy_keeps_only_technically_verified_statements(lang):
     c = oc.caption(5, lang).lower()
     if lang == "ru":
-        assert "сохраняет историю" in c            # conversation history is stored
-        assert "ai-провайдер" in c                  # AI provider may process text
-        assert "экспортировать" in c and "удалять" in c  # export/delete tools exist
+        assert "история переписки сохраняется" in c
+        assert "выгрузить" in c and "удалить" in c
+        assert "ai-провайдер" not in c
     else:
-        assert "stores the history" in c
-        assert "ai provider" in c
+        assert "conversation history is stored" in c
         assert "export" in c and "delete" in c
+        assert "ai provider" not in c
     s = oc.privacy_summary(lang).lower()
     if lang == "ru":
-        assert "безопасности" in s  # safety-audit retention exception disclosed
+        assert "правилами хранения данных" in s
     else:
-        assert "safety policy" in s
+        assert "retention rules" in s
 
 
 # ── F: PRIVACY_POLICY_URL validation (only http/https + non-empty host) ──────

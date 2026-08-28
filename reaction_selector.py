@@ -32,25 +32,32 @@ class ReactionCategory(str, Enum):
 
 
 # Ordered preferred -> fallback candidates, tried in order against a chat's
-# actual available_reactions. Product correction: 🥹 is the PRIMARY reaction
-# for tears-welling / emotional vulnerability / a painful-but-not-acute
-# experience — NOT 🫂. 🫂 may appear inside supportive prose elsewhere; it is
-# deliberately absent from this mapping.
+# actual available_reactions. Several desired product reactions are not in
+# Telegram's current standard Bot API set. They remain semantic preferences,
+# but are sent only when the chat explicitly reports them as available; an
+# omitted available_reactions list is never treated as proof that an arbitrary
+# renderable emoji is a legal message reaction.
 REACTION_MAP: dict[ReactionCategory, tuple[str, ...]] = {
-    ReactionCategory.TEARS_WELLING: ("🥹", "😔"),
-    ReactionCategory.HEARTBREAK_OR_LOSS: ("💔", "🥹", "😔"),
-    ReactionCategory.SADNESS_OR_DISAPPOINTMENT: ("😔", "🥹"),
-    ReactionCategory.LONELINESS_OR_REJECTION: ("🥹", "💔", "😔"),
-    ReactionCategory.ANXIETY_OR_WORRY: ("😟", "😔"),
-    ReactionCategory.FEAR_OR_SHOCK: ("😨", "😟"),
-    ReactionCategory.EXHAUSTION_OR_OVERWHELM: ("😮‍💨", "😔"),
-    ReactionCategory.CONFUSION_OR_UNCERTAINTY: ("🤔", "😕"),
-    ReactionCategory.ANGER_OR_FRUSTRATION: ("😤", "😔"),
-    ReactionCategory.RELIEF_OR_CALM: ("😌", "❤️"),
-    ReactionCategory.GRATITUDE_OR_WARMTH: ("❤️", "👍"),
-    ReactionCategory.PROGRESS_OR_ACHIEVEMENT: ("🔥", "🎉", "👍"),
-    ReactionCategory.PRACTICE_COMPLETED: ("👍", "❤️"),
+    ReactionCategory.SADNESS_OR_DISAPPOINTMENT: ("🫂", "😔"),
+    ReactionCategory.TEARS_WELLING: ("🥹", "🫂"),
+    ReactionCategory.LONELINESS_OR_REJECTION: ("🫂", "🥹"),
+    ReactionCategory.ANXIETY_OR_WORRY: ("😟",),
+    ReactionCategory.FEAR_OR_SHOCK: ("😨",),
+    ReactionCategory.EXHAUSTION_OR_OVERWHELM: ("😮‍💨",),
+    ReactionCategory.HEARTBREAK_OR_LOSS: ("💔",),
+    ReactionCategory.CONFUSION_OR_UNCERTAINTY: ("🤔",),
+    ReactionCategory.ANGER_OR_FRUSTRATION: ("😤",),
+    ReactionCategory.RELIEF_OR_CALM: ("😌",),
+    ReactionCategory.GRATITUDE_OR_WARMTH: ("❤",),
+    ReactionCategory.PROGRESS_OR_ACHIEVEMENT: ("🔥", "🎉"),
+    ReactionCategory.PRACTICE_COMPLETED: ("👍",),
 }
+
+# Relevant intersection between REACTION_MAP and the standard reaction values
+# documented by the installed aiogram ReactionTypeEmoji transport. This list
+# is used only when Telegram omits available_reactions (meaning all standard
+# reactions are allowed). Explicit chat lists remain authoritative.
+_STANDARD_MAPPED_REACTIONS = frozenset(("😨", "💔", "🤔", "❤", "🔥", "🎉", "👍"))
 
 # Risk categories that must NEVER receive a decorative reaction, regardless
 # of confidence or flag state — a crisis/acute-danger message is handled by
@@ -77,6 +84,14 @@ _KEYWORDS: dict[str, dict[ReactionCategory, tuple[str, ...]]] = {
         ReactionCategory.GRATITUDE_OR_WARMTH: (
             "спасибо", "благодарю", "признательн",
         ),
+        ReactionCategory.TEARS_WELLING: (
+            "слёзы наворачиваются", "слезы наворачиваются",
+            "хочется плакать", "готова расплакаться", "готов расплакаться",
+            "едва сдерживаю слёзы", "едва сдерживаю слезы",
+        ),
+        ReactionCategory.LONELINESS_OR_REJECTION: (
+            "мне одиноко", "чувствую себя одиноко", "меня отвергли",
+        ),
         # Owner-canary finding: the ordinary phrases actually sent live
         # ("сегодня мне немного тревожно...", "я очень устал...") matched
         # nothing here AND produced no risk category, so the selector
@@ -96,13 +111,23 @@ _KEYWORDS: dict[str, dict[ReactionCategory, tuple[str, ...]]] = {
             "тревож", "тревог", "переживаю", "беспокоюсь", "волнуюсь",
         ),
         ReactionCategory.EXHAUSTION_OR_OVERWHELM: (
-            "устал", "вымотан", "измотан", "нет сил",
+            "устал", "вымотан", "измотан", "нет сил", "всё навалилось",
+            "все навалилось", "не справляюсь", "перегружен", "перегружена",
         ),
         ReactionCategory.SADNESS_OR_DISAPPOINTMENT: (
             "мне грустно", "обидно", "разочаров", "как жаль", "расстроен",
+            "мне тяжело", "очень тяжело", "так тяжело",
         ),
         ReactionCategory.CONFUSION_OR_UNCERTAINTY: (
             "не знаю что делать", "запуталась", "запутался", "совсем не понимаю",
+        ),
+        ReactionCategory.ANGER_OR_FRUSTRATION: (
+            "я злюсь", "я зол", "я в ярости", "меня бесит",
+        ),
+        ReactionCategory.PROGRESS_OR_ACHIEVEMENT: (
+            "у меня получилось", "я справился", "я справилась", "я смог",
+            "я смогла", "маленькая победа", "сделал первый шаг",
+            "сделала первый шаг",
         ),
     },
     "en": {
@@ -137,10 +162,10 @@ _KEYWORDS: dict[str, dict[ReactionCategory, tuple[str, ...]]] = {
 # Confidence bands — deterministic rule matches, not a probability model.
 # A direct keyword hit is more specific than a broad risk-category/stage
 # fallback, so it is scored higher; EMOTIONAL_REACTION_MIN_CONFIDENCE lets a
-# deployment require the stronger signal only.
+# deployment require the stronger signal only. Stage alone is deliberately
+# not evidence for a progress reaction.
 _CONF_KEYWORD = 0.9
 _CONF_RISK_CATEGORY = 0.75
-_CONF_STAGE = 0.55
 
 
 # ── Keyword-hit guards (P1: false emotional reaction) ──────────────────────
@@ -287,9 +312,6 @@ def select_reaction_category(
     if "dissociation" in risk_categories:
         return ReactionCategory.CONFUSION_OR_UNCERTAINTY, _CONF_RISK_CATEGORY
 
-    if stage == "GROWTH":
-        return ReactionCategory.PROGRESS_OR_ACHIEVEMENT, _CONF_STAGE
-
     return ReactionCategory.NONE, 0.0
 
 
@@ -304,7 +326,10 @@ def pick_supported_emoji(category: ReactionCategory,
     if not candidates:
         return None
     if available is None:
-        return candidates[0]
+        for c in candidates:
+            if c in _STANDARD_MAPPED_REACTIONS:
+                return c
+        return None
     for c in candidates:
         if c in available:
             return c
