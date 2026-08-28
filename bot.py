@@ -1049,10 +1049,10 @@ def _minimal_reviewer_payload(uid: int, eid, note: str) -> str:
 
 
 _CLOSED_TEST_TEXT = {
-    "ru": "Сейчас доступ к X20 ограничен приглашёнными участниками закрытого "
+    "ru": "Сейчас доступ ограничен приглашёнными участниками закрытого "
           "тестирования. Если тебе тяжело прямо сейчас — напиши это здесь, "
           "экстренная поддержка работает для всех.",
-    "en": "X20 access is currently limited to invited participants of a closed "
+    "en": "Access is currently limited to invited participants of a closed "
           "test. If you're struggling right now, write it here — crisis support "
           "still works for everyone.",
 }
@@ -5243,9 +5243,13 @@ async def cb_onboarding(callback: CallbackQuery):
 
 
 @dp.message(Command("profile"))
-async def cmd_profile(message: Message):
-    """§5 — show the user the deterministic profile the bot has built (no diagnoses)."""
-    uid = message.from_user.id
+async def cmd_profile(message: Message, tg_user=None):
+    """§5 — show the user the deterministic profile the bot has built (no diagnoses).
+
+    tg_user: when reached via a callback (results:profile) message.from_user
+    is the BOT -- the real user must be passed explicitly (same tg_user
+    contract as cmd_emotion/cmd_cbt/cmd_journal_settings/cmd_report)."""
+    uid = (tg_user or message.from_user).id
     if not await ensure_full_access_or_closed_test(message, uid):
         return
     lang = await get_user_language(uid)
@@ -5482,7 +5486,7 @@ async def _send_privacy_export(message: Message, uid: int, lang: str) -> None:
         "account and use of the service.")
     buf = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
     await message.answer_document(
-        BufferedInputFile(buf.getvalue(), filename="x20_privacy_export.json"),
+        BufferedInputFile(buf.getvalue(), filename="privacy_export.json"),
         caption=("Копия данных аккаунта (JSON)." if lang == "ru" else
                  "Account data copy (JSON).") + note)
 
@@ -5614,23 +5618,16 @@ async def cmd_unmute(message: Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    """Static, role-unaware by design (PR 1B post-stabilization cleanup):
-    /privacy_export_all and /privacy_delete_all are real self-service rights
-    every caller has regardless of role, so they belong here. /review_pack is
-    deliberately NOT listed -- it's a reviewer/owner tool, not normal
-    self-service; safe to call (denial is generic) but unnecessary UX noise
-    for the ordinary-user audience this static string is written for.
-    Reviewers are briefed out-of-band. Role-aware /help can be revisited
-    later if that stops being sufficient.
-
-    Public-beta product commands are listed; privileged maintenance/review
-    commands remain deliberately absent."""
+    """Round 3: /help is a normal in-chat navigation/help card with
+    user-facing RU/EN labels, not a raw technical slash-command list. Old
+    slash-command handlers (/menu, /questionnaire, /journal, /format,
+    /checkin, /time, /profile, /forget_all, /privacy_export_all,
+    /privacy_delete_all) remain fully registered and callable manually for
+    backward compatibility -- they are simply no longer listed or advertised
+    here. Static/role-unaware by design, same as before this round; every
+    button below reuses an EXISTING gated callback (see _help_keyboard)."""
     lang = await get_user_language(message.from_user.id)
-    await message.answer(
-        ("/start • /menu • /questionnaire • /journal • /format • /checkin • "
-         "/time • /profile • /forget_all • /privacy_export_all • "
-         "/privacy_delete_all • /help"),
-        reply_markup=ReplyKeyboardRemove())
+    await message.answer(navigation.help_text(lang), reply_markup=_help_keyboard(lang))
 
 @dp.message(Command("checkin"))
 async def cmd_checkin(message: Message):
@@ -5839,20 +5836,31 @@ async def cmd_report(message: Message, state: FSMContext, tg_user=None):
     await message.answer(journals.build_weekly_report(emo, chk, lang))
 
 
-@dp.message(Command("journal"))
-async def cmd_journal(message: Message, state: FSMContext):
-    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
-        return
-    lang = await get_user_language(message.from_user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+def _journal_hub_text(lang: str) -> str:
+    return "📝 Дневники" if lang == "ru" else "📝 Diaries"
+
+
+def _journal_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
+    # Single source for the journal hub's real action buttons -- reused by
+    # BOTH the persistent-lower-menu entry (cmd_journal) and the /help entry
+    # (cb_journals_hub, round-3 correction) so there is exactly ONE journal
+    # navigation UX, not a real card on one path and a raw slash-command list
+    # on the other.
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Дневник эмоций", callback_data="jhub:emotion")],
         [InlineKeyboardButton(text="📘 КПТ-дневник", callback_data="jhub:cbt")],
         [InlineKeyboardButton(text="📊 Мой отчёт", callback_data="jhub:report")],
         [InlineKeyboardButton(text="⚙️ Напоминания", callback_data="jhub:settings")],
         [InlineKeyboardButton(text="🚨 Срочно плохо", callback_data="jhub:crisis")],
     ])
-    await message.answer("Дневники X20. Что откроем?" if lang == "ru"
-                         else "X20 journals. What shall we open?", reply_markup=kb)
+
+
+@dp.message(Command("journal"))
+async def cmd_journal(message: Message, state: FSMContext):
+    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+        return
+    lang = await get_user_language(message.from_user.id)
+    await message.answer(_journal_hub_text(lang), reply_markup=_journal_hub_keyboard(lang))
 
 
 @dp.callback_query(F.data.startswith("jhub:"))
@@ -5978,9 +5986,9 @@ async def cmd_journal_export(message: Message, state: FSMContext):
         await message.answer("Журнальных записей пока нет.")
         return
     buf = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
-    buf.name = "x20_journals.json"
+    buf.name = "journals.json"
     from aiogram.types import BufferedInputFile
-    await message.answer_document(BufferedInputFile(buf.getvalue(), filename="x20_journals.json"),
+    await message.answer_document(BufferedInputFile(buf.getvalue(), filename="journals.json"),
                                   caption="Твои журналы (JSON).")
 
 
@@ -7812,6 +7820,31 @@ def _hub_back_keyboard(lang: str) -> InlineKeyboardMarkup:
         text=("⬅️ В меню" if lang == "ru" else "⬅️ Back to menu"), callback_data="menu:back")]])
 
 
+def _help_keyboard(lang: str) -> InlineKeyboardMarkup:
+    # /help is the explicit navigation/help card (round 3) -- the persistent
+    # lower ReplyKeyboard remains the PRIMARY navigation; this is not a
+    # second permanently-visible menu. Reuses the EXACT SAME existing
+    # callbacks as the persistent lower menu / legacy hub buttons -- no
+    # duplicated business logic, only a different card layout. "tests" routes
+    # straight to "q:l" (the real Questionnaire Core), matching the
+    # persistent lower menu's own "🧠 Психологические тесты" button.
+    labels = {key: (ru if lang == "ru" else en) for key, ru, en in navigation.MENU_SECTIONS}
+    rows = [
+        [InlineKeyboardButton(text=labels["talk"], callback_data="talk:hub")],
+        [InlineKeyboardButton(text=labels["tests"], callback_data="q:l")],
+        [InlineKeyboardButton(text=labels["journals"], callback_data="journals:hub"),
+         InlineKeyboardButton(text=labels["results"], callback_data="results:hub")],
+        [InlineKeyboardButton(text=labels["settings"], callback_data="settings:hub")],
+        [InlineKeyboardButton(text=labels["privacy"], callback_data="privacy:hub")],
+        [InlineKeyboardButton(text=labels["about"], callback_data="about:hub")],
+    ]
+    if config.feedback_chat_url():
+        rows.append([InlineKeyboardButton(
+            text=("💬 Обратная связь" if lang == "ru" else "💬 Feedback"),
+            callback_data="feedback:hub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _privacy_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
@@ -7985,12 +8018,32 @@ async def cb_tests_hub(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "journals:hub")
 async def cb_journals_hub(callback: CallbackQuery):
+    """/help -> "📝 Дневники" (round-3 correction): renders the EXACT SAME
+    real journal card/buttons as the persistent-lower-menu entry (cmd_journal)
+    -- one journal navigation UX, not a raw slash-command list on this path.
+    Edits the existing /help card in place via _answer_target's normal
+    CallbackQuery edit-in-place behavior, rather than appending a second
+    navigation card."""
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
-    await _answer_target(callback, navigation.journals_hub_text(lang), reply_markup=_hub_back_keyboard(lang))
+    await _answer_target(callback, _journal_hub_text(lang), reply_markup=_journal_hub_keyboard(lang))
     await callback.answer()
+
+
+def _results_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("📊 Отчёт дневника" if lang == "ru" else "📊 Diary report"),
+            callback_data="results:report"),
+         InlineKeyboardButton(
+            text=("🧭 Самонаблюдения" if lang == "ru" else "🧭 Self-observations"),
+            callback_data="results:profile")],
+        [InlineKeyboardButton(
+            text=("⬅️ В меню" if lang == "ru" else "⬅️ Back to menu"),
+            callback_data="menu:back")],
+    ])
 
 
 @dp.callback_query(F.data == "results:hub")
@@ -7999,7 +8052,33 @@ async def cb_results_hub(callback: CallbackQuery):
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
-    await _answer_target(callback, navigation.results_hub_text(lang), reply_markup=_hub_back_keyboard(lang))
+    await _answer_target(callback, navigation.results_hub_text(lang), reply_markup=_results_hub_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "results:report")
+async def cb_results_report(callback: CallbackQuery):
+    """Reuses the EXISTING /report functionality -- same report content,
+    storage and calculations, only reached from a button instead of a raw
+    slash command."""
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await cmd_report(callback.message, None, tg_user=callback.from_user)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "results:profile")
+async def cb_results_profile(callback: CallbackQuery):
+    """Reuses the EXISTING /profile functionality -- same profile content
+    and calculations, only reached from a button instead of a raw slash
+    command."""
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    await cmd_profile(callback.message, tg_user=callback.from_user)
     await callback.answer()
 
 
@@ -8059,11 +8138,15 @@ async def cb_about_hub(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "menu:back")
 async def cb_menu_back(callback: CallbackQuery):
+    """Round 3: "⬅️ В меню" returns to the /help-style navigation card, not
+    the old legacy "Главное меню / Выберите раздел" hub (_menu_keyboard is
+    retained only for the still-live cb_*_hub backward-compat callbacks, see
+    test_cb_tests_hub_still_works_if_reached_directly)."""
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
-    await _answer_target(callback, navigation.menu_text(lang), reply_markup=_menu_keyboard(lang))
+    await _answer_target(callback, navigation.help_text(lang), reply_markup=_help_keyboard(lang))
     await callback.answer()
 
 
@@ -8125,7 +8208,7 @@ async def main():
         # fully registered below and remain callable if typed manually; this
         # only changes what Telegram's command autocomplete/side list shows.
         await bot.set_my_commands([
-            BotCommand(command="start", description="Start X20"),
+            BotCommand(command="start", description="Start"),
             BotCommand(command="help", description="Help"),
         ])
         await bot.set_my_commands([

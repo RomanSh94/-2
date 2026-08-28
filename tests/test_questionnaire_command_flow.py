@@ -91,11 +91,16 @@ async def _sessions_for(uid):
     return rows
 
 
-# ── /help exposes the real public Questionnaire Core command ─────────────────
-def test_questionnaire_is_in_help():
+# ── /help reaches the real public Questionnaire Core (round 3: via a button,
+# not a raw "/questionnaire" slash-command mention) ───────────────────────────
+def test_questionnaire_reachable_from_help():
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_help(msg))
-    assert "/questionnaire" in msg.answers[0][0]
+    text, kw = msg.answers[0]
+    assert "/questionnaire" not in text
+    kb = kw["reply_markup"]
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "q:l" in datas
 
 
 # ── product gate ─────────────────────────────────────────────────────────────

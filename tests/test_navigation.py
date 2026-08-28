@@ -226,15 +226,16 @@ def test_tests_hub_has_non_diagnostic_framing():
 
 
 def test_results_hub_does_not_show_scores_or_diagnosis():
-    # "уровни"/"диагнозы" legitimately appear in the sentence DENYING them
-    # ("Мы не показываем оценки, диагнозы или уровни выраженности") -- so this
-    # test checks for actual verdict-shaped phrases, not bare words that are
-    # part of the explicit denial itself.
+    # Round 3: the non-diagnostic disclaimer moved OUT of "Мои результаты"
+    # entirely (it belongs to the questionnaire flow, not this hub -- see
+    # tests/test_no_brand_name_in_user_facing_ui.py's Test Group E/F). This
+    # test now only proves the hub never shows verdict-shaped diagnostic
+    # phrasing, which remains the real safety-relevant claim.
     text = navigation.results_hub_text("ru")
     for forbidden in ("результат выше нормы", "лёгкая депрессия", "умеренная депрессия",
-                      "тяжёлая депрессия", "у тебя депрессия", "высокая тревожность"):
+                      "тяжёлая депрессия", "у тебя депрессия", "высокая тревожность",
+                      "не ставит диагнозы"):
         assert forbidden not in text.lower()
-    assert "не ставит диагнозы" in text
 
 
 def test_navigation_text_has_no_dependency_wording():
@@ -308,10 +309,17 @@ def test_nav_callback_respects_active_crisis_gate(monkeypatch, data, handler):
 
 
 # ── /help ─────────────────────────────────────────────────────────────────────
-def test_menu_is_in_help():
+def test_help_reaches_navigation_sections():
+    # Round 3: /help no longer advertises "/menu" by name -- the help card
+    # itself IS the navigation surface now. Verify the same destinations
+    # /menu used to reach are still reachable from /help's own buttons.
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_help(msg))
-    assert "/menu" in msg.answers[0][0]
+    kb = msg.answers[0][1]["reply_markup"]
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "journals:hub" in datas
+    assert "results:hub" in datas
+    assert "/menu" not in msg.answers[0][0]
 
 
 # ── source-level scan: navigation must not touch A1/review-pack/scoring ───────
@@ -424,3 +432,208 @@ def test_voice_off_copy_does_not_promise_a_return_date():
 def test_voice_available_copy_unchanged():
     assert navigation.response_settings_text("ru", available=True) == \
         "Кстати, вот как я звучу 🎧\n\nКак тебе удобнее получать ответы?"
+
+
+# ── menu:back returns to the new help hub, not the legacy menu (round 3) ────
+def test_menu_back_returns_new_help_card_not_legacy_menu():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="menu:back")
+    asyncio.run(bot.cb_menu_back(cb))
+    text, kw = msg.answers[-1]
+    assert text == navigation.help_text("ru")
+    assert "Главное меню" not in text
+    assert "Выберите раздел" not in text
+    datas = [b.callback_data for row in kw["reply_markup"].inline_keyboard for b in row]
+    assert datas == [
+        "talk:hub", "q:l", "journals:hub", "results:hub",
+        "settings:hub", "privacy:hub", "about:hub",
+    ]
+
+
+def test_menu_back_still_respects_crisis_gate(monkeypatch):
+    monkeypatch.setattr(bot, "get_active_crisis", _async((7, 0, "ru")))
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="menu:back")
+    asyncio.run(bot.cb_menu_back(cb))
+    assert len(msg.answers) == 1
+    assert get_hotline("ru")["primary"] in msg.answers[0][0]
+    assert msg.answers[0][0] != navigation.help_text("ru")
+
+
+# ── "Мои результаты" redesign (round 3) ──────────────────────────────────────
+def test_results_hub_exact_ru_text_and_buttons():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="results:hub")
+    asyncio.run(bot.cb_results_hub(cb))
+    text, kw = msg.answers[-1]
+    assert text == (
+        "📊 Мои результаты\n\n"
+        "Здесь можно посмотреть отчёт по дневнику и свои наблюдения за состоянием.")
+    assert "/report" not in text
+    assert "/profile" not in text
+    assert "X20" not in text
+    assert "проверенным контрактом" not in text
+    kb = kw["reply_markup"]
+    rows = [[(b.text, b.callback_data) for b in row] for row in kb.inline_keyboard]
+    assert rows == [
+        [("📊 Отчёт дневника", "results:report"), ("🧭 Самонаблюдения", "results:profile")],
+        [("⬅️ В меню", "menu:back")],
+    ]
+
+
+def test_results_report_button_invokes_real_report_with_real_clicking_user(monkeypatch):
+    calls = []
+    async def fake_cmd_report(message, state, tg_user=None):
+        calls.append(tg_user.id if tg_user is not None else message.from_user.id)
+    monkeypatch.setattr(bot, "cmd_report", fake_cmd_report)
+    real_user = FakeUser(1)
+    bot_authored_user = FakeUser(999)  # simulates callback.message.from_user being the bot
+    msg = FakeMessage(bot_authored_user)
+    cb = FakeCallback(real_user, msg, data="results:report")
+    asyncio.run(bot.cb_results_report(cb))
+    assert calls == [1]
+
+
+def test_results_profile_button_invokes_real_profile_with_real_clicking_user(monkeypatch):
+    calls = []
+    async def fake_cmd_profile(message, tg_user=None):
+        calls.append(tg_user.id if tg_user is not None else message.from_user.id)
+    monkeypatch.setattr(bot, "cmd_profile", fake_cmd_profile)
+    real_user = FakeUser(1)
+    bot_authored_user = FakeUser(999)
+    msg = FakeMessage(bot_authored_user)
+    cb = FakeCallback(real_user, msg, data="results:profile")
+    asyncio.run(bot.cb_results_profile(cb))
+    assert calls == [1]
+
+
+def test_results_report_and_profile_buttons_respect_crisis_gate(monkeypatch):
+    monkeypatch.setattr(bot, "get_active_crisis", _async((7, 0, "ru")))
+    called = {"n": 0}
+    async def _boom(*a, **kw):
+        called["n"] += 1
+    monkeypatch.setattr(bot, "cmd_report", _boom)
+    monkeypatch.setattr(bot, "cmd_profile", _boom)
+    user = FakeUser(1)
+    for data, handler in (("results:report", bot.cb_results_report),
+                          ("results:profile", bot.cb_results_profile)):
+        msg = FakeMessage(user)
+        cb = FakeCallback(user, msg, data=data)
+        asyncio.run(handler(cb))
+        assert get_hotline("ru")["primary"] in msg.answers[0][0]
+    assert called["n"] == 0  # neither real command was ever reached
+
+
+# ── journal hub: ONE navigation UX, not two (round 3 final correction) ──────
+def _journal_buttons(kw):
+    kb = kw["reply_markup"]
+    return [(b.text, b.callback_data) for row in kb.inline_keyboard for b in row]
+
+
+_EXPECTED_JOURNAL_BUTTONS = [
+    ("📝 Дневник эмоций", "jhub:emotion"),
+    ("📘 КПТ-дневник", "jhub:cbt"),
+    ("📊 Мой отчёт", "jhub:report"),
+    ("⚙️ Напоминания", "jhub:settings"),
+    ("🚨 Срочно плохо", "jhub:crisis"),
+]
+
+
+def test_help_journal_button_routes_to_journals_hub():
+    msg = FakeMessage(FakeUser(1))
+    asyncio.run(bot.cmd_help(msg))
+    kb = msg.answers[0][1]["reply_markup"]
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "journals:hub" in datas
+
+
+def test_journals_hub_callback_renders_real_journal_buttons():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="journals:hub")
+    asyncio.run(bot.cb_journals_hub(cb))
+    text, kw = msg.answers[-1]
+    assert text == "📝 Дневники"
+    assert _journal_buttons(kw) == _EXPECTED_JOURNAL_BUTTONS
+
+
+def test_journals_hub_callback_has_no_raw_slash_commands():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="journals:hub")
+    asyncio.run(bot.cb_journals_hub(cb))
+    text, kw = msg.answers[-1]
+    for cmd in ("/emotion", "/cbt", "/report", "/journal_settings",
+                "/journal_export", "/journal_delete"):
+        assert cmd not in text
+        for label, _ in _journal_buttons(kw):
+            assert cmd not in label
+
+
+def test_lower_menu_and_help_journal_entries_share_same_card():
+    # Direct persistent-lower-menu entry (cmd_journal) ...
+    direct_msg = FakeMessage(FakeUser(1))
+    asyncio.run(bot.cmd_journal(direct_msg, None))
+    direct_text, direct_kw = direct_msg.answers[0]
+
+    # ... and the /help -> "📝 Дневники" entry (cb_journals_hub) must render
+    # the IDENTICAL card: one journal navigation UX, not two.
+    user = FakeUser(1)
+    help_msg = FakeMessage(user)
+    cb = FakeCallback(user, help_msg, data="journals:hub")
+    asyncio.run(bot.cb_journals_hub(cb))
+    help_text, help_kw = help_msg.answers[-1]
+
+    assert direct_text == help_text
+    assert _journal_buttons(direct_kw) == _journal_buttons(help_kw)
+
+
+def test_journals_hub_callback_still_respects_crisis_gate(monkeypatch):
+    monkeypatch.setattr(bot, "get_active_crisis", _async((7, 0, "ru")))
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="journals:hub")
+    asyncio.run(bot.cb_journals_hub(cb))
+    assert len(msg.answers) == 1
+    assert get_hotline("ru")["primary"] in msg.answers[0][0]
+    assert msg.answers[0][0] != "📝 Дневники"
+
+
+def test_journals_hub_callback_still_respects_access_gate():
+    user = FakeUser(424242)   # UNKNOWN under personal_use (OWNER_USER_ID=1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="journals:hub")
+    asyncio.run(bot.cb_journals_hub(cb))
+    assert msg.answers
+    assert msg.answers[0][0] != "📝 Дневники"
+
+
+def test_journal_card_has_no_brand_name_anywhere():
+    # cmd_journal path
+    direct_msg = FakeMessage(FakeUser(1))
+    asyncio.run(bot.cmd_journal(direct_msg, None))
+    direct_text, direct_kw = direct_msg.answers[0]
+    # cb_journals_hub path
+    user = FakeUser(1)
+    help_msg = FakeMessage(user)
+    cb = FakeCallback(user, help_msg, data="journals:hub")
+    asyncio.run(bot.cb_journals_hub(cb))
+    help_text, help_kw = help_msg.answers[-1]
+
+    for text, kw in ((direct_text, direct_kw), (help_text, help_kw)):
+        assert "X20" not in text and "x20" not in text
+        for label, _ in _journal_buttons(kw):
+            assert "X20" not in label and "x20" not in label
+
+
+def test_journals_hub_text_builder_is_neutral_and_unused_live():
+    # navigation.journals_hub_text is retained for compatibility only --
+    # no live handler calls it anymore, and its content is now neutral.
+    assert navigation.journals_hub_text("ru") == "📝 Дневники"
+    assert navigation.journals_hub_text("en") == "📝 Diaries"
+    for cmd in ("/emotion", "/cbt", "/report", "/journal_settings",
+                "/journal_export", "/journal_delete"):
+        assert cmd not in navigation.journals_hub_text("ru")
