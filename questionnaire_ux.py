@@ -45,12 +45,12 @@ def list_text(lang: str = "ru") -> str:
                 "Тесты помогут лучше оценить своё состояние и заметить изменения "
                 "со временем.\n\n"
                 "Они не ставят диагноз и не заменяют консультацию специалиста.\n\n"
-                "Выбери, что хочешь проверить:")
+                "Выбери доступный раздел ниже:")
     return ("🧠 Psychological tests\n\n"
             "Tests can help you assess how you are feeling and notice changes "
             "over time.\n\n"
             "They do not diagnose or replace a consultation with a specialist.\n\n"
-            "Choose what you would like to check:")
+            "Choose an available section below:")
 
 
 def catalog_category_text(category_id: str, lang: str = "ru") -> str:

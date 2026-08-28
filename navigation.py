@@ -23,7 +23,7 @@ MENU_SECTIONS = [
     ("results", "📊 Мои результаты", "📊 My results"),
     ("settings", "🎛 Как отвечать", "🎛 How to reply"),
     ("privacy", "🔒 Данные и приватность", "🔒 Data and privacy"),
-    ("about", "ℹ️ О X20", "ℹ️ About X20"),
+    ("about", "ℹ️ О боте", "ℹ️ About the bot"),
 ]
 
 # Placeholder catalog only -- no real scale/questionnaire content or links yet.
@@ -40,6 +40,23 @@ def menu_text(lang: str = "ru") -> str:
     if lang == "ru":
         return "Главное меню\n\nВыберите раздел:"
     return "Main menu\n\nChoose a section:"
+
+
+def help_text(lang: str = "ru") -> str:
+    """Round 3: /help's own card, and what "⬅️ В меню" (menu:back) returns
+    to. NOT a second permanently-visible menu -- the persistent lower
+    ReplyKeyboard remains the primary navigation surface."""
+    if lang == "ru":
+        return (
+            "ℹ️ Помощь\n\n"
+            "Здесь можно быстро перейти к нужному разделу.\n\n"
+            "А если хочешь поговорить — просто напиши сообщение."
+        )
+    return (
+        "ℹ️ Help\n\n"
+        "Here you can quickly jump to the section you need.\n\n"
+        "And if you'd like to talk, just send a message."
+    )
 
 
 def talk_hub_text(lang: str = "ru") -> str:
@@ -94,25 +111,12 @@ def tests_hub_text(lang: str = "ru") -> str:
 
 
 def journals_hub_text(lang: str = "ru") -> str:
-    if lang == "ru":
-        return (
-            "Дневники\n\n"
-            "📝 Дневник эмоций → /emotion\n"
-            "🧠 КПТ-дневник → /cbt\n"
-            "📊 Недельный отчёт → /report\n"
-            "⏰ Настройки напоминаний → /journal_settings\n"
-            "📤 Экспорт дневников → /journal_export\n"
-            "🗑 Удаление дневников → /journal_delete"
-        )
-    return (
-        "Diaries\n\n"
-        "📝 Emotion journal → /emotion\n"
-        "🧠 CBT journal → /cbt\n"
-        "📊 Weekly report → /report\n"
-        "⏰ Reminder settings → /journal_settings\n"
-        "📤 Export journals → /journal_export\n"
-        "🗑 Delete journals → /journal_delete"
-    )
+    """Round 3: no longer reached by any live handler -- bot.py's
+    cb_journals_hub renders the real journal card via the shared
+    _journal_hub_text/_journal_hub_keyboard builders instead (one journal
+    navigation UX, not a second raw slash-command list here). Kept as a
+    neutral, brand-independent heading only for compatibility."""
+    return "📝 Дневники" if lang == "ru" else "📝 Diaries"
 
 
 def privacy_hub_text(lang: str = "ru") -> str:
@@ -155,18 +159,12 @@ def privacy_stored_data_text(lang: str = "ru") -> str:
 def results_hub_text(lang: str = "ru") -> str:
     if lang == "ru":
         return (
-            "Мои результаты\n\n"
-            "📊 Недельный отчёт дневника → /report\n"
-            "🧭 Мой профиль самонаблюдения → /profile\n\n"
-            "Опросники показывают только те результаты, которые разрешены их "
-            "проверенным контрактом. X20 не ставит диагнозы."
+            "📊 Мои результаты\n\n"
+            "Здесь можно посмотреть отчёт по дневнику и свои наблюдения за состоянием."
         )
     return (
-        "My results\n\n"
-        "📊 Weekly journal report → /report\n"
-        "🧭 My self-observation profile → /profile\n\n"
-        "Questionnaires show only results allowed by their validated contract. "
-        "X20 does not diagnose."
+        "📊 My results\n\n"
+        "Here you can see your diary report and your self-observations."
     )
 
 
