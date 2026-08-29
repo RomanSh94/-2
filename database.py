@@ -109,6 +109,34 @@ _PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_INDEX_DDL = (
     "    ON professional_entry_triage_bindings(user_id, consumed_at, superseded_at, expires_at)"
 )
 
+# Push V1 (Silence/Re-engagement re-engagement card) -- its OWN table,
+# deliberately NOT a reuse of interaction_button_bindings: that table
+# requires an assistant messages.turn_id and, on consumption, persists a
+# synthetic role='user' SYNTHETIC_UI message classified as
+# event_type='first_turn_button' -- both wrong for a push action, which
+# must never fabricate USER_FREE_TEXT and is not part of the first-turn
+# continuation graph. anchor_turn_id is informational only (the last real
+# assistant turn at push-send time, or NULL) -- never a foreign key
+# requirement, unlike interaction_button_bindings.turn_id.
+_PUSH_ACTION_BINDINGS_TABLE_DDL = """CREATE TABLE IF NOT EXISTS push_action_bindings (
+    token              TEXT PRIMARY KEY,
+    user_id            INTEGER NOT NULL,
+    chat_id            INTEGER NOT NULL,
+    source_message_id  INTEGER NOT NULL,
+    action             TEXT NOT NULL CHECK (action IN ('push_continue','push_new_topic')),
+    anchor_turn_id     INTEGER,
+    binding_revision   INTEGER NOT NULL,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at         TEXT NOT NULL,
+    consumed_at        TEXT,
+    superseded_at      TEXT
+)"""
+
+_PUSH_ACTION_BINDINGS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_push_action_bindings_open\n"
+    "    ON push_action_bindings(user_id, consumed_at, superseded_at, expires_at)"
+)
+
 SCHEMA = f"""
 PRAGMA journal_mode=WAL;
 
@@ -677,6 +705,10 @@ CREATE TABLE IF NOT EXISTS first_turn_claims (
 -- Python-side comment on _PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_TABLE_DDL).
 {_PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_TABLE_DDL};
 {_PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_INDEX_DDL};
+
+-- Push V1 -- see the Python-side comment on _PUSH_ACTION_BINDINGS_TABLE_DDL.
+{_PUSH_ACTION_BINDINGS_TABLE_DDL};
+{_PUSH_ACTION_BINDINGS_INDEX_DDL};
 
 -- Voice and Adaptive Response UX — neutral response-delivery UI preference,
 -- nothing more. Stores ONLY the three closed-set choices below, never a raw
@@ -1992,17 +2024,66 @@ async def reset_unanswered(uid: int) -> None:
         await db.commit()
 
 
-async def record_push(uid: int, tier: str) -> None:
+async def record_push_v1_delivery(uid: int, tier: str, anchor_turn_id: int,
+                                   expected_last_seen: str) -> bool:
+    """Push V1's ONLY post-send persistence path -- anchor-fenced so a
+    confirmed Telegram send can never recreate push_log/push_settings rows
+    for a user whose account lifecycle was erased (GDPR delete-all) in the
+    window between send and this call. One BEGIN IMMEDIATE transaction:
+
+    (1) verifies `anchor_turn_id` -- the exact assistant turn captured as
+    THIS send's conversation anchor, before the send -- still exists and
+    still belongs to `uid`. If it does not (delete_all_personal_data
+    already ran and committed), writes NOTHING and returns False: no
+    push_log row, no push_settings row, no recreation of any Push V1 state
+    after an intentional erasure. This is never a database error -- it is
+    the correct outcome of a real, concurrent, user-initiated deletion, so
+    callers must not treat it as a transient failure eligible for retry or
+    for the permanent record-failure suppression guard (see
+    scheduler._finalize_push_record).
+
+    (2) if the lifecycle is still live, ALWAYS records the delivery in
+    push_log (a confirmed send is real and must be represented for
+    antispam/audit purposes regardless of what happens after it), but bumps
+    push_settings.consecutive_unanswered only if users.last_seen, read in
+    this SAME transaction, still equals `expected_last_seen` (the value
+    captured before the send). If the user genuinely re-engaged between
+    send and this call -- including via a real touch_last_seen() that
+    already reset consecutive_unanswered to 0 -- that reset must survive;
+    this function must never re-arm it back to a nonzero value. A missing
+    push_settings row is created with consecutive_unanswered already at the
+    correct value (1 if unchanged, 0 if re-engaged) rather than created
+    then immediately corrected, so there is no intermediate wrong state
+    even within this one transaction.
+
+    Any DB exception here propagates to the caller unhandled -- exactly
+    like the anchor/revision/final-guard lookups this mirrors -- where the
+    caller's existing bounded-retry / permanent-suppression handling
+    applies. That handling is for REAL failures only; a lifecycle
+    invalidation (return False, no exception) is a distinct, deliberate
+    outcome the caller must check for separately."""
     async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT 1 FROM messages WHERE id=? AND user_id=? AND role='assistant'",
+            (anchor_turn_id, uid))
+        if await cur.fetchone() is None:
+            await db.commit()
+            return False
+        cur = await db.execute("SELECT last_seen FROM users WHERE id=?", (uid,))
+        row = await cur.fetchone()
+        unchanged = 1 if (row is not None and row[0] == expected_last_seen) else 0
         await db.execute("INSERT INTO push_log (user_id,tier) VALUES (?,?)", (uid, tier))
         await db.execute(
             """INSERT INTO push_settings (user_id,consecutive_unanswered)
-               VALUES (?,1)
+               VALUES (?,?)
                ON CONFLICT(user_id) DO UPDATE SET
-                   consecutive_unanswered=consecutive_unanswered+1,
+                   consecutive_unanswered=CASE WHEN ? THEN consecutive_unanswered+1
+                                                ELSE consecutive_unanswered END,
                    updated_at=datetime('now')""",
-            (uid,))
+            (uid, unchanged, unchanged))
         await db.commit()
+        return True
 
 
 async def get_push_candidates() -> list:
@@ -2037,6 +2118,177 @@ async def get_push_context(uid: int) -> dict:
         "last_crisis_at": crisis[0] if crisis else None,
         "push_log": [(r[0], r[1]) for r in logs],
     }
+
+
+async def has_unresolved_crisis(uid: int) -> bool:
+    """True iff this user currently has ANY crisis_events row with
+    resolved=0 -- deliberately NO recency bound, unlike
+    get_active_crisis()'s 24h interactive-gate window. Used ONLY to veto
+    ordinary Silence/Re-engagement pushes for the user's ENTIRE unresolved
+    crisis lifecycle (which can run up to 7 days via
+    auto_resolve_expired_crises), never to gate conversational/journal/
+    questionnaire entry -- those keep using get_active_crisis()'s existing
+    24h window unchanged. get_push_context()'s last_crisis_at (MAX(created_at)
+    regardless of resolved) is UNCHANGED and still separately drives the
+    existing 24h post-crisis cooldown for a RESOLVED crisis."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM crisis_events WHERE user_id=? AND resolved=0 LIMIT 1", (uid,))
+        row = await cur.fetchone()
+    return row is not None
+
+
+async def get_unresolved_crisis(uid: int) -> tuple | None:
+    """The user's current unresolved crisis event, with NO recency bound --
+    unlike get_active_crisis()'s 24h interactive-gate window. Returns
+    (event_id, stage, lang) for the most recent resolved=0 row, or None.
+
+    Used by Push V1's cb_push_action to re-show the EXISTING crisis safety
+    surface for the user's ENTIRE unresolved crisis lifecycle (which can run
+    up to 7 days via the crisis-followup auto-resolve sweep), not just the
+    first 24h the ordinary conversational gate (get_active_crisis) covers.
+    Never used to gate ordinary conversational/journal/questionnaire entry --
+    those keep get_active_crisis()'s existing 24h window unchanged."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id, COALESCE(crisis_stage, 0), lang FROM crisis_events "
+            "WHERE user_id=? AND resolved=0 ORDER BY id DESC LIMIT 1", (uid,))
+        row = await cur.fetchone()
+    return (row[0], row[1], row[2]) if row else None
+
+
+async def get_last_seen(uid: int) -> str | None:
+    """Raw users.last_seen string for one user, or None if the row doesn't
+    exist."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT last_seen FROM users WHERE id=?", (uid,))
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def final_push_send_guard(uid: int, expected_last_seen: str,
+                                 expected_revision: int,
+                                 anchor_turn_id: int) -> bool:
+    """Push V1's ONE authoritative, last-possible-moment pre-send check --
+    a SINGLE eligibility SELECT statement, not several separately awaited
+    queries: separate SELECTs (even on the same connection) are NOT an
+    atomic observation, since a write from another connection can land
+    between them. This one statement asks the engine for every fact in one
+    query execution, evaluated by SQLite as a single read: (1)
+    users.last_seen must still equal the exact value captured earlier in
+    this scheduler tick (no re-engagement since the candidate was gathered
+    -- including during any later prerequisite lookup, e.g. the anchor/
+    revision fetches that now run BEFORE this guard); (2) the user must
+    have no unresolved crisis (NOT EXISTS); (3) user_interaction_revision
+    (0 if the user has no row yet) must still equal `expected_revision` --
+    this is what closes the P1 access-revocation race: block_user_access
+    bumps this same counter on every genuine active->blocked transition
+    (see database.block_user_access), so a revocation that happened during
+    ANY earlier prerequisite await -- including the fresh
+    access_control.has_full_access() recheck scheduler performs immediately
+    before calling this guard -- is caught here even though it changes no
+    other observable signal; (4) `anchor_turn_id` must still exist as a
+    real role='assistant' messages row owned by `uid` -- this closes part
+    of the GDPR delete-all race (an account whose conversation history was
+    erased between anchor-capture and this call can never pass), with the
+    remainder of that window closed independently by the anchor-fenced
+    write in record_push_v1_delivery. Returns True only if a row is
+    returned, i.e. every one of these holds for a genuinely existing user.
+
+    Callers (scheduler._send_silence_pushes) MUST NOT perform any other
+    database/network await between a True result here and the actual
+    Telegram send -- this guard exists specifically to close the awaited-
+    gap race where activity, a crisis, or an access revocation arrives
+    during one of the earlier prerequisite awaits and would otherwise go
+    unnoticed by a check performed before those awaits ran. Any DB
+    exception here propagates to the caller unhandled, where the existing
+    fail-closed handling blocks the send."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM users u "
+            "LEFT JOIN user_interaction_revision r ON r.user_id = u.id "
+            "WHERE u.id=? AND u.last_seen=? AND COALESCE(r.revision, 0)=? "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM crisis_events c "
+            "  WHERE c.user_id=u.id AND c.resolved=0"
+            ") "
+            "AND EXISTS ("
+            "  SELECT 1 FROM messages m "
+            "  WHERE m.id=? AND m.user_id=u.id AND m.role='assistant'"
+            ") LIMIT 1",
+            (uid, expected_last_seen, expected_revision, anchor_turn_id))
+        row = await cur.fetchone()
+    return row is not None
+
+
+async def touch_last_seen(uid: int) -> None:
+    """UPDATE-only activity-recency touch: refreshes users.last_seen for an
+    EXISTING row only, and -- if a push_settings row already exists -- also
+    resets consecutive_unanswered to 0. Never INSERTs EITHER row (so an
+    unknown/never-messaged user gets no users row, and a user with no
+    push_settings row gets none created, merely because this ran), never
+    grants access, never changes role/onboarding/crisis/privacy state,
+    never bumps message_count, and stores no message/callback content
+    whatsoever -- exactly these two columns, on already-existing rows.
+
+    Exists so the Silence Engine's inactivity signal AND its ignored-push
+    backoff both reflect REAL product use (persistent lower-menu taps,
+    inline navigation, journal/questionnaire UI, a Push V1 button tap) and
+    not only ordinary free-text turns through pipeline()/reset_unanswered
+    -- see bot.ActivityTouchMiddleware, the single centralized hook that
+    calls this for every real inbound Message/CallbackQuery update. Without
+    this, a user who returns through any non-free-text surface would leave
+    consecutive_unanswered pinned at MAX_UNANSWERED forever, permanently
+    vetoing ordinary re-engagement pushes despite genuine re-engagement."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("UPDATE users SET last_seen=datetime('now') WHERE id=?", (uid,))
+        await db.execute(
+            "UPDATE push_settings SET consecutive_unanswered=0, updated_at=datetime('now') "
+            "WHERE user_id=?", (uid,))
+        await db.commit()
+
+
+# Push V1 UI replies (Continue/New-topic deterministic openers) are
+# persisted for ordinary conversation continuity, but must NEVER themselves
+# become a future push's "real conversation anchor" -- that would let one
+# no-anchor-fallback push manufacture eligibility for the next one. A
+# distinct scenario value (never used by any ordinary pipeline/Professional
+# Core turn) is the smallest clean way to exclude them, without inspecting
+# raw content or adding an LLM-based classifier.
+PUSH_UI_SCENARIO = "push_ui"
+
+
+async def get_last_assistant_message_id(uid: int) -> int | None:
+    """The id of this user's most recent GENUINE conversational
+    role='assistant' messages row (scenario != PUSH_UI_SCENARIO), or None
+    if they have no such history yet. Used as the Push V1 Continue anchor
+    -- see push_action_bindings.anchor_turn_id -- and, more importantly, as
+    the send-time eligibility gate: scheduler._send_silence_pushes does not
+    send the Push V1 card at all when this is None, since its copy
+    explicitly claims "after our conversation" and must never say that
+    without one. A row with scenario IS NULL (legacy/pre-provenance data)
+    is still eligible -- only an EXPLICIT push_ui row is excluded."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id FROM messages WHERE user_id=? AND role='assistant' "
+            "AND (scenario IS NULL OR scenario != ?) ORDER BY id DESC LIMIT 1",
+            (uid, PUSH_UI_SCENARIO))
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def turn_belongs_to_user(turn_id: int, uid: int) -> bool:
+    """True iff `turn_id` is a real, still-existing role='assistant'
+    messages row owned by `uid`. Used to verify a Push V1 Continue anchor
+    is still valid before referencing it -- defends against the anchored
+    row having been deleted (e.g. a privacy delete-all) between push-send
+    and the Continue tap."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM messages WHERE id=? AND user_id=? AND role='assistant'",
+            (turn_id, uid))
+        row = await cur.fetchone()
+    return row is not None
 
 
 # ── GDPR memory (Epic 2) ──────────────────────────────────────────────────────
@@ -2367,10 +2619,31 @@ async def user_has_active_access(uid: int) -> bool:
 
 
 async def block_user_access(uid: int) -> None:
+    """Owner-driven revocation. Idempotent: a second call on an
+    already-blocked (or never-granted) user_access row affects zero rows
+    and bumps nothing further.
+
+    On a REAL active->blocked transition -- and ONLY then -- atomically
+    (same transaction) bumps user_interaction_revision. Access revocation
+    is a genuine lifecycle-invalidating event, exactly like a fresh user
+    turn or a successful Push V1 button consumption, and must invalidate
+    any revision snapshot a scheduler tick may already be holding: Push
+    V1's final_push_send_guard binds its own captured revision to this
+    same counter specifically so an access revocation occurring during any
+    prerequisite await is still caught at the final guard, without the
+    guard having to re-check access itself. Never touches users.last_seen
+    or users.message_count -- this is access state, not activity, and must
+    never be mistaken for it by the Silence Engine or by Push V1's
+    freshness check."""
     async with aiosqlite.connect(DB) as db:
-        await db.execute(
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
             "UPDATE user_access SET status='blocked', updated_at=datetime('now') "
-            "WHERE user_id=?", (uid,))
+            "WHERE user_id=? AND status='active'", (uid,))
+        if cur.rowcount:
+            await db.execute(
+                "INSERT INTO user_interaction_revision (user_id, revision) VALUES (?, 1) "
+                "ON CONFLICT(user_id) DO UPDATE SET revision = revision + 1", (uid,))
         await db.commit()
 
 
@@ -3971,6 +4244,256 @@ async def supersede_professional_entry_triage_bindings(user_id: int) -> int:
             (user_id,))
         await db.commit()
         return cur.rowcount
+
+
+# ── Push V1 -- Continue / New-topic bindings ───────────────────────────────
+# Its own table (push_action_bindings, see the DDL comment above), modeled
+# on the professional_entry_triage_bindings functions immediately above
+# (same revision-guard / creation-time supersede / consumption-time sibling
+# supersede shape) but NOT a reuse of interaction_button_bindings: a push
+# action must never require an assistant messages.turn_id, must never
+# persist a synthetic role='user' message, and must never be classified as
+# event_type='first_turn_button'.
+ALLOWED_PUSH_ACTIONS = {"push_continue", "push_new_topic"}
+
+
+async def create_push_action_bindings(
+        user_id: int, chat_id: int, source_message_id: int,
+        response_revision: int, anchor_turn_id: int | None,
+        bindings: list[dict]) -> bool:
+    """Atomic, all-or-nothing creation of the Push V1 Continue/New-topic
+    bindings for one just-sent push message. Every row's action is
+    validated against ALLOWED_PUSH_ACTIONS BEFORE any SQL runs; the batch
+    must contain exactly one row per action -- not fewer, not more, no
+    duplicates.
+
+    Inside one BEGIN IMMEDIATE transaction: (1) requires the LIVE
+    user_interaction_revision to still equal response_revision (a genuine
+    newer ordinary user turn between send and this call means no offer is
+    created at all -- the delivered push is left as plain text by the
+    caller); (2) if anchor_turn_id is not None, requires it to still exist
+    as a real role='assistant' messages row owned by user_id -- a missing
+    push_settings/user_interaction_revision row after a GDPR delete-all
+    would otherwise make current_revision fall back to 0, which a
+    captured response_revision=0 (a genuinely new user's first-ever push)
+    could accidentally match; checking the anchor independently closes
+    this regardless of what the revision comparison alone would allow;
+    (3) supersedes every still-open push binding this user already has, so
+    an earlier undelivered/unconsumed push's buttons are never actionable
+    once a newer push has been sent; (4) inserts the new rows, each
+    carrying the SAME anchor_turn_id (the last real assistant turn at send
+    time, or None). Returns False (nothing written) if the revision has
+    moved or the anchor no longer exists."""
+    actions = [row["action"] for row in bindings]
+    for action in actions:
+        if action not in ALLOWED_PUSH_ACTIONS:
+            raise ValueError(f"unknown push action: {action!r}")
+    if len(actions) != len(set(actions)):
+        raise ValueError("push action binding batch must not contain a duplicate action")
+    if set(actions) != ALLOWED_PUSH_ACTIONS:
+        raise ValueError(
+            "push action binding batch must contain exactly one row per "
+            f"ALLOWED_PUSH_ACTIONS member -- got {sorted(actions)}")
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT revision FROM user_interaction_revision WHERE user_id=?", (user_id,))
+        r = await cur.fetchone()
+        current_revision = r[0] if r else 0
+        if current_revision != response_revision:
+            await db.commit()
+            return False
+        if anchor_turn_id is not None:
+            cur = await db.execute(
+                "SELECT 1 FROM messages WHERE id=? AND user_id=? AND role='assistant'",
+                (anchor_turn_id, user_id))
+            if await cur.fetchone() is None:
+                await db.commit()
+                return False
+        await db.execute(
+            "UPDATE push_action_bindings SET superseded_at=datetime('now') "
+            "WHERE user_id=? AND consumed_at IS NULL AND superseded_at IS NULL",
+            (user_id,))
+        for row in bindings:
+            await db.execute(
+                "INSERT INTO push_action_bindings "
+                "(token, user_id, chat_id, source_message_id, action, "
+                " anchor_turn_id, binding_revision, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+                (row["token"], user_id, chat_id, source_message_id, row["action"],
+                 anchor_turn_id, response_revision, row["expires_at"]))
+        await db.commit()
+        return True
+
+
+@dataclass(frozen=True)
+class PushActionConsumptionResult:
+    action: str
+    anchor_turn_id: int | None
+
+
+async def consume_push_action_binding(
+        token: str, user_id: int, chat_id: int, source_message_id: int
+) -> "PushActionConsumptionResult | None":
+    """Atomic, single-use, isolated consumption. The caller supplies only
+    the opaque token; action and anchor_turn_id are loaded exclusively from
+    the DB row, never trusted from callback_data.
+
+    Returns None on any rejection (missing token, wrong user/chat/message,
+    unknown action, already consumed, superseded, expired, or revision
+    mismatch -- all collapse to the same outcome; NONE of these bump the
+    revision). On success, also: (1) supersedes the sibling action from the
+    SAME push (same user_id + source_message_id) so at most one of
+    Continue/New-topic can ever be consumed from one delivered push; (2)
+    advances user_interaction_revision by exactly 1, in the SAME
+    transaction -- a successful push-action tap is a genuine lifecycle
+    event (like any ordinary user turn), so it must invalidate any OTHER
+    still-open, revision-bound control (an older push's bindings, an
+    entry-triage offer, a continuation-button offer) exactly the way a
+    fresh user message already does via bump_user_revision. This is a
+    lifecycle-invalidation bump, never a fabricated role='user' message and
+    never a user_interaction_events row -- push actions stay fully isolated
+    from the first-turn continuation graph."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT action, user_id, chat_id, source_message_id, anchor_turn_id, "
+            " binding_revision FROM push_action_bindings WHERE token=?", (token,))
+        row = await cur.fetchone()
+        if not row:
+            await db.commit()
+            return None
+        (action, row_user_id, row_chat_id, row_source_message_id,
+         anchor_turn_id, binding_revision) = row
+        if action not in ALLOWED_PUSH_ACTIONS:
+            await db.commit()
+            return None
+        if (row_user_id != user_id or row_chat_id != chat_id
+                or row_source_message_id != source_message_id):
+            await db.commit()
+            return None
+
+        cur = await db.execute(
+            "SELECT revision FROM user_interaction_revision WHERE user_id=?", (user_id,))
+        r = await cur.fetchone()
+        current_revision = r[0] if r else 0
+        if current_revision != binding_revision:
+            await db.commit()
+            return None
+
+        cur = await db.execute(
+            "UPDATE push_action_bindings SET consumed_at=datetime('now') "
+            "WHERE token=? AND user_id=? AND chat_id=? AND source_message_id=? "
+            "  AND consumed_at IS NULL AND superseded_at IS NULL AND expires_at > datetime('now')",
+            (token, user_id, chat_id, source_message_id))
+        if cur.rowcount != 1:
+            await db.commit()
+            return None
+
+        await db.execute(
+            "UPDATE push_action_bindings SET superseded_at=datetime('now') "
+            "WHERE user_id=? AND source_message_id=? AND token != ? "
+            "  AND consumed_at IS NULL AND superseded_at IS NULL",
+            (user_id, source_message_id, token))
+
+        await db.execute(
+            "INSERT INTO user_interaction_revision (user_id, revision) VALUES (?, 1) "
+            "ON CONFLICT(user_id) DO UPDATE SET revision = revision + 1",
+            (user_id,))
+
+        await db.commit()
+        return PushActionConsumptionResult(action=action, anchor_turn_id=anchor_turn_id)
+
+
+async def supersede_push_action_bindings(user_id: int) -> int:
+    """Lifecycle invalidation ONLY. Marks every currently open push binding
+    for this exact user_id as superseded -- used as best-effort crisis-start
+    cleanup (mirrors supersede_professional_entry_triage_bindings) so a
+    pre-crisis push offer can never become actionable again once the crisis
+    resolves. Idempotent: a second call when nothing is open affects zero
+    rows. Affects ONLY push_action_bindings."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "UPDATE push_action_bindings SET superseded_at=datetime('now') "
+            "WHERE user_id=? AND consumed_at IS NULL AND superseded_at IS NULL",
+            (user_id,))
+        await db.commit()
+        return cur.rowcount
+
+
+async def final_push_keyboard_publish_guard(
+        uid: int, chat_id: int, source_message_id: int,
+        expected_revision: int, anchor_turn_id: int, tokens: dict) -> bool:
+    """Push V1's ONE authoritative, last-possible-moment check that a
+    just-created binding pair is still safe to PUBLISH as a keyboard --
+    called after create_push_action_bindings has already durably committed
+    the two rows, immediately before bot.edit_message_reply_markup. Closes
+    the gap where a GDPR delete-all (or any other lifecycle-invalidating
+    event) commits in the window between binding creation and keyboard
+    publication: without this, the scheduler would attach a keyboard whose
+    tokens no longer resolve to anything a callback could ever consume.
+
+    A SINGLE read-only SELECT (no explicit transaction needed -- there is
+    nothing to write here, and a lone SELECT already observes one
+    consistent SQLite snapshot for its own execution, the same reasoning
+    final_push_send_guard relies on) verifies, together: (1) BOTH
+    push_continue and push_new_topic rows for `tokens` still exist, for the
+    exact uid/chat_id/source_message_id/expected_revision, and are still
+    open (not consumed, not superseded, not expired) -- if EITHER token's
+    row is gone or closed, this fails; (2) `expected_revision` is still the
+    LIVE user_interaction_revision for uid (0 if the user has no row) --
+    NOT merely a re-check of the rows' own stored binding_revision column,
+    which is a static value frozen at creation time and therefore cannot,
+    by itself, detect that a genuine ordinary user turn (or any other
+    revision-bumping lifecycle event) has moved the live revision since the
+    bindings were created: the rows can still physically exist, still be
+    open, and still carry the original binding_revision, while the button
+    they back is already guaranteed to be rejected by
+    consume_push_action_binding's own live-revision check at tap time --
+    publishing a keyboard in that state would be visibly actionable but
+    already dead on arrival; (3) the exact anchor_turn_id supplied still
+    exists as a real role='assistant' messages row owned by uid. Returns
+    True only if every one of these holds.
+
+    SQLite and the Telegram API cannot be made globally atomic: this guard
+    only guarantees that any deletion/invalidation which COMMITTED before
+    this SELECT ran will be observed and will correctly block publication.
+    A deletion that begins AFTER this guard returns True, or during the
+    subsequent Telegram edit_message_reply_markup call itself, is an
+    unavoidable cross-system residual -- callers (cb_push_action) already
+    fail closed independently at consumption time via
+    consume_push_action_binding's own token/revision checks, so a stale
+    keyboard from that narrow residual window still cannot be used to
+    resurrect erased state; it can only ever fail closed when tapped.
+
+    Callers MUST NOT perform any other database/network await between a
+    True result here and the actual bot.edit_message_reply_markup(...)
+    call -- exactly the same discipline final_push_send_guard requires
+    before bot.send_message."""
+    continue_token = tokens["push_continue"]
+    new_topic_token = tokens["push_new_topic"]
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT 1 WHERE ("
+            "  SELECT COUNT(*) FROM push_action_bindings"
+            "  WHERE user_id=? AND chat_id=? AND source_message_id=?"
+            "    AND binding_revision=?"
+            "    AND consumed_at IS NULL AND superseded_at IS NULL"
+            "    AND expires_at > datetime('now')"
+            "    AND ((token=? AND action='push_continue')"
+            "      OR (token=? AND action='push_new_topic'))"
+            ") = 2 "
+            "AND COALESCE("
+            "  (SELECT revision FROM user_interaction_revision WHERE user_id=?), 0"
+            ") = ? "
+            "AND EXISTS ("
+            "  SELECT 1 FROM messages WHERE id=? AND user_id=? AND role='assistant'"
+            ") LIMIT 1",
+            (uid, chat_id, source_message_id, expected_revision,
+             continue_token, new_topic_token,
+             uid, expected_revision,
+             anchor_turn_id, uid))
+        row = await cur.fetchone()
+    return row is not None
 
 
 # Localized, deterministic, enum-mapped labels -- RU/EN, matching this

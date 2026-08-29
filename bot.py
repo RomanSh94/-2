@@ -189,6 +189,18 @@ from database import (
     create_professional_entry_triage_bindings, consume_professional_entry_triage_binding,
     supersede_professional_entry_triage_bindings,
 )
+# Push V1 -- Continue/New-topic binding consumption (send side lives in
+# scheduler.py). touch_last_seen backs ActivityTouchMiddleware below.
+from database import (
+    consume_push_action_binding, supersede_push_action_bindings,
+    turn_belongs_to_user, touch_last_seen, get_unresolved_crisis,
+    PUSH_UI_SCENARIO,
+)
+from prompts import (
+    PUSH_V1_CONTINUE_REPLY_RU, PUSH_V1_CONTINUE_REPLY_EN,
+    PUSH_V1_NO_ANCHOR_REPLY_RU, PUSH_V1_NO_ANCHOR_REPLY_EN,
+    PUSH_V1_NEW_TOPIC_REPLY_RU, PUSH_V1_NEW_TOPIC_REPLY_EN,
+)
 # Professional Free-Text Runtime V1 -- bot.py imports ONLY the dedicated
 # orchestrator module (professional_free_text_runtime) plus the already-
 # merged, offline history read/build primitives; it never imports the
@@ -1271,6 +1283,16 @@ async def trigger_crisis(message: Message, uid: int, username: str,
         await supersede_professional_entry_triage_bindings(uid)
     except Exception as e:
         print(f"[crisis] entry-triage supersession FAILED uid={uid}: {type(e).__name__}")
+    # Push V1: same reasoning as the entry-triage supersession immediately
+    # above -- a Continue/New-topic offer that existed BEFORE this crisis
+    # became active must never become actionable again once the crisis
+    # resolves. cb_push_action's own active-crisis check is the primary
+    # safety property (it re-checks live at tap time regardless of this
+    # call); this is defense-in-depth cleanup only.
+    try:
+        await supersede_push_action_bindings(uid)
+    except Exception as e:
+        print(f"[crisis] push-binding supersession FAILED uid={uid}: {type(e).__name__}")
 
     eid = None
     try:
@@ -4648,6 +4670,37 @@ class DuplicateUpdateGuard(BaseMiddleware):
 dp.update.outer_middleware(DuplicateUpdateGuard())
 
 
+class ActivityTouchMiddleware(BaseMiddleware):
+    """Push V1 §5: refreshes users.last_seen for ANY real inbound Message or
+    CallbackQuery, independent of which handler eventually processes it --
+    the Silence Engine's inactivity signal must reflect real product use
+    (persistent lower-menu taps, inline navigation, journal/questionnaire
+    UI), not only ordinary free-text turns through pipeline()/upsert_user.
+
+    database.touch_last_seen is UPDATE-only (never INSERTs), so an unknown/
+    never-messaged user never gets a `users` row created merely by this
+    middleware running, and it never mutates access, role, onboarding,
+    crisis state, message_count, or privacy/deletion state -- exactly one
+    column, on an already-existing row. Best-effort: a failure here must
+    never block real handler processing. One centralized hook instead of
+    duplicating a touch call across dozens of handlers."""
+    async def __call__(self, handler, event, data):
+        uid = None
+        if event.message is not None and event.message.from_user is not None:
+            uid = event.message.from_user.id
+        elif event.callback_query is not None and event.callback_query.from_user is not None:
+            uid = event.callback_query.from_user.id
+        if uid is not None:
+            try:
+                await touch_last_seen(uid)
+            except Exception:
+                pass
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(ActivityTouchMiddleware())
+
+
 # ── Stale-response guard: suppress an ordinary answer superseded mid-flight ─
 # Reproduced race (see tests): aiogram runs updates as concurrent tasks
 # (handle_as_tasks=True), so two turns from the SAME user can run pipeline()
@@ -5148,6 +5201,118 @@ async def cb_professional_entry_triage(callback: CallbackQuery):
     except Exception as e:
         print(f"[professional-entry-triage] assistant persistence FAILED uid={uid}: "
               f"{type(e).__name__}")
+        return
+
+
+# ── Push V1 -- Continue / New-topic (§11, §12) ───────────────────────────────
+async def _push_continue_reply_text(uid: int, lang: str, anchor_turn_id: int | None) -> str:
+    """Deterministic only -- Push V1 never asks an LLM to infer a topic from
+    a push (product contract). If the anchored assistant turn from
+    push-send time still exists and still belongs to this user, use the
+    real 'resume' opener; otherwise degrade to a neutral low-pressure talk
+    entry -- never an invented continuation."""
+    has_anchor = False
+    if anchor_turn_id is not None:
+        try:
+            has_anchor = await turn_belongs_to_user(anchor_turn_id, uid)
+        except Exception:
+            has_anchor = False
+    if has_anchor:
+        return PUSH_V1_CONTINUE_REPLY_EN if lang == "en" else PUSH_V1_CONTINUE_REPLY_RU
+    return PUSH_V1_NO_ANCHOR_REPLY_EN if lang == "en" else PUSH_V1_NO_ANCHOR_REPLY_RU
+
+
+@dp.callback_query(F.data.startswith("pushbtn:"))
+async def cb_push_action(callback: CallbackQuery, state: FSMContext = None):
+    """Push V1 Continue/New-topic tap -- a trusted UI selection, never user
+    free text. Gate order: unresolved-crisis check FIRST (for the user's
+    ENTIRE unresolved lifecycle, not just get_active_crisis()'s 24h
+    interactive window -- see get_unresolved_crisis; best-effort supersede
+    any open push offers, then RE-SHOW the existing crisis safety surface
+    for that exact event via the normal delivery ladder, never creating a
+    second crisis_events row), THEN a live product-access recheck (silent
+    -- no closed-test screen; this is a stale-offer tap, not a fresh
+    command entrypoint), THEN a mandatory-onboarding recheck, THEN atomic
+    single-use binding consumption (which itself re-verifies the live
+    user_interaction_revision, rejecting a stale tap from before a newer
+    ordinary user turn, and advances the revision by 1 on success). This
+    tap never writes a fabricated role='user' message and never touches
+    interaction_button_bindings/user_interaction_events -- entirely
+    isolated from the first-turn continuation graph. An active unfinished
+    journal FSM (if any) is abandoned only AFTER every gate above has
+    passed, using the same narrow helper every other navigation entrypoint
+    uses."""
+    uid = callback.from_user.id
+    token = callback.data[len("pushbtn:"):]
+    await callback.answer()
+    lang = await get_user_language(uid)
+
+    lookup_failed = False
+    unresolved = None
+    try:
+        unresolved = await get_unresolved_crisis(uid)
+    except Exception:
+        lookup_failed = True
+    if lookup_failed or unresolved is not None:
+        # Fail closed: an unresolved-crisis lookup FAILURE blocks normal
+        # continuation exactly like a genuine unresolved crisis would, even
+        # though (having no data) it cannot re-show a screen.
+        try:
+            await supersede_push_action_bindings(uid)
+        except Exception:
+            pass
+        if unresolved is not None:
+            eid, stage, clang = unresolved
+            try:
+                text, kb = crisis_screen(stage, clang, eid)
+                await send_crisis(callback.message.answer, text, kb, clang, uid, eid, "screen")
+            except Exception as e:
+                print(f"[push-v1] crisis re-show FAILED uid={uid}: {type(e).__name__}")
+        return
+
+    try:
+        has_access = await access_control.has_full_access(uid)
+    except Exception:
+        has_access = False
+    if not has_access:
+        return
+
+    if await _onboarding_blocks_ordinary_entry(uid):
+        return
+
+    result = await consume_push_action_binding(
+        token, uid, callback.message.chat.id, callback.message.message_id)
+    if result is None:
+        return
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await _clear_active_journal_if_leaving(state)
+
+    if result.action == "push_continue":
+        text = await _push_continue_reply_text(uid, lang, result.anchor_turn_id)
+    else:
+        text = PUSH_V1_NEW_TOPIC_REPLY_EN if lang == "en" else PUSH_V1_NEW_TOPIC_REPLY_RU
+
+    # Delivery BEFORE persistence -- same discipline as
+    # cb_professional_entry_triage: a Telegram send failure must leave zero
+    # assistant rows.
+    try:
+        await callback.message.answer(text)
+    except Exception as e:
+        print(f"[push-v1] delivery FAILED uid={uid}: {type(e).__name__}")
+        return
+    try:
+        # PUSH_UI_SCENARIO (not "open_chat"): this deterministic UI reply
+        # must never itself become a future push's "real conversation
+        # anchor" -- see database.get_last_assistant_message_id.
+        await save_message(uid, "assistant", text, PUSH_UI_SCENARIO, lang,
+                           source=MessageSource.ASSISTANT_DELIVERED)
+    except Exception as e:
+        print(f"[push-v1] assistant persistence FAILED uid={uid}: {type(e).__name__}")
         return
 
 

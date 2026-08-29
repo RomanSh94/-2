@@ -448,6 +448,23 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
                   "-- never in logs/alerts. chat_id/source_message_id are Telegram "
                   "transport identifiers, not content, but are still never logged "
                   "beyond what is already necessary for delivery."),
+
+    # Push V1 -- Silence/Re-engagement Continue/New-topic bindings. Same
+    # ENGAGEMENT shape/treatment as interaction_button_bindings/
+    # professional_entry_triage_bindings above: a bounded navigation choice
+    # (which of the two closed push actions the user tapped), never raw
+    # conversation content -- anchor_turn_id is an internal row id, not
+    # content itself. CASCADE_DELETE, no special retention.
+    "push_action_bindings": _e(
+        table="push_action_bindings", user_id_column="user_id", category="ENGAGEMENT",
+        export_policy="INCLUDE", delete_policy="CASCADE_DELETE",
+        retention_policy="Until user-requested delete-all.",
+        log_policy="The opaque callback token must never appear in logs/alerts. "
+                  "`action` is one of two closed values (push_continue/"
+                  "push_new_topic) -- never in logs/alerts. chat_id/"
+                  "source_message_id/anchor_turn_id are internal identifiers, not "
+                  "content, but are still never logged beyond what is already "
+                  "necessary for delivery."),
 }
 
 

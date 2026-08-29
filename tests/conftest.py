@@ -47,3 +47,31 @@ def _reset_dependency_monitor():
     if "bot" in sys.modules:
         import dependency_monitor as _dm
         sys.modules["bot"].dependency_monitor = _dm.DependencyMonitor()
+
+
+@pytest.fixture(autouse=True)
+def _reset_seen_update_ids():
+    """Push V1 (Round 5) — same class of gap as _reset_dependency_monitor
+    above: bot._seen_update_ids (DuplicateUpdateGuard's dedup store) is a
+    single MODULE-LEVEL OrderedDict, created ONCE at bot.py import time and
+    never reset between tests. Every real-dispatch test file (see
+    tests/test_journal_navigation_dispatch.py, test_push_v1_callback.py,
+    test_activity_touch_middleware.py, ...) builds its own Update objects
+    with a LOCAL, per-file `itertools.count(1)` update_id sequence, so
+    running multiple such files in the SAME pytest process reintroduces the
+    exact numbers bot.py already saw from an EARLIER file and
+    DuplicateUpdateGuard silently drops them as duplicates -- a real,
+    reproduced full-suite failure (confirmed: test_lower_menu_message_
+    refreshes_last_seen and test_journal_hub_callback_refreshes_last_seen
+    failed with decision=duplicate_dropped only when run alongside other
+    real-dispatch files, never in isolation). Clearing this ONE dict between
+    tests closes it deterministically, without touching production code or
+    weakening any assertion -- production relies on Telegram's own
+    update_id monotonicity, which this in-memory dict was never meant to
+    survive process/test boundaries anyway."""
+    import sys
+    if "bot" in sys.modules:
+        sys.modules["bot"]._seen_update_ids.clear()
+    yield
+    if "bot" in sys.modules:
+        sys.modules["bot"]._seen_update_ids.clear()

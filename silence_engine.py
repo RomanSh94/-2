@@ -65,6 +65,7 @@ def _count_in_window(push_times: list, now: datetime, window: timedelta) -> int:
 def decide_push(now: datetime, last_activity: datetime, *,
                 muted_until: datetime | None = None,
                 last_crisis_at: datetime | None = None,
+                has_unresolved_crisis: bool = False,
                 consecutive_unanswered: int = 0,
                 tier_push_times: dict | None = None,
                 quiet_start: int = QUIET_START,
@@ -77,6 +78,15 @@ def decide_push(now: datetime, last_activity: datetime, *,
     `quiet_now`: if given, quiet-hours are evaluated against THIS time (the
     user's LOCAL time) instead of `now` (UTC) — fixes the tz-shift so we don't
     ping people in the middle of their night. All other logic still uses `now`.
+    `has_unresolved_crisis`: Push V1 P0 fix — a deterministic boolean, NOT
+    derived from `last_crisis_at`. Unlike the 24h-since-`last_crisis_at`
+    veto below (which fires for ANY crisis event, resolved or not, and only
+    for 24h), this vetoes for the user's ENTIRE unresolved crisis lifecycle
+    (which can run up to 7 days via the crisis-followup auto-resolve sweep)
+    -- an unresolved crisis must never be treated as "cooled down" merely
+    because 24h have passed. Deliberately a separate parameter rather than
+    overloading `last_crisis_at` semantics, so a RESOLVED crisis still gets
+    exactly the existing 24h cooldown below, unchanged.
     """
     tier_push_times = tier_push_times or {}
 
@@ -88,7 +98,16 @@ def decide_push(now: datetime, last_activity: datetime, *,
     if is_quiet_hours(quiet_now or now, quiet_start, quiet_end):
         return None
 
-    # (4) within 24h of a crisis event
+    # (0) P0: an unresolved crisis vetoes for its entire lifecycle, not
+    # just 24h — checked before the resolved-crisis 24h cooldown below so
+    # this is never accidentally shadowed by it.
+    if has_unresolved_crisis:
+        return None
+
+    # (4) within 24h of a crisis event (resolved or not — see docstring;
+    # for an UNRESOLVED crisis this is now redundant with rule (0) above,
+    # but stays unchanged so a RESOLVED crisis <24h ago keeps this exact
+    # existing cooldown).
     if last_crisis_at is not None and (now - last_crisis_at) < timedelta(hours=24):
         return None
 

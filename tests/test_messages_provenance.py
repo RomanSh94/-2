@@ -219,14 +219,18 @@ def test_no_save_message_call_in_bot_py_omits_or_mismatches_source():
     test. Covers every genuine writer: ordinary typed-user, crisis,
     controller, depression-disclosure, disambiguation, professional, and
     every assistant writer (ordinary/deterministic/controller/Entry-Triage/
-    first-turn/professional/Therapist Core). The exact count (17, up from 15
-    for Therapist Core V1's explicitly sourced user-claim and assistant
-    delivery writers) is
+    first-turn/professional/Therapist Core/Push V1 UI reply). The exact
+    count (18, up from 17 for Push V1's cb_push_action assistant-delivery
+    writer -- the deterministic Continue/New-topic UI reply, tagged
+    PUSH_UI_SCENARIO and source=MessageSource.ASSISTANT_DELIVERED; up from
+    15 before that for Therapist Core V1's explicitly sourced user-claim
+    and assistant delivery writers) is
     intentionally pinned here so a FUTURE writer added without provenance
     is caught even if it happens to reuse an already-correct source= value
     -- see test_pipeline_user_and_assistant_writers_classified_correctly
     and test_run_professional_free_text_and_deliver_assistant_writer_uses_
-    assistant_delivered below for the two new call sites individually."""
+    assistant_delivered below for two of the other new call sites
+    individually."""
     src = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     expected_by_role = {"user": "USER_AUTHORED", "assistant": "ASSISTANT_DELIVERED"}
@@ -244,7 +248,7 @@ def test_no_save_message_call_in_bot_py_omits_or_mismatches_source():
             assert source_attr is not None, f"save_message call at bot.py:{node.lineno} has no source="
             assert source_attr == expected_by_role.get(role), (
                 f"save_message call at bot.py:{node.lineno}: role={role!r} source={source_attr!r}")
-    assert checked == 17, f"expected exactly 17 known save_message call sites in bot.py, found {checked}"
+    assert checked == 18, f"expected exactly 18 known save_message call sites in bot.py, found {checked}"
 
 
 def test_trigger_crisis_user_writer_uses_user_authored():

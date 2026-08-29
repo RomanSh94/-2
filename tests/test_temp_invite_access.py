@@ -146,6 +146,49 @@ def test_temp_invite_expired_user_loses_full_access(monkeypatch):
     assert ac.has_temp_test_access(uid, now=later) is False
 
 
+# ── Push V1 correction: proactive_push_eligible() excludes temp-test-only
+# access, since a wall-clock lease has no DB row/revision hook the
+# scheduler's revision-bound final guard could ever observe if it expires
+# mid-tick -- see access_control.proactive_push_eligible's own docstring. ──
+def test_temp_test_only_user_not_proactive_push_eligible_even_while_lease_valid(monkeypatch):
+    # has_full_access() correctly returns True for an ordinary in-session
+    # reply via the temp lease -- but proactive_push_eligible() must
+    # exclude temp-test-ONLY access even while the lease is currently
+    # valid.
+    _activate_all(monkeypatch)
+    uid = 950
+    assert ac.grant_temp_test_access(uid) is True
+    assert asyncio.run(ac.has_full_access(uid)) is True
+    assert asyncio.run(ac.proactive_push_eligible(uid)) is False
+
+
+def test_temp_test_plus_permanent_access_still_proactive_push_eligible(monkeypatch, tmp_path):
+    # An UNKNOWN uid with BOTH a temp grant AND permanent, active
+    # database.user_access must remain eligible -- permanent access is
+    # checked independently and wins, regardless of the temp grant.
+    monkeypatch.chdir(tmp_path)
+    _activate_all(monkeypatch)  # also sets database.DB = "x20_test.db"
+    asyncio.run(database.init_db())
+    uid = 951
+    asyncio.run(database.grant_user_access(uid))
+    assert ac.grant_temp_test_access(uid) is True
+    assert ac.has_temp_test_access(uid) is True  # the temp grant is genuinely active
+    assert asyncio.run(ac.proactive_push_eligible(uid)) is True
+
+
+def test_normal_permanent_access_path_unchanged_for_proactive_push(monkeypatch, tmp_path):
+    # No temp grant at all -- ordinary permanent invite access must still
+    # make proactive_push_eligible() True, exactly like has_full_access().
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "personal_use")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(database, "DB", "x20_perm.db", raising=False)
+    asyncio.run(database.init_db())
+    uid = 952
+    asyncio.run(database.grant_user_access(uid))
+    assert asyncio.run(ac.has_full_access(uid)) is True
+    assert asyncio.run(ac.proactive_push_eligible(uid)) is True
+
+
 def test_temp_invite_user_a1_allowed_while_active(monkeypatch):
     _activate_all(monkeypatch)
     uid = 900

@@ -362,24 +362,61 @@ CRISIS_FOLLOWUP_EN = {
 }
 
 
-PUSH_MSGS_RU = {
-    "12h": ["Эй. Просто проверяю — как ты?", "Привет. Я тут, если что."],
-    "3d":  ["Давно не виделись. Всё ок?", "Привет. Как ты эти дни?"],
-    "7d":  ["Прошла неделя. Я здесь.", "Привет. Если захочешь — я рядом."],
-    "30d": ["Месяц молчания. Если захочешь — я тут.", "Привет. Просто напоминаю: я рядом."],
-}
-PUSH_MSGS_EN = {
-    "12h": ["Hey. Just checking in — how are you?", "Hi. I'm here if you need it."],
-    "3d":  ["Haven't seen you in a bit. All okay?", "Hi. How have these days been?"],
-    "7d":  ["It's been a week. I'm here.", "Hi. Whenever you want — I'm around."],
-    "30d": ["A month of quiet. If you ever want, I'm here.", "Hi. Just a reminder: I'm around."],
-}
+# ── Push V1 (Silence/Re-engagement card) ────────────────────────────────────
+# Deterministic and neutral by product contract: no tier-specific copy, no
+# conversation content, no LLM. The internal inactivity tier (12h/3d/7d/30d)
+# still drives WHETHER and how often this fires (silence_engine.decide_push,
+# unchanged) and is still logged to push_log for frequency-limit bookkeeping
+# -- it is simply never reflected in the text itself.
+PUSH_V1_TEXT_RU = (
+    "Как ты после нашего разговора?\n"
+    "Если захочешь, можем продолжить с того места или переключиться на что-то другое."
+)
+PUSH_V1_TEXT_EN = (
+    "How have you been since we talked?\n"
+    "If you'd like, we can pick up where we left off or switch to something else."
+)
+
+PUSH_V1_CONTINUE_LABEL_RU = "Продолжить"
+PUSH_V1_CONTINUE_LABEL_EN = "Continue"
+PUSH_V1_NEW_TOPIC_LABEL_RU = "Начать другую тему"
+PUSH_V1_NEW_TOPIC_LABEL_EN = "Start another topic"
+
+# Sent after a valid "Продолжить" tap when a real prior assistant turn is
+# still available as the resumption anchor. Deterministic -- Push V1 never
+# asks an LLM to infer or restate the actual prior topic.
+PUSH_V1_CONTINUE_REPLY_RU = (
+    "Можем продолжить с того места, где остановились.\n"
+    "Что из того разговора сейчас больше всего осталось с тобой?"
+)
+PUSH_V1_CONTINUE_REPLY_EN = (
+    "We can pick up where we left off.\n"
+    "What from that conversation has stayed with you the most?"
+)
+
+# Sent after a valid "Продолжить" tap when there is no real anchor to resume
+# (e.g. no prior assistant turn, or the anchored turn no longer exists) --
+# a neutral low-pressure opener, never an invented continuation.
+PUSH_V1_NO_ANCHOR_REPLY_RU = "Расскажи, что сейчас происходит или о чём хочется поговорить."
+PUSH_V1_NO_ANCHOR_REPLY_EN = "Tell me what's going on right now, or what you'd like to talk about."
+
+# Sent after a valid "Начать другую тему" tap. Explicitly leaves the old
+# topic behind without requiring a fully formulated new one, and keeps a
+# low-pressure just-talk path open.
+PUSH_V1_NEW_TOPIC_REPLY_RU = (
+    "Хорошо, прошлую тему пока оставим.\n\n"
+    "Что сейчас больше всего занимает мысли? Можно даже одним словом.\n\n"
+    "Если сложно выбрать тему, можем просто немного поговорить."
+)
+PUSH_V1_NEW_TOPIC_REPLY_EN = (
+    "Okay, let's leave that topic for now.\n\n"
+    "What's on your mind most right now? Even one word is fine.\n\n"
+    "If it's hard to pick a topic, we can just talk for a bit."
+)
 
 
-def get_push_msg(lang: str = "ru", tier: str = "12h") -> str:
-    import random
-    table = PUSH_MSGS_EN if lang == "en" else PUSH_MSGS_RU
-    return random.choice(table.get(tier, table["12h"]))
+def get_push_v1_text(lang: str = "ru") -> str:
+    return PUSH_V1_TEXT_EN if lang == "en" else PUSH_V1_TEXT_RU
 
 
 def get_crisis_followup(lang: str = "ru", tag: str = "1h") -> str:
