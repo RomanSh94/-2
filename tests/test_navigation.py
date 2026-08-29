@@ -539,6 +539,7 @@ _EXPECTED_JOURNAL_BUTTONS = [
     ("📊 Мой отчёт", "jhub:report"),
     ("⚙️ Напоминания", "jhub:settings"),
     ("🚨 Срочно плохо", "jhub:crisis"),
+    ("⬅️ В меню", "menu:back"),
 ]
 
 
@@ -556,7 +557,7 @@ def test_journals_hub_callback_renders_real_journal_buttons():
     cb = FakeCallback(user, msg, data="journals:hub")
     asyncio.run(bot.cb_journals_hub(cb))
     text, kw = msg.answers[-1]
-    assert text == "📝 Дневники"
+    assert text == "📝 Дневники\n\nВыбери, что хочешь открыть:"
     assert _journal_buttons(kw) == _EXPECTED_JOURNAL_BUTTONS
 
 

@@ -158,13 +158,19 @@ def test_journal_card_is_brand_neutral(monkeypatch):
     async def _lang(*a, **kw):
         return "ru"
 
+    async def _no_crisis(*a, **kw):
+        return None
+
     monkeypatch.setattr(bot, "ensure_full_access_or_closed_test", _true)
     monkeypatch.setattr(bot, "get_user_language", _lang)
+    # cmd_journal now goes through _nav_gate (Round 4 final correction),
+    # which runs journal_guard's active-crisis check before the access gate.
+    monkeypatch.setattr(bot, "get_active_crisis", _no_crisis)
 
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_journal(msg, None))
     text = msg.answers[0][0]
-    assert text == "📝 Дневники"
+    assert text == "📝 Дневники\n\nВыбери, что хочешь открыть:"
     assert _has_no_brand_name(text)
 
 

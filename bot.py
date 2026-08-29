@@ -782,6 +782,33 @@ _LOWER_MENU = {
     ),
 }
 
+# Round 4: the ONE canonical source of navigation-control labels, derived
+# from _LOWER_MENU itself so there is never a second, independently
+# maintained copy that could silently drift. Used to keep persistent-menu
+# button presses from ever being consumed as journal free-text answers (see
+# emotion_step/cbt_step's filter chain below).
+_LOWER_MENU_CONTROL_LABELS = frozenset(
+    label for rows in _LOWER_MENU.values() for row in rows for label in row
+)
+
+
+async def _clear_active_journal_if_leaving(state: FSMContext = None) -> None:
+    """Abandon an unfinished EmotionJournal/CbtJournal FSM session when the
+    user explicitly navigates away (a persistent-menu control, /help,
+    /start, or inline navigation). Touches ONLY these two journal states --
+    never onboarding, questionnaire sessions, InterventionStates,
+    disclosure flows, or any other product FSM -- and never deletes an
+    already-SAVED journal entry; it only abandons the unsaved, in-progress
+    FSM step (jstep/jdata or cstep/cdata), exactly like /journal_cancel
+    already does today. state=None is a harmless no-op (some call sites are
+    exercised directly in tests without a real FSMContext); aiogram always
+    supplies a real one in production."""
+    if state is None:
+        return
+    current = await state.get_state()
+    if current in (EmotionJournal.active.state, CbtJournal.active.state):
+        await state.clear()
+
 
 def persistent_lower_menu_kb(lang: str) -> ReplyKeyboardMarkup:
     rows = _LOWER_MENU["ru" if lang == "ru" else "en"]
@@ -4736,12 +4763,21 @@ def _ingest_leave(uid: int, holder: _IngestHolder, acquired: bool = True) -> Non
 
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext = None):
     from datetime import datetime, timezone
     uid = message.from_user.id
     # /start is a new turn: bump the generation so any ordinary answer still
     # being generated for this user is superseded and not delivered afterward.
     _bump_user_generation(uid)
+    # Round 4: /start is an explicit navigation escape -- abandon a stale
+    # active EmotionJournal/CbtJournal FSM only (never onboarding history,
+    # never a data reset); everything below this line is unrelated existing
+    # /start behavior, untouched. `state` defaults to None (not required)
+    # purely for backward compatibility with the many pre-existing tests
+    # that call cmd_start(msg) without it; the real dispatcher always
+    # injects a genuine FSMContext.
+    if state is not None:
+        await _clear_active_journal_if_leaving(state)
     # Phase 2 correction §8: /start supersedes any pending Depression
     # Disclosure Gate flow -- old buttons become inert, the new /start menu
     # is never blocked by it. Best-effort (never blocks /start itself).
@@ -5617,7 +5653,7 @@ async def cmd_unmute(message: Message):
 
 
 @dp.message(Command("help"))
-async def cmd_help(message: Message):
+async def cmd_help(message: Message, state: FSMContext = None):
     """Round 3: /help is a normal in-chat navigation/help card with
     user-facing RU/EN labels, not a raw technical slash-command list. Old
     slash-command handlers (/menu, /questionnaire, /journal, /format,
@@ -5625,7 +5661,16 @@ async def cmd_help(message: Message):
     /privacy_delete_all) remain fully registered and callable manually for
     backward compatibility -- they are simply no longer listed or advertised
     here. Static/role-unaware by design, same as before this round; every
-    button below reuses an EXISTING gated callback (see _help_keyboard)."""
+    button below reuses an EXISTING gated callback (see _help_keyboard).
+
+    Round 4: /help was already reachable while an EmotionJournal/CbtJournal
+    FSM was active (Command filters are matched before the journal's F.text
+    filter), but the stale journal state itself was never cleared, so the
+    NEXT ordinary message would still be silently consumed by the old
+    journal. Abandoning it here closes that gap without any extra "journal
+    cancelled" noise."""
+    if state is not None:
+        await _clear_active_journal_if_leaving(state)
     lang = await get_user_language(message.from_user.id)
     await message.answer(navigation.help_text(lang), reply_markup=_help_keyboard(lang))
 
@@ -5684,9 +5729,13 @@ async def cmd_emotion(message: Message, state: FSMContext, tg_user=None):
     await state.clear()
     await state.set_state(EmotionJournal.active)
     await state.update_data(jstep=0, jdata={}, orange=False, nudged=False)
-    intro = ("📝 Дневник эмоций. Отвечай как есть, в любой момент — /journal_cancel.\n\n"
-             if lang == "ru" else
-             "📝 Emotion journal. Answer freely; stop anytime with /journal_cancel.\n\n")
+    intro = (
+        "📝 Дневник эмоций\n\n"
+        "Отвечай как есть. Если захочешь остановиться — можно выйти в меню в любой момент.\n\n"
+        if lang == "ru" else
+        "📝 Emotion journal\n\n"
+        "Answer as it feels. If you want to stop, you can leave to the menu at any time.\n\n"
+    )
     await message.answer(intro + journals.emotion_prompt("event", lang))
 
 
@@ -5701,7 +5750,7 @@ async def cmd_journal_cancel(message: Message, state: FSMContext):
                              if lang == "ru" else "Okay, stopped. Nothing saved.")
 
 
-@dp.message(EmotionJournal.active, F.text)
+@dp.message(EmotionJournal.active, F.text, ~F.text.in_(_LOWER_MENU_CONTROL_LABELS))
 async def emotion_step(message: Message, state: FSMContext):
     uid = message.from_user.id
     username = message.from_user.username or ""
@@ -5769,14 +5818,19 @@ async def cmd_cbt(message: Message, state: FSMContext, tg_user=None):
     await state.clear()
     await state.set_state(CbtJournal.active)
     await state.update_data(cstep=0, cdata={})
-    intro = ("📘 КПТ-дневник. Ты сам(а) формулируешь мысли — я только записываю. "
-             "Остановиться — /journal_cancel.\n\n" if lang == "ru" else
-             "📘 CBT journal. You reframe your own thought — I just record. "
-             "Stop with /journal_cancel.\n\n")
+    intro = (
+        "📘 КПТ-дневник\n\n"
+        "Ты сам формулируешь мысли — я только помогаю их записать. "
+        "Если захочешь остановиться — можно выйти в меню в любой момент.\n\n"
+        if lang == "ru" else
+        "📘 CBT journal\n\n"
+        "You formulate your own thoughts — I just help write them down. "
+        "If you want to stop, you can leave to the menu at any time.\n\n"
+    )
     await message.answer(intro + journals.cbt_prompt("situation", lang))
 
 
-@dp.message(CbtJournal.active, F.text)
+@dp.message(CbtJournal.active, F.text, ~F.text.in_(_LOWER_MENU_CONTROL_LABELS))
 async def cbt_step(message: Message, state: FSMContext):
     uid = message.from_user.id
     username = message.from_user.username or ""
@@ -5837,7 +5891,9 @@ async def cmd_report(message: Message, state: FSMContext, tg_user=None):
 
 
 def _journal_hub_text(lang: str) -> str:
-    return "📝 Дневники" if lang == "ru" else "📝 Diaries"
+    if lang == "ru":
+        return "📝 Дневники\n\nВыбери, что хочешь открыть:"
+    return "📝 Diaries\n\nChoose what you'd like to open:"
 
 
 def _journal_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
@@ -5852,14 +5908,31 @@ def _journal_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Мой отчёт", callback_data="jhub:report")],
         [InlineKeyboardButton(text="⚙️ Напоминания", callback_data="jhub:settings")],
         [InlineKeyboardButton(text="🚨 Срочно плохо", callback_data="jhub:crisis")],
+        [InlineKeyboardButton(
+            text=("⬅️ В меню" if lang == "ru" else "⬅️ Back to menu"),
+            callback_data="menu:back")],
     ])
 
 
 @dp.message(Command("journal"))
-async def cmd_journal(message: Message, state: FSMContext):
-    if not await ensure_full_access_or_closed_test(message, message.from_user.id):
+async def cmd_journal(message: Message, state: FSMContext = None):
+    # Round 4 final correction: the journal-hub entry must use the SAME
+    # navigation safety contract as every other nav entrypoint (journal_guard
+    # / active-crisis check THEN ordinary access gate, via _nav_gate) rather
+    # than the bare access gate alone. This matters now specifically because
+    # the persistent-lower-menu "📝 Дневники" button reaches this function
+    # (via lower_menu_journals) even while an EmotionJournal/CbtJournal FSM
+    # is active -- before this fix, an active crisis would have been caught
+    # by emotion_step/cbt_step's own journal_guard call instead; the Round 4
+    # routing fix means that no longer happens, so this entrypoint must catch
+    # it itself. The unfinished journal is abandoned only AFTER the gate
+    # permits normal navigation, so a blocked crisis screen is never
+    # accompanied by a lost journal session.
+    uid = message.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(message, uid, lang):
         return
-    lang = await get_user_language(message.from_user.id)
+    await _clear_active_journal_if_leaving(state)
     await message.answer(_journal_hub_text(lang), reply_markup=_journal_hub_keyboard(lang))
 
 
@@ -5867,6 +5940,11 @@ async def cmd_journal(message: Message, state: FSMContext):
 async def cb_jhub(callback: CallbackQuery, state: FSMContext):
     action = callback.data.split(":")[1]
     await callback.answer()
+    # Round 4: report/settings/crisis don't start a fresh journal FSM
+    # themselves (unlike emotion/cbt, which already clear it via
+    # cmd_emotion/cmd_cbt), so a stale active journal must be abandoned here
+    # too. Harmless no-op for emotion/cbt -- they clear it again right after.
+    await _clear_active_journal_if_leaving(state)
     if action == "emotion":
         await cmd_emotion(callback.message, state, tg_user=callback.from_user)
     elif action == "cbt":
@@ -6540,11 +6618,13 @@ async def cmd_dass21(message: Message):
 
 
 @dp.message(Command("questionnaire"))
-async def cmd_questionnaire(message: Message):
+async def cmd_questionnaire(message: Message, state: FSMContext = None):
     uid = message.from_user.id
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(message, uid, lang):
         return
+    if state is not None:
+        await _clear_active_journal_if_leaving(state)
     catalog = await _available_questionnaire_catalog(uid)
     await message.answer(
         questionnaire_ux.list_text(lang),
@@ -6552,11 +6632,13 @@ async def cmd_questionnaire(message: Message):
 
 
 @dp.callback_query(F.data == "q:l")
-async def cb_questionnaire_list(callback: CallbackQuery):
+async def cb_questionnaire_list(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(callback, uid, lang):
         return
+    if state is not None:
+        await _clear_active_journal_if_leaving(state)
     catalog = await _available_questionnaire_catalog(uid)
     await _edit_or_answer(callback.message)(
         questionnaire_ux.list_text(lang),
@@ -7919,19 +8001,20 @@ async def cmd_menu(message: Message):
 
 
 @dp.message(F.text.in_({"🧠 Психологические тесты", "🧠 Psychological tests"}))
-async def lower_menu_tests(message: Message):
-    await cmd_questionnaire(message)
+async def lower_menu_tests(message: Message, state: FSMContext):
+    await cmd_questionnaire(message, state)
 
 
 @dp.message(F.text.in_({"📊 Мои результаты", "📊 My results"}))
-async def lower_menu_results(message: Message):
+async def lower_menu_results(message: Message, state: FSMContext):
     uid = message.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(message, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     await message.answer(
         navigation.results_hub_text(lang),
-        reply_markup=_hub_back_keyboard(lang))
+        reply_markup=_results_hub_keyboard(lang))
 
 
 @dp.message(F.text.in_({"📝 Дневники", "📝 Diaries"}))
@@ -7940,11 +8023,12 @@ async def lower_menu_journals(message: Message, state: FSMContext):
 
 
 @dp.message(F.text.in_({"🎛 Как отвечать", "🎛 How to reply"}))
-async def lower_menu_response_settings(message: Message):
+async def lower_menu_response_settings(message: Message, state: FSMContext):
     uid = message.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(message, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     available = await _voice_ux_enabled_for(uid)
     await message.answer(
         navigation.response_settings_text(lang, available=available),
@@ -7952,33 +8036,36 @@ async def lower_menu_response_settings(message: Message):
 
 
 @dp.message(F.text.in_({"🔒 Данные и приватность", "🔒 Data and privacy"}))
-async def lower_menu_privacy(message: Message):
+async def lower_menu_privacy(message: Message, state: FSMContext):
     uid = message.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(message, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     await message.answer(
         navigation.privacy_hub_text(lang),
         reply_markup=_privacy_hub_keyboard(lang))
 
 
 @dp.callback_query(F.data == "talk:hub")
-async def cb_talk_hub(callback: CallbackQuery):
+async def cb_talk_hub(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     await _answer_target(callback, navigation.talk_hub_text(lang),
                          reply_markup=_hub_back_keyboard(lang))
     await callback.answer()
 
 
 @dp.callback_query(F.data == "settings:hub")
-async def cb_settings_hub(callback: CallbackQuery):
+async def cb_settings_hub(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     available = await _voice_ux_enabled_for(uid)
     keyboard = (_response_settings_keyboard(lang) if available
                 else _hub_back_keyboard(lang))
@@ -8017,17 +8104,19 @@ async def cb_tests_hub(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "journals:hub")
-async def cb_journals_hub(callback: CallbackQuery):
+async def cb_journals_hub(callback: CallbackQuery, state: FSMContext = None):
     """/help -> "📝 Дневники" (round-3 correction): renders the EXACT SAME
     real journal card/buttons as the persistent-lower-menu entry (cmd_journal)
     -- one journal navigation UX, not a raw slash-command list on this path.
     Edits the existing /help card in place via _answer_target's normal
     CallbackQuery edit-in-place behavior, rather than appending a second
-    navigation card."""
+    navigation card. Round 4: also abandons a stale active journal FSM
+    (inline navigation must escape it just like the persistent menu does)."""
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     await _answer_target(callback, _journal_hub_text(lang), reply_markup=_journal_hub_keyboard(lang))
     await callback.answer()
 
@@ -8047,11 +8136,13 @@ def _results_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
 
 
 @dp.callback_query(F.data == "results:hub")
-async def cb_results_hub(callback: CallbackQuery):
+async def cb_results_hub(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
+    if state is not None:
+        await _clear_active_journal_if_leaving(state)
     await _answer_target(callback, navigation.results_hub_text(lang), reply_markup=_results_hub_keyboard(lang))
     await callback.answer()
 
@@ -8083,11 +8174,12 @@ async def cb_results_profile(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "privacy:hub")
-async def cb_privacy_hub(callback: CallbackQuery):
+async def cb_privacy_hub(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     await _answer_target(
         callback, navigation.privacy_hub_text(lang),
         reply_markup=_privacy_hub_keyboard(lang))
@@ -8127,25 +8219,31 @@ async def cb_privacy_delete_open(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "about:hub")
-async def cb_about_hub(callback: CallbackQuery):
+async def cb_about_hub(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     await _answer_target(callback, navigation.about_hub_text(lang), reply_markup=_hub_back_keyboard(lang))
     await callback.answer()
 
 
 @dp.callback_query(F.data == "menu:back")
-async def cb_menu_back(callback: CallbackQuery):
+async def cb_menu_back(callback: CallbackQuery, state: FSMContext = None):
     """Round 3: "⬅️ В меню" returns to the /help-style navigation card, not
     the old legacy "Главное меню / Выберите раздел" hub (_menu_keyboard is
     retained only for the still-live cb_*_hub backward-compat callbacks, see
-    test_cb_tests_hub_still_works_if_reached_directly)."""
+    test_cb_tests_hub_still_works_if_reached_directly).
+
+    Round 4: menu:back is the primary inline escape hatch out of a stale
+    active journal FSM, so it must abandon one here too."""
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _nav_gate(callback, uid, lang):
         return
+    if state is not None:
+        await _clear_active_journal_if_leaving(state)
     await _answer_target(callback, navigation.help_text(lang), reply_markup=_help_keyboard(lang))
     await callback.answer()
 
