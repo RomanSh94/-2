@@ -75,6 +75,45 @@ def test_crisis_older_than_24h_allows():
     assert decide_push(NOON, _ago(days=2), last_crisis_at=_ago(hours=30)) == "12h"
 
 
+# ── Push V1 P0 fix: has_unresolved_crisis is a SEPARATE, lifecycle-length
+# veto -- not derived from last_crisis_at, and not bounded to 24h. ──────────
+def test_unresolved_crisis_vetoes_even_when_created_long_ago():
+    # last_crisis_at is 30h ago (would otherwise be allowed, per
+    # test_crisis_older_than_24h_allows above) -- has_unresolved_crisis=True
+    # must still veto, because the crisis lifecycle itself is still open.
+    assert decide_push(NOON, _ago(days=2), last_crisis_at=_ago(hours=30),
+                       has_unresolved_crisis=True) is None
+
+
+def test_unresolved_crisis_vetoes_with_no_last_crisis_at_at_all():
+    # has_unresolved_crisis must be checked independently of last_crisis_at
+    # -- even if last_crisis_at is None (e.g. a caller that only computes
+    # the unresolved flag), the veto still applies.
+    assert decide_push(NOON, _ago(days=2), has_unresolved_crisis=True) is None
+
+
+def test_resolved_crisis_still_gets_existing_24h_cooldown():
+    # has_unresolved_crisis=False (the crisis was resolved) -- the
+    # PRE-EXISTING 24h cooldown on last_crisis_at must still apply
+    # unchanged.
+    assert decide_push(NOON, _ago(days=2), last_crisis_at=_ago(hours=5),
+                       has_unresolved_crisis=False) is None
+
+
+def test_resolved_crisis_over_24h_ago_allows_normal_behavior():
+    # has_unresolved_crisis=False AND last_crisis_at >=24h ago -> normal
+    # silence-engine behavior resumes, exactly as before this round.
+    assert decide_push(NOON, _ago(days=2), last_crisis_at=_ago(hours=30),
+                       has_unresolved_crisis=False) == "12h"
+
+
+def test_has_unresolved_crisis_defaults_to_false():
+    # Backward compatibility: every pre-existing call site (and every test
+    # above this one) omits has_unresolved_crisis entirely and must behave
+    # exactly as it did before this parameter existed.
+    assert decide_push(NOON, _ago(hours=13)) == "12h"
+
+
 def test_too_many_unanswered_vetoes():
     assert decide_push(NOON, _ago(days=2),
                        consecutive_unanswered=MAX_UNANSWERED) is None

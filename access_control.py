@@ -188,27 +188,14 @@ def resolved_reviewers_for(tester_uid: int) -> list[int]:
         return []
 
 
-async def has_full_access(uid: int) -> bool:
-    """Whether this uid may use ordinary product features right now.
-
-    `public` mode: ordinary product access is available without an invite.
-    OWNER keeps ordinary access without changing role; CLINICIAN_REVIEWER stays
-    review-only and receives no ordinary product access.  No branch here grants
-    a role, cross-user access, review-pack access, or A1 access.
-
-    OWNER (personal_use / controlled_clinical_test): always True.
-    CLINICIAN_TESTER: True only if ALL of: mode is controlled_clinical_test, the
-      tester has acknowledged the test-mode notice, AND at least one reviewer is
-      currently mapped to them AND that reviewer id is a genuine, currently-
-      configured CLINICIAN_REVIEWER (checkpoint item 6 — a mapping to a
-      non-reviewer id does not count). The reviewer-mapping check is
-      re-evaluated on EVERY call (not cached at acknowledgment time) so that if
-      a mapping is later removed, a previously-active tester is disabled
-      immediately, not left as a silently-orphaned active user with no reviewer
-      (§ correction 6).
-    CLINICIAN_REVIEWER / UNKNOWN: always False (reviewers get the review-pack
-      path only, never ordinary bot product access; see can_request_review_pack).
-    """
+async def _has_full_access_impl(uid: int, allow_temp_test: bool) -> bool:
+    """Shared implementation for has_full_access() (allow_temp_test=True) and
+    proactive_push_eligible() (allow_temp_test=False) -- see both for the
+    policy each one implements; this holds every check that is IDENTICAL
+    between them (mode validity, role resolution, public mode, OWNER,
+    CLINICIAN_TESTER, permanent user_access) so neither caller duplicates
+    that policy. The only branch that differs is whether a temporary,
+    wall-clock-expiring test grant (has_temp_test_access) counts."""
     if not _mode_is_valid():
         return False
     role = resolve_role_safe(uid)
@@ -233,7 +220,13 @@ async def has_full_access(uid: int) -> bool:
     # inert unless every fail-closed condition in has_temp_test_access /
     # is_temp_test_invite_active holds (test instance + test DB + mode +
     # enabled flag + valid window) — see access_control.py's temp-invite block.
-    if has_temp_test_access(uid):
+    # Deliberately SKIPPED when allow_temp_test is False, and checked BEFORE
+    # the permanent user_access check below so that a uid with BOTH a temp
+    # grant and permanent access still resolves via whichever check runs —
+    # for has_full_access (allow_temp_test=True) either one is sufficient;
+    # for proactive_push_eligible (allow_temp_test=False) only the permanent
+    # check below can grant, independent of temp-access status.
+    if allow_temp_test and has_temp_test_access(uid):
         return True
     # PR A — ordinary-user private invite access. A permanent, production
     # mechanism (unlike the temp-invite block above): once a uid has an
@@ -249,6 +242,66 @@ async def has_full_access(uid: int) -> bool:
     except Exception:
         pass
     return False
+
+
+async def has_full_access(uid: int) -> bool:
+    """Whether this uid may use ordinary product features right now.
+
+    `public` mode: ordinary product access is available without an invite.
+    OWNER keeps ordinary access without changing role; CLINICIAN_REVIEWER stays
+    review-only and receives no ordinary product access.  No branch here grants
+    a role, cross-user access, review-pack access, or A1 access.
+
+    OWNER (personal_use / controlled_clinical_test): always True.
+    CLINICIAN_TESTER: True only if ALL of: mode is controlled_clinical_test, the
+      tester has acknowledged the test-mode notice, AND at least one reviewer is
+      currently mapped to them AND that reviewer id is a genuine, currently-
+      configured CLINICIAN_REVIEWER (checkpoint item 6 — a mapping to a
+      non-reviewer id does not count). The reviewer-mapping check is
+      re-evaluated on EVERY call (not cached at acknowledgment time) so that if
+      a mapping is later removed, a previously-active tester is disabled
+      immediately, not left as a silently-orphaned active user with no reviewer
+      (§ correction 6).
+    CLINICIAN_REVIEWER / UNKNOWN: always False (reviewers get the review-pack
+      path only, never ordinary bot product access; see can_request_review_pack).
+    """
+    return await _has_full_access_impl(uid, allow_temp_test=True)
+
+
+async def proactive_push_eligible(uid: int) -> bool:
+    """Whether `uid` may be proactively re-engaged by an UNSOLICITED product
+    notification (Push V1's Silence/Re-engagement job) right now. Deliberately
+    STRICTER than has_full_access() in exactly one respect: temporary,
+    wall-clock-expiring test access (has_temp_test_access) does NOT count.
+
+    Why: has_temp_test_access is a purely in-process, in-memory lease
+    (_TEMP_TEST_GRANTED_UNTIL) with no backing database row and therefore no
+    hook into user_interaction_revision -- database.block_user_access's
+    revision bump (which Push V1's final_push_send_guard checks) can only
+    ever fire for a REAL user_access row transition, so it structurally
+    cannot observe a temp lease's wall-clock expiry. Without this exclusion,
+    a scheduler tick could read has_full_access()==True via an
+    about-to-expire temp lease, the lease could then expire before the
+    Telegram send, and final_push_send_guard would have no signal at all to
+    catch it (last_seen/crisis/revision/anchor are all unaffected by a lease
+    expiring). Rather than inventing lease-aware semantics for a guard that
+    is otherwise purely SQLite-atomic, Push V1 simply never treats
+    temp-test-only access as sufficient grounds to proactively contact
+    someone -- an ordinary IN-SESSION reply (has_full_access) may still use
+    it, since that path completes synchronously within the lease's own
+    lifetime.
+
+    Semantics (identical to has_full_access() except the one exclusion
+    above): OWNER -> True; a currently-eligible CLINICIAN_TESTER -> True
+    (not lease-based -- re-evaluated fresh every call, same as
+    has_full_access); a permanent, active user_access row -> True
+    REGARDLESS of whether uid also happens to hold an active temp-test grant
+    right now (permanent access is checked independently of, and is
+    sufficient on its own, so it "wins"); TEMP-TEST-ONLY access -> False;
+    public-mode ordinary access -> True (not time-limited, no lease
+    involved, so no race exists there); any DB lookup exception or invalid
+    mode -> False (fail closed, mirrors has_full_access exactly)."""
+    return await _has_full_access_impl(uid, allow_temp_test=False)
 
 
 async def a1_allowed(requester_uid: int) -> bool:
