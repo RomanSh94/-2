@@ -2291,6 +2291,56 @@ async def turn_belongs_to_user(turn_id: int, uid: int) -> bool:
     return row is not None
 
 
+async def get_trusted_conversation_history_through_anchor(
+        user_id: int, anchor_turn_id: int) -> list:
+    """Push V1 Contextual Continue V1 read primitive -- NOT get_professional_
+    conversation_history_rows reused with a +1 trick, because that function's
+    own contract (`source IN ('USER_AUTHORED','ASSISTANT_DELIVERED')` only)
+    is insufficient here: a prior Push V1 UI reply IS genuinely persisted
+    with source=ASSISTANT_DELIVERED (it really was delivered, real
+    deterministic content the user really saw), so relying on `source`
+    alone would let a prior sealed push_ui acknowledgement leak into a
+    trusted-conversation-continuation context as if it were real discourse.
+    This mirrors get_last_assistant_message_id's own exact reasoning for
+    excluding scenario=PUSH_UI_SCENARIO from anchor SELECTION, applied here
+    to anchor CONTEXT instead.
+
+    Returns raw (id, role, content, source) rows, oldest-first, for every
+    row with id<=anchor_turn_id (INCLUSIVE -- the anchor's own row is a
+    genuine prior assistant turn and belongs in the context) that is both:
+    (1) source IN ('USER_AUTHORED','ASSISTANT_DELIVERED') -- excludes
+    SYNTHETIC_UI and NULL/legacy-provenance rows, identically to
+    get_professional_conversation_history_rows; (2) scenario IS NULL OR
+    scenario != PUSH_UI_SCENARIO -- excludes prior Push V1 UI replies.
+
+    Fenced to the EXACT anchor_turn_id the caller captured at push-send
+    time -- never "whatever the latest conversation is now". id<=? is
+    correct (not id<?+something) because messages.id is a strictly
+    monotonic AUTOINCREMENT column: no row can exist strictly between
+    anchor_turn_id and anchor_turn_id+1, so this bound is exact, not an
+    approximation.
+
+    The caller is responsible for passing these rows through
+    professional_turn_conversation_context.build_conversation_context_
+    from_history_rows -- this function performs no bounds/omission logic
+    of its own and returns raw rows. No I/O beyond the one SELECT; no
+    model call; no current-turn concept of any kind (there is no current
+    turn here -- see push_contextual_continue.py's own module docstring)."""
+    if type(anchor_turn_id) is not int or anchor_turn_id <= 0:
+        raise ValueError(
+            "get_trusted_conversation_history_through_anchor: "
+            f"anchor_turn_id must be a positive int, got {anchor_turn_id!r}")
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id, role, content, source FROM messages"
+            " WHERE user_id=? AND id<=?"
+            " AND source IN ('USER_AUTHORED','ASSISTANT_DELIVERED')"
+            " AND (scenario IS NULL OR scenario != ?)"
+            " ORDER BY id ASC",
+            (user_id, anchor_turn_id, PUSH_UI_SCENARIO))
+        return await cur.fetchall()
+
+
 # ── GDPR memory (Epic 2) ──────────────────────────────────────────────────────
 
 async def get_memory_overview(uid: int) -> dict:
@@ -4329,6 +4379,7 @@ async def create_push_action_bindings(
 class PushActionConsumptionResult:
     action: str
     anchor_turn_id: int | None
+    post_consume_revision: int
 
 
 async def consume_push_action_binding(
@@ -4352,7 +4403,21 @@ async def consume_push_action_binding(
     fresh user message already does via bump_user_revision. This is a
     lifecycle-invalidation bump, never a fabricated role='user' message and
     never a user_interaction_events row -- push actions stay fully isolated
-    from the first-turn continuation graph."""
+    from the first-turn continuation graph.
+
+    Also returns post_consume_revision -- the EXACT resulting revision,
+    derived by pure arithmetic (binding_revision + 1) from the SAME
+    binding_revision already verified above in THIS transaction, never by
+    a separate get_user_revision() lookup performed after this function
+    returns. A later lookup would race: if a genuinely newer lifecycle
+    event (another user turn, another push action, an access revocation)
+    landed between this transaction's commit and that later lookup, the
+    caller would wrongly treat that NEWER revision as if it were the
+    revision this exact consumption produced, defeating any freshness
+    guard built on top of it (owner P0 correction -- see
+    final_push_continue_delivery_guard / record_push_v1_contextual_
+    continue_delivery below, which both bind to this exact captured
+    value)."""
     async with aiosqlite.connect(DB) as db:
         await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
@@ -4401,7 +4466,9 @@ async def consume_push_action_binding(
             (user_id,))
 
         await db.commit()
-        return PushActionConsumptionResult(action=action, anchor_turn_id=anchor_turn_id)
+        return PushActionConsumptionResult(
+            action=action, anchor_turn_id=anchor_turn_id,
+            post_consume_revision=binding_revision + 1)
 
 
 async def supersede_push_action_bindings(user_id: int) -> int:
@@ -4494,6 +4561,152 @@ async def final_push_keyboard_publish_guard(
              anchor_turn_id, uid))
         row = await cur.fetchone()
     return row is not None
+
+
+_PUSH_ACTION_FENCE_PREDICATE = (
+    "EXISTS ("
+    "  SELECT 1 FROM push_action_bindings"
+    "  WHERE token=? AND user_id=? AND chat_id=? AND source_message_id=?"
+    "    AND action=? AND consumed_at IS NOT NULL AND superseded_at IS NULL"
+    "    AND (binding_revision + 1) = ?"
+    ") "
+    "AND COALESCE((SELECT revision FROM user_interaction_revision WHERE user_id=?), 0) = ? "
+    "AND NOT EXISTS (SELECT 1 FROM crisis_events WHERE user_id=? AND resolved=0) "
+    "AND (? IS NULL OR EXISTS ("
+    "  SELECT 1 FROM messages WHERE id=? AND user_id=? AND role='assistant'"
+    "))"
+)
+
+
+def _push_action_fence_params(uid, chat_id, source_message_id, token, action,
+                               expected_revision, anchor_turn_id):
+    return (token, uid, chat_id, source_message_id, action, expected_revision,
+            uid, expected_revision,
+            uid,
+            anchor_turn_id, anchor_turn_id, uid)
+
+
+async def final_push_action_reply_delivery_guard(
+        uid: int, chat_id: int, source_message_id: int, token: str, action: str,
+        expected_revision: int, anchor_turn_id: int | None) -> bool:
+    """Push V1's ONE authoritative, last-possible-moment pre-delivery check,
+    shared by BOTH successfully-consumed push actions (push_continue --
+    contextual success or deterministic fallback -- and push_new_topic) --
+    called as the LAST awaited prerequisite immediately before the Telegram
+    send, AFTER any awaited work this tap's reply required (Contextual
+    Continue's provider call; nothing awaited for New Topic, but the SAME
+    fence still applies to it).
+
+    A SINGLE read-only SELECT (same reasoning as final_push_send_guard and
+    final_push_keyboard_publish_guard: one statement is one consistent
+    SQLite snapshot; separate awaited SELECTs are not) verifies, together:
+
+    (1) EXACT CONSUMED TOKEN IDENTITY -- the opaque token this tap actually
+    consumed (never a new one, never logged, never persisted anywhere new)
+    still has a row in push_action_bindings for the exact (uid, chat_id,
+    source_message_id, action) this callback observed, with consumed_at
+    NOT NULL (genuinely consumed) and superseded_at NULL, AND that row's
+    own binding_revision + 1 equals `expected_revision` -- reconfirming,
+    from the row itself, the SAME arithmetic PushActionConsumptionResult.
+    post_consume_revision already encodes, rather than trusting the
+    caller-supplied value alone. `expires_at` is deliberately NOT
+    re-checked here: expiry was already validated atomically at consume
+    time (consume_push_action_binding's own UPDATE ... WHERE expires_at >
+    datetime('now')); a legitimately consumed action must not become
+    invalid merely because generation crossed the original lease deadline.
+
+    This token predicate closes a real numeric-revision ABA gap plain
+    revision equality cannot: bump_user_revision() recreates an ABSENT
+    user_interaction_revision row starting at 1, so a delete-all followed
+    by ANY later ordinary interaction can make the LIVE revision numerically
+    equal an OLD captured expected_revision again, even though the account's
+    entire push/conversation lifecycle was erased and rebuilt in between.
+    delete_all_personal_data CASCADE-deletes push_action_bindings, so the
+    EXACT consumed token's row is permanently gone in that scenario --
+    this predicate alone (independent of the revision check below) fails
+    closed regardless of what the numeric revision has since become.
+
+    (2) live user_interaction_revision (0 if the user has no row) still
+    equals `expected_revision`. (3) no unresolved crisis exists (NOT EXISTS
+    on crisis_events.resolved=0) -- checked independently, because a newly
+    started crisis moves neither the token row nor the revision counter.
+    (4) if `anchor_turn_id` is not None, it must still exist as a real
+    role='assistant' messages row owned by uid -- callers pass None here
+    whenever the reply about to be delivered does not actually depend on
+    the anchor's content (every New Topic reply, and every Contextual
+    Continue deterministic fallback), and the exact anchor_turn_id only
+    when a genuine contextual generation grounded in it is about to be sent.
+
+    Returns True only if every one of these holds. Callers MUST fail
+    closed on any exception from this call, and MUST NOT perform any other
+    database/network await between a True result here and the actual
+    Telegram send -- exactly the discipline final_push_send_guard and
+    final_push_keyboard_publish_guard already require of their own
+    callers. (A synchronous, non-awaited in-memory generation-supersession
+    check may still run between this guard and the send -- see bot.
+    _user_generation_superseded -- since it performs no I/O of its own.)"""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            f"SELECT 1 WHERE {_PUSH_ACTION_FENCE_PREDICATE}",
+            _push_action_fence_params(
+                uid, chat_id, source_message_id, token, action,
+                expected_revision, anchor_turn_id))
+        row = await cur.fetchone()
+    return row is not None
+
+
+async def record_push_action_reply_delivery(
+        uid: int, chat_id: int, source_message_id: int, token: str, action: str,
+        text: str, scenario: str, lang: str,
+        expected_revision: int, anchor_turn_id: int | None) -> bool:
+    """Push V1's ONLY post-send persistence path for a reply Telegram has
+    already confirmed delivered, shared by BOTH push actions -- lifecycle-
+    fenced so that confirmed send can never resurrect/recreate conversation
+    state for a user whose lifecycle was invalidated (GDPR delete-all, a
+    newer genuine user turn, a real access revocation, or a newly-started
+    unresolved crisis) in the window between final_push_action_reply_
+    delivery_guard and this call, INCLUDING while the Telegram send itself
+    was in flight -- SQLite and the Telegram API cannot be made globally
+    atomic, so that narrow residual window is the one thing no pre-send
+    guard alone can ever close (mirrors record_push_v1_delivery's own
+    reasoning for the scheduler send path).
+
+    One BEGIN IMMEDIATE transaction re-verifies EXACTLY the same fence
+    final_push_action_reply_delivery_guard already verified pre-send --
+    same exact consumed token identity, same live revision, same
+    unresolved-crisis check, same conditional anchor check -- as one atomic
+    read, and INSERTs the delivered assistant reply (source=
+    ASSISTANT_DELIVERED) only if it still holds. Returns True (row written)
+    or False (nothing written -- the lifecycle moved during or after the
+    Telegram send, including a delete-all that removed the exact consumed
+    token's row even if the numeric revision has since been made to look
+    unchanged by a later ordinary interaction).
+
+    A False return is never a database error and never eligible for retry
+    or resend: it is the correct outcome of a real, concurrent,
+    user-initiated (or crisis-initiated) lifecycle event. Callers must not
+    attempt to recover, resend, or otherwise compensate -- Telegram may
+    already have delivered the text to the user; that cross-system
+    residual is unavoidable and is never papered over by writing (or
+    re-writing) anything here. This function never recreates any row
+    delete_all_personal_data already removed."""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            f"SELECT 1 WHERE {_PUSH_ACTION_FENCE_PREDICATE}",
+            _push_action_fence_params(
+                uid, chat_id, source_message_id, token, action,
+                expected_revision, anchor_turn_id))
+        row = await cur.fetchone()
+        if row is None:
+            await db.commit()
+            return False
+        await db.execute(
+            "INSERT INTO messages (user_id,role,content,scenario,lang,source) "
+            "VALUES (?, 'assistant', ?, ?, ?, ?)",
+            (uid, text, scenario, lang, MessageSource.ASSISTANT_DELIVERED.value))
+        await db.commit()
+        return True
 
 
 # Localized, deterministic, enum-mapped labels -- RU/EN, matching this

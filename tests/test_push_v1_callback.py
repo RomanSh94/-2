@@ -44,12 +44,22 @@ class _StubSession(BaseSession):
     def __init__(self):
         super().__init__()
         self.sent = []
+        # Optional async callable(method), invoked ONCE (then cleared) right
+        # before a SendMessage request's response is built -- used ONLY by
+        # the P0 freshness-fencing tests below to simulate a real lifecycle
+        # event (e.g. delete_all_personal_data) committing WHILE a Telegram
+        # send is in flight, i.e. AFTER any pre-send guard already passed.
+        # None for every other test in this file -- zero behavior change.
+        self.send_side_effect = None
 
     async def close(self):
         pass
 
     async def make_request(self, bot_, method, timeout=None):
         self.sent.append(method)
+        if self.send_side_effect is not None and type(method).__name__ == "SendMessage":
+            effect, self.send_side_effect = self.send_side_effect, None
+            await effect(method)
         returning = method.__returning__
         if returning is bool:
             data = {"ok": True, "result": True}
@@ -76,6 +86,50 @@ def _async(value=None):
     return _f
 
 
+class _FakeCompletions:
+    """Records every create(**kwargs) call in `.calls`. response_content=
+    a string -> simulates a successful provider reply; raise_exc=an
+    exception instance -> simulates a provider/network failure; response_
+    content=None (default) -> simulates an empty/no-usable-content
+    response. Never makes any real network call.
+
+    side_effect: an optional async callable (no args), awaited AFTER the
+    call is recorded but BEFORE any response/exception is produced --
+    used ONLY by the P0 freshness-fencing tests below to perform a REAL
+    lifecycle-invalidating DB mutation (a new user turn, a real access
+    revocation, a real crisis start, a real delete-all) WHILE the awaited
+    provider call is still "in flight", simulating exactly the race window
+    the owner correction closes. None for every other test -- zero
+    behavior change."""
+    def __init__(self, response_content=None, raise_exc=None, side_effect=None):
+        self.response_content = response_content
+        self.raise_exc = raise_exc
+        self.side_effect = side_effect
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.side_effect is not None:
+            await self.side_effect()
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        import types
+        if self.response_content is None:
+            return types.SimpleNamespace(choices=[])
+        message = types.SimpleNamespace(content=self.response_content)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+
+
+class _FakeOpenAIClient:
+    def __init__(self, response_content=None, raise_exc=None, side_effect=None):
+        self.completions = _FakeCompletions(response_content, raise_exc, side_effect)
+        self.chat = self  # client.chat.completions.create(...)
+
+    @property
+    def calls(self):
+        return self.completions.calls
+
+
 @pytest.fixture
 def tmp_db(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB", str(tmp_path / "push_cb.db"))
@@ -97,6 +151,11 @@ def _common(monkeypatch, tmp_db):
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", False)
     stub = _StubSession()
     monkeypatch.setattr(bot.bot, "session", stub)
+    # Default: a provider failure, never a real network call. Tests that
+    # specifically exercise a successful Contextual Continue generation
+    # override bot.client themselves (see test_push_contextual_continue.py).
+    monkeypatch.setattr(bot, "client", _FakeOpenAIClient(
+        raise_exc=RuntimeError("simulated provider failure -- no real network call")))
     return stub
 
 
@@ -136,6 +195,41 @@ async def _seed_conversation_anchor(uid=USER_ID):
         source=database.MessageSource.ASSISTANT_DELIVERED)
 
 
+async def _seed_grounded_conversation(uid=USER_ID):
+    """A genuine USER_AUTHORED + ASSISTANT_DELIVERED pair -- unlike
+    _seed_conversation_anchor (assistant-only), this satisfies the P1-1
+    trusted-USER-evidence requirement so a Contextual Continue tap actually
+    reaches the model instead of degrading before ever calling it. Returns
+    the anchor row id (the assistant row)."""
+    await database.save_message(
+        uid, "user", "У меня есть реальная тема для разговора.", "open_chat", "ru",
+        source=database.MessageSource.USER_AUTHORED)
+    return await database.save_message(
+        uid, "assistant", "Расскажи подробнее.", "open_chat", "ru",
+        source=database.MessageSource.ASSISTANT_DELIVERED)
+
+
+async def _deliver_real_push_with_grounded_anchor(stub, uid=USER_ID):
+    """Like _deliver_real_push, but seeds a genuine grounded (USER+
+    ASSISTANT) conversation instead of an assistant-only row, so a
+    Contextual Continue tap actually attempts a model call. Returns
+    (chat_id, message_id, continue_token, new_topic_token, anchor_id)."""
+    await _seed_inactive_user(uid)
+    anchor_id = await _seed_grounded_conversation(uid)
+    await scheduler._send_silence_pushes(bot.bot)
+    async with database.aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            "SELECT token, action, chat_id, source_message_id FROM push_action_bindings "
+            "WHERE user_id=? AND consumed_at IS NULL AND superseded_at IS NULL", (uid,))
+        rows = await cur.fetchall()
+    by_action = {r[1]: r for r in rows}
+    assert set(by_action) == {"push_continue", "push_new_topic"}
+    chat_id = by_action["push_continue"][2]
+    message_id = by_action["push_continue"][3]
+    return (chat_id, message_id, by_action["push_continue"][0],
+            by_action["push_new_topic"][0], anchor_id)
+
+
 async def _deliver_real_push(stub, uid=USER_ID, with_anchor=True):
     """Drives the REAL send path (scheduler._send_silence_pushes) through
     the SAME stub session bot.py's dispatcher uses, so the resulting
@@ -165,6 +259,12 @@ async def _deliver_real_push(stub, uid=USER_ID, with_anchor=True):
 
 # ── Continue / New-topic valid paths ────────────────────────────────────────
 def test_continue_valid_path_with_anchor_sends_resume_opener(_common):
+    # A valid anchor exists, so Contextual Continue is genuinely attempted
+    # (see _common's default bot.client -- a simulated provider failure).
+    # This proves the MODEL_FAILURE_FALLBACK degradation path specifically:
+    # a provider failure must still deliver the exact original deterministic
+    # resume opener, never an empty/broken reply. Contextual-generation
+    # SUCCESS is covered separately in test_push_contextual_continue.py.
     async def run():
         # _deliver_real_push seeds a real anchor by default.
         chat_id, message_id, continue_token, _ = await _deliver_real_push(_common)
@@ -256,6 +356,8 @@ def test_crisis_unresolved_over_24h_after_delivery_blocks_and_reshows_screen(_co
     assert expected_text in _common.texts()
     # no second crisis_events row was created:
     assert events_after == events_before
+    # the unresolved-crisis gate wins BEFORE any contextual generation call:
+    assert bot.client.calls == []
 
 
 async def _crisis_event_count():
@@ -280,6 +382,8 @@ def test_access_revoked_after_delivery_blocks_continuation(monkeypatch, _common)
     asyncio.run(run())
     assert prompts.PUSH_V1_CONTINUE_REPLY_RU not in _common.texts()
     assert prompts.PUSH_V1_NO_ANCHOR_REPLY_RU not in _common.texts()
+    # the revoked-access gate wins BEFORE any contextual generation call:
+    assert bot.client.calls == []
 
 
 # ── §13.G: mandatory onboarding becomes active -- cannot be bypassed
@@ -292,6 +396,8 @@ def test_active_onboarding_after_delivery_blocks_continuation(monkeypatch, _comm
     asyncio.run(run())
     assert prompts.PUSH_V1_CONTINUE_REPLY_RU not in _common.texts()
     assert prompts.PUSH_V1_NO_ANCHOR_REPLY_RU not in _common.texts()
+    # the active-onboarding gate wins BEFORE any contextual generation call:
+    assert bot.client.calls == []
 
 
 # ── active journal FSM is abandoned (not contaminated) on a valid tap ──────
@@ -315,3 +421,501 @@ def test_continue_tap_clears_a_stale_active_journal_fsm(_common):
     # opener is expected here -- this test's own concern is the journal
     # FSM clear above, not anchor semantics (covered separately).
     assert prompts.PUSH_V1_CONTINUE_REPLY_RU in _common.texts()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# P0 owner correction: in-flight Contextual Continue freshness fencing.
+#
+# _push_continue_reply_text may await a real provider/network call. Each
+# test below seeds a REAL grounded (USER+ASSISTANT) conversation so a
+# genuine model call is actually attempted (unlike the assistant-only
+# anchor used by the plain valid-path tests above, which never reaches the
+# model at all -- see P1-1), arms a side effect that performs a REAL
+# lifecycle-invalidating DB mutation WHILE that call (or, for the mandatory
+# test E, the Telegram send itself) is still in flight, and proves the
+# resulting stale generation is never delivered and never persisted.
+# ══════════════════════════════════════════════════════════════════════════
+
+async def _message_row_count(uid=USER_ID):
+    async with database.aiosqlite.connect(database.DB) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM messages WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+    return row[0]
+
+
+async def _live_revision(uid=USER_ID):
+    async with database.aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            "SELECT revision FROM user_interaction_revision WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+    return row[0] if row else 0
+
+
+async def _open_push_binding_count(uid=USER_ID):
+    async with database.aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM push_action_bindings WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+    return row[0]
+
+
+async def _assistant_rows(uid=USER_ID):
+    async with database.aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            "SELECT id, scenario, source, content FROM messages "
+            "WHERE user_id=? AND role='assistant' ORDER BY id", (uid,))
+        return await cur.fetchall()
+
+
+async def _user_rows(uid=USER_ID):
+    async with database.aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            "SELECT id, source, content FROM messages "
+            "WHERE user_id=? AND role='user' ORDER BY id", (uid,))
+        return await cur.fetchall()
+
+
+def _sent_since(stub, since_index):
+    """Every method sent AFTER the given index into stub.sent -- used to
+    exclude the ORIGINAL push notification (scheduler._send_silence_pushes
+    is itself a SendMessage, captured in stub.sent before the tap even
+    happens) from assertions about what the CALLBACK itself sent."""
+    return stub.sent[since_index:]
+
+
+def _texts_since(stub, since_index):
+    return [getattr(m, "text", None) for m in _sent_since(stub, since_index) if getattr(m, "text", None)]
+
+
+# ── A. New genuine user turn arrives DURING the awaited model call ─────────
+def test_new_user_turn_during_generation_blocks_stale_reply(monkeypatch, _common):
+    async def bump_mid_generation():
+        await database.save_message(
+            USER_ID, "user", "новое сообщение во время генерации", "open_chat", "ru",
+            source=database.MessageSource.USER_AUTHORED)
+        await database.bump_user_revision(USER_ID)
+
+    fake = _FakeOpenAIClient(
+        response_content="Устаревший контекстный ответ.", side_effect=bump_mid_generation)
+    monkeypatch.setattr(bot, "client", fake)
+
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        rows_before = await _message_row_count()
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+        return rows_before, sent_before
+    rows_before, sent_before = asyncio.run(run())
+
+    assert len(fake.calls) == 1  # generation WAS genuinely attempted
+    assert _texts_since(_common, sent_before) == []  # neither the stale candidate nor a fallback
+    rows_after = asyncio.run(_message_row_count())
+    assert rows_after == rows_before + 1  # only the mid-generation user row; no new assistant row
+
+
+# ── B. Access revoked DURING the awaited model call ─────────────────────────
+def test_access_revoked_during_generation_blocks_stale_reply(monkeypatch, _common):
+    async def revoke_mid_generation():
+        await database.block_user_access(USER_ID)
+
+    fake = _FakeOpenAIClient(
+        response_content="Устаревший контекстный ответ.", side_effect=revoke_mid_generation)
+    monkeypatch.setattr(bot, "client", fake)
+
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        # A genuine active row is required for block_user_access to perform
+        # a REAL active->blocked transition (and therefore a real revision
+        # bump) -- see database.block_user_access.
+        await database.grant_user_access(USER_ID)
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    assert len(fake.calls) == 1
+    assert _texts_since(_common, sent_before) == []
+    rows = asyncio.run(_assistant_rows())
+    assert "Устаревший контекстный ответ." not in [r[3] for r in rows]
+
+
+# ── C. Crisis begins DURING the awaited model call ──────────────────────────
+def test_crisis_starts_during_generation_blocks_stale_reply(monkeypatch, _common):
+    async def crisis_mid_generation():
+        await database.log_crisis_event(USER_ID, "critical", 10, ["suicide"], "x", "ru")
+
+    fake = _FakeOpenAIClient(
+        response_content="Устаревший контекстный ответ.", side_effect=crisis_mid_generation)
+    monkeypatch.setattr(bot, "client", fake)
+
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    assert len(fake.calls) == 1
+    # A crisis starting mid-generation moves NO revision counter at all --
+    # this specifically proves the final guard checks unresolved crisis
+    # independently, not merely via revision movement.
+    assert _texts_since(_common, sent_before) == []
+    rows = asyncio.run(_assistant_rows())
+    assert "Устаревший контекстный ответ." not in [r[3] for r in rows]
+
+
+# ── D. GDPR delete-all DURING the awaited model call ────────────────────────
+def test_delete_all_during_generation_blocks_stale_reply_and_stays_deleted(monkeypatch, _common):
+    async def delete_all_mid_generation():
+        await database.delete_all_personal_data(USER_ID)
+
+    fake = _FakeOpenAIClient(
+        response_content="Устаревший контекстный ответ.", side_effect=delete_all_mid_generation)
+    monkeypatch.setattr(bot, "client", fake)
+
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    assert len(fake.calls) == 1
+    assert _texts_since(_common, sent_before) == []
+    assert asyncio.run(_message_row_count()) == 0
+    assert asyncio.run(_open_push_binding_count()) == 0
+    assert asyncio.run(_live_revision()) == 0
+
+
+# ── E. (MANDATORY) GDPR delete-all DURING the Telegram send itself, AFTER
+# the final pre-send guard already passed -- proves the POST-DELIVERY fence,
+# not merely the pre-send guard. SQLite and Telegram cannot be made globally
+# atomic; this is the one race no pre-send check alone can ever close. ─────
+def test_delete_all_during_telegram_send_prevents_post_delivery_persistence(monkeypatch, _common):
+    fake = _FakeOpenAIClient(response_content="Реальный контекстный ответ.")
+    monkeypatch.setattr(bot, "client", fake)
+
+    async def delete_all_during_send(method):
+        await database.delete_all_personal_data(USER_ID)
+
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        sent_before = len(_common.sent)
+        _common.send_side_effect = delete_all_during_send
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    # The pre-send guard passed (lifecycle was intact at that point) so the
+    # REAL generated text was delivered to Telegram exactly once:
+    since = _sent_since(_common, sent_before)
+    send_calls = [m for m in since if type(m).__name__ == "SendMessage"]
+    assert len(send_calls) == 1
+    assert "Реальный контекстный ответ." in _texts_since(_common, sent_before)
+    # ...but post-delivery persistence must have observed the delete-all
+    # (which committed while that very send was in flight) and written
+    # NOTHING -- no resurrected messages/bindings/revision, and no retry:
+    assert asyncio.run(_message_row_count()) == 0
+    assert asyncio.run(_open_push_binding_count()) == 0
+    assert asyncio.run(_live_revision()) == 0
+
+
+# ── F. Normal successful path ────────────────────────────────────────────────
+def test_normal_successful_continue_delivers_once_and_persists_with_correct_provenance(
+        monkeypatch, _common):
+    fake = _FakeOpenAIClient(response_content="Настоящий контекстный ответ.")
+    monkeypatch.setattr(bot, "client", fake)
+
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    assert len(fake.calls) == 1
+    since = _sent_since(_common, sent_before)
+    send_calls = [m for m in since if type(m).__name__ == "SendMessage"]
+    assert len(send_calls) == 1
+    assert "Настоящий контекстный ответ." in _texts_since(_common, sent_before)
+    rows = asyncio.run(_assistant_rows())
+    _id, scenario, source, content = rows[-1]
+    assert content == "Настоящий контекстный ответ."
+    assert source == database.MessageSource.ASSISTANT_DELIVERED.value
+    assert scenario == bot.push_contextual_continue.SCENARIO
+    # A fresh user's push binding was created at binding_revision=0, so
+    # consumption must have produced exactly post_consume_revision=1, and
+    # it must still be the live value -- nothing invalidated it:
+    assert asyncio.run(_live_revision()) == 1
+
+
+def test_consume_push_action_binding_returns_exact_post_consume_revision():
+    """Direct DB-level proof that post_consume_revision is derived by pure
+    arithmetic (binding_revision + 1) from the SAME transaction, not from a
+    later, separately-racing get_user_revision() lookup."""
+    async def run():
+        await _seed_inactive_user(USER_ID)
+        await _seed_grounded_conversation(USER_ID)
+        # Establish a KNOWN non-zero starting revision so this proves
+        # "binding_revision + 1" generally, not merely "1 for a brand-new
+        # user".
+        await database.bump_user_revision(USER_ID)  # live revision -> 1
+        await scheduler._send_silence_pushes(bot.bot)
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT token, chat_id, source_message_id, binding_revision "
+                "FROM push_action_bindings WHERE user_id=? AND action='push_continue' "
+                "AND consumed_at IS NULL", (USER_ID,))
+            token, chat_id, message_id, binding_revision = await cur.fetchone()
+        result = await database.consume_push_action_binding(token, USER_ID, chat_id, message_id)
+        return result, binding_revision
+    result, binding_revision = asyncio.run(run())
+    assert result is not None
+    assert binding_revision == 1
+    assert result.post_consume_revision == binding_revision + 1 == 2
+    assert asyncio.run(_live_revision()) == result.post_consume_revision
+
+
+# ── G. Provider failure fallback with UNCHANGED lifecycle ──────────────────
+def test_provider_failure_with_unchanged_lifecycle_persists_fallback_via_fence(_common):
+    # _common's default bot.client is already a simulated provider failure.
+    # A genuine grounded anchor means generation IS attempted this time
+    # (unlike the assistant-only anchor used by
+    # test_continue_valid_path_with_anchor_sends_resume_opener above, which
+    # never reaches the model at all -- see P1-1).
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+    asyncio.run(run())
+
+    assert len(bot.client.calls) == 1  # generation genuinely attempted and genuinely failed
+    texts = [t for t in _common.texts() if t]
+    assert texts.count(prompts.PUSH_V1_CONTINUE_REPLY_RU) == 1
+    rows = asyncio.run(_assistant_rows())
+    _id, scenario, source, content = rows[-1]
+    assert content == prompts.PUSH_V1_CONTINUE_REPLY_RU
+    assert source == database.MessageSource.ASSISTANT_DELIVERED.value
+    assert scenario == database.PUSH_UI_SCENARIO  # the deterministic fallback, never fabricated content
+    user_rows = asyncio.run(_user_rows())
+    assert all(r[1] == database.MessageSource.USER_AUTHORED.value for r in user_rows)
+    # lifecycle unchanged -- still exactly the post-consume value:
+    assert asyncio.run(_live_revision()) == 1
+
+
+# ── H. Final-guard DB lookup failure -- must fail closed ────────────────────
+def test_final_guard_db_failure_fails_closed(monkeypatch, _common):
+    fake = _FakeOpenAIClient(response_content="Настоящий контекстный ответ.")
+    monkeypatch.setattr(bot, "client", fake)
+
+    async def _raise_guard(*a, **kw):
+        raise RuntimeError("simulated DB failure in final guard")
+    monkeypatch.setattr(bot, "final_push_action_reply_delivery_guard", _raise_guard)
+
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    assert len(fake.calls) == 1  # generation itself succeeded...
+    assert _texts_since(_common, sent_before) == []  # ...but nothing is sent when the guard errors
+    # only the seeded USER+ASSISTANT rows -- no candidate, no fallback, no write:
+    assert asyncio.run(_message_row_count()) == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Owner P0/P1 correction: New Topic now shares the SAME final lifecycle
+# fence and lifecycle-fenced persistence as Continue (final_push_action_
+# reply_delivery_guard / record_push_action_reply_delivery), and the exact
+# CONSUMED PUSH BINDING TOKEN is fenced as an immutable lifecycle nonce
+# (independent of, and strictly stronger than, numeric revision equality
+# alone) in both the pre-send guard and post-send persistence. New Topic's
+# user-visible product behavior (fixed text, no model call, PUSH_UI_SCENARIO)
+# is unchanged throughout.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── A. (MANDATORY) New Topic -- delete-all DURING the Telegram send itself,
+# AFTER the final pre-send guard already passed. ────────────────────────────
+def test_new_topic_delete_all_during_telegram_send_prevents_post_delivery_persistence(_common):
+    async def delete_all_during_send(method):
+        await database.delete_all_personal_data(USER_ID)
+
+    async def run():
+        chat_id, message_id, _, new_topic_token = await _deliver_real_push(_common)
+        sent_before = len(_common.sent)
+        _common.send_side_effect = delete_all_during_send
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{new_topic_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    since = _sent_since(_common, sent_before)
+    send_calls = [m for m in since if type(m).__name__ == "SendMessage"]
+    assert len(send_calls) == 1  # sent exactly once, no retry
+    assert prompts.PUSH_V1_NEW_TOPIC_REPLY_RU in _texts_since(_common, sent_before)
+    assert asyncio.run(_message_row_count()) == 0
+    assert asyncio.run(_open_push_binding_count()) == 0
+    assert asyncio.run(_live_revision()) == 0
+
+
+# ── B. New Topic -- lifecycle invalidated AFTER consumption, BEFORE the
+# final delivery guard runs (proves New Topic now uses the shared fence). ──
+def test_new_topic_lifecycle_invalidated_before_final_send_blocks_delivery(monkeypatch, _common):
+    calls = {"n": 0}
+    real_check = bot._onboarding_blocks_ordinary_entry
+
+    async def _wrapped(uid):
+        calls["n"] += 1
+        result = await real_check(uid)
+        if calls["n"] >= 2:
+            # The SECOND call is the post-generation recheck inside
+            # cb_push_action, i.e. strictly AFTER binding consumption and
+            # BEFORE the final guard -- a real invalidating event here must
+            # still be caught by the guard even though onboarding itself
+            # does not block (FIRST_USER_ONBOARDING_ENABLED=False).
+            await database.delete_all_personal_data(USER_ID)
+        return result
+    monkeypatch.setattr(bot, "_onboarding_blocks_ordinary_entry", _wrapped)
+
+    async def run():
+        chat_id, message_id, _, new_topic_token = await _deliver_real_push(_common)
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{new_topic_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    assert calls["n"] == 2
+    assert _texts_since(_common, sent_before) == []
+    assert asyncio.run(_message_row_count()) == 0
+
+
+# ── C. Revision ABA -- Continue deterministic fallback. delete-all removes
+# the exact consumed token; a LATER ordinary interaction recreates the
+# numeric revision back to the SAME old expected value. Numeric equality
+# alone would false-pass; the exact token predicate must not. ─────────────
+def test_revision_aba_continue_fallback_blocked_by_token_fence(monkeypatch, _common):
+    async def aba_mid_generation():
+        await database.delete_all_personal_data(USER_ID)
+        recreated = await database.bump_user_revision(USER_ID)
+        assert recreated == 1  # numerically equals the OLD expected post_consume_revision
+
+    fake = _FakeOpenAIClient(
+        raise_exc=RuntimeError("simulated provider outage"), side_effect=aba_mid_generation)
+    monkeypatch.setattr(bot, "client", fake)
+
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    assert len(fake.calls) == 1  # generation attempted, provider failed -> deterministic fallback path
+    # The live numeric revision now equals the OLD expected value again...
+    assert asyncio.run(_live_revision()) == 1
+    # ...yet the exact consumed token's row is permanently gone, so the
+    # fallback must still be blocked:
+    assert _texts_since(_common, sent_before) == []
+    assert asyncio.run(_message_row_count()) == 0
+
+
+# ── D. Revision ABA DURING the Telegram send (New Topic). Distinguishes the
+# token lifecycle fence from numeric revision equality at the POST-DELIVERY
+# persistence layer specifically. ───────────────────────────────────────────
+def test_revision_aba_during_telegram_send_blocked_by_token_fence(_common):
+    async def aba_during_send(method):
+        await database.delete_all_personal_data(USER_ID)
+        recreated = await database.bump_user_revision(USER_ID)
+        assert recreated == 1
+
+    async def run():
+        chat_id, message_id, _, new_topic_token = await _deliver_real_push(_common)
+        sent_before = len(_common.sent)
+        _common.send_side_effect = aba_during_send
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{new_topic_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    since = _sent_since(_common, sent_before)
+    send_calls = [m for m in since if type(m).__name__ == "SendMessage"]
+    assert len(send_calls) == 1  # the pre-send guard passed -- lifecycle was intact then
+    assert prompts.PUSH_V1_NEW_TOPIC_REPLY_RU in _texts_since(_common, sent_before)
+    # numeric revision now matches the OLD expected value again...
+    assert asyncio.run(_live_revision()) == 1
+    # ...but nothing was resurrected, because the exact consumed token's row
+    # disappeared and never came back:
+    assert asyncio.run(_message_row_count()) == 0
+
+
+# ── E. /start (generation supersession) DURING the awaited Contextual
+# Continue model call -- exercises the REAL existing _bump_user_generation
+# mechanism directly, without touching DB revision at all. ─────────────────
+def test_start_generation_supersession_during_generation_blocks_stale_reply(monkeypatch, _common):
+    async def bump_generation_mid_call():
+        bot._bump_user_generation(USER_ID)  # simulates a real /start arriving mid-flight
+
+    fake = _FakeOpenAIClient(
+        response_content="Устаревший контекстный ответ.", side_effect=bump_generation_mid_call)
+    monkeypatch.setattr(bot, "client", fake)
+
+    async def run():
+        chat_id, message_id, continue_token, _, _ = \
+            await _deliver_real_push_with_grounded_anchor(_common)
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    assert len(fake.calls) == 1  # generation genuinely succeeded...
+    assert _texts_since(_common, sent_before) == []  # ...but nothing is sent: generation superseded
+    assert asyncio.run(_message_row_count()) == 2  # only the seeded USER+ASSISTANT rows
+    # the DB-only fence (token/revision/crisis/anchor) would have PASSED on
+    # its own -- this specifically proves the in-memory generation check is
+    # independently load-bearing, not merely redundant with the DB guard:
+    assert asyncio.run(_live_revision()) == 1
+
+
+# ── H. Normal New Topic regression: byte-for-behavior unchanged product
+# text, now delivered through the shared fenced pipeline. ──────────────────
+def test_new_topic_regression_delivers_once_and_persists_with_correct_provenance(_common):
+    async def run():
+        chat_id, message_id, _, new_topic_token = await _deliver_real_push(_common)
+        sent_before = len(_common.sent)
+        await bot.dp.feed_update(
+            bot.bot, _make_callback_update(f"pushbtn:{new_topic_token}", message_id, chat_id))
+        return sent_before
+    sent_before = asyncio.run(run())
+
+    assert bot.client.calls == []  # zero model calls
+    since = _sent_since(_common, sent_before)
+    send_calls = [m for m in since if type(m).__name__ == "SendMessage"]
+    assert len(send_calls) == 1
+    assert prompts.PUSH_V1_NEW_TOPIC_REPLY_RU in _texts_since(_common, sent_before)
+    rows = asyncio.run(_assistant_rows())
+    _id, scenario, source, content = rows[-1]
+    assert content == prompts.PUSH_V1_NEW_TOPIC_REPLY_RU
+    assert source == database.MessageSource.ASSISTANT_DELIVERED.value
+    assert scenario == database.PUSH_UI_SCENARIO
+    assert asyncio.run(_user_rows()) == []  # zero fabricated USER rows
