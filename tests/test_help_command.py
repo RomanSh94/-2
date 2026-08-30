@@ -62,8 +62,8 @@ def test_help_card_exact_ru_text():
     assert msg.answers[0][0] == navigation.help_text("ru")
     assert msg.answers[0][0] == (
         "ℹ️ Помощь\n\n"
-        "Здесь можно быстро перейти к нужному разделу.\n\n"
-        "А если хочешь поговорить — просто напиши сообщение.")
+        "Здесь можно посмотреть информацию о боте и настройках приватности.\n\n"
+        "Если хочешь поговорить — просто напиши сообщение.")
 
 
 def test_help_card_en_equivalent(monkeypatch):
@@ -84,29 +84,39 @@ def test_help_card_has_no_x20():
 
 
 def test_help_buttons_route_through_existing_safe_callbacks():
+    # UI polish V1: Help exposes ONLY About and Privacy, in that order --
+    # every other section (talk/tests/journals/results/settings) already
+    # lives on the persistent lower menu (or, for talk, is superseded by
+    # the always-available text field) and was dropped to stop duplicating
+    # it. Destinations are the exact same pre-existing callbacks.
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_help(msg))
     _, kw = msg.answers[0]
     datas = [d for _, d in _button_texts_and_data(kw)]
-    assert datas == [
-        "talk:hub", "q:l", "journals:hub", "results:hub",
-        "settings:hub", "privacy:hub", "about:hub",
-    ]
+    assert datas == ["about:hub", "privacy:hub"]
 
 
-def test_help_shows_feedback_button_only_when_configured(monkeypatch):
-    monkeypatch.setattr(bot.config, "FEEDBACK_CHAT_URL", "https://t.me/x20_feedback")
+def test_help_never_shows_feedback_button_regardless_of_config(monkeypatch):
+    # Feedback is one of the "must contain ONLY About and Privacy" removals
+    # too -- must stay absent whether or not a feedback chat URL is
+    # configured.
+    for url in ("https://t.me/x20_feedback", ""):
+        monkeypatch.setattr(bot.config, "FEEDBACK_CHAT_URL", url)
+        msg = FakeMessage(FakeUser(1))
+        asyncio.run(bot.cmd_help(msg))
+        _, kw = msg.answers[0]
+        datas = [d for _, d in _button_texts_and_data(kw)]
+        assert "feedback:hub" not in datas
+
+
+def test_help_removed_labels_are_absent():
+    # _lang fixture forces lang="ru" -- compare against the RU labels.
+    labels = {key: ru for key, ru, en in navigation.MENU_SECTIONS}
+    removed = {labels["talk"], labels["tests"], labels["journals"],
+               labels["results"], labels["settings"]}
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_help(msg))
     _, kw = msg.answers[0]
-    datas = [d for _, d in _button_texts_and_data(kw)]
-    assert datas[-1] == "feedback:hub"
-
-
-def test_help_hides_feedback_button_when_unset(monkeypatch):
-    monkeypatch.setattr(bot.config, "FEEDBACK_CHAT_URL", "")
-    msg = FakeMessage(FakeUser(1))
-    asyncio.run(bot.cmd_help(msg))
-    _, kw = msg.answers[0]
-    datas = [d for _, d in _button_texts_and_data(kw)]
-    assert "feedback:hub" not in datas
+    present_labels = {label for label, _ in _button_texts_and_data(kw)}
+    assert present_labels.isdisjoint(removed)
+    assert present_labels == {labels["about"], labels["privacy"]}

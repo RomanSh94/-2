@@ -8072,23 +8072,19 @@ def _help_keyboard(lang: str) -> InlineKeyboardMarkup:
     # lower ReplyKeyboard remains the PRIMARY navigation; this is not a
     # second permanently-visible menu. Reuses the EXACT SAME existing
     # callbacks as the persistent lower menu / legacy hub buttons -- no
-    # duplicated business logic, only a different card layout. "tests" routes
-    # straight to "q:l" (the real Questionnaire Core), matching the
-    # persistent lower menu's own "🧠 Психологические тесты" button.
+    # duplicated business logic, only a different card layout.
+    #
+    # UI polish V1: talk/tests/journals/results/settings all dropped --
+    # each one either duplicates a persistent-lower-menu button (tests,
+    # journals, results, settings="🎛 Как отвечать") or is redundant with
+    # the always-available text field (talk). Feedback dropped too, so
+    # Help now surfaces ONLY About and Privacy, per the product spec.
+    # Destinations (about:hub / privacy:hub) are completely unchanged.
     labels = {key: (ru if lang == "ru" else en) for key, ru, en in navigation.MENU_SECTIONS}
     rows = [
-        [InlineKeyboardButton(text=labels["talk"], callback_data="talk:hub")],
-        [InlineKeyboardButton(text=labels["tests"], callback_data="q:l")],
-        [InlineKeyboardButton(text=labels["journals"], callback_data="journals:hub"),
-         InlineKeyboardButton(text=labels["results"], callback_data="results:hub")],
-        [InlineKeyboardButton(text=labels["settings"], callback_data="settings:hub")],
-        [InlineKeyboardButton(text=labels["privacy"], callback_data="privacy:hub")],
         [InlineKeyboardButton(text=labels["about"], callback_data="about:hub")],
+        [InlineKeyboardButton(text=labels["privacy"], callback_data="privacy:hub")],
     ]
-    if config.feedback_chat_url():
-        rows.append([InlineKeyboardButton(
-            text=("💬 Обратная связь" if lang == "ru" else "💬 Feedback"),
-            callback_data="feedback:hub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

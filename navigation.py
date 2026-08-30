@@ -45,17 +45,24 @@ def menu_text(lang: str = "ru") -> str:
 def help_text(lang: str = "ru") -> str:
     """Round 3: /help's own card, and what "⬅️ В меню" (menu:back) returns
     to. NOT a second permanently-visible menu -- the persistent lower
-    ReplyKeyboard remains the primary navigation surface."""
+    ReplyKeyboard remains the primary navigation surface.
+
+    UI polish V1: Help no longer advertises section shortcuts the
+    persistent lower menu already provides (tests/journals/results/
+    settings) or a "Talk" button (the text field is always available) --
+    see _help_keyboard in bot.py. Copy updated to match: it now only
+    describes the two things Help itself still surfaces (About, Privacy)
+    plus the always-available text field."""
     if lang == "ru":
         return (
             "ℹ️ Помощь\n\n"
-            "Здесь можно быстро перейти к нужному разделу.\n\n"
-            "А если хочешь поговорить — просто напиши сообщение."
+            "Здесь можно посмотреть информацию о боте и настройках приватности.\n\n"
+            "Если хочешь поговорить — просто напиши сообщение."
         )
     return (
         "ℹ️ Help\n\n"
-        "Here you can quickly jump to the section you need.\n\n"
-        "And if you'd like to talk, just send a message."
+        "Here you can see information about the bot and privacy settings.\n\n"
+        "If you'd like to talk, just send a message."
     )
 
 

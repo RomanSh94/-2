@@ -160,22 +160,35 @@ def test_owner_1_is_a_valid_push_candidate_and_gets_the_push():
 
 
 def test_exactly_two_buttons_continue_and_new_topic():
-    async def scenario():
-        await _seed_inactive_user_with_anchor(1, days_inactive=2)
-        bot = FakeBot()
-        await scheduler._send_silence_pushes(bot)
-        return bot
-    bot = run(scenario())
-    assert len(bot.edited_markup) == 1
-    _, _, kb = bot.edited_markup[0]
+    # UI polish V1: one row, two buttons -- Continue first, New topic
+    # second. Callback data/token semantics are unchanged from the prior
+    # two-row layout. Direct unit test of _push_v1_keyboard itself (not
+    # the full _send_silence_pushes integration path) -- this is a pure
+    # presentation-layer property and should not depend on decide_push's
+    # real-wall-clock quiet-hours/cadence decision, which the full
+    # integration path is otherwise subject to.
+    kb = scheduler._push_v1_keyboard("ru", {"push_continue": "tok-a", "push_new_topic": "tok-b"})
     rows = kb.inline_keyboard
-    assert len(rows) == 2
-    assert len(rows[0]) == 1 and len(rows[1]) == 1
-    assert rows[0][0].text == prompts.PUSH_V1_CONTINUE_LABEL_RU
-    assert rows[1][0].text == prompts.PUSH_V1_NEW_TOPIC_LABEL_RU
-    assert rows[0][0].callback_data.startswith("pushbtn:")
-    assert rows[1][0].callback_data.startswith("pushbtn:")
-    assert rows[0][0].callback_data != rows[1][0].callback_data
+    assert len(rows) == 1
+    assert len(rows[0]) == 2
+    continue_btn, new_topic_btn = rows[0]
+    assert continue_btn.text == prompts.PUSH_V1_CONTINUE_LABEL_RU
+    assert new_topic_btn.text == prompts.PUSH_V1_NEW_TOPIC_LABEL_RU
+    assert continue_btn.callback_data == "pushbtn:tok-a"
+    assert new_topic_btn.callback_data == "pushbtn:tok-b"
+    assert continue_btn.callback_data != new_topic_btn.callback_data
+
+
+def test_continue_button_has_primary_style_new_topic_does_not():
+    # aiogram 3.7.0 passes an untyped "style" field through construction
+    # and serialization (Pydantic extra="allow") -- see the compatibility
+    # probe for the UI-polish task. Continue gets style="primary"; New
+    # topic intentionally carries no style field (default Telegram look).
+    # Direct unit test of _push_v1_keyboard -- see note above.
+    kb = scheduler._push_v1_keyboard("ru", {"push_continue": "tok-a", "push_new_topic": "tok-b"})
+    continue_btn, new_topic_btn = kb.inline_keyboard[0]
+    assert continue_btn.style == "primary"
+    assert "style" not in new_topic_btn.model_dump(exclude_none=True)
 
 
 def test_bindings_exist_before_the_keyboard_is_attached():
@@ -711,7 +724,8 @@ def test_genuine_ordinary_conversation_anchor_sends_normally_with_two_buttons():
     assert len(bot.sent) == 1
     assert len(bot.edited_markup) == 1
     _, _, kb = bot.edited_markup[0]
-    assert len(kb.inline_keyboard) == 2
+    assert len(kb.inline_keyboard) == 1
+    assert len(kb.inline_keyboard[0]) == 2
 
 
 # ── POST-CODEX CORRECTION §1 (P1): access revocation must be bound to the

@@ -310,15 +310,20 @@ def test_nav_callback_respects_active_crisis_gate(monkeypatch, data, handler):
 
 # ── /help ─────────────────────────────────────────────────────────────────────
 def test_help_reaches_navigation_sections():
-    # Round 3: /help no longer advertises "/menu" by name -- the help card
-    # itself IS the navigation surface now. Verify the same destinations
-    # /menu used to reach are still reachable from /help's own buttons.
+    # UI polish V1: /help no longer duplicates the frequent navigation
+    # sections the persistent lower menu already provides (journals,
+    # results, tests, settings) or a Talk button (superseded by the
+    # always-available text field). It now reaches only About and
+    # Privacy -- see test_help_command.py for the exhaustive assertion of
+    # that new button set.
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_help(msg))
     kb = msg.answers[0][1]["reply_markup"]
     datas = [b.callback_data for row in kb.inline_keyboard for b in row]
-    assert "journals:hub" in datas
-    assert "results:hub" in datas
+    assert "journals:hub" not in datas
+    assert "results:hub" not in datas
+    assert "about:hub" in datas
+    assert "privacy:hub" in datas
     assert "/menu" not in msg.answers[0][0]
 
 
@@ -445,10 +450,7 @@ def test_menu_back_returns_new_help_card_not_legacy_menu():
     assert "Главное меню" not in text
     assert "Выберите раздел" not in text
     datas = [b.callback_data for row in kw["reply_markup"].inline_keyboard for b in row]
-    assert datas == [
-        "talk:hub", "q:l", "journals:hub", "results:hub",
-        "settings:hub", "privacy:hub", "about:hub",
-    ]
+    assert datas == ["about:hub", "privacy:hub"]
 
 
 def test_menu_back_still_respects_crisis_gate(monkeypatch):
@@ -543,12 +545,17 @@ _EXPECTED_JOURNAL_BUTTONS = [
 ]
 
 
-def test_help_journal_button_routes_to_journals_hub():
+def test_help_no_longer_offers_a_journals_button():
+    # UI polish V1: journals now lives only on the persistent lower menu --
+    # Help must not re-offer it. cb_journals_hub itself (reached via the
+    # lower menu's own "📝 Дневники" entry, see cmd_journal) is completely
+    # unchanged -- see test_lower_menu_and_help_journal_entries_share_same_card
+    # below, which still calls it directly and is unaffected by this.
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_help(msg))
     kb = msg.answers[0][1]["reply_markup"]
     datas = [b.callback_data for row in kb.inline_keyboard for b in row]
-    assert "journals:hub" in datas
+    assert "journals:hub" not in datas
 
 
 def test_journals_hub_callback_renders_real_journal_buttons():

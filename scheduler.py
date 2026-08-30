@@ -218,12 +218,20 @@ def _push_binding_expiry() -> str:
 
 
 def _push_v1_keyboard(lang: str, tokens: dict) -> InlineKeyboardMarkup:
+    """UI polish V1: one row, two buttons -- Continue then New topic. Callback
+    data/token semantics are completely unchanged from the two-row layout;
+    this is presentation only. `style="primary"` on Continue is an extra
+    field aiogram 3.7.0's TelegramObject base class passes through
+    construction and serialization untyped (Pydantic extra="allow") -- see
+    the compatibility probe in the UI-polish task; New topic intentionally
+    carries no style field, so Telegram renders it with default styling."""
     continue_label = PUSH_V1_CONTINUE_LABEL_EN if lang == "en" else PUSH_V1_CONTINUE_LABEL_RU
     new_topic_label = PUSH_V1_NEW_TOPIC_LABEL_EN if lang == "en" else PUSH_V1_NEW_TOPIC_LABEL_RU
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=continue_label,
-                              callback_data=f"pushbtn:{tokens['push_continue']}")],
-        [InlineKeyboardButton(text=new_topic_label,
+                              callback_data=f"pushbtn:{tokens['push_continue']}",
+                              style="primary"),
+         InlineKeyboardButton(text=new_topic_label,
                               callback_data=f"pushbtn:{tokens['push_new_topic']}")],
     ])
 
