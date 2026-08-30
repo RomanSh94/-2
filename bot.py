@@ -97,6 +97,7 @@ from safety_validator import (
     is_elevated_risk, classify_rejection_reason,
     validate_first_turn_response, get_first_turn_fallback,
     validate_continuation_response,
+    validate_response_without_current_user,
 )
 from traced_response import Influence, traced_response_builder, persist_influence_trace
 from prompts import get_disambiguation_message
@@ -194,6 +195,7 @@ from database import (
 from database import (
     consume_push_action_binding, supersede_push_action_bindings,
     turn_belongs_to_user, touch_last_seen, get_unresolved_crisis,
+    final_push_action_reply_delivery_guard, record_push_action_reply_delivery,
     PUSH_UI_SCENARIO,
 )
 from prompts import (
@@ -208,13 +210,17 @@ from prompts import (
 # directly (see professional_free_text_runtime.py's own module docstring --
 # it is the sole place those are imported in this codebase's runtime path).
 from database import get_professional_conversation_history_rows
-from professional_turn_conversation_context import build_conversation_context_from_history_rows
+from database import get_trusted_conversation_history_through_anchor
+from professional_turn_conversation_context import (
+    build_conversation_context_from_history_rows, ConversationTurnRole,
+)
 from professional_free_text_runtime import (
     run_professional_free_text_turn,
     ProfessionalFreeTextRuntimeStatus,
     ProfessionalFreeTextFailureStage,
 )
 from therapist_core_v1 import generate_therapist_core_v1
+import push_contextual_continue
 import conversation_controller as controller
 from therapeutic_domain import (
     Intent, RepairConstraint, LifecycleStatus, ConsentState, PracticeProposalStatus,
@@ -5220,21 +5226,122 @@ async def cb_professional_entry_triage(callback: CallbackQuery):
 
 
 # ── Push V1 -- Continue / New-topic (§11, §12) ───────────────────────────────
-async def _push_continue_reply_text(uid: int, lang: str, anchor_turn_id: int | None) -> str:
-    """Deterministic only -- Push V1 never asks an LLM to infer a topic from
-    a push (product contract). If the anchored assistant turn from
-    push-send time still exists and still belongs to this user, use the
-    real 'resume' opener; otherwise degrade to a neutral low-pressure talk
-    entry -- never an invented continuation."""
+# Contextual Continue V1: the anchor-existence gate below is UNCHANGED from
+# the original deterministic-only design (turn_belongs_to_user re-verified
+# at callback time, exactly like before). What changed is what happens
+# once a real anchor is confirmed: instead of always returning the fixed
+# PUSH_V1_CONTINUE_REPLY_* string, this now ATTEMPTS one real, anchor-
+# fenced contextual generation first, falling back to that exact same
+# fixed string on ANY failure (empty trusted context, provider failure,
+# validator rejection) -- see _try_push_contextual_continue. The no-anchor
+# path is completely untouched: no model call, no context fetch, same
+# PUSH_V1_NO_ANCHOR_REPLY_* fallback as before.
+async def _try_push_contextual_continue(uid: int, lang: str, anchor_turn_id: int) -> str | None:
+    """Attempt one real Contextual Continue V1 generation, fenced to the
+    EXACT push-send-time anchor_turn_id via database.get_trusted_
+    conversation_history_through_anchor -- a DEDICATED primitive, not
+    get_professional_conversation_history_rows reused: that function's own
+    source-only filter would let a prior Push V1 UI reply (genuinely
+    persisted as source=ASSISTANT_DELIVERED) leak into this context as if
+    it were real discourse, so a separate primitive that ALSO excludes
+    scenario=PUSH_UI_SCENARIO is required -- see that function's own
+    docstring.
+
+    Two mandatory pre-generation legality checks, in addition to the
+    empty-context check, before the model is ever called (owner P1
+    correction):
+
+    (1) EXACT-ANCHOR-SURVIVES: the bounded context's FINAL turn must be
+    the exact anchor_turn_id, as an ASSISTANT turn. turn_belongs_to_user
+    (called by the caller before this function runs) only proves the row
+    exists/same-uid/role='assistant' -- it does NOT prove source=
+    ASSISTANT_DELIVERED, scenario!=push_ui, or that the anchor survived
+    bounded-context construction (e.g. individually exceeding
+    professional_turn_conversation_context.MAX_TURN_CONTENT_CHARS gets it
+    silently omitted by build_conversation_context_from_history_rows).
+    get_trusted_conversation_history_through_anchor's own WHERE clause
+    already excludes a source-mismatched or push_ui anchor row from the
+    query results entirely; the assertion here is what detects that
+    exclusion (or an oversized-turn omission) happened, rather than
+    silently continuing with an OLDER conversation and treating it as if
+    it were the exact anchored one. context.turns is ordered by strictly
+    increasing message_row_id with the anchor being the query's own upper
+    bound, so the anchor -- if present at all -- can only ever be the
+    last entry; no separate DB round-trip is needed to prove this.
+
+    (2) TRUSTED-USER-EVIDENCE-REQUIRED: at least one ConversationTurnRole.
+    USER turn must survive in the bounded context. Prior ASSISTANT content
+    is discourse history only (see push_contextual_continue.py's own
+    module docstring) -- it is NEVER sufficient by itself to establish
+    what the conversation is actually about, so an assistant-only context
+    must degrade exactly like an empty one.
+
+    Returns the validator-accepted candidate text, or None on ANY failure
+    (empty trusted context, exact anchor not surviving, no trusted USER
+    turn, a provider/network failure, or Safety Validator rejection).
+    Never raises to its caller and never itself returns or constructs a
+    fallback string -- _push_continue_reply_text alone owns the fallback
+    decision on None."""
+    try:
+        rows = await get_trusted_conversation_history_through_anchor(uid, anchor_turn_id)
+        context = build_conversation_context_from_history_rows(rows)
+    except Exception as e:
+        print(f"[push-v1] contextual continue context-build FAILED uid={uid}: {type(e).__name__}")
+        return None
+    if context.is_empty:
+        return None
+    final_turn = context.turns[-1]
+    if (final_turn.message_row_id != anchor_turn_id
+            or final_turn.role is not ConversationTurnRole.ASSISTANT):
+        # The exact anchor did not survive as the final trusted turn --
+        # never fall back to an older conversation and pretend it is the
+        # exact anchored one.
+        return None
+    if not any(turn.role is ConversationTurnRole.USER for turn in context.turns):
+        # Assistant discourse alone never establishes what the
+        # conversation is about.
+        return None
+    try:
+        candidate = await push_contextual_continue.generate_push_contextual_continue(
+            client=client, model="gpt-4o-mini", conversation_context=context,
+            lang=lang, max_tokens=300,
+        )
+    except Exception as e:
+        print(f"[push-v1] contextual continue generation FAILED uid={uid}: {type(e).__name__}")
+        return None
+    is_safe, reason = validate_response_without_current_user(candidate, lang)
+    if not is_safe:
+        print(f"[push-v1] contextual continue REJECTED uid={uid}: "
+              f"{classify_rejection_reason(reason)}")
+        return None
+    return candidate
+
+
+async def _push_continue_reply_text(uid: int, lang: str, anchor_turn_id: int | None) -> tuple[str, str]:
+    """If the anchored assistant turn from push-send time still exists and
+    still belongs to this user, ATTEMPT a real contextual continuation
+    first (see _try_push_contextual_continue); on any failure there, or if
+    there is no anchor at all, degrade to the existing deterministic
+    reply -- never an invented continuation, and the model is NEVER
+    consulted at all when there is no anchor. Returns (text, scenario):
+    scenario is push_contextual_continue.SCENARIO (a genuine conversational
+    turn) only for a successful contextual generation; every fallback path
+    keeps the original PUSH_UI_SCENARIO tagging unchanged, since those
+    really are sealed, non-conversational UI acknowledgements."""
     has_anchor = False
     if anchor_turn_id is not None:
         try:
             has_anchor = await turn_belongs_to_user(anchor_turn_id, uid)
         except Exception:
             has_anchor = False
-    if has_anchor:
-        return PUSH_V1_CONTINUE_REPLY_EN if lang == "en" else PUSH_V1_CONTINUE_REPLY_RU
-    return PUSH_V1_NO_ANCHOR_REPLY_EN if lang == "en" else PUSH_V1_NO_ANCHOR_REPLY_RU
+    if not has_anchor:
+        return (PUSH_V1_NO_ANCHOR_REPLY_EN if lang == "en" else PUSH_V1_NO_ANCHOR_REPLY_RU,
+                PUSH_UI_SCENARIO)
+    contextual = await _try_push_contextual_continue(uid, lang, anchor_turn_id)
+    if contextual is not None:
+        return contextual, push_contextual_continue.SCENARIO
+    return (PUSH_V1_CONTINUE_REPLY_EN if lang == "en" else PUSH_V1_CONTINUE_REPLY_RU,
+            PUSH_UI_SCENARIO)
 
 
 @dp.callback_query(F.data.startswith("pushbtn:"))
@@ -5256,9 +5363,46 @@ async def cb_push_action(callback: CallbackQuery, state: FSMContext = None):
     isolated from the first-turn continuation graph. An active unfinished
     journal FSM (if any) is abandoned only AFTER every gate above has
     passed, using the same narrow helper every other navigation entrypoint
-    uses."""
+    uses.
+
+    Owner P0 correction (freshness-fenced delivery, generalized to BOTH
+    push actions): action="push_continue" may await a real provider/
+    network call (_push_continue_reply_text); push_new_topic awaits
+    nothing extra, but shares the exact same final lifecycle fence below
+    on the reasoning that ANY awaited work in this handler -- including the
+    crisis/access/onboarding gate lookups and binding consumption
+    themselves -- opens the same kind of window. Everything from binding
+    consumption onward funnels into ONE shared final check before
+    delivery: database.final_push_action_reply_delivery_guard, which binds
+    to the EXACT opaque token this tap consumed (not merely a numeric
+    revision -- see that function's own docstring for the delete-all/
+    bump_user_revision ABA gap this closes), the exact post_consume_
+    revision, live unresolved-crisis state, and (only when the reply
+    genuinely depends on it) the exact anchor. Immediately before the
+    Telegram send -- and again immediately after it returns, before
+    persistence begins -- a SEPARATE, purely in-memory, non-awaited check
+    (_user_generation_superseded) catches a newer ordinary turn (e.g.
+    /start, which calls _bump_user_generation) that the DB-only fence
+    cannot see because an ordinary turn does not, by itself, move
+    user_interaction_revision. Post-send persistence is likewise fenced
+    (database.record_push_action_reply_delivery) to close the residual
+    window where an invalidating event commits WHILE the Telegram send
+    itself is in flight -- SQLite and Telegram cannot be made globally
+    atomic. New Topic's user-visible product behavior is unchanged: no
+    model call, no conversation context, the exact existing fixed reply,
+    PUSH_UI_SCENARIO -- only its pre-send freshness and post-send
+    persistence safety are now shared with Continue."""
     uid = callback.from_user.id
     token = callback.data[len("pushbtn:"):]
+    # Captured BEFORE any awaited work in this handler (owner P1-3
+    # correction), so a newer ordinary turn that starts executing during
+    # ANY later await here -- the crisis/access/onboarding lookups, binding
+    # consumption, or Contextual Continue's provider call -- can be
+    # detected via the EXISTING _user_generation mechanism the ordinary
+    # pipeline already relies on. A Push callback never bumps the
+    # generation itself: this is about detecting a newer turn, not
+    # manufacturing another generation event.
+    captured_generation = _user_generation.get(uid, 0)
     await callback.answer()
     lang = await get_user_language(uid)
 
@@ -5295,8 +5439,9 @@ async def cb_push_action(callback: CallbackQuery, state: FSMContext = None):
     if await _onboarding_blocks_ordinary_entry(uid):
         return
 
-    result = await consume_push_action_binding(
-        token, uid, callback.message.chat.id, callback.message.message_id)
+    chat_id = callback.message.chat.id
+    source_message_id = callback.message.message_id
+    result = await consume_push_action_binding(token, uid, chat_id, source_message_id)
     if result is None:
         return
 
@@ -5308,27 +5453,99 @@ async def cb_push_action(callback: CallbackQuery, state: FSMContext = None):
     await _clear_active_journal_if_leaving(state)
 
     if result.action == "push_continue":
-        text = await _push_continue_reply_text(uid, lang, result.anchor_turn_id)
+        # May await a real provider/network call -- see
+        # _try_push_contextual_continue. Every check below re-verifies the
+        # user's lifecycle live, because it may have changed during that
+        # await exactly like during any other awaited prerequisite.
+        text, scenario = await _push_continue_reply_text(uid, lang, result.anchor_turn_id)
     else:
+        # New Topic: no context, no model call, always the fixed reply,
+        # always PUSH_UI_SCENARIO -- product behavior unchanged.
         text = PUSH_V1_NEW_TOPIC_REPLY_EN if lang == "en" else PUSH_V1_NEW_TOPIC_REPLY_RU
+        scenario = PUSH_UI_SCENARIO
+
+    try:
+        still_has_access = await access_control.has_full_access(uid)
+    except Exception:
+        still_has_access = False
+    if not still_has_access:
+        return
+    if await _onboarding_blocks_ordinary_entry(uid):
+        return
+
+    # The anchor is only "required" for THIS response when it is a real,
+    # anchor-grounded contextual generation -- every deterministic fallback
+    # string (no-anchor / empty-context / assistant-only / oversized-anchor
+    # / provider-failure / validator-rejection) and every New Topic reply
+    # does not depend on the anchor's content at all, so its own
+    # disappearance must not block an otherwise-current deterministic
+    # reply. (result.action != "push_continue" alone already makes
+    # scenario != push_contextual_continue.SCENARIO, so this one
+    # expression is correct for both actions without a separate branch.)
+    guard_anchor = result.anchor_turn_id if scenario == push_contextual_continue.SCENARIO else None
+    try:
+        guard_ok = await final_push_action_reply_delivery_guard(
+            uid, chat_id, source_message_id, token, result.action,
+            result.post_consume_revision, guard_anchor)
+    except Exception as e:
+        print(f"[push-v1] final guard FAILED uid={uid}: {type(e).__name__}")
+        guard_ok = False
+    if not guard_ok:
+        # A newer lifecycle event has won: send nothing (no candidate, no
+        # generic fallback), persist nothing, never retry the model, never
+        # send a second message.
+        return
+
+    # Synchronous, non-awaited generation fence -- NO await between this
+    # check and the Telegram send call, exactly like the ordinary pipeline
+    # already requires of its own pre-delivery check.
+    if _user_generation_superseded(uid, captured_generation):
+        return
 
     # Delivery BEFORE persistence -- same discipline as
     # cb_professional_entry_triage: a Telegram send failure must leave zero
-    # assistant rows.
+    # assistant rows. No other database/network await happens between the
+    # guard above and this call.
     try:
         await callback.message.answer(text)
     except Exception as e:
         print(f"[push-v1] delivery FAILED uid={uid}: {type(e).__name__}")
         return
-    try:
-        # PUSH_UI_SCENARIO (not "open_chat"): this deterministic UI reply
-        # must never itself become a future push's "real conversation
-        # anchor" -- see database.get_last_assistant_message_id.
-        await save_message(uid, "assistant", text, PUSH_UI_SCENARIO, lang,
-                           source=MessageSource.ASSISTANT_DELIVERED)
-    except Exception as e:
-        print(f"[push-v1] assistant persistence FAILED uid={uid}: {type(e).__name__}")
+
+    # Re-check the SAME synchronous fence immediately after the send:
+    # Telegram may already have delivered the text once (an unavoidable
+    # cross-system residual); if a newer turn started WHILE that send was
+    # in flight, persist nothing and never resend.
+    if _user_generation_superseded(uid, captured_generation):
+        print(f"[push-v1] generation superseded after delivery uid={uid}")
         return
+
+    # scenario is PUSH_UI_SCENARIO for every deterministic UI
+    # acknowledgement (New Topic always; Continue whenever it fell back) --
+    # this deterministic reply must never itself become a future push's
+    # "real conversation anchor" -- see database.get_last_assistant_
+    # message_id. A successful Contextual Continue is tagged push_
+    # contextual_continue.SCENARIO instead: it is a genuine conversational
+    # assistant turn, not a sealed UI reply, and must remain eligible as a
+    # future anchor. Persistence is lifecycle-fenced to the SAME
+    # (token, expected_revision, guard_anchor) tuple the pre-send guard
+    # just verified, closing the residual window where a delete-all (or
+    # any other invalidating event) commits WHILE the Telegram send above
+    # was itself in flight -- SQLite and Telegram cannot be made globally
+    # atomic, so this is the one thing the pre-send guard alone cannot
+    # close.
+    try:
+        persisted = await record_push_action_reply_delivery(
+            uid, chat_id, source_message_id, token, result.action,
+            text, scenario, lang, result.post_consume_revision, guard_anchor)
+    except Exception as e:
+        print(f"[push-v1] post-delivery persistence FAILED uid={uid}: {type(e).__name__}")
+        return
+    if not persisted:
+        # Telegram already delivered the text; that cross-system residual
+        # is unavoidable. The lifecycle moved during/after the send, so
+        # nothing is written -- never resend, never recreate deleted state.
+        print(f"[push-v1] post-delivery lifecycle invalidated uid={uid}")
 
 
 @dp.callback_query(F.data.startswith("onb:"))

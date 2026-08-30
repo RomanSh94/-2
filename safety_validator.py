@@ -313,6 +313,43 @@ def validate_response_with_context(response_text: str,
     return True, None
 
 
+def validate_response_without_current_user(
+        response_text: str, lang: str = "ru") -> tuple[bool, str | None]:
+    """Validate an LLM reply that was generated with NO genuine current user
+    turn at all -- e.g. Push V1 Contextual Continue, whose entire input is a
+    trusted UI action (a button tap) plus bounded PRIOR conversation
+    context, never a real current user message. validate_response_with_
+    context's `user_last_message`/`risk_result` parameters both presuppose a
+    genuine current-turn message that was risk-scored (detect_risk output);
+    feeding them a fabricated stand-in (the button label, a system-authored
+    steering string, or a fixed empty-signal risk dict) would be exactly
+    the kind of synthetic-input misuse the CRITICAL PROVENANCE RULE
+    forbids, even though passing it happens not to change today's control
+    flow -- see this function's own existence as the fix for that.
+
+    Reuses the SAME underlying deterministic checks validate_response_with_
+    context itself uses -- no second safety policy: validate_response (the
+    core forbidden-phrase/length/certainty-language check) and
+    check_toxic_validation (absolutist-distortion confirmation). Does NOT
+    run the two risk_result-gated checks (post-ambiguous approval language,
+    risky-suggestion-at-elevated-risk) -- those are meaningless without a
+    genuine current user message to have been ambiguous or risk-scored in
+    the first place, and this function must never pretend they ran.
+
+    Returns (is_safe, reason_if_unsafe), same shape as validate_response_
+    with_context. On False, the caller must use a deterministic fallback,
+    never re-prompt the LLM."""
+    is_safe, reason = validate_response(response_text, lang)
+    if not is_safe:
+        return False, reason
+
+    is_toxic, matched = check_toxic_validation(response_text)
+    if is_toxic:
+        return False, f"toxic validation: confirmed distortion '{matched}'"
+
+    return True, None
+
+
 # ── Generic first-turn contract: validation foundation ────────────────────────
 # Phase 1 only -- not yet called from the pipeline. Deterministic checks for
 # the generic first-turn response contract (see prompts/design notes): no
