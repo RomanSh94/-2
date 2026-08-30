@@ -219,18 +219,34 @@ def test_no_save_message_call_in_bot_py_omits_or_mismatches_source():
     test. Covers every genuine writer: ordinary typed-user, crisis,
     controller, depression-disclosure, disambiguation, professional, and
     every assistant writer (ordinary/deterministic/controller/Entry-Triage/
-    first-turn/professional/Therapist Core/Push V1 UI reply). The exact
-    count (18, up from 17 for Push V1's cb_push_action assistant-delivery
-    writer -- the deterministic Continue/New-topic UI reply, tagged
-    PUSH_UI_SCENARIO and source=MessageSource.ASSISTANT_DELIVERED; up from
-    15 before that for Therapist Core V1's explicitly sourced user-claim
-    and assistant delivery writers) is
+    first-turn/professional/Therapist Core). The exact count (17) is
     intentionally pinned here so a FUTURE writer added without provenance
     is caught even if it happens to reuse an already-correct source= value
     -- see test_pipeline_user_and_assistant_writers_classified_correctly
     and test_run_professional_free_text_and_deliver_assistant_writer_uses_
     assistant_delivered below for two of the other new call sites
-    individually."""
+    individually.
+
+    Push V1's cb_push_action does NOT contribute a direct save_message(...)
+    call site here: both push_continue and push_new_topic persist their
+    delivered reply through the dedicated, lifecycle-fenced database.
+    record_push_action_reply_delivery(...) primitive instead (its own
+    INSERT INTO messages runs inside database.py, re-verifying the exact
+    consumed push-binding token, live revision, unresolved-crisis state,
+    and conditional anchor immediately before writing) -- required so a
+    confirmed Telegram send can never resurrect/recreate conversation state
+    after a GDPR delete-all raced the send itself. This intentionally
+    DECREASES the count from an earlier 18 (when cb_push_action still
+    called save_message(...) directly for its deterministic UI reply) to
+    17 -- this is not a missing provenance annotation, and the pinned
+    count is kept exact (never widened to >=) so any FUTURE direct
+    save_message(...) writer added to bot.py -- Push V1's or otherwise --
+    still requires explicit review here. Provenance/scenario correctness
+    for the Push V1 replies delivered through record_push_action_reply_
+    delivery(...) is instead covered directly in tests/
+    test_push_v1_callback.py (source=ASSISTANT_DELIVERED and the correct
+    scenario for both a successful contextual Continue, a deterministic
+    Continue fallback, and New Topic)."""
     src = pathlib.Path(bot.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     expected_by_role = {"user": "USER_AUTHORED", "assistant": "ASSISTANT_DELIVERED"}
@@ -248,7 +264,7 @@ def test_no_save_message_call_in_bot_py_omits_or_mismatches_source():
             assert source_attr is not None, f"save_message call at bot.py:{node.lineno} has no source="
             assert source_attr == expected_by_role.get(role), (
                 f"save_message call at bot.py:{node.lineno}: role={role!r} source={source_attr!r}")
-    assert checked == 18, f"expected exactly 18 known save_message call sites in bot.py, found {checked}"
+    assert checked == 17, f"expected exactly 17 known save_message call sites in bot.py, found {checked}"
 
 
 def test_trigger_crisis_user_writer_uses_user_authored():
