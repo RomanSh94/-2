@@ -91,16 +91,34 @@ async def _sessions_for(uid):
     return rows
 
 
-# ── /help reaches the real public Questionnaire Core (round 3: via a button,
-# not a raw "/questionnaire" slash-command mention) ───────────────────────────
-def test_questionnaire_reachable_from_help():
+# ── UI polish V1 supersedes the round-3 contract above: Help no longer
+# exposes Questionnaire Core (or any other main-navigation shortcut) --
+# see tests/test_help_command.py for the exhaustive Help-button-set
+# assertion (About + Privacy only, in that order). Psychological tests
+# remain reachable through the REAL persistent-lower-menu dispatcher
+# handler, bot.lower_menu_tests, which delegates to cmd_questionnaire
+# completely unchanged. ─────────────────────────────────────────────────────
+def test_questionnaire_not_reachable_from_help():
     msg = FakeMessage(FakeUser(1))
     asyncio.run(bot.cmd_help(msg))
     text, kw = msg.answers[0]
     assert "/questionnaire" not in text
     kb = kw["reply_markup"]
     datas = [b.callback_data for row in kb.inline_keyboard for b in row]
-    assert "q:l" in datas
+    assert "q:l" not in datas
+    assert datas == ["about:hub", "privacy:hub"]
+
+
+def test_questionnaire_reachable_from_persistent_lower_menu():
+    # Exercises the REAL dispatcher-registered lower-menu handler
+    # (bot.lower_menu_tests) directly -- not a hand-rolled equivalent --
+    # confirming psychological tests are still one tap away from the
+    # persistent lower menu's "🧠 Психологические тесты" button, exactly as
+    # before this UI change.
+    msg = FakeMessage(FakeUser(1))
+    asyncio.run(bot.lower_menu_tests(msg, None))
+    assert msg.answers
+    assert msg.answers[-1][0] == bot.questionnaire_ux.list_text("ru")
 
 
 # ── product gate ─────────────────────────────────────────────────────────────
