@@ -782,15 +782,19 @@ _legacy_kb_cleared: set[int] = set()
 
 
 _LOWER_MENU = {
+    # Privacy row removed (owner product decision): Data & Privacy already
+    # lives in Help (see _help_keyboard) -- the persistent lower menu no
+    # longer duplicates it. lower_menu_privacy (the F.text handler below)
+    # and privacy:hub/_privacy_hub_keyboard/navigation.privacy_hub_text are
+    # all untouched -- Privacy is still fully reachable from Help, only the
+    # duplicate entry point here is gone.
     "ru": (
         ("🧠 Психологические тесты", "📊 Мои результаты"),
         ("📝 Дневники", "🎛 Как отвечать"),
-        ("🔒 Данные и приватность",),
     ),
     "en": (
         ("🧠 Psychological tests", "📊 My results"),
         ("📝 Diaries", "🎛 How to reply"),
-        ("🔒 Data and privacy",),
     ),
 }
 
@@ -799,9 +803,20 @@ _LOWER_MENU = {
 # maintained copy that could silently drift. Used to keep persistent-menu
 # button presses from ever being consumed as journal free-text answers (see
 # emotion_step/cbt_step's filter chain below).
+#
+# Privacy row removed from _LOWER_MENU's rendering above, but its label
+# must stay recognized here: emotion_step/cbt_step's exclusion filter is
+# the ONLY thing standing between an in-progress journal FSM and silently
+# swallowing that exact text as journal content. A user's Telegram client
+# can still show an already-cached copy of the OLD keyboard (Telegram
+# caches the last-sent ReplyKeyboardMarkup) for a while after this
+# deploy, so a tap on that stale button -- or the same text typed
+# manually -- must still escape the FSM and reach lower_menu_privacy
+# (still fully registered, unchanged) exactly as before, not get treated
+# as journal free-text.
 _LOWER_MENU_CONTROL_LABELS = frozenset(
     label for rows in _LOWER_MENU.values() for row in rows for label in row
-)
+) | {"🔒 Данные и приватность", "🔒 Data and privacy"}
 
 
 async def _clear_active_journal_if_leaving(state: FSMContext = None) -> None:
