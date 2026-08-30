@@ -2544,13 +2544,46 @@ def test_first_ordinary_reply_carries_permanent_lower_menu(tmp_db, monkeypatch):
     assert msg.answers[0][0] == "an ordinary answer"
     markup = msg.answers[0][1].get("reply_markup")
     assert isinstance(markup, bot.ReplyKeyboardMarkup)
+    # Privacy row removed (owner product decision): Data & Privacy now lives
+    # only in Help, not duplicated in the persistent lower menu.
     assert [[button.text for button in row] for row in markup.keyboard] == [
         ["🧠 Психологические тесты", "📊 Мои результаты"],
         ["📝 Дневники", "🎛 Как отвечать"],
-        ["🔒 Данные и приватность"],
     ]
     assert markup.is_persistent is True
     assert markup.resize_keyboard is True
+
+
+def test_persistent_lower_menu_kb_shape_ru_and_en():
+    # Direct, exhaustive proof of the post-removal shape for both
+    # languages: exactly 2 rows, 2 buttons per row, 4 buttons total, in
+    # the required order, Privacy absent, "Как отвечать"/"How to reply"
+    # present.
+    ru = bot.persistent_lower_menu_kb("ru")
+    ru_rows = [[b.text for b in row] for row in ru.keyboard]
+    assert ru_rows == [
+        ["🧠 Психологические тесты", "📊 Мои результаты"],
+        ["📝 Дневники", "🎛 Как отвечать"],
+    ]
+    assert len(ru_rows) == 2
+    assert all(len(row) == 2 for row in ru_rows)
+    assert sum(len(row) for row in ru_rows) == 4
+    flat_ru = [label for row in ru_rows for label in row]
+    assert "🔒 Данные и приватность" not in flat_ru
+    assert "🎛 Как отвечать" in flat_ru
+
+    en = bot.persistent_lower_menu_kb("en")
+    en_rows = [[b.text for b in row] for row in en.keyboard]
+    assert en_rows == [
+        ["🧠 Psychological tests", "📊 My results"],
+        ["📝 Diaries", "🎛 How to reply"],
+    ]
+    assert len(en_rows) == 2
+    assert all(len(row) == 2 for row in en_rows)
+    assert sum(len(row) for row in en_rows) == 4
+    flat_en = [label for row in en_rows for label in row]
+    assert "🔒 Data and privacy" not in flat_en
+    assert "🎛 How to reply" in flat_en
 
 
 def test_permanent_lower_menu_remains_attached_on_later_replies(tmp_db, monkeypatch):
