@@ -320,9 +320,9 @@ TTS_MAX_AUDIO_SECONDS  = int(os.getenv("TTS_MAX_AUDIO_SECONDS", "90"))
 # Reaction configuration (not rollout flags -- inert while
 # EMOTIONAL_REACTIONS_ENABLED is false).
 EMOTIONAL_REACTION_COOLDOWN_SECONDS = int(
-    os.getenv("EMOTIONAL_REACTION_COOLDOWN_SECONDS", "60"))
+    os.getenv("EMOTIONAL_REACTION_COOLDOWN_SECONDS", "300"))
 EMOTIONAL_REACTION_MIN_CONFIDENCE = float(
-    os.getenv("EMOTIONAL_REACTION_MIN_CONFIDENCE", "0.6"))
+    os.getenv("EMOTIONAL_REACTION_MIN_CONFIDENCE", "0.9"))
 
 # Bounded TTLs for the two pieces of ephemeral FSM-scoped state used by
 # format-command replay (not rollout flags -- inert while

@@ -225,11 +225,16 @@ def test_env_example_keeps_both_new_flags_false():
     assert "ELEVENLABS_TTS_ENABLED=false" in content
     assert "ELEVENLABS_API_KEY=" in content
     assert "EMOTIONAL_REACTIONS_ENABLED=false" in content
-    assert "EMOTIONAL_REACTION_COOLDOWN_SECONDS=60" in content
+    assert "EMOTIONAL_REACTION_COOLDOWN_SECONDS=300" in content
+    assert "EMOTIONAL_REACTION_MIN_CONFIDENCE=0.9" in content
 
 
-def test_reaction_cooldown_default_is_sixty_seconds():
-    assert config.EMOTIONAL_REACTION_COOLDOWN_SECONDS == 60
+def test_reaction_cooldown_default_is_five_minutes():
+    # Reactions are occasional, not per-message: an approximately one-per-
+    # five-minutes ceiling per user, and only the stronger direct-keyword
+    # signal (not a broad risk-category fallback) qualifies by default.
+    assert config.EMOTIONAL_REACTION_COOLDOWN_SECONDS == 300
+    assert config.EMOTIONAL_REACTION_MIN_CONFIDENCE == 0.9
 
 
 def test_existing_three_flags_still_false_and_unchanged():
@@ -734,32 +739,50 @@ def test_listen_button_creates_no_database_row(tmp_db):
 
 
 # ── §23 Reactions ────────────────────────────────────────────────────────────
+# Emotional Reactions V1: the owner-approved product contract allows exactly
+# four visible Telegram reactions (❤️ support, 💔 explicit heartbreak/loss,
+# 🤗 effort/progress, 🎉 celebration/good news) or none. Categories outside
+# this contract (confusion, anger, gratitude, relief, fear/shock) remain
+# detectable -- reusable signal infrastructure -- but are never mapped to a
+# visible emoji; see REACTION_MAP in reaction_selector.py.
 
 @pytest.mark.parametrize("category,expected", [
-    (rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, ("🫂", "😔")),
-    (rs.ReactionCategory.TEARS_WELLING, ("🥹", "🫂")),
-    (rs.ReactionCategory.LONELINESS_OR_REJECTION, ("🫂", "🥹")),
-    (rs.ReactionCategory.ANXIETY_OR_WORRY, ("😟",)),
-    (rs.ReactionCategory.FEAR_OR_SHOCK, ("😨",)),
-    (rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM, ("😮‍💨",)),
+    (rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, ("❤",)),
+    (rs.ReactionCategory.TEARS_WELLING, ("❤",)),
+    (rs.ReactionCategory.LONELINESS_OR_REJECTION, ("❤",)),
+    (rs.ReactionCategory.ANXIETY_OR_WORRY, ("❤",)),
+    (rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM, ("❤",)),
     (rs.ReactionCategory.HEARTBREAK_OR_LOSS, ("💔",)),
-    (rs.ReactionCategory.CONFUSION_OR_UNCERTAINTY, ("🤔",)),
-    (rs.ReactionCategory.ANGER_OR_FRUSTRATION, ("😤",)),
-    (rs.ReactionCategory.RELIEF_OR_CALM, ("😌",)),
-    (rs.ReactionCategory.GRATITUDE_OR_WARMTH, ("❤",)),
-    (rs.ReactionCategory.PROGRESS_OR_ACHIEVEMENT, ("🔥", "🎉")),
-    (rs.ReactionCategory.PRACTICE_COMPLETED, ("👍",)),
+    (rs.ReactionCategory.PROGRESS_OR_ACHIEVEMENT, ("🤗",)),
+    (rs.ReactionCategory.PRACTICE_COMPLETED, ("🤗",)),
+    (rs.ReactionCategory.GOOD_NEWS_OR_CELEBRATION, ("🎉",)),
 ])
 def test_reaction_mapping_matches_approved_semantics(category, expected):
     assert rs.REACTION_MAP[category] == expected
 
 
-def test_near_tears_prefers_tears_then_explicitly_supported_hug_fallback():
+@pytest.mark.parametrize("category", [
+    rs.ReactionCategory.FEAR_OR_SHOCK,
+    rs.ReactionCategory.CONFUSION_OR_UNCERTAINTY,
+    rs.ReactionCategory.ANGER_OR_FRUSTRATION,
+    rs.ReactionCategory.RELIEF_OR_CALM,
+    rs.ReactionCategory.GRATITUDE_OR_WARMTH,
+])
+def test_unapproved_categories_have_no_visible_mapping(category):
+    # Detection infrastructure is preserved (select_reaction_category can
+    # still return these), but none may ever produce a visible reaction.
+    assert rs.REACTION_MAP.get(category, ()) == ()
+    assert rs.pick_supported_emoji(category, None) is None
+
+
+def test_near_tears_selects_support_reaction():
     cat, _ = rs.select_reaction_category("мне так тяжело, слёзы наворачиваются",
                                           ["hopelessness"], "OPEN", "ru")
     assert cat == rs.ReactionCategory.TEARS_WELLING
-    assert rs.pick_supported_emoji(cat, ["🥹", "🫂"]) == "🥹"
-    assert rs.pick_supported_emoji(cat, ["🫂"]) == "🫂"
+    assert rs.pick_supported_emoji(cat, ["❤"]) == "❤"
+    # No fallback chain: an unrelated emoji is never substituted, even if
+    # the chat happens to support it.
+    assert rs.pick_supported_emoji(cat, ["🫂"]) is None
 
 
 def test_crisis_categories_never_react():
@@ -789,7 +812,7 @@ def test_low_confidence_suppresses_reaction(tmp_db, monkeypatch):
         calls["n"] += 1
     monkeypatch.setattr(bot.bot, "set_message_reaction", spy)
     msg = FakeMessage(FakeUser(1), "text")
-    run(bot._maybe_react(msg, 1, rs.ReactionCategory.RELIEF_OR_CALM, 0.55))
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, 0.55))
     assert calls["n"] == 0
 
 
@@ -823,15 +846,17 @@ def test_at_most_one_reaction_per_call(tmp_db, monkeypatch):
     monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
     monkeypatch.setattr(bot.bot, "set_message_reaction", fake_set_reaction)
     msg = FakeMessage(FakeUser(5), "x")
-    run(bot._maybe_react(msg, 5, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))
+    run(bot._maybe_react(msg, 5, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
     assert len(calls) == 1
     assert len(calls[0]["reaction"]) == 1
 
 
-def test_unsupported_preferred_emoji_uses_approved_fallback():
+def test_unsupported_chat_reaction_returns_none_not_a_substitute():
+    # Exactly one approved emoji per category, no fallback chain: if a chat
+    # doesn't support it, the answer is "no reaction", never a substitute.
     emoji = rs.pick_supported_emoji(
         rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, ["😔"])
-    assert emoji == "😔"  # 🫂 unsupported here -> approved fallback
+    assert emoji is None
 
 
 def test_no_supported_candidate_is_a_noop(tmp_db, monkeypatch):
@@ -844,9 +869,9 @@ def test_no_supported_candidate_is_a_noop(tmp_db, monkeypatch):
     monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
     monkeypatch.setattr(bot.bot, "set_message_reaction", fake_set_reaction)
     msg = FakeMessage(FakeUser(1), "x")
-    run(bot._maybe_react(msg, 1, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
     assert calls["n"] == 0
-    assert rs.pick_supported_emoji(rs.ReactionCategory.GRATITUDE_OR_WARMTH, []) is None
+    assert rs.pick_supported_emoji(rs.ReactionCategory.HEARTBREAK_OR_LOSS, []) is None
 
 
 def test_telegram_reaction_error_does_not_propagate(tmp_db, monkeypatch):
@@ -858,7 +883,7 @@ def test_telegram_reaction_error_does_not_propagate(tmp_db, monkeypatch):
     monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
     monkeypatch.setattr(bot.bot, "set_message_reaction", boom)
     msg = FakeMessage(FakeUser(1), "x")
-    run(bot._maybe_react(msg, 1, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))  # must not raise
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))  # must not raise
 
 
 def test_omitted_available_reactions_means_all_standard_allowed():
@@ -868,14 +893,245 @@ def test_omitted_available_reactions_means_all_standard_allowed():
     from aiogram.types import ChatFullInfo
     assert ChatFullInfo.model_fields["available_reactions"].default is None
     assert rs.pick_supported_emoji(rs.ReactionCategory.HEARTBREAK_OR_LOSS, None) == "💔"
-    # Renderable is not the same as Bot-API-supported: never assume 🫂/😌.
-    assert rs.pick_supported_emoji(rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, None) is None
+    assert rs.pick_supported_emoji(rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, None) == "❤"
+    # A category outside the four approved product reactions is never sent,
+    # regardless of what the chat allows.
     assert rs.pick_supported_emoji(rs.ReactionCategory.RELIEF_OR_CALM, None) is None
 
 
 def test_reaction_category_is_never_persisted():
     src = inspect.getsource(bot._maybe_react) + inspect.getsource(bot.pipeline)
     assert "INSERT" not in src.upper() or "reaction" not in src.lower()
+
+
+# ── §23a Emotional Reactions V1 -- four-reaction product contract ──────────
+
+@pytest.mark.parametrize("phrase", [
+    "Мне одиноко",
+    "Мне тревожно из-за работы",
+    "Мне грустно",
+    "Я очень устал и нет сил",
+])
+def test_heart_support_rule_selects_heart(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert conf >= config.EMOTIONAL_REACTION_MIN_CONFIDENCE
+    assert rs.pick_supported_emoji(cat, None) == "❤"
+
+
+@pytest.mark.parametrize("phrase", [
+    "Мы расстались.",
+    "Он меня бросил.",
+    "Умер близкий мне человек.",
+])
+def test_heartbreak_narrow_rule_selects_broken_heart(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert cat == rs.ReactionCategory.HEARTBREAK_OR_LOSS
+    assert rs.pick_supported_emoji(cat, None) == "💔"
+
+
+@pytest.mark.parametrize("phrase", [
+    "Мне одиноко",
+    "Мне грустно",
+    "Мне тревожно из-за работы",
+])
+def test_heartbreak_narrow_rule_excludes_ordinary_distress(phrase):
+    # Sadness/loneliness/anxiety alone must never earn the narrower
+    # heartbreak reaction -- only the general ❤️ support reaction, or none.
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert cat != rs.ReactionCategory.HEARTBREAK_OR_LOSS
+    assert rs.pick_supported_emoji(cat, None) != "💔"
+
+
+@pytest.mark.parametrize("phrase", [
+    "Я сделал первый шаг.",
+    "Я справился с трудной задачей.",
+])
+def test_progress_hug_rule_selects_hug(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "GROWTH", "ru")
+    assert cat == rs.ReactionCategory.PROGRESS_OR_ACHIEVEMENT
+    assert rs.pick_supported_emoji(cat, None) == "🤗"
+
+
+def test_progress_hug_rule_covers_practice_completion():
+    # Practice completion is signaled directly by bot.py's cb_quality
+    # handler (a fixed category, not text-derived) -- confirm it still
+    # maps to the approved effort/progress reaction.
+    assert rs.pick_supported_emoji(
+        rs.ReactionCategory.PRACTICE_COMPLETED, None) == "🤗"
+
+
+@pytest.mark.parametrize("phrase", [
+    "Я сдал экзамен.",
+    "Меня взяли на работу.",
+    "Мы помирились.",
+])
+def test_celebration_rule_selects_party_popper(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert cat == rs.ReactionCategory.GOOD_NEWS_OR_CELEBRATION
+    assert rs.pick_supported_emoji(cat, None) == "🎉"
+
+
+@pytest.mark.parametrize("phrase", [
+    "Расскажи коротко, как работает этот бот.",
+    "ок",
+    "понял",
+    "Завтра встреча в 15:00.",
+    "Я больше не тревожусь.",
+    'Она сказала: "Я очень устала".',
+    "Мой коллега тревожится.",
+    "Что означает слово «тревога»?",
+])
+def test_default_no_reaction_rule(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert cat == rs.ReactionCategory.NONE
+    assert conf == 0.0
+    assert rs.pick_supported_emoji(cat, None) is None
+
+
+def test_crisis_no_reaction_end_to_end():
+    cat, conf = rs.select_reaction_category(
+        "мне так плохо, что не хочу жить", ["suicide"], "ACUTE_DISTRESS", "ru")
+    assert cat == rs.ReactionCategory.NONE and conf == 0.0
+    assert rs.pick_supported_emoji(cat, None) is None
+
+
+def test_unsupported_reaction_in_available_reactions_is_noop():
+    cat, _ = rs.select_reaction_category("Мы расстались.", [], "OPEN", "ru")
+    assert cat == rs.ReactionCategory.HEARTBREAK_OR_LOSS
+    assert rs.pick_supported_emoji(cat, []) is None
+    assert rs.pick_supported_emoji(cat, ["🎉"]) is None  # never substitutes, even for another approved emoji
+
+
+_ALL_APPROVED_OR_NONE = {"❤", "💔", "🤗", "🎉", None}
+_RETIRED_EMOJI = {"😔", "🥹", "😨", "🤔", "🔥", "👍", "🫂", "😟", "😮‍💨", "😤", "😌"}
+
+
+@pytest.mark.parametrize("phrase,risk_categories,stage", [
+    ("Мне одиноко", [], "OPEN"),
+    ("Мы расстались.", [], "OPEN"),
+    ("Я сделал первый шаг.", [], "GROWTH"),
+    ("Я сдал экзамен.", [], "OPEN"),
+    ("Расскажи коротко, как работает этот бот.", [], "OPEN"),
+    ("Спасибо!", [], "OPEN"),  # detectable category, but outside the four approved
+    ("текст", ["suicide"], "ACUTE_DISTRESS"),
+])
+def test_output_boundary_only_four_approved_emoji_or_none(phrase, risk_categories, stage):
+    cat, _ = rs.select_reaction_category(phrase, risk_categories, stage, "ru")
+    emoji = rs.pick_supported_emoji(cat, None)
+    assert emoji in _ALL_APPROVED_OR_NONE
+    assert emoji not in _RETIRED_EMOJI
+
+
+def test_no_retired_emoji_anywhere_in_reaction_map():
+    for candidates in rs.REACTION_MAP.values():
+        for emoji in candidates:
+            assert emoji not in _RETIRED_EMOJI
+            assert emoji in {"❤", "💔", "🤗", "🎉"}
+
+
+# ── §23b Reactions must be occasional (owner correction) ───────────────────
+# Default frequency was too permissive: a 60s cooldown at 0.6 min confidence
+# let broad risk-category fallbacks (0.75) decorate messages routinely.
+# New defaults: 300s cooldown, 0.9 min confidence -- only a direct guarded
+# keyword hit (_CONF_KEYWORD=0.9) qualifies by default; a bare risk-category
+# fallback (_CONF_RISK_CATEGORY=0.75) no longer does. Absence of a reaction
+# stays preferable to over-reacting.
+
+def test_direct_keyword_signal_eligible_at_default_confidence(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    async def fake_get_chat(chat_id):
+        return types.SimpleNamespace(available_reactions=None)
+    calls = []
+    async def spy_react(**kw):
+        calls.append(kw)
+    monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
+    msg = FakeMessage(FakeUser(1), "x")
+    # 0.9 == _CONF_KEYWORD, and the confidence gate is strict-less-than, so
+    # a direct keyword hit must still clear the new 0.9 default.
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
+    assert len(calls) == 1
+
+
+def test_broad_risk_category_fallback_rejected_at_default_confidence(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    calls = {"n": 0}
+    async def spy(*a, **kw):
+        calls["n"] += 1
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy)
+    msg = FakeMessage(FakeUser(1), "x")
+    # 0.75 == _CONF_RISK_CATEGORY: below the new 0.9 default, so a bare
+    # risk-category fallback no longer produces a decorative reaction.
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.75))
+    assert calls["n"] == 0
+
+
+def test_second_reaction_within_five_minutes_is_suppressed(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "EMOTIONAL_REACTIONS_ENABLED", True)
+    async def fake_get_chat(chat_id):
+        return types.SimpleNamespace(available_reactions=None)
+    calls = []
+    async def spy_react(**kw):
+        calls.append(kw)
+    monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
+    monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
+    msg = FakeMessage(FakeUser(1), "x")
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
+    assert len(calls) == 1  # second call, well within the 300s default, is suppressed
+
+
+# ── §23c 💔 requires clear personal loss (owner correction) ────────────────
+# Bare "умер"/"умерла"/"развод" were removed as independent qualifiers: a
+# stranger's death or an abstract question about divorce is not the user's
+# own loss, and 💔 must stay narrow to breakup/bereavement/betrayal the user
+# reports as their own.
+
+@pytest.mark.parametrize("phrase", [
+    "Умер известный актёр.",
+    "Что думаешь о разводе?",
+])
+def test_heartbreak_rule_rejects_generic_death_or_divorce_mentions(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert cat != rs.ReactionCategory.HEARTBREAK_OR_LOSS
+    assert rs.pick_supported_emoji(cat, None) != "💔"
+
+
+@pytest.mark.parametrize("phrase", [
+    "У меня умер близкий человек.",
+    "Мы разводимся.",
+    "Он меня бросил.",
+])
+def test_heartbreak_rule_accepts_clear_personal_loss(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert cat == rs.ReactionCategory.HEARTBREAK_OR_LOSS
+    assert rs.pick_supported_emoji(cat, None) == "💔"
+
+
+# ── §23d 💔 requires clear personal loss -- EN mirror ───────────────────────
+# Same fail-closed contract as §23c, applied to the EN keyword list: bare
+# "passed away"/"she died"/"he died"/"divorce" removed as independent
+# qualifiers.
+
+@pytest.mark.parametrize("phrase", [
+    "A famous actor passed away.",
+    "What do you think about divorce?",
+])
+def test_en_heartbreak_rule_rejects_generic_death_or_divorce_mentions(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "en")
+    assert cat != rs.ReactionCategory.HEARTBREAK_OR_LOSS
+    assert rs.pick_supported_emoji(cat, None) != "💔"
+
+
+@pytest.mark.parametrize("phrase", [
+    "Someone close to me passed away.",
+    "We're getting divorced.",
+    "She broke up with me.",
+])
+def test_en_heartbreak_rule_accepts_clear_personal_loss(phrase):
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "en")
+    assert cat == rs.ReactionCategory.HEARTBREAK_OR_LOSS
+    assert rs.pick_supported_emoji(cat, None) == "💔"
 
 
 # ── §24 Privacy ──────────────────────────────────────────────────────────────
@@ -2494,7 +2750,7 @@ def test_public_reactions_non_owner_one_call(tmp_db, monkeypatch):
     monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
     monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
     msg = FakeMessage(FakeUser(2), "x")
-    run(bot._maybe_react(msg, 2, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))
+    run(bot._maybe_react(msg, 2, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
     assert len(calls) == 1
 
 
@@ -2525,7 +2781,7 @@ def test_owner_gate_reactions_owner_in_group_unaffected(tmp_db, monkeypatch):
     monkeypatch.setattr(bot.bot, "get_chat", fake_get_chat)
     monkeypatch.setattr(bot.bot, "set_message_reaction", spy_react)
     msg = FakeMessage(FakeUser(1), "x", chat_type="group")
-    run(bot._maybe_react(msg, 1, rs.ReactionCategory.GRATITUDE_OR_WARMTH, 0.9))
+    run(bot._maybe_react(msg, 1, rs.ReactionCategory.HEARTBREAK_OR_LOSS, 0.9))
     assert len(calls) == 1
 
 
@@ -2701,7 +2957,7 @@ def test_explicit_small_win_selects_high_confidence_progress_reaction():
         "У меня получилось сделать первый шаг.", [], "GROWTH", "ru")
     assert category == rs.ReactionCategory.PROGRESS_OR_ACHIEVEMENT
     assert confidence == 0.9
-    assert rs.pick_supported_emoji(category, None) == "🔥"
+    assert rs.pick_supported_emoji(category, None) == "🤗"
 
 
 @pytest.mark.parametrize("phrase", [
