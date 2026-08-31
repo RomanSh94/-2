@@ -118,6 +118,10 @@ def _common(monkeypatch, tmp_db):
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", False)
     stub = _StubSession()
     monkeypatch.setattr(bot.bot, "session", stub)
+    monkeypatch.setattr(
+        scheduler, "_generate_contextual_push_text",
+        _async("В прошлый раз ты говорил, что работа выматывает. Стало ли сейчас легче?"),
+    )
     return stub
 
 

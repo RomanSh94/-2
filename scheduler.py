@@ -7,7 +7,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from functools import partial
 from prompts import (
-    get_checkin_msg, get_crisis_followup, get_push_v1_text,
+    get_checkin_msg, get_crisis_followup,
     PUSH_V1_CONTINUE_LABEL_RU, PUSH_V1_CONTINUE_LABEL_EN,
     PUSH_V1_NEW_TOPIC_LABEL_RU, PUSH_V1_NEW_TOPIC_LABEL_EN,
 )
@@ -30,9 +30,14 @@ from database import (
     has_unresolved_crisis, get_last_assistant_message_id,
     get_user_revision, create_push_action_bindings, final_push_send_guard,
     final_push_keyboard_publish_guard,
+    get_trusted_conversation_history_through_anchor,
     get_active_onboarding_state, get_onboarding_state,
     get_onboarding_eligibility, has_privacy_notice_ack,
 )
+from professional_turn_conversation_context import (
+    build_conversation_context_from_history_rows,
+)
+import push_contextual_reengagement
 
 
 def _minimal_reviewer_payload(uid: int, eid, note: str) -> str:
@@ -309,7 +314,32 @@ async def _finalize_push_record(uid: int, tier: str, anchor_turn_id: int,
     return "failed"
 
 
-async def _send_silence_pushes(bot: Bot) -> None:
+async def _generate_contextual_push_text(
+        uid: int, lang: str, anchor_turn_id: int, model_client) -> str | None:
+    """Build exact-anchor trusted context and make one minimized generation.
+
+    No identifiers are placed in the provider request. Any DB/build/provider/
+    output failure means no Push; this boundary has no neutral fallback.
+    """
+    if model_client is None:
+        return None
+    try:
+        rows = await get_trusted_conversation_history_through_anchor(uid, anchor_turn_id)
+        context = build_conversation_context_from_history_rows(rows)
+    except Exception as e:
+        print(f"[scheduler] contextual push preparation failed uid={uid}: {type(e).__name__}")
+        return None
+    return await push_contextual_reengagement.generate_contextual_reengagement_push(
+        client=model_client,
+        model="gpt-4o-mini",
+        conversation_context=context,
+        anchor_turn_id=anchor_turn_id,
+        lang=lang,
+        max_tokens=120,
+    )
+
+
+async def _send_silence_pushes(bot: Bot, model_client=None) -> None:
     """Re-engagement pushes (Push V1). Antispam cadence still lives entirely
     in decide_push() (unchanged tiers/limits/quiet-hours/mute); this
     function additionally, in order: (1) vetoes early for the user's whole
@@ -352,8 +382,9 @@ async def _send_silence_pushes(bot: Bot) -> None:
     post-erasure recreation) either records the delivery or -- if the
     user's account lifecycle was erased in the exact window after send --
     reports "lifecycle_invalidated", in which case no binding is created
-    and no keyboard is ever attached. Otherwise sends the fixed, neutral
-    Push V1 card, and — only if its two-button binding is durably created
+    and no keyboard is ever attached. Otherwise sends one short contextual
+    Push grounded in bounded trusted history through the exact anchor, and —
+    only if its two-button binding is durably created
     AND final_push_keyboard_publish_guard (P1 correction, § delete-all-
     between-binding-and-publication) confirms, in the LAST awaited DB read
     before the edit call, that both bindings are still open and the anchor
@@ -458,6 +489,16 @@ async def _send_silence_pushes(bot: Bot) -> None:
             print(f"[scheduler] push revision-fetch failed {uid}: {e}")
             continue
 
+        # Contextual Re-engagement Push V1: exact-anchor history recovery and
+        # the single provider call happen before the existing fresh access
+        # recheck and final lifecycle guard. Insufficient USER_AUTHORED
+        # evidence, provider failure, or deterministic output rejection means
+        # no Push; the former fixed neutral card is deliberately not used.
+        push_text = await _generate_contextual_push_text(
+            uid, lang or "ru", anchor_turn_id, model_client)
+        if push_text is None:
+            continue
+
         # P1 correction, § access revocation: a SECOND, fresh access check
         # positioned AFTER the anchor/revision prerequisite awaits -- the
         # EARLIER check (above, before those awaits) cannot by itself catch
@@ -495,7 +536,7 @@ async def _send_silence_pushes(bot: Bot) -> None:
             continue
 
         try:
-            sent = await bot.send_message(uid, get_push_v1_text(lang or "ru"))
+            sent = await bot.send_message(uid, push_text)
         except Exception as e:
             print(f"[scheduler] push {tier} send failed {uid}: {e}")
             continue
@@ -620,7 +661,7 @@ async def _send_journal_checkins(bot: Bot) -> None:
             print(f"[journal-checkin] {u['user_id']}: {type(e).__name__}: {e}")
 
 
-def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
+def setup_scheduler(bot: Bot, model_client=None) -> AsyncIOScheduler:
     s = AsyncIOScheduler()
     s.add_job(_send_checkins, "cron", minute=0, args=[bot],
               id="checkins", replace_existing=True, misfire_grace_time=300)
@@ -628,7 +669,7 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
               id="crisis_followups", replace_existing=True, misfire_grace_time=600)
     s.add_job(_send_stage3_followups, "interval", minutes=3, args=[bot],
               id="stage3_followups", replace_existing=True, misfire_grace_time=120)
-    s.add_job(_send_silence_pushes, "interval", minutes=30, args=[bot],
+    s.add_job(_send_silence_pushes, "interval", minutes=30, args=[bot, model_client],
               id="silence_pushes", replace_existing=True, misfire_grace_time=600)
     s.add_job(_send_journal_checkins, "cron", minute=0, args=[bot],
               id="journal_checkins", replace_existing=True, misfire_grace_time=300)

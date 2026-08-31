@@ -8711,7 +8711,7 @@ async def main():
             "bot command registration failed; continuing startup "
             "(error_type=%s)", type(exc).__name__)
     start_dashboard()
-    scheduler = setup_scheduler(bot)
+    scheduler = setup_scheduler(bot, client)
     scheduler.start()
     print("✅ X20 Bot started")
     # NOTE: no drop_pending_updates here. In aiogram 3.7 it is NOT a
