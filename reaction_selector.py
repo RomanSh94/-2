@@ -28,36 +28,47 @@ class ReactionCategory(str, Enum):
     GRATITUDE_OR_WARMTH = "GRATITUDE_OR_WARMTH"
     PROGRESS_OR_ACHIEVEMENT = "PROGRESS_OR_ACHIEVEMENT"
     PRACTICE_COMPLETED = "PRACTICE_COMPLETED"
+    GOOD_NEWS_OR_CELEBRATION = "GOOD_NEWS_OR_CELEBRATION"
     NONE = "NONE"
 
 
-# Ordered preferred -> fallback candidates, tried in order against a chat's
-# actual available_reactions. Several desired product reactions are not in
-# Telegram's current standard Bot API set. They remain semantic preferences,
-# but are sent only when the chat explicitly reports them as available; an
-# omitted available_reactions list is never treated as proof that an arbitrary
-# renderable emoji is a legal message reaction.
+# Emotional Reactions V1 -- owner-approved four-reaction product contract.
+# These are the ONLY visible Telegram reactions this module may ever emit.
+# A category not listed here (confusion, anger, gratitude, relief, fear/
+# shock) is still detectable by select_reaction_category -- kept as signal
+# infrastructure, not deleted -- but has NO visible mapping: pick_supported_
+# emoji always returns None for it rather than reusing an approved emoji
+# just to preserve old behavior.
+#
+# Exactly one candidate per category, not a fallback chain: if a chat
+# doesn't support the approved emoji, no reaction is sent -- an unrelated
+# emoji is never substituted (see pick_supported_emoji).
 REACTION_MAP: dict[ReactionCategory, tuple[str, ...]] = {
-    ReactionCategory.SADNESS_OR_DISAPPOINTMENT: ("🫂", "😔"),
-    ReactionCategory.TEARS_WELLING: ("🥹", "🫂"),
-    ReactionCategory.LONELINESS_OR_REJECTION: ("🫂", "🥹"),
-    ReactionCategory.ANXIETY_OR_WORRY: ("😟",),
-    ReactionCategory.FEAR_OR_SHOCK: ("😨",),
-    ReactionCategory.EXHAUSTION_OR_OVERWHELM: ("😮‍💨",),
+    # ❤️ general emotional support: sadness, loneliness, anxiety, tears,
+    # exhaustion/overwhelm when clearly personal.
+    ReactionCategory.SADNESS_OR_DISAPPOINTMENT: ("❤",),
+    ReactionCategory.TEARS_WELLING: ("❤",),
+    ReactionCategory.LONELINESS_OR_REJECTION: ("❤",),
+    ReactionCategory.ANXIETY_OR_WORRY: ("❤",),
+    ReactionCategory.EXHAUSTION_OR_OVERWHELM: ("❤",),
+    # 💔 explicit heartbreak/loss only -- breakup, bereavement, betrayal.
+    # Deliberately narrow and separate from ❤️: ordinary sadness, anxiety,
+    # loneliness or tiredness must never earn this reaction.
     ReactionCategory.HEARTBREAK_OR_LOSS: ("💔",),
-    ReactionCategory.CONFUSION_OR_UNCERTAINTY: ("🤔",),
-    ReactionCategory.ANGER_OR_FRUSTRATION: ("😤",),
-    ReactionCategory.RELIEF_OR_CALM: ("😌",),
-    ReactionCategory.GRATITUDE_OR_WARMTH: ("❤",),
-    ReactionCategory.PROGRESS_OR_ACHIEVEMENT: ("🔥", "🎉"),
-    ReactionCategory.PRACTICE_COMPLETED: ("👍",),
+    # 🤗 effort / coping / progress -- encouragement, not celebration.
+    ReactionCategory.PROGRESS_OR_ACHIEVEMENT: ("🤗",),
+    ReactionCategory.PRACTICE_COMPLETED: ("🤗",),
+    # 🎉 explicit positive outcome / good news worth celebrating.
+    ReactionCategory.GOOD_NEWS_OR_CELEBRATION: ("🎉",),
 }
 
 # Relevant intersection between REACTION_MAP and the standard reaction values
 # documented by the installed aiogram ReactionTypeEmoji transport. This list
 # is used only when Telegram omits available_reactions (meaning all standard
-# reactions are allowed). Explicit chat lists remain authoritative.
-_STANDARD_MAPPED_REACTIONS = frozenset(("😨", "💔", "🤔", "❤", "🔥", "🎉", "👍"))
+# reactions are allowed). Explicit chat lists remain authoritative. Owner
+# confirmed all four approved emoji are present in Telegram's actual
+# reaction picker.
+_STANDARD_MAPPED_REACTIONS = frozenset(("❤", "💔", "🤗", "🎉"))
 
 # Risk categories that must NEVER receive a decorative reaction, regardless
 # of confidence or flag state — a crisis/acute-danger message is handled by
@@ -69,9 +80,18 @@ _NEVER_REACT_RISK_CATEGORIES = {"suicide", "self_harm"}
 # unambiguous phrases each) — this is not a sentiment-analysis system.
 _KEYWORDS: dict[str, dict[ReactionCategory, tuple[str, ...]]] = {
     "ru": {
+        # Bare "умер"/"умерла"/"развод" are deliberately NOT keywords here:
+        # they match a stranger's death or a general conversation about
+        # divorce just as readily as the user's own loss, and 💔 must stay
+        # narrow to a clear personal event. Each phrase below explicitly
+        # marks the loss as the user's own (a first-person frame, "мой"/
+        # "моя", or "близкий мне").
         ReactionCategory.HEARTBREAK_OR_LOSS: (
-            "расстались", "бросил меня", "бросила меня", "потеряла его",
-            "потерял её", "умер", "умерла", "развод", "рассталась", "расстался",
+            "расстались", "бросил меня", "бросила меня", "меня бросил",
+            "меня бросила", "потеряла его", "потерял её", "рассталась",
+            "расстался", "у меня умер", "у меня умерла", "умер мой",
+            "умерла моя", "умер близкий мне", "умерла близкая мне",
+            "мы разводимся", "я развожусь", "мой развод",
         ),
         ReactionCategory.FEAR_OR_SHOCK: (
             "испугал", "испугалась", "испугался", "очень страшно", "в шоке",
@@ -129,11 +149,27 @@ _KEYWORDS: dict[str, dict[ReactionCategory, tuple[str, ...]]] = {
             "я смогла", "маленькая победа", "сделал первый шаг",
             "сделала первый шаг",
         ),
+        # Narrow and explicit on purpose: a bare "получилось" is ambiguous
+        # between an effort/coping win (-> 🤗, see PROGRESS_OR_ACHIEVEMENT
+        # above -- e.g. "получилось не сорваться") and a major good-news
+        # event, so it is deliberately NOT a keyword here. Only unambiguous,
+        # explicit good-news phrasing earns 🎉.
+        ReactionCategory.GOOD_NEWS_OR_CELEBRATION: (
+            "сдал экзамен", "сдала экзамен", "взяли на работу", "помирились",
+        ),
     },
     "en": {
+        # Bare "passed away"/"she died"/"he died"/"divorce" are deliberately
+        # NOT keywords here: they match a stranger's death or a general
+        # conversation about divorce just as readily as the user's own loss.
+        # Each phrase below marks the loss as the user's own -- a first-
+        # person frame ("me") or an event noun with no third-person subject
+        # ("divorce" alone, without "she"/"he"/a named relation).
         ReactionCategory.HEARTBREAK_OR_LOSS: (
-            "broke up with me", "left me", "passed away", "she died", "he died",
-            "divorce", "lost her", "lost him",
+            "broke up with me", "left me", "lost her", "lost him",
+            "someone close to me died", "someone close to me passed away",
+            "we are getting divorced", "we're getting divorced",
+            "i am getting divorced", "i'm getting divorced", "my divorce",
         ),
         ReactionCategory.FEAR_OR_SHOCK: (
             "scared me", "so scared", "terrified", "so shocked",
@@ -155,6 +191,10 @@ _KEYWORDS: dict[str, dict[ReactionCategory, tuple[str, ...]]] = {
         ),
         ReactionCategory.CONFUSION_OR_UNCERTAINTY: (
             "don't know what to do", "so confused", "i don't understand any of this",
+        ),
+        ReactionCategory.GOOD_NEWS_OR_CELEBRATION: (
+            "passed my exam", "passed the exam", "got the job", "got hired",
+            "we made up", "we reconciled",
         ),
     },
 }
