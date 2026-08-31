@@ -95,7 +95,7 @@ def test_registered_botcommand_descriptions_have_no_brand_name(monkeypatch):
     monkeypatch.setattr(bot, "dp", FakeDispatcher())
     monkeypatch.setattr(bot, "init_db", fake_init_db)
     monkeypatch.setattr(bot, "start_dashboard", lambda: None)
-    monkeypatch.setattr(bot, "setup_scheduler", lambda scheduler_bot: FakeScheduler())
+    monkeypatch.setattr(bot, "setup_scheduler", lambda scheduler_bot, model_client: FakeScheduler())
 
     asyncio.run(bot.main())
 

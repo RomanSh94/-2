@@ -189,8 +189,8 @@ def test_command_registration_failure_does_not_block_startup(monkeypatch, caplog
                         lambda: events.append(("dashboard", None)))
     monkeypatch.setattr(
         bot, "setup_scheduler",
-        lambda scheduler_bot: (
-            events.append(("scheduler-setup", scheduler_bot)) or FakeScheduler()))
+        lambda scheduler_bot, model_client: (
+            events.append(("scheduler-setup", scheduler_bot, model_client)) or FakeScheduler()))
 
     with caplog.at_level("WARNING"):
         run(bot.main())
@@ -199,7 +199,10 @@ def test_command_registration_failure_does_not_block_startup(monkeypatch, caplog
         ("init-db", None),
         ("commands", ["start", "help"]),
         ("dashboard", None),
-        ("scheduler-setup", fake_bot),
+        # Pins the real production wiring: setup_scheduler now receives the
+        # exact same OpenAI client bot.py already uses elsewhere (Contextual
+        # Re-engagement Push V1), not a second/different client instance.
+        ("scheduler-setup", fake_bot, bot.client),
         ("scheduler-start", None),
         ("polling", fake_bot),
     ]
@@ -235,7 +238,7 @@ def test_visible_command_list_is_trimmed_to_start_and_help(monkeypatch):
     monkeypatch.setattr(bot, "dp", FakeDispatcher())
     monkeypatch.setattr(bot, "init_db", fake_init_db)
     monkeypatch.setattr(bot, "start_dashboard", lambda: None)
-    monkeypatch.setattr(bot, "setup_scheduler", lambda scheduler_bot: FakeScheduler())
+    monkeypatch.setattr(bot, "setup_scheduler", lambda scheduler_bot, model_client: FakeScheduler())
 
     run(bot.main())
 

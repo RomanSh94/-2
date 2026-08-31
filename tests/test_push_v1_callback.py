@@ -156,6 +156,10 @@ def _common(monkeypatch, tmp_db):
     # override bot.client themselves (see test_push_contextual_continue.py).
     monkeypatch.setattr(bot, "client", _FakeOpenAIClient(
         raise_exc=RuntimeError("simulated provider failure -- no real network call")))
+    monkeypatch.setattr(
+        scheduler, "_generate_contextual_push_text",
+        _async("В прошлый раз ты говорил, что работа выматывает. Стало ли сейчас легче?"),
+    )
     return stub
 
 

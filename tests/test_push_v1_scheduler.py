@@ -36,8 +36,18 @@ import database
 import onboarding_content
 import prompts
 import scheduler
+import push_contextual_reengagement as reengagement
 
 run = asyncio.run
+
+_TEST_CONTEXTUAL_PUSH_RU = (
+    "В прошлый раз ты писал: «Работа сильно выматывает меня каждый день.» — "
+    "хочешь вернуться к этой теме?"
+)
+_TEST_CONTEXTUAL_PUSH_EN = (
+    "Last time you wrote: “Work has been exhausting every day.” — "
+    "would you like to return to this topic?"
+)
 
 
 class FakeUser:
@@ -102,6 +112,9 @@ def _common(monkeypatch, tmp_db):
     # suppression guard is process-local and must not leak state across
     # tests.
     monkeypatch.setattr(scheduler, "_unrecorded_send_uids", set())
+    async def _contextual_copy(_uid, lang, _anchor_turn_id, _model_client):
+        return _TEST_CONTEXTUAL_PUSH_EN if lang == "en" else _TEST_CONTEXTUAL_PUSH_RU
+    monkeypatch.setattr(scheduler, "_generate_contextual_push_text", _contextual_copy)
     return tmp_db
 
 
@@ -127,23 +140,24 @@ async def _seed_inactive_user_with_anchor(uid, days_inactive=2, lang="ru"):
     await _seed_conversation_anchor(uid)
 
 
-def test_ru_push_copy_is_exact_and_deterministic():
-    assert prompts.get_push_v1_text("ru") == (
-        "Как ты после нашего разговора?\n"
-        "Если захочешь, можем продолжить с того места или переключиться на что-то другое."
-    )
+def test_contextual_ru_fixture_satisfies_preview_contract():
+    assert reengagement.parse_and_render_selection(
+        '{"turn_ref":"U0"}',
+        {"U0": "Работа сильно выматывает меня каждый день."},
+        "ru",
+    ) == _TEST_CONTEXTUAL_PUSH_RU
 
 
-def test_en_push_copy_is_natural_equivalent():
-    text = prompts.get_push_v1_text("en")
-    assert "since we talked" in text
-    assert "pick up where we left off" in text
-    assert "switch to something else" in text
+def test_contextual_en_fixture_satisfies_preview_contract():
+    assert reengagement.parse_and_render_selection(
+        '{"turn_ref":"U0"}',
+        {"U0": "Work has been exhausting every day."},
+        "en",
+    ) == _TEST_CONTEXTUAL_PUSH_EN
 
 
-def test_push_v1_text_has_no_randomness():
-    # Deterministic per product contract -- unlike the old tier-random copy.
-    assert prompts.get_push_v1_text("ru") == prompts.get_push_v1_text("ru")
+def test_contextual_fixture_is_not_the_old_neutral_fallback():
+    assert _TEST_CONTEXTUAL_PUSH_RU != prompts.get_push_v1_text("ru")
 
 
 def test_owner_1_is_a_valid_push_candidate_and_gets_the_push():
@@ -156,7 +170,7 @@ def test_owner_1_is_a_valid_push_candidate_and_gets_the_push():
     assert len(bot.sent) == 1
     uid, text = bot.sent[0]
     assert uid == 1
-    assert text == prompts.PUSH_V1_TEXT_RU
+    assert text == _TEST_CONTEXTUAL_PUSH_RU
 
 
 def test_exactly_two_buttons_continue_and_new_topic():

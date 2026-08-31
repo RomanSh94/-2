@@ -298,6 +298,21 @@ def test_valid_push_v1_button_tap_resets_consecutive_unanswered(monkeypatch):
     import scheduler
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", False)
 
+    async def _fake_contextual_push(uid, lang, anchor_turn_id, model_client):
+        # This test is about ActivityTouchMiddleware + the real push
+        # binding/callback/consumption path, not contextual grounding or
+        # generation -- that contract is independently covered by
+        # tests/test_push_contextual_reengagement.py and
+        # tests/test_push_v1_scheduler.py. A deterministic stub here lets
+        # _send_silence_pushes produce a real, bindable Push without a real
+        # (or fake) OpenAI client and without reintroducing the retired
+        # neutral fallback text.
+        return (
+            "В прошлый раз ты писал: «Работа сильно выматывает меня каждый день.» "
+            "— хочешь вернуться к этой теме?"
+        )
+    monkeypatch.setattr(scheduler, "_generate_contextual_push_text", _fake_contextual_push)
+
     async def run():
         await _seed_stale_user()
         await database.save_message(
