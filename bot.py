@@ -8684,7 +8684,7 @@ async def cb_journals_hub(callback: CallbackQuery, state: FSMContext = None):
 def _results_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=("🧪 Тесты" if lang == "ru" else "🧪 Tests"),
+            text=("🧪 Результаты теста" if lang == "ru" else "🧪 Tests"),
             callback_data="results:tests")],
         [InlineKeyboardButton(
             text=("📊 Отчёт дневника" if lang == "ru" else "📊 Diary report"),

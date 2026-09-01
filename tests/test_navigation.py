@@ -483,7 +483,7 @@ def test_results_hub_exact_ru_text_and_buttons():
     kb = kw["reply_markup"]
     rows = [[(b.text, b.callback_data) for b in row] for row in kb.inline_keyboard]
     assert rows == [
-        [("🧪 Тесты", "results:tests")],
+        [("🧪 Результаты теста", "results:tests")],
         [("📊 Отчёт дневника", "results:report"), ("🧭 Самонаблюдения", "results:profile")],
         [("⬅️ В меню", "menu:back")],
     ]
