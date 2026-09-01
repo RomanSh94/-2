@@ -931,6 +931,49 @@ def test_generic_discuss_gate_independent_of_dass_flag():
 
 
 # ── back to result (q:r) — DASS-aware, read-only ─────────────────────────────
+def test_completed_questionnaire_history_query_is_scoped_filtered_and_newest_first(flow):
+    older = asyncio.run(database.start_questionnaire_session(OWNER, QID, "1"))
+    asyncio.run(database.complete_questionnaire_session(older))
+    newer = asyncio.run(database.start_questionnaire_session(OWNER, QID, "1"))
+    asyncio.run(database.complete_questionnaire_session(newer))
+    active = asyncio.run(database.start_questionnaire_session(OWNER, QID, "1"))
+    cancelled = asyncio.run(database.start_questionnaire_session(OWNER, QID, "1"))
+    asyncio.run(database.cancel_questionnaire_session(cancelled))
+    other_user = asyncio.run(database.start_questionnaire_session(INVITED, QID, "1"))
+    asyncio.run(database.complete_questionnaire_session(other_user))
+
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    con.execute("UPDATE questionnaire_sessions SET completed_at=? WHERE id=?",
+                ("2026-08-01 10:00:00", older))
+    con.execute("UPDATE questionnaire_sessions SET completed_at=? WHERE id=?",
+                ("2026-08-02 10:00:00", newer))
+    con.commit()
+    con.close()
+
+    rows = asyncio.run(database.get_completed_questionnaire_sessions(OWNER))
+    assert [row["id"] for row in rows] == [newer, older]
+    assert all(set(row) == {"id", "questionnaire_id", "questionnaire_version", "completed_at"}
+               for row in rows)
+    assert active not in [row["id"] for row in rows]
+    assert cancelled not in [row["id"] for row in rows]
+    assert other_user not in [row["id"] for row in rows]
+
+
+def test_results_history_dass_attempt_routes_to_existing_read_only_result(flow):
+    session_id, _ = _complete_dass(OWNER, answer="a1")
+    before = asyncio.run(database.get_questionnaire_session(session_id))
+
+    history = _press(bot.cb_results_tests, OWNER, "results:tests")
+    labels_by_data = {cd: text for text, cd in _buttons(history.answers[-1][1])}
+    assert labels_by_data[f"q:r:{session_id}"].startswith("DASS-21 · ")
+
+    result = _press(bot.cb_questionnaire_result, OWNER, f"q:r:{session_id}")
+    assert "Депрессия: 14" in result.answers[-1][0]
+    after = asyncio.run(database.get_questionnaire_session(session_id))
+    assert after == before
+
+
 def test_back_to_result_owner_succeeds_no_mutation(flow):
     session_id, _ = _complete_dass(OWNER, answer="a1")
     before = asyncio.run(database.get_questionnaire_session(session_id))

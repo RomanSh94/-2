@@ -167,12 +167,23 @@ def results_hub_text(lang: str = "ru") -> str:
     if lang == "ru":
         return (
             "📊 Мои результаты\n\n"
-            "Здесь можно посмотреть отчёт по дневнику и свои наблюдения за состоянием."
+            "Здесь можно посмотреть результаты тестов, отчёт по дневнику "
+            "и свои наблюдения за состоянием."
         )
     return (
         "📊 My results\n\n"
-        "Here you can see your diary report and your self-observations."
+        "Here you can see your test results, diary report, and self-observations."
     )
+
+
+def questionnaire_history_text(has_attempts: bool, lang: str = "ru") -> str:
+    if lang == "ru":
+        return ("🧪 Тесты\n\nВыберите завершённый тест:"
+                if has_attempts else
+                "🧪 Тесты\n\nЗавершённых тестов пока нет.")
+    return ("🧪 Tests\n\nChoose a completed test:"
+            if has_attempts else
+            "🧪 Tests\n\nThere are no completed tests yet.")
 
 
 def about_hub_text(lang: str = "ru") -> str:
