@@ -247,6 +247,15 @@ def cancelled_text(lang: str = "ru") -> str:
     return "Questionnaire stopped."
 
 
+def paused_text(lang: str = "ru") -> str:
+    # Owner-review UX correction: the LIVE question card transforms into
+    # this paused-state card in place (see bot.py's cb_questionnaire_pause)
+    # -- it must not require the user to type any command to continue.
+    if lang == "ru":
+        return "⏸ Прогресс сохранён.\n\nМожно продолжить в любой момент."
+    return "⏸ Progress saved.\n\nYou can continue at any time."
+
+
 # ── PR B — gated result/calculations/explanation screens ────────────────────
 # Everything below is dormant unless config.QUESTIONNAIRE_INTERPRETATION_ENABLED
 # is true AND the definition passes the eligibility check in bot.py (synthetic
@@ -363,11 +372,20 @@ def explanation_text(scale_explanation_main: str, lang: str = "ru") -> str:
 
 def specialist_report_text(title: str, completed_at: str | None,
                             answer_lines: list[str],
-                            score_line: str | None, lang: str = "ru") -> str:
+                            score_line: str | None, lang: str = "ru",
+                            subscale_lines: list[str] | None = None) -> str:
+    """`subscale_lines` is optional, pre-formatted "Label: value" lines (e.g.
+    DASS-21's Депрессия/Тревога/Стресс) computed by the caller through its
+    own validated scoring path -- this function only places them, it never
+    computes or labels anything itself. Prepended right after the title/date,
+    ahead of the raw answers, since it is the clinically relevant summary."""
     if lang == "ru":
         parts = [f"📄 Отчёт для специалиста\n\n{title}"]
         if completed_at:
             parts.append(f"Дата завершения: {completed_at}")
+        if subscale_lines:
+            parts.append("")
+            parts.extend(subscale_lines)
         parts.append("")
         parts.append("Ответы:")
         parts.extend(answer_lines)
@@ -382,6 +400,9 @@ def specialist_report_text(title: str, completed_at: str | None,
     parts = [f"📄 Specialist report\n\n{title}"]
     if completed_at:
         parts.append(f"Completed: {completed_at}")
+    if subscale_lines:
+        parts.append("")
+        parts.extend(subscale_lines)
     parts.append("")
     parts.append("Answers:")
     parts.extend(answer_lines)

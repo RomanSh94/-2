@@ -6496,8 +6496,15 @@ async def cmd_journal_delete(message: Message, state: FSMContext):
 #   q:s:<qid>              start
 #   q:a:<sid>:<step>:<aid> answer
 #   q:b:<sid>              back
-#   q:p:<sid>              pause/continue later
-#   q:x:<sid>              cancel
+#   q:p:<sid>              pause/continue later (the ONLY exit action exposed
+#                          in the live question keyboard as of the owner-
+#                          review UX correction below)
+#   q:x:<sid>              cancel -- destructive; no longer exposed as a
+#                          standalone user-facing button, but kept registered
+#                          (a pre-deploy client may still show a cached old
+#                          keyboard) and reused internally by q:n's restart
+#   q:n:<sid>              explicit restart: cancel this session, start a
+#                          fresh one for the SAME questionnaire at step 0
 # item_id is NEVER embedded in callback_data -- the current item is derived
 # from session.current_index (aliased here as "step"), read fresh from the
 # DB on every callback.
@@ -6587,11 +6594,14 @@ def _compact_button_token(value) -> str | None:
 
 
 def _questionnaire_nav_row(session_id: int, lang: str) -> list:
+    # Owner-review UX correction: the visible exit action is now the existing
+    # state-preserving pause path (q:p), not the destructive cancel (q:x) --
+    # current_index and all recorded answers survive; see cb_questionnaire_pause.
     return [
         InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
                              callback_data=f"q:b:{session_id}"),
-        InlineKeyboardButton(text=("✖️ Прервать" if lang == "ru" else "✖️ Cancel"),
-                             callback_data=f"q:x:{session_id}"),
+        InlineKeyboardButton(text=("⏸ Продолжить позже" if lang == "ru" else "⏸ Continue later"),
+                             callback_data=f"q:p:{session_id}"),
     ]
 
 
@@ -6620,12 +6630,7 @@ def _questionnaire_item_keyboard(definition: dict, session_id: int, step: int, i
         rows = [[InlineKeyboardButton(text=opt["label"],
                                       callback_data=f"q:a:{session_id}:{step}:{opt['id']}")]
                 for opt in item["options"]]
-    rows.append([
-        InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
-                             callback_data=f"q:b:{session_id}"),
-        InlineKeyboardButton(text=("✖️ Прервать" if lang == "ru" else "✖️ Cancel"),
-                             callback_data=f"q:x:{session_id}"),
-    ])
+    rows.append(_questionnaire_nav_row(session_id, lang))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -6682,7 +6687,28 @@ def _catalog_info_keyboard(category_id: str, lang: str,
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _questionnaire_detail_keyboard(qid: str, lang: str) -> InlineKeyboardMarkup:
+def _questionnaire_detail_keyboard(qid: str, lang: str, *, active_session: dict | None = None,
+                                   total_items: int | None = None) -> InlineKeyboardMarkup:
+    """`active_session` is the caller's OWN compatible (same id+version) active
+    session, if any -- see _compatible_active_session. When present, the
+    detail screen must not misleadingly offer only "Начать": it offers
+    Continue (routes to the existing q:s resume path, unchanged) and the one
+    intentional destructive reset, q:n. Session ids are never rendered as
+    text, only embedded in callback_data like every other questionnaire
+    button."""
+    if active_session is not None:
+        current = active_session["current_index"] + 1
+        total = total_items if total_items is not None else "?"
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=(f"▶️ Продолжить — вопрос {current} из {total}" if lang == "ru"
+                      else f"▶️ Continue -- question {current} of {total}"),
+                callback_data=f"q:s:{qid}")],
+            [InlineKeyboardButton(text=("🔄 Начать заново" if lang == "ru" else "🔄 Start over"),
+                                  callback_data=f"q:n:{active_session['id']}")],
+            [InlineKeyboardButton(text=("⬅️ К списку" if lang == "ru" else "⬅️ To the list"),
+                                  callback_data="q:l")],
+        ])
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=("▶️ Начать" if lang == "ru" else "▶️ Start"),
                               callback_data=f"q:s:{qid}")],
@@ -6692,17 +6718,18 @@ def _questionnaire_detail_keyboard(qid: str, lang: str) -> InlineKeyboardMarkup:
 
 
 def _questionnaire_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
-    # PR C1.1: added the specialist-report button (q:o:<sid>) as its own row,
-    # ahead of the navigation buttons -- this is the flag-off/ineligible path,
-    # where the report still renders (all answers, no score line; see q:o's
-    # own conditional-score-line logic in cb_questionnaire_specialist_report).
+    # Owner-review UX correction: a completed result is a historical artifact
+    # (it must stay visible in chat), so "another questionnaire" no longer
+    # routes to q:l -- q:l edits callback.message in place via _edit_or_
+    # answer, which would silently overwrite this very card. q:t (below)
+    # sends the SAME catalog as a brand-new message instead. "🏠 В меню"
+    # is dropped too: menu:back renders the Help card, which is not what a
+    # questionnaire completion screen's home button should mean.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=("🧾 Отчёт специалисту" if lang == "ru" else "🧾 Specialist report"),
+        [InlineKeyboardButton(text=("🧾 Отчёт для специалиста" if lang == "ru" else "🧾 Specialist report"),
                               callback_data=f"q:o:{session_id}")],
-        [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
-                              callback_data="q:l")],
-        [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
-                              callback_data="menu:back")],
+        [InlineKeyboardButton(text=("🧠 Другой тест" if lang == "ru" else "🧠 Another test"),
+                              callback_data="q:t")],
     ])
 
 
@@ -6711,21 +6738,19 @@ def _dass21_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMar
     # keyboard, plus the discuss-result row (q:m:<sid>), gated entirely by
     # config.DASS21_DISCUSSION_ENABLED at the _send_dass21_result call site
     # (default off -- the plain _questionnaire_completion_keyboard is used
-    # instead, byte-for-byte unchanged from before this PR).
-    rows = [
-        [InlineKeyboardButton(text=("🧾 Отчёт специалисту" if lang == "ru" else "🧾 Specialist report"),
-                              callback_data=f"q:o:{session_id}")],
-    ]
+    # instead). Owner-review UX correction: same q:t/no-menu:back treatment
+    # as _questionnaire_completion_keyboard, see its comment above.
+    rows = []
     if access_control.DEPLOYMENT_MODE != "public":
         rows.append([InlineKeyboardButton(
             text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss the result"),
             callback_data=f"q:m:{session_id}")])
-    rows.extend([
-        [InlineKeyboardButton(text=("⬅️ Другой опросник" if lang == "ru" else "⬅️ Another questionnaire"),
-                              callback_data="q:l")],
-        [InlineKeyboardButton(text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
-                              callback_data="menu:back")],
-    ])
+    rows.append([InlineKeyboardButton(
+        text=("🧾 Отчёт для специалиста" if lang == "ru" else "🧾 Specialist report"),
+        callback_data=f"q:o:{session_id}")])
+    rows.append([InlineKeyboardButton(
+        text=("🧠 Другой тест" if lang == "ru" else "🧠 Another test"),
+        callback_data="q:t")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -6990,6 +7015,19 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
     await send(text, reply_markup=keyboard)
 
 
+async def _compatible_active_session(uid: int, definition: dict) -> dict | None:
+    """The caller's own active session for this EXACT definition id+version,
+    or None. Same compatibility rule cb_questionnaire_start already uses to
+    decide resume-vs-refuse; shared here so every detail-screen entry point
+    (cmd_dass21, cb_questionnaire_detail) offers Continue/Start-over
+    identically instead of re-deriving the rule."""
+    active = await get_active_questionnaire_session(uid)
+    if (active and active["questionnaire_id"] == definition["id"]
+            and active["questionnaire_version"] == definition["version"]):
+        return active
+    return None
+
+
 @dp.message(Command("dass21"))
 async def cmd_dass21(message: Message):
     """PR #55 — owner-only entry to the exact DASS-21 flow. Routes to the
@@ -7010,8 +7048,11 @@ async def cmd_dass21(message: Message):
             or not registry.combined_can_start(qid, _load_catalog_document())):
         await message.answer(questionnaire_ux.not_available_text(lang))
         return
+    active_session = await _compatible_active_session(uid, definition)
     await message.answer(questionnaire_ux.detail_text(definition, lang),
-                         reply_markup=_questionnaire_detail_keyboard(qid, lang))
+                         reply_markup=_questionnaire_detail_keyboard(
+                             qid, lang, active_session=active_session,
+                             total_items=len(definition.get("items", []))))
 
 
 @dp.message(Command("questionnaire"))
@@ -7038,6 +7079,29 @@ async def cb_questionnaire_list(callback: CallbackQuery, state: FSMContext = Non
         await _clear_active_journal_if_leaving(state)
     catalog = await _available_questionnaire_catalog(uid)
     await _edit_or_answer(callback.message)(
+        questionnaire_ux.list_text(lang),
+        reply_markup=_questionnaire_list_keyboard(lang, catalog))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "q:t")
+async def cb_questionnaire_another(callback: CallbackQuery, state: FSMContext = None):
+    """"Другой тест" from a COMPLETED result/report card. Deliberately does
+    NOT reuse q:l's behavior of editing callback.message in place -- that
+    would silently overwrite/destroy the very completion card this button is
+    attached to. Sends the identical catalog content, through the identical
+    gates and business logic as q:l (_questionnaire_gate,
+    _available_questionnaire_catalog, _questionnaire_list_keyboard), as a
+    brand-new message instead, so the completed result stays in chat
+    history untouched."""
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    if state is not None:
+        await _clear_active_journal_if_leaving(state)
+    catalog = await _available_questionnaire_catalog(uid)
+    await callback.message.answer(
         questionnaire_ux.list_text(lang),
         reply_markup=_questionnaire_list_keyboard(lang, catalog))
     await callback.answer()
@@ -7140,9 +7204,12 @@ async def cb_questionnaire_detail(callback: CallbackQuery):
         await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
+    active_session = await _compatible_active_session(uid, definition)
     await _edit_or_answer(callback.message)(
         questionnaire_ux.detail_text(definition, lang),
-        reply_markup=_questionnaire_detail_keyboard(qid, lang))
+        reply_markup=_questionnaire_detail_keyboard(
+            qid, lang, active_session=active_session,
+            total_items=len(definition.get("items", []))))
     await callback.answer()
 
 
@@ -7332,11 +7399,31 @@ async def cb_questionnaire_back(callback: CallbackQuery):
     await callback.answer()
 
 
+def _questionnaire_paused_keyboard(qid: str, session_id: int, lang: str) -> InlineKeyboardMarkup:
+    # "Продолжить" reuses q:s:<qid> UNCHANGED -- cb_questionnaire_start
+    # already resumes from get_active_questionnaire_session(uid) when a
+    # compatible active session exists, so pausing doesn't need (and must
+    # not invent) a second resume mechanism. "Прервать" reuses q:x:<sid>
+    # UNCHANGED -- the ONLY place q:x is still user-reachable, since the
+    # live question card no longer offers it (see _questionnaire_nav_row).
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("▶️ Продолжить" if lang == "ru" else "▶️ Continue"),
+                              callback_data=f"q:s:{qid}")],
+        [InlineKeyboardButton(text=("✖️ Прервать" if lang == "ru" else "✖️ Cancel"),
+                              callback_data=f"q:x:{session_id}")],
+    ])
+
+
 @dp.callback_query(F.data.startswith("q:p:"))
 async def cb_questionnaire_pause(callback: CallbackQuery):
     """Pause / continue later: no-op on session state (current_index already
-    persists the resume point on every answer) -- just acknowledges and shows
-    a neutral confirmation, without ending the session like cancel does."""
+    persists the resume point on every answer) -- transforms the LIVE
+    question card in place into a paused-state card via the shared
+    _edit_or_answer path, the SAME edit-with-fallback mechanism every other
+    questionnaire screen already uses (its own docstring documents the exact
+    narrow-TelegramBadRequest-then-new-message contract; not reimplemented
+    here). Never requires the user to type a command -- the paused card's
+    own buttons are the only continue/cancel path."""
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(callback, uid, lang):
@@ -7352,9 +7439,10 @@ async def cb_questionnaire_pause(callback: CallbackQuery):
         await callback.answer()
         return
 
-    await callback.message.answer(
-        "Опрос сохранён, можно продолжить позже через /questionnaire." if lang == "ru"
-        else "Progress saved -- continue later with /questionnaire.")
+    await _edit_or_answer(callback.message)(
+        questionnaire_ux.paused_text(lang),
+        reply_markup=_questionnaire_paused_keyboard(
+            session["questionnaire_id"], session_id, lang))
     await callback.answer()
 
 
@@ -7381,6 +7469,61 @@ async def cb_questionnaire_cancel(callback: CallbackQuery):
     except Exception:
         pass
     await callback.message.answer(questionnaire_ux.cancelled_text(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:n:"))
+async def cb_questionnaire_restart(callback: CallbackQuery):
+    """Начать заново -- the ONE intentional destructive reset of an
+    unfinished questionnaire (owner-review UX correction). Re-runs exactly
+    the same access/clinical/DASS gates cb_questionnaire_start uses to begin
+    a session, so a restart can never create a session the ordinary start
+    path itself would refuse. The gate check happens BEFORE the existing
+    session is cancelled -- a failed gate leaves the original session
+    untouched (active, same current_index), never destroyed for nothing.
+
+    Only after that does it reuse cancel_questionnaire_session (same
+    function q:x uses) on the caller's OWN session, then start_questionnaire_
+    session for a fresh one at step 0. Old-session ownership isolation falls
+    out of reusing these exact primitives -- once cancelled, the old
+    session_id fails _load_owned_active_session's status=='active' check, so
+    any stale q:a/q:b/q:p/q:x/q:n callback still carrying it is a silent
+    no-op, same as any other superseded session today."""
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+
+    session = await _load_owned_active_session(session_id, uid)
+    if session is None:
+        await callback.answer()
+        return
+
+    qid = session["questionnaire_id"]
+    registry = _load_registry_fresh()
+    manifest_document = _load_catalog_document()
+    if not registry.combined_can_start(qid, manifest_document):
+        await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    if await _dass21_blocked(qid, uid):
+        await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    definition = registry.get(qid)
+
+    await cancel_questionnaire_session(session_id)
+    new_session_id = await start_questionnaire_session(uid, definition["id"], definition["version"])
+    # The immediate re-render below (_edit_or_answer -> edit_text) replaces
+    # this card's text AND keyboard together -- no separate best-effort
+    # edit_reply_markup(None) needed first; see _edit_or_answer's own narrow
+    # TelegramBadRequest-then-fallback contract, unchanged.
+    await _send_questionnaire_step(_edit_or_answer(callback.message), definition, new_session_id, 0, lang)
     await callback.answer()
 
 
@@ -7647,10 +7790,30 @@ async def cb_questionnaire_specialist_report(callback: CallbackQuery):
         except questionnaires.ScoringError:
             score_line = None
 
+    # Owner-review UX correction: DASS-21 doesn't use the generic sum-score
+    # path above (is_result_eligible always rejects the real definition by
+    # design), so its report had no numeric summary at all. Reuse the SAME
+    # validated, freshly-authorized recompute the result/discuss screens use
+    # -- never a second scoring algorithm, never persisted. On any failure
+    # (auth revoked, integrity broken, not actually completed yet) this is
+    # simply None and the report renders exactly as it does today (answers
+    # only) -- not a new failure mode, no partial/guessed numbers.
+    subscale_lines = None
+    if dass21_runtime.is_dass21_definition_id(session["questionnaire_id"]):
+        dass_result = await _dass21_recompute_result_or_none(session)
+        if dass_result is not None:
+            dep = dass_result.subscales["depression"]
+            anx = dass_result.subscales["anxiety"]
+            stress = dass_result.subscales["stress"]
+            subscale_lines = (
+                [f"Депрессия: {dep}", f"Тревога: {anx}", f"Стресс: {stress}"] if lang == "ru"
+                else [f"Depression: {dep}", f"Anxiety: {anx}", f"Stress: {stress}"])
+
     completed_at = session.get("completed_at") if isinstance(session, dict) else None
 
     report = questionnaire_ux.specialist_report_text(
-        definition["title"], completed_at, answer_lines, score_line, lang)
+        definition["title"], completed_at, answer_lines, score_line, lang,
+        subscale_lines=subscale_lines)
     await callback.message.answer(report)
     await callback.answer()
 
@@ -7709,6 +7872,12 @@ def _dass21_discuss_menu_keyboard(session_id: int, lang: str) -> InlineKeyboardM
     # "Why did this come out this way?" button, none of these imply the
     # questionnaire result ESTABLISHES a cause (see questionnaire_ux.
     # dass21_discuss_topic_prompt's non-causal boundary instruction).
+    #
+    # Owner-review UX correction: "🏠 В меню" is deliberately NOT a row here
+    # -- menu:back renders the Help card, not a questionnaire "home", and the
+    # persistent lower menu is already always visible/reachable. Only this
+    # DASS menu is touched; _discuss_menu_keyboard (generic, below) is
+    # unchanged/out of scope.
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text=("📊 Что измеряют эти шкалы?" if lang == "ru" else "📊 What do these scales measure?"),
@@ -7726,9 +7895,6 @@ def _dass21_discuss_menu_keyboard(session_id: int, lang: str) -> InlineKeyboardM
         [InlineKeyboardButton(
             text=("⬅️ Назад к результату" if lang == "ru" else "⬅️ Back to result"),
             callback_data=f"q:r:{session_id}")],
-        [InlineKeyboardButton(
-            text=("🏠 В меню" if lang == "ru" else "🏠 To the menu"),
-            callback_data="menu:back")],
     ])
 
 

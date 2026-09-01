@@ -3,6 +3,7 @@ tmp sqlite DB. Uses ONLY the synthetic shape fixture as the private file — no
 real item wording appears anywhere in tracked files."""
 import asyncio
 import hashlib
+import inspect
 import json
 import pathlib
 import shutil
@@ -238,6 +239,108 @@ def test_cancel_remains_available_when_gate_fails(flow, monkeypatch):
     monkeypatch.setattr(config, "DASS21_ENABLED", False)
     msg = _press(bot.cb_questionnaire_cancel, 1, f"q:x:{session_id}")
     assert msg.answers[-1][0] == questionnaire_ux.cancelled_text("ru")
+
+
+# ── owner-review UX correction: restart re-runs the same fresh DASS
+# integrity/authorization gates cb_questionnaire_start itself uses ──────────
+def test_restart_revalidates_dass_integrity_before_destroying_session(flow, monkeypatch):
+    _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _sessions_for(1)[0][0]
+    _press(bot.cb_questionnaire_answer, 1, f"q:a:{session_id}:0:a0")
+    monkeypatch.setattr(config, "DASS21_DEFINITION_SHA256", "0" * 64)
+
+    msg = _press(bot.cb_questionnaire_restart, 1, f"q:n:{session_id}")
+    assert msg.answers[-1][0] == questionnaire_ux.not_available_text("ru")
+    # gate failed BEFORE the destructive cancel: original session untouched.
+    row = _sessions_for(1)[0]
+    assert row[1] == "active" and row[2] == 1
+    assert len(_sessions_for(1)) == 1   # no fresh session was created either
+
+
+def _complete_dass_flow(user, msg):
+    _press(bot.cb_questionnaire_start, user.id, f"q:s:{QID}")
+    session_id = _sessions_for(user.id)[0][0]
+    for step in range(21):
+        asyncio.run(bot.cb_questionnaire_answer(
+            FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a1")))
+    return session_id
+
+
+def test_completed_dass_result_keyboard_with_discussion_enabled(flow, monkeypatch):
+    monkeypatch.setattr(config, "DASS21_DISCUSSION_ENABLED", True)
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = _complete_dass_flow(user, msg)
+
+    _, kw = msg.answers[-1]
+    buttons = [(b.text, b.callback_data) for row in kw["reply_markup"].inline_keyboard for b in row]
+    # Owner-review UX correction: exact order/shape, no "🏠 В меню".
+    assert buttons == [
+        ("💬 Обсудить результат", f"q:m:{session_id}"),
+        ("🧾 Отчёт для специалиста", f"q:o:{session_id}"),
+        ("🧠 Другой тест", "q:t"),
+    ]
+    assert not any("В меню" in text for text, _ in buttons)
+
+
+def test_another_test_opens_catalog_as_new_message_not_edit(flow):
+    # Structural guarantee: q:t must never route through _edit_or_answer,
+    # which edits callback.message in place -- exactly the mechanism that
+    # would overwrite a completed result/report card.
+    src = inspect.getsource(bot.cb_questionnaire_another)
+    assert "_edit_or_answer" not in src
+    assert "callback.message.answer(" in src
+
+
+def test_another_test_does_not_overwrite_completed_result(flow):
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    _complete_dass_flow(user, msg)
+    result_text = msg.answers[-1][0]
+
+    asyncio.run(bot.cb_questionnaire_another(FakeCallback(user, msg, data="q:t")))
+
+    assert msg.answers[-2][0] == result_text                        # untouched
+    assert msg.answers[-1][0] == questionnaire_ux.list_text("ru")   # a NEW entry
+
+
+def test_specialist_report_includes_dass_subscale_values_and_answers(flow):
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = _complete_dass_flow(user, msg)
+
+    report_msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_specialist_report(
+        FakeCallback(user, report_msg, data=f"q:o:{session_id}")))
+    text = report_msg.answers[-1][0]
+
+    # Same validated recompute the result screen uses: 21 answers of value 1
+    # -> each subscale 7 * 1 * 2 = 14 (see
+    # test_owner_full_flow_completes_with_three_subscale_values).
+    assert "Депрессия: 14" in text
+    assert "Тревога: 14" in text
+    assert "Стресс: 14" in text
+    assert "Ответы:" in text
+    assert "не диагноз" in text
+
+
+def test_specialist_report_omits_subscales_when_dass_reauth_fails(flow, monkeypatch):
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = _complete_dass_flow(user, msg)
+
+    monkeypatch.setattr(config, "DASS21_DEFINITION_SHA256", "0" * 64)
+    report_msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_specialist_report(
+        FakeCallback(user, report_msg, data=f"q:o:{session_id}")))
+    text = report_msg.answers[-1][0]
+
+    # No fabricated/stale numbers when fresh integrity fails -- the report
+    # still renders (answers only), same degraded shape DASS already had
+    # before this PR; never blocked entirely, never guessed.
+    for banned in ("Депрессия:", "Тревога:", "Стресс:"):
+        assert banned not in text
+    assert "Ответы:" in text
 
 
 def test_gate_failure_at_completion_no_partial_result(flow, monkeypatch):
@@ -521,7 +624,10 @@ def test_dass21_completion_keyboard_missing_qm_button_tracked_gap(flow, monkeypa
     # What IS actually there: specialist report + navigation (PR A's
     # completion keyboard), proving this is the real, exercised path.
     assert f"q:o:{session_id}" in datas
-    assert "q:l" in datas and "menu:back" in datas
+    # Owner-review UX correction: "q:t" (send-catalog-as-new-message) replaced
+    # q:l/menu:back on the completion card.
+    assert "q:t" in datas
+    assert "q:l" not in datas and "menu:back" not in datas
     # Independent confirmation of WHY: the real DASS definition fails the
     # generic sum-score eligibility gate that q:m depends on.
     definition = json.loads(FIXTURE.read_text(encoding="utf-8"))
