@@ -69,6 +69,15 @@ class FakeMessage:
         pass
 
 
+class FakeEditableMessage(FakeMessage):
+    def __init__(self, user, text=""):
+        super().__init__(user, text)
+        self.edits = []
+
+    async def edit_text(self, text, **kw):
+        self.edits.append((text, kw))
+
+
 class FakeCallback:
     def __init__(self, user, message, data=""):
         self.from_user = user
@@ -192,10 +201,24 @@ def test_discuss_button_absent_when_flag_off(flow, monkeypatch):
 
 def test_discuss_button_present_when_flag_on(flow):
     session_id, msg = _complete_dass(OWNER)
+    assert _buttons(msg.answers[-1][1]) == [
+        ("💬 Обсудить результат", f"q:m:{session_id}"),
+        ("🧾 Отчёт для специалиста", f"q:o:{session_id}"),
+        ("🧠 Другой тест", "q:t"),
+    ]
+
+
+def test_public_mode_does_not_presentation_hide_authorized_discussion(flow, monkeypatch):
+    monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
+    monkeypatch.setattr(config, "DASS21_DISCUSSION_ENABLED", True)
+    decision = asyncio.run(dass21_access.authorize_dass21_user(INVITED))
+    assert decision.allowed
+
+    session_id, msg = _complete_dass(INVITED)
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
     assert f"q:m:{session_id}" in datas
-    labels_by_data = {cd: text for text, cd in _buttons(msg.answers[-1][1])}
-    assert labels_by_data[f"q:m:{session_id}"] == "💬 Обсудить результат"
+    menu = _press(bot.cb_questionnaire_discuss_menu, INVITED, f"q:m:{session_id}")
+    assert menu.answers[-1][0] == questionnaire_ux.discuss_menu_text("ru")
 
 
 def test_discuss_button_en_label(flow, monkeypatch):
@@ -960,18 +983,100 @@ def test_completed_questionnaire_history_query_is_scoped_filtered_and_newest_fir
     assert other_user not in [row["id"] for row in rows]
 
 
-def test_results_history_dass_attempt_routes_to_existing_read_only_result(flow):
-    session_id, _ = _complete_dass(OWNER, answer="a1")
-    before = asyncio.run(database.get_questionnaire_session(session_id))
+def test_results_history_browses_one_dynamic_card_and_pin_is_explicit(flow):
+    older_id, _ = _complete_dass(OWNER, answer="a1")
+    newer_id, _ = _complete_dass(OWNER, answer="a2")
+    session_before = {
+        sid: asyncio.run(database.get_questionnaire_session(sid))
+        for sid in (older_id, newer_id)
+    }
+    responses_before = {
+        sid: asyncio.run(database.get_questionnaire_responses(sid))
+        for sid in (older_id, newer_id)
+    }
 
-    history = _press(bot.cb_results_tests, OWNER, "results:tests")
-    labels_by_data = {cd: text for text, cd in _buttons(history.answers[-1][1])}
-    assert labels_by_data[f"q:r:{session_id}"].startswith("DASS-21 · ")
+    user = FakeUser(OWNER)
+    card = FakeEditableMessage(user)
+    asyncio.run(bot.cb_results_tests(FakeCallback(user, card, data="results:tests")))
+    assert card.answers == []
+    assert len(card.edits) == 1
+    assert card.edits[-1][0] == "🧪 Результаты тестов\n\nВыберите результат:"
+    history_buttons = _buttons(card.edits[-1][1])
+    history_datas = [callback_data for _, callback_data in history_buttons]
+    assert f"results:test:{newer_id}" in history_datas
+    assert f"results:test:{older_id}" in history_datas
+    assert not any(data.startswith("q:r:") for data in history_datas)
 
-    result = _press(bot.cb_questionnaire_result, OWNER, f"q:r:{session_id}")
-    assert "Депрессия: 14" in result.answers[-1][0]
-    after = asyncio.run(database.get_questionnaire_session(session_id))
-    assert after == before
+    asyncio.run(bot.cb_results_test(
+        FakeCallback(user, card, data=f"results:test:{older_id}")))
+    assert len(card.edits) == 2
+    assert card.answers == []
+    assert "Депрессия: 14" in card.edits[-1][0]
+    assert _buttons(card.edits[-1][1]) == [
+        ("💬 Обсудить результат", f"q:m:{older_id}"),
+        ("🧾 Отчёт для специалиста", f"q:o:{older_id}"),
+        ("📌 Оставить в чате", f"results:pin:{older_id}"),
+        ("⬅️ К результатам", "results:tests"),
+    ]
+
+    asyncio.run(bot.cb_results_test(
+        FakeCallback(user, card, data=f"results:test:{newer_id}")))
+    assert len(card.edits) == 3
+    assert card.answers == []
+    assert "Депрессия: 28" in card.edits[-1][0]
+
+    asyncio.run(bot.cb_results_tests(FakeCallback(user, card, data="results:tests")))
+    assert len(card.edits) == 4
+    assert card.edits[-1][0] == "🧪 Результаты тестов\n\nВыберите результат:"
+
+    asyncio.run(bot.cb_results_test(
+        FakeCallback(user, card, data=f"results:test:{older_id}")))
+    edits_before_pin = len(card.edits)
+    asyncio.run(bot.cb_results_pin(
+        FakeCallback(user, card, data=f"results:pin:{older_id}")))
+    assert len(card.edits) == edits_before_pin
+    assert len(card.answers) == 1
+    assert "Депрессия: 14" in card.answers[0][0]
+
+    for sid in (older_id, newer_id):
+        assert asyncio.run(database.get_questionnaire_session(sid)) == session_before[sid]
+        assert asyncio.run(database.get_questionnaire_responses(sid)) == responses_before[sid]
+
+
+@pytest.mark.parametrize("handler,prefix", [
+    (bot.cb_results_test, "results:test"),
+    (bot.cb_results_pin, "results:pin"),
+])
+def test_history_open_and_pin_require_owner_and_completed_session(flow, handler, prefix):
+    completed_id, _ = _complete_dass(OWNER, answer="a1")
+    active_id, _ = _complete_dass(OWNER, answer="a1", n=5)
+
+    attacker_card = FakeEditableMessage(FakeUser(INVITED))
+    asyncio.run(handler(FakeCallback(
+        attacker_card.from_user, attacker_card, data=f"{prefix}:{completed_id}")))
+    assert attacker_card.edits == []
+    assert attacker_card.answers == []
+
+    owner_card = FakeEditableMessage(FakeUser(OWNER))
+    asyncio.run(handler(FakeCallback(
+        owner_card.from_user, owner_card, data=f"{prefix}:{active_id}")))
+    assert owner_card.edits == []
+    assert owner_card.answers == []
+
+
+@pytest.mark.parametrize("handler,prefix", [
+    (bot.cb_results_test, "results:test"),
+    (bot.cb_results_pin, "results:pin"),
+])
+def test_history_open_and_pin_repeat_dass_access_validation(flow, handler, prefix):
+    session_id, _ = _complete_dass(INVITED, answer="a1")
+    asyncio.run(database.block_user_access(INVITED))
+
+    card = FakeEditableMessage(FakeUser(INVITED))
+    asyncio.run(handler(FakeCallback(
+        card.from_user, card, data=f"{prefix}:{session_id}")))
+    emitted = card.edits if handler is bot.cb_results_test else card.answers
+    assert emitted[-1][0] == questionnaire_ux.not_available_text("ru")
 
 
 def test_back_to_result_owner_succeeds_no_mutation(flow):

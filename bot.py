@@ -6601,7 +6601,7 @@ def _questionnaire_nav_row(session_id: int, lang: str) -> list:
     return [
         InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
                              callback_data=f"q:b:{session_id}"),
-        InlineKeyboardButton(text=("⏸ Продолжить позже" if lang == "ru" else "⏸ Continue later"),
+        InlineKeyboardButton(text=("⏸ Отложить" if lang == "ru" else "⏸ Continue later"),
                              callback_data=f"q:p:{session_id}"),
     ]
 
@@ -6741,11 +6741,9 @@ def _dass21_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMar
     # (default off -- the plain _questionnaire_completion_keyboard is used
     # instead). Owner-review UX correction: same q:t/no-menu:back treatment
     # as _questionnaire_completion_keyboard, see its comment above.
-    rows = []
-    if access_control.DEPLOYMENT_MODE != "public":
-        rows.append([InlineKeyboardButton(
-            text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss the result"),
-            callback_data=f"q:m:{session_id}")])
+    rows = [[InlineKeyboardButton(
+        text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss the result"),
+        callback_data=f"q:m:{session_id}")]]
     rows.append([InlineKeyboardButton(
         text=("🧾 Отчёт для специалиста" if lang == "ru" else "🧾 Specialist report"),
         callback_data=f"q:o:{session_id}")])
@@ -6903,7 +6901,8 @@ async def _dass21_recompute_result_or_none(session: dict):
         return None
 
 
-async def _send_dass21_back_to_result(send, session: dict, lang: str) -> None:
+async def _send_dass21_back_to_result(send, session: dict, lang: str,
+                                      *, reply_markup_override=None) -> None:
     """Workstream B — read-only DASS-21 "back to result" (q:r on an already-
     completed DASS-21 session). Recomputes the three subscales fresh through
     the SAME Dass21DiscussionAdapter the discuss flow uses (fresh
@@ -6915,9 +6914,11 @@ async def _send_dass21_back_to_result(send, session: dict, lang: str) -> None:
     if result is None:
         await send(questionnaire_ux.not_available_text(lang))
         return
-    keyboard = (_dass21_completion_keyboard(session["id"], lang)
-                if config.DASS21_DISCUSSION_ENABLED
-                else _questionnaire_completion_keyboard(session["id"], lang))
+    keyboard = reply_markup_override
+    if keyboard is None:
+        keyboard = (_dass21_completion_keyboard(session["id"], lang)
+                    if config.DASS21_DISCUSSION_ENABLED
+                    else _questionnaire_completion_keyboard(session["id"], lang))
     await send(questionnaire_ux.dass21_result_text(result.subscales, lang), reply_markup=keyboard)
 
 
@@ -8707,11 +8708,40 @@ def _results_tests_keyboard(sessions: list[dict], lang: str) -> InlineKeyboardMa
         date = completed_at[:10]
         label = f"DASS-21 · {date}" if date else "DASS-21"
         rows.append([InlineKeyboardButton(
-            text=label, callback_data=f"q:r:{session['id']}")])
+            text=label, callback_data=f"results:test:{session['id']}")])
     rows.append([InlineKeyboardButton(
         text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
         callback_data="results:hub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _results_history_result_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
+    rows = []
+    if config.DASS21_DISCUSSION_ENABLED:
+        rows.append([InlineKeyboardButton(
+            text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss the result"),
+            callback_data=f"q:m:{session_id}")])
+    rows.extend([
+        [InlineKeyboardButton(
+            text=("🧾 Отчёт для специалиста" if lang == "ru" else "🧾 Specialist report"),
+            callback_data=f"q:o:{session_id}")],
+        [InlineKeyboardButton(
+            text=("📌 Оставить в чате" if lang == "ru" else "📌 Leave in chat"),
+            callback_data=f"results:pin:{session_id}")],
+        [InlineKeyboardButton(
+            text=("⬅️ К результатам" if lang == "ru" else "⬅️ Back to results"),
+            callback_data="results:tests")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _load_owned_completed_history_dass(session_id: int, uid: int):
+    session = await _load_owned_session(session_id, uid)
+    if session is None or session.get("status") != "completed":
+        return None
+    if not dass21_runtime.is_dass21_definition_id(session["questionnaire_id"]):
+        return None
+    return session
 
 
 @dp.callback_query(F.data == "results:hub")
@@ -8745,6 +8775,46 @@ async def cb_results_tests(callback: CallbackQuery):
         navigation.questionnaire_history_text(bool(visible_sessions), lang),
         reply_markup=_results_tests_keyboard(visible_sessions, lang),
     )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("results:test:"))
+async def cb_results_test(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+    session = await _load_owned_completed_history_dass(session_id, uid)
+    if session is None:
+        await callback.answer()
+        return
+    await _send_dass21_back_to_result(
+        _edit_or_answer(callback.message), session, lang,
+        reply_markup_override=_results_history_result_keyboard(session_id, lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("results:pin:"))
+async def cb_results_pin(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+    session = await _load_owned_completed_history_dass(session_id, uid)
+    if session is None:
+        await callback.answer()
+        return
+    await _send_dass21_back_to_result(callback.message.answer, session, lang)
     await callback.answer()
 
 
