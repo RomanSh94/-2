@@ -178,9 +178,9 @@ def results_hub_text(lang: str = "ru") -> str:
 
 def questionnaire_history_text(has_attempts: bool, lang: str = "ru") -> str:
     if lang == "ru":
-        return ("🧪 Тесты\n\nВыберите завершённый тест:"
+        return ("🧪 Результаты тестов\n\nВыберите результат:"
                 if has_attempts else
-                "🧪 Тесты\n\nЗавершённых тестов пока нет.")
+                "🧪 Результаты тестов\n\nЗавершённых тестов пока нет.")
     return ("🧪 Tests\n\nChoose a completed test:"
             if has_attempts else
             "🧪 Tests\n\nThere are no completed tests yet.")

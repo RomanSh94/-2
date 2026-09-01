@@ -496,6 +496,7 @@ def test_results_tests_empty_history_is_safe(monkeypatch):
     cb = FakeCallback(user, msg, data="results:tests")
     asyncio.run(bot.cb_results_tests(cb))
     text, kw = msg.answers[-1]
+    assert text == "🧪 Результаты тестов\n\nЗавершённых тестов пока нет."
     assert text == navigation.questionnaire_history_text(False, "ru")
     datas = [b.callback_data for row in kw["reply_markup"].inline_keyboard for b in row]
     assert datas == ["results:hub"]

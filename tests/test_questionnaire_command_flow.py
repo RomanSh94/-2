@@ -139,17 +139,14 @@ def test_public_ordinary_user_reaches_questionnaire_core(monkeypatch):
     assert msg.answers[-1][0] == bot.questionnaire_ux.list_text("ru")
 
 
-def test_public_result_keyboard_hides_a1_discussion(monkeypatch):
+def test_public_generic_result_keyboard_hides_discussion(monkeypatch):
     monkeypatch.setattr(ac, "DEPLOYMENT_MODE", "public")
-    for keyboard in (
-            bot._questionnaire_result_keyboard(7, "ru"),
-            bot._dass21_completion_keyboard(7, "ru")):
-        callback_data = [
-            button.callback_data
-            for row in keyboard.inline_keyboard
-            for button in row
-        ]
-        assert "q:m:7" not in callback_data
+    callback_data = [
+        button.callback_data
+        for row in bot._questionnaire_result_keyboard(7, "ru").inline_keyboard
+        for button in row
+    ]
+    assert "q:m:7" not in callback_data
 
 
 # ── active-crisis gate ────────────────────────────────────────────────────────
@@ -632,11 +629,18 @@ def test_live_question_keyboard_has_back_and_pause_not_cancel():
     user = FakeUser(1)
     msg = FakeMessage(user)
     asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
     _, kw = msg.answers[-1]
-    datas = [b.callback_data for row in kw["reply_markup"].inline_keyboard for b in row]
+    buttons = [(b.text, b.callback_data)
+               for row in kw["reply_markup"].inline_keyboard for b in row]
+    datas = [callback_data for _, callback_data in buttons]
     assert any(d.startswith("q:b:") for d in datas)
     assert any(d.startswith("q:p:") for d in datas)
     assert not any(d.startswith("q:x:") for d in datas)
+    assert buttons[-2:] == [
+        ("⬅️ Назад", f"q:b:{session_id}"),
+        ("⏸ Отложить", f"q:p:{session_id}"),
+    ]
 
 
 def test_pause_produces_paused_card_with_continue_and_cancel():
