@@ -3654,6 +3654,18 @@ async def get_questionnaire_session(session_id: int) -> dict | None:
             "questionnaire_version": row[3], "status": row[4], "current_index": row[5]}
 
 
+async def get_completed_questionnaire_sessions(uid: int) -> list[dict]:
+    """Minimal owner-scoped history read for completed questionnaire attempts."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT id, questionnaire_id, questionnaire_version, completed_at "
+            "FROM questionnaire_sessions WHERE user_id=? AND status='completed' "
+            "ORDER BY completed_at DESC, id DESC", (uid,))
+        rows = await cur.fetchall()
+    return [{"id": r[0], "questionnaire_id": r[1],
+             "questionnaire_version": r[2], "completed_at": r[3]} for r in rows]
+
+
 async def record_questionnaire_response(uid: int, session_id: int, questionnaire_id: str,
                                         item_id: str, answer_id: str, answer_value: str) -> None:
     # Idempotent per (session_id, item_id): re-answering an item -- e.g. after

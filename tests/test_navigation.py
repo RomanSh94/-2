@@ -101,6 +101,7 @@ NAV_CALLBACKS = {
     "tests:hub": bot.cb_tests_hub,
     "journals:hub": bot.cb_journals_hub,
     "results:hub": bot.cb_results_hub,
+    "results:tests": bot.cb_results_tests,
     "settings:hub": bot.cb_settings_hub,
     "privacy:hub": bot.cb_privacy_hub,
     "about:hub": bot.cb_about_hub,
@@ -473,7 +474,8 @@ def test_results_hub_exact_ru_text_and_buttons():
     text, kw = msg.answers[-1]
     assert text == (
         "📊 Мои результаты\n\n"
-        "Здесь можно посмотреть отчёт по дневнику и свои наблюдения за состоянием.")
+        "Здесь можно посмотреть результаты тестов, отчёт по дневнику "
+        "и свои наблюдения за состоянием.")
     assert "/report" not in text
     assert "/profile" not in text
     assert "X20" not in text
@@ -481,9 +483,22 @@ def test_results_hub_exact_ru_text_and_buttons():
     kb = kw["reply_markup"]
     rows = [[(b.text, b.callback_data) for b in row] for row in kb.inline_keyboard]
     assert rows == [
+        [("🧪 Тесты", "results:tests")],
         [("📊 Отчёт дневника", "results:report"), ("🧭 Самонаблюдения", "results:profile")],
         [("⬅️ В меню", "menu:back")],
     ]
+
+
+def test_results_tests_empty_history_is_safe(monkeypatch):
+    monkeypatch.setattr(bot, "get_completed_questionnaire_sessions", _async([]))
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    cb = FakeCallback(user, msg, data="results:tests")
+    asyncio.run(bot.cb_results_tests(cb))
+    text, kw = msg.answers[-1]
+    assert text == navigation.questionnaire_history_text(False, "ru")
+    datas = [b.callback_data for row in kw["reply_markup"].inline_keyboard for b in row]
+    assert datas == ["results:hub"]
 
 
 def test_results_report_button_invokes_real_report_with_real_clicking_user(monkeypatch):

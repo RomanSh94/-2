@@ -137,7 +137,8 @@ from database import (
     log_crisis_delivery,
     get_tester_acknowledged, set_tester_acknowledged,
     start_questionnaire_session, get_active_questionnaire_session,
-    get_questionnaire_session, record_questionnaire_response,
+    get_questionnaire_session, get_completed_questionnaire_sessions,
+    record_questionnaire_response,
     advance_questionnaire_session, complete_questionnaire_session,
     cancel_questionnaire_session, get_questionnaire_responses,
     claim_dass21_discuss_reply, transition_dass21_discuss_claim,
@@ -8683,6 +8684,9 @@ async def cb_journals_hub(callback: CallbackQuery, state: FSMContext = None):
 def _results_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
+            text=("🧪 Тесты" if lang == "ru" else "🧪 Tests"),
+            callback_data="results:tests")],
+        [InlineKeyboardButton(
             text=("📊 Отчёт дневника" if lang == "ru" else "📊 Diary report"),
             callback_data="results:report"),
          InlineKeyboardButton(
@@ -8694,6 +8698,22 @@ def _results_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _results_tests_keyboard(sessions: list[dict], lang: str) -> InlineKeyboardMarkup:
+    rows = []
+    for session in sessions:
+        if not dass21_runtime.is_dass21_definition_id(session["questionnaire_id"]):
+            continue
+        completed_at = session.get("completed_at") or ""
+        date = completed_at[:10]
+        label = f"DASS-21 · {date}" if date else "DASS-21"
+        rows.append([InlineKeyboardButton(
+            text=label, callback_data=f"q:r:{session['id']}")])
+    rows.append([InlineKeyboardButton(
+        text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+        callback_data="results:hub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.callback_query(F.data == "results:hub")
 async def cb_results_hub(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
@@ -8703,6 +8723,28 @@ async def cb_results_hub(callback: CallbackQuery, state: FSMContext = None):
     if state is not None:
         await _clear_active_journal_if_leaving(state)
     await _answer_target(callback, navigation.results_hub_text(lang), reply_markup=_results_hub_keyboard(lang))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "results:tests")
+async def cb_results_tests(callback: CallbackQuery):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _nav_gate(callback, uid, lang):
+        return
+    try:
+        sessions = await get_completed_questionnaire_sessions(uid)
+    except aiosqlite.Error:
+        sessions = []
+    visible_sessions = [
+        session for session in sessions
+        if dass21_runtime.is_dass21_definition_id(session["questionnaire_id"])
+    ]
+    await _answer_target(
+        callback,
+        navigation.questionnaire_history_text(bool(visible_sessions), lang),
+        reply_markup=_results_tests_keyboard(visible_sessions, lang),
+    )
     await callback.answer()
 
 
