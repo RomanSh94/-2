@@ -130,6 +130,7 @@ def test_every_callback_format_is_at_most_64_bytes():
     step = 4
     formats = [
         "q:l",
+        "q:t",
         "q:c:anxiety",
         "q:d:demo_anxiety_v1",
         "q:s:demo_anxiety_v1",
@@ -137,6 +138,7 @@ def test_every_callback_format_is_at_most_64_bytes():
         f"q:b:{sid}",
         f"q:p:{sid}",
         f"q:x:{sid}",
+        f"q:n:{sid}",
     ]
     for fmt in formats:
         assert len(fmt.encode("utf-8")) <= 64, f"{fmt!r} exceeds 64 bytes"

@@ -396,8 +396,8 @@ _EXEMPT_COMMANDS = [
 _BLOCKED_CALLBACK_DATA = [
     "mood:0", "before:p1:s1:ru:5", "after:5", "quality:1",
     "profile:reset", "jhub:emotion", "jset:tz", "jtz:+3", "checkin:8",
-    "q:l", "q:c:stress", "q:i:demo", "q:d:demo", "q:s:demo", "q:a:1:0:a1",
-    "q:b:1", "q:p:1", "q:x:1", "q:r:1", "q:k:1", "q:e:1", "q:o:1",
+    "q:l", "q:t", "q:c:stress", "q:i:demo", "q:d:demo", "q:s:demo", "q:a:1:0:a1",
+    "q:b:1", "q:p:1", "q:x:1", "q:n:1", "q:r:1", "q:k:1", "q:e:1", "q:o:1",
     "q:m:1", "q:m:1:why",
     "tests:hub", "journals:hub", "results:hub", "about:hub", "menu:back",
     "emotion:map",

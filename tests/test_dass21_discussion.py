@@ -211,9 +211,11 @@ def test_discuss_menu_opens_for_completed_dass_session(flow):
     msg = _press(bot.cb_questionnaire_discuss_menu, OWNER, f"q:m:{session_id}")
     assert msg.answers[-1][0] == questionnaire_ux.discuss_menu_text("ru")
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
+    # Owner-review UX correction: "🏠 В меню"/menu:back removed from the DASS
+    # discuss menu (menu:back opens Help, not a questionnaire "home").
     assert datas == [f"q:m:{session_id}:measures", f"q:m:{session_id}:relate",
                       f"q:m:{session_id}:next", f"q:m:{session_id}:specialist",
-                      f"q:r:{session_id}", "menu:back"]
+                      f"q:r:{session_id}"]
 
 
 def test_discuss_menu_uses_dass_safe_labels_not_causal_generic_ones(flow):

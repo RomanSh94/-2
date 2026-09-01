@@ -412,7 +412,11 @@ def test_callback_format_unchanged(flow):
     datas = [cd for _, cd in _card_buttons(kw)]
     assert any(cd.startswith("q:a:") and cd.endswith(":a0") for cd in datas)
     assert any(cd.startswith("q:b:") for cd in datas)
-    assert any(cd.startswith("q:x:") for cd in datas)
+    # Owner-review UX correction: the live card's exit action is now the
+    # state-preserving pause (q:p), not the destructive cancel (q:x) --
+    # q:x stays registered for old cached keyboards, but is no longer rendered.
+    assert any(cd.startswith("q:p:") for cd in datas)
+    assert not any(cd.startswith("q:x:") for cd in datas)
     assert all(len(cd.encode("utf-8")) <= 64 for cd in datas)
 
 

@@ -115,8 +115,9 @@ def test_config_flag_defaults_false(monkeypatch):
     importlib.reload(config)  # restore for subsequent tests using real config
 
 
-# ── 2. flag-false completion is byte-identical to PR A ───────────────────────
-def test_flag_off_completion_is_byte_identical_to_pr_a():
+# ── 2. flag-false completion keyboard shape (owner-review UX correction: no
+# longer byte-identical to PR A -- q:l/menu:back replaced by q:t) ───────────
+def test_flag_off_completion_has_specialist_report_and_another_test_buttons():
     user = FakeUser(1)
     msg = FakeMessage(user)
     session_id = _complete_flow(user, msg)
@@ -126,7 +127,10 @@ def test_flag_off_completion_is_byte_identical_to_pr_a():
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
     # PR C1.1: completion keyboard now also carries the specialist-report
     # button (q:o:<sid>) ahead of the nav buttons -- was ["q:l", "menu:back"].
-    assert callback_datas == [f"q:o:{session_id}", "q:l", "menu:back"]
+    # Owner-review UX correction: "Другой опросник"/q:l + "🏠 В меню"/menu:back
+    # replaced by "🧠 Другой тест"/q:t (a completed card must not be
+    # overwritten by q:l's in-place edit, and menu:back opens Help).
+    assert callback_datas == [f"q:o:{session_id}", "q:t"]
     session = asyncio.run(database.get_questionnaire_session(session_id))
     assert session["status"] == "completed"
 
@@ -456,7 +460,10 @@ def test_intensity_label_only_four_values():
 
 
 # ── existing PR A tests / navigation / emotion-map untouched (smoke) ─────────
-def test_pr_a_completion_keyboard_unchanged_shape():
+# Owner-review UX correction: this completion keyboard is no longer
+# unchanged/byte-identical to PR A (q:l/menu:back -> q:t); name updated to
+# describe the CURRENT invariant instead of the obsolete PR-A one.
+def test_completion_keyboard_omits_q_l_and_menu_back():
     user = FakeUser(1)
     msg = FakeMessage(user)
     session_id = _complete_flow(user, msg)  # flag is False (autouse fixture default)
@@ -465,7 +472,9 @@ def test_pr_a_completion_keyboard_unchanged_shape():
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
     # PR C1.1: completion keyboard now also carries the specialist-report
     # button (q:o:<sid>) ahead of the nav buttons -- was ["q:l", "menu:back"].
-    assert callback_datas == [f"q:o:{session_id}", "q:l", "menu:back"]
+    # Owner-review UX correction: see test_flag_off_completion_is_byte_
+    # identical_to_pr_a above -- same q:t/no-menu:back shape.
+    assert callback_datas == [f"q:o:{session_id}", "q:t"]
 
 
 # ── PR C1.1 — specialist report button wired into result/completion keyboards

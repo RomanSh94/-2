@@ -362,7 +362,12 @@ def test_full_flow_reaches_completion_screen_with_no_score():
     assert session["status"] == "completed"
     kb = kw["reply_markup"]
     callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    assert "q:l" in callback_datas and "menu:back" in callback_datas
+    # Owner-review UX correction: "Другой опросник"/q:l and "🏠 В меню"/
+    # menu:back are gone from the completion card -- q:l edits in place
+    # (would overwrite this very card) and menu:back opens Help, not a
+    # questionnaire "home". q:t sends the catalog as a new message instead.
+    assert "q:t" in callback_datas
+    assert "q:l" not in callback_datas and "menu:back" not in callback_datas
 
 
 # ── session ownership ─────────────────────────────────────────────────────────
@@ -464,6 +469,317 @@ def test_cancel_clears_session():
     assert msg.answers[-1][0] == bot.questionnaire_ux.cancelled_text("ru")
 
 
+# ── owner-review UX correction: pause is state-preserving, restart is the
+# only intentional destructive reset ─────────────────────────────────────────
+
+async def _responses_for(session_id):
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    rows = con.execute(
+        "SELECT item_id, answer_id FROM questionnaire_responses WHERE session_id=? "
+        "ORDER BY item_id", (session_id,)).fetchall()
+    con.close()
+    return rows
+
+
+def test_pause_keeps_session_active_and_preserves_current_index():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:0:a1")))
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:1:a1")))
+
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+
+    session = asyncio.run(database.get_questionnaire_session(session_id))
+    assert session["status"] == "active"
+    assert session["current_index"] == 2
+    # Owner-review UX correction: pause transforms the card in place -- no
+    # "type /questionnaire" hint, no separate confirmation message.
+    assert msg.answers[-1][0] == bot.questionnaire_ux.paused_text("ru")
+    assert "/questionnaire" not in msg.answers[-1][0]
+
+
+def test_resume_after_pause_renders_question_n_not_one():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:0:a1")))
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:1:a1")))
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+
+    resume_msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, resume_msg, data="q:s:demo_anxiety_v1")))
+
+    text, _ = resume_msg.answers[-1]
+    assert "Вопрос 3 из 5" in text   # current_index==2 -> question 3, not 1
+    assert len(asyncio.run(_sessions_for(1))) == 1   # resumed, no duplicate session
+
+
+def test_answers_survive_pause_and_resume():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:0:a1")))
+    before = asyncio.run(_responses_for(session_id))
+
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+    asyncio.run(bot.cb_questionnaire_start(
+        FakeCallback(user, FakeMessage(user), data="q:s:demo_anxiety_v1")))
+
+    assert asyncio.run(_responses_for(session_id)) == before
+    assert len(before) == 1
+
+
+def test_back_revise_survives_pause_and_resume():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:0:a1")))
+    asyncio.run(bot.cb_questionnaire_back(FakeCallback(user, msg, data=f"q:b:{session_id}")))
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:0:a2")))
+
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+    asyncio.run(bot.cb_questionnaire_start(
+        FakeCallback(user, FakeMessage(user), data="q:s:demo_anxiety_v1")))
+
+    responses = asyncio.run(_responses_for(session_id))
+    assert len(responses) == 1     # revision replaced the prior answer, not duplicated
+    assert responses[0][1] == "a2"  # latest value wins, even across a pause/resume
+
+
+def test_detail_screen_offers_continue_and_restart_with_active_session():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:0:a1")))
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+
+    detail_msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_detail(FakeCallback(user, detail_msg, data="q:d:demo_anxiety_v1")))
+    text, kw = detail_msg.answers[-1]
+    kb = kw["reply_markup"]
+    button_texts = [b.text for row in kb.inline_keyboard for b in row]
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+
+    assert any("вопрос 2 из 5" in t.lower() for t in button_texts)
+    assert "q:s:demo_anxiety_v1" in datas   # Continue still routes through the existing resume path
+    assert f"q:n:{session_id}" in datas
+    assert "q:l" in datas
+    assert str(session_id) not in text
+    assert all(str(session_id) not in t for t in button_texts)
+
+
+def test_restart_creates_fresh_session_at_question_one():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    old_session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{old_session_id}:0:a1")))
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{old_session_id}:1:a1")))
+
+    restart_msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_restart(
+        FakeCallback(user, restart_msg, data=f"q:n:{old_session_id}")))
+
+    text, _ = restart_msg.answers[-1]
+    assert "Вопрос 1 из 5" in text
+
+    rows = asyncio.run(_sessions_for(1))
+    assert len(rows) == 2
+    old_row = next(r for r in rows if r[0] == old_session_id)
+    assert old_row[3] == "cancelled"
+    new_row = next(r for r in rows if r[0] != old_session_id)
+    assert new_row[3] == "active" and new_row[4] == 0
+    assert asyncio.run(_responses_for(new_row[0])) == []
+    assert len(asyncio.run(_responses_for(old_session_id))) == 2   # old answers untouched
+
+
+def test_old_session_callbacks_after_restart_do_not_mutate_new_session():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    old_session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{old_session_id}:0:a1")))
+
+    asyncio.run(bot.cb_questionnaire_restart(
+        FakeCallback(user, FakeMessage(user), data=f"q:n:{old_session_id}")))
+    new_session_id = next(r[0] for r in asyncio.run(_sessions_for(1)) if r[0] != old_session_id)
+
+    stale_msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_answer(
+        FakeCallback(user, stale_msg, data=f"q:a:{old_session_id}:0:a1")))
+    asyncio.run(bot.cb_questionnaire_back(
+        FakeCallback(user, stale_msg, data=f"q:b:{old_session_id}")))
+    asyncio.run(bot.cb_questionnaire_pause(
+        FakeCallback(user, stale_msg, data=f"q:p:{old_session_id}")))
+    asyncio.run(bot.cb_questionnaire_restart(
+        FakeCallback(user, stale_msg, data=f"q:n:{old_session_id}")))
+
+    new_session = asyncio.run(database.get_questionnaire_session(new_session_id))
+    assert new_session["current_index"] == 0
+    assert new_session["status"] == "active"
+    assert asyncio.run(_responses_for(new_session_id)) == []
+    assert len(asyncio.run(_sessions_for(1))) == 2   # no third session sneaked in
+
+
+def test_live_question_keyboard_has_back_and_pause_not_cancel():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    _, kw = msg.answers[-1]
+    datas = [b.callback_data for row in kw["reply_markup"].inline_keyboard for b in row]
+    assert any(d.startswith("q:b:") for d in datas)
+    assert any(d.startswith("q:p:") for d in datas)
+    assert not any(d.startswith("q:x:") for d in datas)
+
+
+def test_pause_produces_paused_card_with_continue_and_cancel():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+
+    text, kw = msg.answers[-1]
+    assert text == bot.questionnaire_ux.paused_text("ru")
+    buttons = [(b.text, b.callback_data) for row in kw["reply_markup"].inline_keyboard for b in row]
+    assert buttons == [
+        ("▶️ Продолжить", "q:s:demo_anxiety_v1"),
+        ("✖️ Прервать", f"q:x:{session_id}"),
+    ]
+
+
+def test_continue_button_on_paused_card_resumes_exact_saved_question():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:0:a1")))
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(user, msg, data=f"q:a:{session_id}:1:a1")))
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+    _, kw = msg.answers[-1]
+    continue_data = next(b.callback_data for row in kw["reply_markup"].inline_keyboard
+                          for b in row if b.text == "▶️ Продолжить")
+
+    # Tapping the paused card's own Continue button -- not a fresh /questionnaire.
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data=continue_data)))
+
+    text, _ = msg.answers[-1]
+    assert "Вопрос 3 из 5" in text   # current_index==2 -> question 3, not 1
+    assert len(asyncio.run(_sessions_for(1))) == 1   # still the one resumed session
+
+
+def test_cancel_button_on_paused_card_cancels_only_the_callers_session():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+    _, kw = msg.answers[-1]
+    cancel_data = next(b.callback_data for row in kw["reply_markup"].inline_keyboard
+                        for b in row if b.text == "✖️ Прервать")
+    assert cancel_data == f"q:x:{session_id}"
+
+    other = FakeUser(2)
+    other_msg = FakeMessage(other)
+    # personal_use mode (see _common) only grants OWNER_USER_ID (1) full
+    # access automatically; a second genuine user needs the same permanent
+    # invite grant real users get via cmd_start's deep-link handling.
+    asyncio.run(database.grant_user_access(2))
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(other, other_msg, data="q:s:demo_anxiety_v1")))
+    other_session_id = asyncio.run(_sessions_for(2))[0][0]
+
+    # Tapping the paused card's own Cancel button -- reuses q:x unchanged.
+    asyncio.run(bot.cb_questionnaire_cancel(FakeCallback(user, msg, data=cancel_data)))
+
+    assert asyncio.run(database.get_questionnaire_session(session_id))["status"] == "cancelled"
+    assert asyncio.run(database.get_questionnaire_session(other_session_id))["status"] == "active"
+
+
+def test_wrong_user_continue_button_never_resumes_someone_elses_session():
+    owner = FakeUser(1)
+    msg = FakeMessage(owner)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(owner, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+    asyncio.run(bot.cb_questionnaire_answer(FakeCallback(owner, msg, data=f"q:a:{session_id}:0:a1")))
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(owner, msg, data=f"q:p:{session_id}")))
+
+    # The paused card's "Продолжить" is q:s:<qid> -- an attacker who somehow
+    # sends the SAME callback_data can only ever resume THEIR OWN active
+    # session, never the owner's: q:s looks up the active session by the
+    # TAPPING user's id, never by a session id carried in callback_data.
+    attacker = FakeUser(999)
+    attacker_msg = FakeMessage(attacker)
+    # personal_use mode (see _common) only grants OWNER_USER_ID (1) full
+    # access automatically; the attacker needs the same permanent invite
+    # grant a real second user gets via cmd_start's deep-link handling --
+    # otherwise this test would pass for the wrong reason (blocked by the
+    # access gate rather than by session-ownership scoping, which is what
+    # this test exists to prove).
+    asyncio.run(database.grant_user_access(999))
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(attacker, attacker_msg, data="q:s:demo_anxiety_v1")))
+
+    attacker_rows = asyncio.run(_sessions_for(999))
+    assert len(attacker_rows) == 1
+    assert attacker_rows[0][0] != session_id
+    owner_session = asyncio.run(database.get_questionnaire_session(session_id))
+    assert owner_session["status"] == "active" and owner_session["current_index"] == 1
+
+
+def test_wrong_user_cannot_pause_or_restart_session():
+    owner = FakeUser(1)
+    msg = FakeMessage(owner)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(owner, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+
+    attacker = FakeUser(999)
+    attacker_msg = FakeMessage(attacker)
+    asyncio.run(bot.cb_questionnaire_pause(
+        FakeCallback(attacker, attacker_msg, data=f"q:p:{session_id}")))
+    asyncio.run(bot.cb_questionnaire_restart(
+        FakeCallback(attacker, attacker_msg, data=f"q:n:{session_id}")))
+
+    session = asyncio.run(database.get_questionnaire_session(session_id))
+    assert session["status"] == "active"
+    assert session["current_index"] == 0
+    assert len(asyncio.run(_sessions_for(1))) == 1   # untouched; no session created either
+
+
+def test_pause_edit_failure_falls_back_to_new_message_with_paused_card():
+    from aiogram.exceptions import TelegramBadRequest
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+
+    async def _raise_bad_request(text, **kw):
+        raise TelegramBadRequest(method=None, message="message can't be edited")
+    msg.edit_text = _raise_bad_request
+
+    asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+    assert msg.answers[-1][0] == bot.questionnaire_ux.paused_text("ru")
+
+
+def test_pause_edit_unexpected_error_is_not_swallowed():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_start(FakeCallback(user, msg, data="q:s:demo_anxiety_v1")))
+    session_id = asyncio.run(_sessions_for(1))[0][0]
+
+    async def _raise_runtime_error(text, **kw):
+        raise RuntimeError("boom")
+    msg.edit_text = _raise_runtime_error
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(bot.cb_questionnaire_pause(FakeCallback(user, msg, data=f"q:p:{session_id}")))
+
+
 # ── mid-session invalidation (continuous validity re-check) ──────────────────
 def test_answer_rejected_when_definition_invalidated_mid_session(monkeypatch):
     user = FakeUser(1)
@@ -532,5 +848,5 @@ def test_all_callback_formats_stay_under_64_bytes():
             assert btn.callback_data.encode("utf-8").__len__() <= 64
 
     session_id = asyncio.run(_sessions_for(1))[0][0]
-    for fmt in (f"q:b:{session_id}", f"q:p:{session_id}", f"q:x:{session_id}"):
+    for fmt in (f"q:b:{session_id}", f"q:p:{session_id}", f"q:x:{session_id}", f"q:n:{session_id}"):
         assert len(fmt.encode("utf-8")) <= 64
