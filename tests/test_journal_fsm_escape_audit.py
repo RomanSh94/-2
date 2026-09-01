@@ -211,6 +211,7 @@ def test_lower_menu_results_uses_the_real_results_hub_keyboard():
     buttons = [(b.text, b.callback_data)
                for row in kw["reply_markup"].inline_keyboard for b in row]
     assert buttons == [
+        ("🧪 Тесты", "results:tests"),
         ("📊 Отчёт дневника", "results:report"),
         ("🧭 Самонаблюдения", "results:profile"),
         ("⬅️ В меню", "menu:back"),
