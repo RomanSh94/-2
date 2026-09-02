@@ -60,6 +60,25 @@ class FakeCallback:
         self.answered += 1
 
 
+class FakeState:
+    def __init__(self):
+        self.current = "sentinel"
+        self.data = {"sentinel": True}
+
+    async def set_state(self, value):
+        self.current = value
+
+    async def update_data(self, **values):
+        self.data.update(values)
+
+    async def get_state(self):
+        return self.current
+
+    async def clear(self):
+        self.current = None
+        self.data = {}
+
+
 def _async(value=None):
     async def _f(*a, **kw):
         return value
@@ -395,15 +414,43 @@ def test_discuss_influence_is_content_ful_and_names_session(monkeypatch):
         assert placeholder not in inf.human_readable.lower()
 
 
-# ── 12. no FSM state introduced for this feature ──────────────────────────────
-def test_discuss_no_fsm_state_added():
-    import inspect as _inspect
-    src = _inspect.getsource(bot)
-    # InterventionStates is the ONLY existing StatesGroup in bot.py; discuss
-    # code must not add a new one.
-    discuss_src = src.split("# ── PR C2 — discuss-with-bot")[1].split("# ── Navigation Hub")[0]
-    assert "StatesGroup" not in discuss_src
-    assert "FSMContext" not in discuss_src
+# ── 12. generic discussion remains stateless ─────────────────────────────────
+def test_generic_discuss_does_not_touch_dass_fsm_state():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = _complete_flow(user, msg)
+    state = FakeState()
+    asyncio.run(bot.cb_questionnaire_discuss_menu(
+        FakeCallback(user, msg, data=f"q:m:{session_id}"), state))
+    assert state.current == "sentinel"
+    assert state.data == {"sentinel": True}
+
+
+def test_generic_result_clears_active_dass_discussion():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = _complete_flow(user, msg)
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": 999}
+    asyncio.run(bot.cb_questionnaire_result(
+        FakeCallback(user, msg, data=f"q:r:{session_id}"), state))
+    assert state.current is None
+    assert state.data == {}
+
+
+def test_generic_discuss_clears_active_dass_discussion():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    session_id = _complete_flow(user, msg)
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": 999}
+    asyncio.run(bot.cb_questionnaire_discuss_menu(
+        FakeCallback(user, msg, data=f"q:m:{session_id}"), state))
+    assert state.current is None
+    assert state.data == {}
+    assert msg.answers[-1][0] == questionnaire_ux.discuss_menu_text("ru")
 
 
 # ── 13. PR C2.1: button now present on the result keyboard (flag ON +

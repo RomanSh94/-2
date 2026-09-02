@@ -194,10 +194,10 @@ def test_owner_full_flow_completes_with_three_subscale_values(flow):
     text = msg.answers[-1][0]
     # 21 answers of value 1 -> each subscale 7 * 1 * 2 = 14
     assert "DASS-21" in text
-    assert "Депрессия: 14" in text
-    assert "Тревога: 14" in text
-    assert "Стресс: 14" in text
-    assert "не диагноз" in text
+    assert "Депрессия — 14" in text
+    assert "Тревога — 14" in text
+    assert "Стресс — 14" in text
+    assert "не является диагнозом" in text
     # no overall total / severity wording
     for banned in ("Итог", "Общий", "норма", "лёгк", "умерен", "тяжёл"):
         assert banned not in text
@@ -276,9 +276,8 @@ def test_completed_dass_result_keyboard_with_discussion_enabled(flow, monkeypatc
     buttons = [(b.text, b.callback_data) for row in kw["reply_markup"].inline_keyboard for b in row]
     # Owner-review UX correction: exact order/shape, no "🏠 В меню".
     assert buttons == [
-        ("💬 Обсудить результат", f"q:m:{session_id}"),
+        ("💬 Разобрать результат", f"q:m:{session_id}"),
         ("🧾 Отчёт для специалиста", f"q:o:{session_id}"),
-        ("🧠 Другой тест", "q:t"),
     ]
     assert not any("В меню" in text for text, _ in buttons)
 
@@ -395,7 +394,7 @@ def test_no_score_persisted(flow):
     for step in range(21):
         asyncio.run(bot.cb_questionnaire_answer(
             FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a3")))
-    assert "Депрессия: 42" in msg.answers[-1][0]
+    assert "Депрессия — 42" in msg.answers[-1][0]
     # Only the 21 raw responses exist -- no computed score anywhere in the DB.
     import sqlite3
     con = sqlite3.connect(database.DB)
@@ -486,7 +485,7 @@ def test_successful_result_marks_session_completed_once(flow):
     for step in range(21):
         asyncio.run(bot.cb_questionnaire_answer(
             FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a0")))
-    assert "Депрессия: 0" in msg.answers[-1][0]
+    assert "Депрессия — 0" in msg.answers[-1][0]
     session = asyncio.run(database.get_questionnaire_session(session_id))
     assert session["status"] == "completed"
 
@@ -516,7 +515,7 @@ def test_owner_recovers_result_after_transient_failure(flow, monkeypatch):
     msg2 = _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
     assert "21" in msg2.answers[-1][0]  # back on the last question
     msg3 = _press(bot.cb_questionnaire_answer, 1, f"q:a:{session_id}:20:a0")
-    assert "Депрессия: 0" in msg3.answers[-1][0]
+    assert "Депрессия — 0" in msg3.answers[-1][0]
     assert asyncio.run(
         database.get_questionnaire_session(session_id))["status"] == "completed"
 
@@ -550,8 +549,8 @@ def test_back_then_revise_answer_does_not_duplicate_and_completes(flow):
     assert len({r["item_id"] for r in rows}) == 21        # one per item
     # step 2 == dass21_03 (a depression item); revised a1 (=1) -> depression 1*2=2
     text = msg.answers[-1][0]
-    assert "Депрессия: 2" in text
-    assert "Тревога: 0" in text and "Стресс: 0" in text
+    assert "Депрессия — 2" in text
+    assert "Тревога — 0" in text and "Стресс — 0" in text
 
 
 def test_answer_same_item_twice_keeps_latest_value(flow):
@@ -621,13 +620,9 @@ def test_dass21_completion_keyboard_missing_qm_button_tracked_gap(flow, monkeypa
     assert kb is not None
     datas = [b.callback_data for row in kb.inline_keyboard for b in row]
     assert f"q:m:{session_id}" not in datas
-    # What IS actually there: specialist report + navigation (PR A's
-    # completion keyboard), proving this is the real, exercised path.
-    assert f"q:o:{session_id}" in datas
-    # Owner-review UX correction: "q:t" (send-catalog-as-new-message) replaced
-    # q:l/menu:back on the completion card.
-    assert "q:t" in datas
-    assert "q:l" not in datas and "menu:back" not in datas
+    # DASS-specific completion remains useful without discussion, while the
+    # old generic "another test" route is no longer exposed here.
+    assert datas == [f"q:o:{session_id}"]
     # Independent confirmation of WHY: the real DASS definition fails the
     # generic sum-score eligibility gate that q:m depends on.
     definition = json.loads(FIXTURE.read_text(encoding="utf-8"))
