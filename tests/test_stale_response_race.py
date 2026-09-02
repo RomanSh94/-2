@@ -49,6 +49,10 @@ class FakeMessage:
 class FakeFSM:
     def __init__(self):
         self._d = {}
+        self._state = None
+
+    async def get_state(self):
+        return self._state
 
     async def get_data(self):
         return dict(self._d)
@@ -57,7 +61,11 @@ class FakeFSM:
         self._d.update(kw)
 
     async def set_state(self, state):
-        pass
+        self._state = getattr(state, "state", state)
+
+    async def clear(self):
+        self._state = None
+        self._d.clear()
 
 
 def _async(value=None):

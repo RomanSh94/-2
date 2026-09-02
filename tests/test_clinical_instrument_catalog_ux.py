@@ -327,7 +327,8 @@ def test_root_uses_exact_public_beta_categories_and_hides_empty_ones():
         ("adhd_attention", "СДВГ и внимание", "ADHD and attention"),
         ("other", "Другие тесты", "Other tests"),
     ]
-    assert datas == ["menu:back"]
+    assert datas == []
+    assert "menu:back" not in datas
     assert "Сон" not in text
 
 
@@ -339,12 +340,14 @@ def test_catalog_never_shows_bare_empty_category_dead_end(monkeypatch):
     msg = FakeMessage(user)
     cb = FakeCallback(user, msg, data="q:c:anxiety")
     # catalog_instruments_by_category on an empty doc -> no instruments; the
-    # handler must still attach navigation, never a dead end.
+    # stale category callback returns to the fresh root, never a dead end.
     asyncio.run(bot.cb_questionnaire_category(cb))
     text, kw = msg.answers[-1]
+    assert text == questionnaire_ux.list_text("ru")
     assert "нет доступных опросников" not in text   # old dead-end string gone
     datas = [d for _, d in _buttons(kw)]
-    assert datas == ["menu:back"]
+    assert datas == []
+    assert "menu:back" not in datas
 
 
 def test_catalog_buttons_one_per_row():
@@ -575,7 +578,8 @@ def test_no_second_reachable_questionnaire_category_source():
     msg = FakeMessage(user)
     asyncio.run(bot.cb_questionnaire_list(FakeCallback(user, msg, data="q:l")))
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
-    assert datas == ["menu:back"]
+    assert datas == []
+    assert "menu:back" not in datas
 
 
 # ── §4.2 catalog_start_definition_id is the single combined gate ──────────────

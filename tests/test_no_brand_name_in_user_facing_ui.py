@@ -126,7 +126,10 @@ def test_questionnaire_root_uses_new_wording():
 
 # ── Test Group F: every currently reachable result screen keeps its
 # non-diagnostic disclaimer ──────────────────────────────────────────────────
-@pytest.mark.parametrize("lang,phrase", [("ru", "а не диагноз"), ("en", "not a diagnosis")])
+@pytest.mark.parametrize("lang,phrase", [
+    ("ru", "Результат не является диагнозом."),
+    ("en", "The result is not a diagnosis."),
+])
 def test_dass21_result_screen_keeps_disclaimer(lang, phrase):
     subscales = {"depression": 4, "anxiety": 3, "stress": 5}
     assert phrase in questionnaire_ux.dass21_result_text(subscales, lang)

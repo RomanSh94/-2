@@ -420,7 +420,7 @@ def test_invited_back_replace_keeps_one_row_and_result_uses_replacement(flow):
             FakeCallback(user, msg, data=f"q:a:{sid}:{step}:a0")))
     text = msg.answers[-1][0]
     # item 1 (dass21_01) is a Stress item; replacement 1 -> Стресс 1*2=2
-    assert "Стресс: 2" in text and "Депрессия: 0" in text and "Тревога: 0" in text
+    assert "Стресс — 2" in text and "Депрессия — 0" in text and "Тревога — 0" in text
     import sqlite3
     con = sqlite3.connect(database.DB)
     n, dist = con.execute(
@@ -454,8 +454,8 @@ def test_invited_result_has_no_llm_total_or_severity(flow):
         asyncio.run(bot.cb_questionnaire_answer(
             FakeCallback(user, msg, data=f"q:a:{sid}:{step}:a3")))
     text = msg.answers[-1][0]
-    assert "Депрессия: 42" in text and "Тревога: 42" in text and "Стресс: 42" in text
-    assert "не диагноз" in text
+    assert "Депрессия — 42" in text and "Тревога — 42" in text and "Стресс — 42" in text
+    assert "Результат не является диагнозом." in text
     for banned in ("Итог", "Общий", "норма", "лёгк", "умерен", "тяжёл"):
         assert banned not in text
 
