@@ -239,6 +239,7 @@ import dass21_runtime
 import dass21_access
 import dass21_scorer
 import gad7_core
+import gad7_ux
 import discussion_adapters
 import aiosqlite
 import navigation
@@ -7059,7 +7060,7 @@ async def _send_gad7_result(send, definition: dict, session_id: int, lang: str) 
         score = int(result.raw_total)
         await complete_questionnaire_session(session_id)
         await send(
-            questionnaire_ux.gad7_result_text(
+            gad7_ux.result_text(
                 score, gad7_core.band_label_ru(score), lang),
             reply_markup=_questionnaire_completion_keyboard(session_id, lang))
     except Exception:
@@ -7093,7 +7094,7 @@ async def _send_gad7_historical_result(send, session: dict, lang: str,
     _definition, result = reconstructed
     score = int(result.raw_total)
     await send(
-        questionnaire_ux.gad7_result_text(
+        gad7_ux.result_text(
             score, gad7_core.band_label_ru(score), lang),
         reply_markup=(reply_markup
                       if reply_markup is not None
@@ -7187,7 +7188,7 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
         return
     total = len(definition.get("items", []))
     if gad7_core.is_gad7_definition(definition):
-        text = questionnaire_ux.gad7_question_text(
+        text = gad7_ux.question_text(
             step, total, item["text"], item.get("options", []), lang)
     else:
         text = questionnaire_ux.question_text(step, total, item["text"], lang,
@@ -7197,7 +7198,7 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
         # Deterministic safe fallback (never a silent truncation of the
         # protected wording): drop the in-card legend and show the FULL labels
         # on the buttons instead -- the pre-#57 layout.
-        text = (questionnaire_ux.gad7_question_text(
+        text = (gad7_ux.question_text(
                     step, total, item["text"], [], lang)
                 if gad7_core.is_gad7_definition(definition)
                 else questionnaire_ux.question_text(step, total, item["text"], lang))
@@ -7397,7 +7398,7 @@ async def cb_questionnaire_detail(callback: CallbackQuery, state: FSMContext = N
         await callback.answer()
         return
     active_session = await _compatible_active_session(uid, definition)
-    detail = (questionnaire_ux.gad7_detail_text(lang)
+    detail = (gad7_ux.detail_text(lang)
               if gad7_core.is_gad7_definition(definition)
               else questionnaire_ux.detail_text(definition, lang))
     await _edit_or_answer(callback.message)(

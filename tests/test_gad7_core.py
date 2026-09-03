@@ -13,6 +13,7 @@ import clinical_scoring
 import config
 import database
 import gad7_core
+import gad7_ux
 import questionnaires
 import questionnaire_ux
 
@@ -206,7 +207,7 @@ def test_incomplete_and_invalid_responses_fail_closed(flow):
 
 def test_detail_and_question_use_exact_single_card_contract(flow):
     detail = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
-    assert detail.edits[-1][0] == questionnaire_ux.gad7_detail_text("ru")
+    assert detail.edits[-1][0] == gad7_ux.detail_text("ru")
     assert _buttons(detail.edits[-1]) == [
         ("Начать", f"q:s:{QID}"), ("← К тестам", "q:l")]
 
@@ -259,15 +260,15 @@ def test_completion_replaces_card_has_no_discussion_and_no_score_crisis(flow, mo
     session = asyncio.run(database.get_questionnaire_session(session_id))
     assert session["status"] == "completed"
     assert message.answers == []
-    assert message.edits[-1][0] == questionnaire_ux.gad7_result_text(21, "тяжёлая", "ru")
+    assert message.edits[-1][0] == gad7_ux.result_text(21, "тяжёлая", "ru")
     callback_data = [data for _text, data in _buttons(message.edits[-1])]
     assert f"q:o:{session_id}" in callback_data
     assert not any(data.startswith("q:m:") for data in callback_data)
 
 
 def test_result_copy_low_and_high_is_non_diagnostic():
-    low = questionnaire_ux.gad7_result_text(4, "минимальная", "ru")
-    high = questionnaire_ux.gad7_result_text(10, "умеренная", "ru")
+    low = gad7_ux.result_text(4, "минимальная", "ru")
+    high = gad7_ux.result_text(10, "умеренная", "ru")
     assert "Общий балл — 4 из 21" in low
     assert "более подробной оценки" not in low
     assert "Общий балл — 10 из 21" in high
