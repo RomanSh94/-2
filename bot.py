@@ -2767,6 +2767,39 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # NEVER re-prompt the LLM here.
         answer = select_fallback(risk, lang)
 
+    # DASS-21 free-text adds a narrow factual contract on top of the unchanged
+    # global safety validator. A DASS rejection never triggers a repair LLM call:
+    # it uses a deterministic, globally revalidated fallback instead. Comparison
+    # openings are likewise computed from trusted subscale integers, not by the LLM.
+    if dass_discussion_result is not None:
+        dass_safe, _dass_reason = _validate_dass21_free_text_response(
+            answer, dass_discussion_result, user_text, lang)
+        comparison_intent = _dass21_has_comparison_intent(user_text, lang)
+        if dass_safe:
+            candidate = answer
+            if comparison_intent:
+                candidate = (_dass21_comparison_prefix(dass_discussion_result, lang)
+                             + "\n\n" + answer)
+        else:
+            candidate = _dass21_safe_fallback(dass_discussion_result, user_text, lang)
+        if _dass21_delivery_candidate_is_safe(
+                candidate, dass_discussion_result, user_text, risk, lang):
+            answer = candidate
+        else:
+            fallback = _dass21_safe_fallback(
+                dass_discussion_result, user_text, lang)
+            if _dass21_delivery_candidate_is_safe(
+                    fallback, dass_discussion_result, user_text, risk, lang):
+                answer = fallback
+            else:
+                emergency = _dass21_emergency_fallback(lang)
+                if _dass21_delivery_candidate_is_safe(
+                        emergency, dass_discussion_result, user_text, risk, lang):
+                    answer = emergency
+                else:
+                    await message.answer(questionnaire_ux.not_available_text(lang))
+                    return
+
     # 17. Send (with a human-feeling typing pause, §7.2). The user message was
     # already persisted before the LLM call (step 14.5) to preserve arrival
     # order; only the assistant row + delivery remain, and both are gated on
@@ -8283,22 +8316,345 @@ def _dass21_free_text_system_context(dass_result, lang: str) -> str:
     dep = dass_result.subscales["depression"]
     anx = dass_result.subscales["anxiety"]
     stress = dass_result.subscales["stress"]
+    ordering = _dass21_score_ordering_text(dass_result, lang)
     if lang == "ru":
         return ("\n\nДОВЕРЕННЫЙ ВНУТРЕННИЙ КОНТЕКСТ ОПРОСНИКА (это не слова пользователя): "
                 f"инструмент={dass_result.instrument_version}; "
                 f"translation_id={dass_result.translation_id}; "
                 f"депрессия={dep}; тревога={anx}; стресс={stress}. "
+                f"Доверенные числовые отношения: {ordering}. "
                 "Используй показатели только как дополнительный ориентир для обсуждения "
                 "проявлений за последнюю неделю. Не выводи из них причины, диагноз, "
                 "вероятность расстройства, общий балл, степень тяжести или выбор метода "
-                "терапии. Не утверждай, что пользователь сам сообщил эти числа.")
+                "терапии. Перед любым сравнением арифметически сопоставь три числа; "
+                "исправь неверную сравнительную предпосылку пользователя и всегда называй "
+                "равные значения равными. «Самый высокий» означает только числовое "
+                "сравнение, а не клиническую тяжесть. Не превращай период «последняя "
+                "неделя» в постоянное или хроническое состояние. Чётко отличай факт из "
+                "DASS от гипотезы, основанной на отдельно описанной пользователем ситуации. "
+                "Не утверждай, что пользователь сам сообщил эти числа.")
     return ("\n\nTRUSTED INTERNAL QUESTIONNAIRE CONTEXT (not user-authored): "
             f"instrument={dass_result.instrument_version}; "
             f"translation_id={dass_result.translation_id}; "
             f"depression={dep}; anxiety={anx}; stress={stress}. "
+            f"Trusted numeric relationships: {ordering}. "
             "Use these scores only as supporting context for discussing experiences over "
             "the past week. Do not infer causes, diagnosis, disorder probability, a total "
-            "score, severity, or a therapy choice. Do not claim the user stated the scores.")
+            "score, severity, or a therapy choice. Arithmetically compare all three numbers "
+            "before any comparative claim; correct a false comparative premise and always "
+            "describe equal values as a tie. 'Highest' means numeric ordering only, not "
+            "clinical severity. Do not turn the past-week scope into a persistent or chronic "
+            "state. Distinguish a DASS-derived fact from a hypothesis grounded in context the "
+            "user separately described. Do not claim the user stated the scores.")
+
+
+_DASS21_SCALE_KEYS = ("depression", "anxiety", "stress")
+_DASS21_SCALE_LABELS = {
+    "ru": {"depression": "депрессия", "anxiety": "тревога", "stress": "стресс"},
+    "en": {"depression": "depression", "anxiety": "anxiety", "stress": "stress"},
+}
+_DASS21_SCALE_LABELS_RU_GENITIVE = {
+    "depression": "депрессии", "anxiety": "тревоги", "stress": "стресса",
+}
+
+
+def _dass21_score_relations(dass_result) -> dict:
+    """Pure arithmetic facts derived only from the three trusted subscales."""
+    scores = {key: int(dass_result.subscales[key]) for key in _DASS21_SCALE_KEYS}
+    values = sorted(set(scores.values()), reverse=True)
+    groups = tuple(
+        tuple(key for key in _DASS21_SCALE_KEYS if scores[key] == value)
+        for value in values
+    )
+    return {
+        "scores": scores,
+        "groups": groups,
+        "highest": groups[0],
+        "lowest": groups[-1],
+    }
+
+
+def _dass21_join_scale_labels(keys, lang: str) -> str:
+    labels = [_DASS21_SCALE_LABELS[lang][key] for key in keys]
+    conjunction = " и " if lang == "ru" else " and "
+    if len(labels) < 2:
+        return labels[0]
+    return ", ".join(labels[:-1]) + conjunction + labels[-1]
+
+
+def _dass21_score_ordering_text(dass_result, lang: str) -> str:
+    facts = _dass21_score_relations(dass_result)
+    scores = facts["scores"]
+    groups = []
+    for keys in facts["groups"]:
+        groups.append(" = ".join(
+            f"{_DASS21_SCALE_LABELS[lang][key]}={scores[key]}" for key in keys))
+    ordering = " > ".join(groups)
+    highest = _dass21_join_scale_labels(facts["highest"], lang)
+    lowest = _dass21_join_scale_labels(facts["lowest"], lang)
+    if lang == "ru":
+        tie = " (равные значения)" if len(facts["highest"]) > 1 else ""
+        return (f"{ordering}; самый высокий числовой показатель: {highest}{tie}; "
+                f"самый низкий числовой показатель: {lowest}")
+    tie = " (tie)" if len(facts["highest"]) > 1 else ""
+    return (f"{ordering}; highest numeric scale: {highest}{tie}; "
+            f"lowest numeric scale: {lowest}")
+
+
+def _dass21_has_comparison_intent(user_text: str, lang: str) -> bool:
+    low = (user_text or "").casefold().replace("ё", "е")
+    if lang == "ru":
+        return bool(re.search(
+            r"\b(?:выше|ниже|больше|меньше|равн\w*|одинаков\w*|"
+            r"сам\w*\s+(?:высок\w*|низк\w*)|сравн\w*)\b", low))
+    return bool(re.search(
+        r"\b(?:higher|lower|highest|lowest|more|less|equal|same|tie|tied|"
+        r"compare|comparison)\b", low))
+
+
+def _dass21_comparison_prefix(dass_result, lang: str) -> str:
+    """Deterministic factual opening; the LLM never calculates ordering."""
+    facts = _dass21_score_relations(dass_result)
+    scores = facts["scores"]
+    highest = facts["highest"]
+    if len(highest) == 3:
+        value = scores[highest[0]]
+        if lang == "ru":
+            return ("По этим результатам ни один показатель не выше остальных: "
+                    f"депрессия, тревога и стресс одинаковы — по {value}.")
+        return ("In these results, no scale is higher than the others: "
+                f"depression, anxiety, and stress are tied at {value} each.")
+    if len(highest) == 2:
+        first, second = highest
+        remaining = next(key for key in _DASS21_SCALE_KEYS if key not in highest)
+        if lang == "ru":
+            labels = _dass21_join_scale_labels(highest, lang)
+            return (f"По этим результатам {_DASS21_SCALE_LABELS['ru'][first]} не выше "
+                    f"{_DASS21_SCALE_LABELS_RU_GENITIVE[second]}: {labels} одинаковы — "
+                    f"по {scores[first]}, а {_DASS21_SCALE_LABELS['ru'][remaining]} — "
+                    f"{scores[remaining]}.")
+        labels = _dass21_join_scale_labels(highest, lang)
+        return (f"In these results, {_DASS21_SCALE_LABELS['en'][first]} is not higher "
+                f"than {_DASS21_SCALE_LABELS['en'][second]}: {labels} are tied at "
+                f"{scores[first]}, while {_DASS21_SCALE_LABELS['en'][remaining]} is "
+                f"{scores[remaining]}.")
+    ordered = [key for group in facts["groups"] for key in group]
+    high = ordered[0]
+    rest = ordered[1:]
+    if lang == "ru":
+        details = "; ".join(
+            f"{_DASS21_SCALE_LABELS['ru'][key]} — {scores[key]}" for key in rest)
+        return ("По этим результатам самый высокий числовой показатель — "
+                f"{_DASS21_SCALE_LABELS['ru'][high]}: {scores[high]}; {details}.")
+    details = "; ".join(
+        f"{_DASS21_SCALE_LABELS['en'][key]} is {scores[key]}" for key in rest)
+    return ("In these results, the highest numeric scale is "
+            f"{_DASS21_SCALE_LABELS['en'][high]} at {scores[high]}; {details}.")
+
+
+def _dass21_match_is_negated(low: str, match, lang: str) -> bool:
+    token = "не" if lang == "ru" else "not"
+    prefix = low[max(0, match.start() - 12):match.start()]
+    return (bool(re.search(rf"\b{token}\s*$", prefix))
+            or bool(re.search(rf"\b{token}\b", match.group(0))))
+
+
+def _validate_dass21_free_text_response(text: str, dass_result, user_text: str,
+                                        lang: str) -> tuple[bool, str | None]:
+    """Narrow DASS-only factual guard; the global safety validator still runs."""
+    del user_text  # Narrative remains available to the LLM, never a score fact here.
+    low = (text or "").casefold().replace("ё", "е")
+    if not low.strip():
+        return False, "empty DASS response"
+
+    if lang == "ru":
+        scale = r"(?:тревог\w*|тревожност\w*|депресси\w*|стресс\w*)"
+        severity = r"(?:повышенн\w*|высок\w*|умеренн\w*|тяжел\w*|низк\w*|легк\w*)"
+        severity_patterns = (
+            rf"\b{severity}\s+(?:(?:уровень|уровня|показатель|балл)\s+)?{scale}\b",
+            rf"\b{scale}(?:\s+(?:показатель|балл|уровень))?\s+"
+            rf"(?:является\s+|считается\s+|—\s*)?{severity}\b",
+            rf"\b(?:уровень|показатель|балл)\s+{scale}[^.!?\n]{{0,12}}{severity}\b",
+        )
+    else:
+        scale = r"(?:anxiety|depression|stress)"
+        severity = r"(?:elevated|high|moderate|severe|low|mild)"
+        severity_patterns = (
+            rf"\b{severity}\s+(?:(?:level|score)\s+(?:of|for)\s+)?{scale}\b",
+            rf"\b{scale}(?:\s+(?:score|level))?\s+"
+            rf"(?:is|appears|looks|seems)\s+{severity}\b",
+        )
+    for pattern in severity_patterns:
+        for match in re.finditer(pattern, low):
+            if not _dass21_match_is_negated(low, match, lang):
+                return False, "unsupported DASS severity classification"
+
+    facts = _dass21_score_relations(dass_result)
+    scores = facts["scores"]
+    scale_patterns = ({
+        "depression": r"депресси\w*",
+        "anxiety": r"(?:тревог\w*|тревожност\w*)",
+        "stress": r"стресс\w*",
+    } if lang == "ru" else {
+        "depression": r"depression", "anxiety": r"anxiety", "stress": r"stress",
+    })
+    relation_words = (r"выше|больше|ниже|меньше" if lang == "ru"
+                      else r"higher|greater|more|lower|less")
+    greater_words = ({"выше", "больше"} if lang == "ru"
+                     else {"higher", "greater", "more"})
+    for left in _DASS21_SCALE_KEYS:
+        for right in _DASS21_SCALE_KEYS:
+            if left == right:
+                continue
+            pattern = (
+                rf"\b{scale_patterns[left]}\b(?P<middle>[^.!?\n]{{0,40}}?)"
+                rf"\b(?P<relation>{relation_words})\b"
+                rf"(?:\s+(?:чем|than))?[^.!?\n]{{0,12}}\b{scale_patterns[right]}\b"
+            )
+            for match in re.finditer(pattern, low):
+                claimed = (scores[left] > scores[right]
+                           if match.group("relation") in greater_words
+                           else scores[left] < scores[right])
+                negation = (r"\bне\s*$" if lang == "ru" else r"\bnot\s*$")
+                if re.search(negation, match.group("middle")):
+                    claimed = not claimed
+                if not claimed:
+                    return False, "incorrect DASS score comparison"
+
+    if lang == "ru":
+        other_scales_tail = (
+            r"(?:чем\s+)?(?:всех\s+)?остальн\w*"
+            r"(?:\s+(?:показател\w*|балл\w*|шкал\w*))?"
+        )
+    else:
+        other_scales_tail = (
+            r"than\s+(?:all\s+)?(?:the\s+)?"
+            r"(?:others|other\s+(?:scores|scales|indicators))"
+        )
+    for left in _DASS21_SCALE_KEYS:
+        pattern = (
+            rf"\b{scale_patterns[left]}\b(?P<middle>[^.!?\n]{{0,24}}?)"
+            rf"\b(?P<relation>{relation_words})\b\s+{other_scales_tail}\b"
+        )
+        for match in re.finditer(pattern, low):
+            other_scores = (
+                scores[key] for key in _DASS21_SCALE_KEYS if key != left)
+            claimed = (all(scores[left] > score for score in other_scores)
+                       if match.group("relation") in greater_words
+                       else all(scores[left] < score for score in other_scores))
+            negation = (r"\bне\s*$" if lang == "ru" else r"\bnot\s*$")
+            if re.search(negation, match.group("middle")):
+                claimed = not claimed
+            if not claimed:
+                return False, "incorrect DASS score comparison"
+
+    equality = (r"(?:равн\w*|одинаков\w*)" if lang == "ru"
+                else r"(?:equal|same|tied)")
+    connector = "и" if lang == "ru" else "and"
+    for index, left in enumerate(_DASS21_SCALE_KEYS):
+        for right in _DASS21_SCALE_KEYS[index + 1:]:
+            patterns = (
+                rf"\b{scale_patterns[left]}\b\s+{connector}\s+"
+                rf"\b{scale_patterns[right]}\b(?P<middle>[^.!?\n]{{0,30}}?)"
+                rf"\b(?P<relation>{equality})\b",
+                rf"\b{scale_patterns[left]}\b(?P<middle>[^.!?\n]{{0,24}}?)"
+                rf"\b(?P<relation>{equality})\b[^.!?\n]{{0,12}}"
+                rf"\b{scale_patterns[right]}\b",
+            )
+            for pattern in patterns:
+                for match in re.finditer(pattern, low):
+                    claimed = scores[left] == scores[right]
+                    negation = (r"\bне\s*$" if lang == "ru" else r"\bnot\s*$")
+                    if re.search(negation, match.group("middle")):
+                        claimed = not claimed
+                    if not claimed:
+                        return False, "incorrect DASS score comparison"
+
+    for key, pattern in scale_patterns.items():
+        if lang == "ru":
+            highest_patterns = (
+                (rf"\b{pattern}\b[^.!?\n]{{0,30}}"
+                 rf"сам(?:ый|ая|ое)\s+высок\w+\s+"
+                 rf"(?:показател\w*|балл\w*|шкал\w*)"),
+                (rf"\bсам(?:ый|ая|ое)\s+высок\w+\s+"
+                 rf"(?:числов\w+\s+)?(?:показател\w*|балл\w*|шкал\w*)"
+                 rf"[^.!?\n]{{0,30}}\b{pattern}\b"),
+            )
+        else:
+            highest_patterns = (
+                (rf"\b{pattern}\b[^.!?\n]{{0,30}}"
+                 rf"(?:the\s+)?(?:only\s+)?highest\s+"
+                 rf"(?:score|scale|indicator)\b"),
+                (rf"\b(?:the\s+)?(?:only\s+)?highest\s+"
+                 rf"(?:numeric\s+)?(?:score|scale|indicator)\b"
+                 rf"[^.!?\n]{{0,30}}\b{pattern}\b"),
+            )
+        for highest_pattern in highest_patterns:
+            for match in re.finditer(highest_pattern, low):
+                if not _dass21_match_is_negated(low, match, lang) \
+                        and facts["highest"] != (key,):
+                    return False, "incorrect DASS highest-scale claim"
+
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])|\n", low) if part.strip()]
+    if lang == "ru":
+        score_marker = r"\b(?:балл\w*|показател\w*|результат\w*|dass-?21)\b"
+        attribution = r"\b(?:означа\w*|показыва\w*|свидетельству\w*|видно)\b"
+        negated_attribution = r"\bне\s+(?:означа\w*|показыва\w*|свидетельству\w*)\b"
+        permanence = r"\b(?:постоянн\w*|хронич\w*|всегда)\b"
+        cause = r"\b(?:причин\w*|вызван\w*|обусловлен\w*|из-за)\b"
+        cause_assertion = r"\b(?:означа\w*|показыва\w*|указыв\w*|вызван\w*|обусловлен\w*)\b"
+    else:
+        score_marker = r"\b(?:score|result|indicator|dass-?21)\b"
+        attribution = r"\b(?:means?|shows?|indicates?|demonstrates?)\b"
+        negated_attribution = r"\b(?:does\s+not|doesn't|cannot|can't)\s+(?:mean|show|indicate)\b"
+        permanence = r"\b(?:constant|constantly|chronic|persistent|permanently)\b"
+        cause = r"\b(?:cause|caused|because\s+of|due\s+to)\b"
+        cause_assertion = r"\b(?:means?|shows?|indicates?|caused|due\s+to)\b"
+    for sentence in sentences:
+        has_score = re.search(score_marker, sentence)
+        negated = re.search(negated_attribution, sentence)
+        if has_score and re.search(attribution, sentence) \
+                and re.search(permanence, sentence) and not negated:
+            return False, "DASS score asserted a persistent state"
+        if has_score and re.search(cause, sentence) \
+                and re.search(cause_assertion, sentence) and not negated:
+            return False, "DASS score asserted a cause"
+    return True, None
+
+
+def _dass21_safe_fallback(dass_result, user_text: str, lang: str) -> str:
+    prefix = (_dass21_comparison_prefix(dass_result, lang) + "\n\n"
+              if _dass21_has_comparison_intent(user_text, lang) else "")
+    if lang == "ru":
+        return prefix + (
+            "Сам DASS-21 не показывает, почему получились именно такие баллы, и не "
+            "позволяет по ним определить диагноз или степень тяжести. Он отражает три "
+            "группы проявлений за последнюю неделю.\n\nЕсли хочешь, можем разобраться, "
+            "что происходило на этой неделе: было ли больше беспокойства и страха, "
+            "телесных реакций, трудностей с расслаблением или раздражительности."
+        )
+    return prefix + (
+        "DASS-21 does not show why these scores occurred and cannot determine a diagnosis "
+        "or severity from them. It reflects three groups of experiences over the past "
+        "week.\n\nIf you want, we can look at what was happening this week: worry or fear, "
+        "physical reactions, difficulty relaxing, or irritability."
+    )
+
+
+def _dass21_delivery_candidate_is_safe(text: str, dass_result, user_text: str,
+                                       risk: str, lang: str) -> bool:
+    global_safe, _ = validate_response_with_context(text, user_text, risk, lang)
+    dass_safe, _ = _validate_dass21_free_text_response(
+        text, dass_result, user_text, lang)
+    return global_safe and dass_safe
+
+
+def _dass21_emergency_fallback(lang: str) -> str:
+    if lang == "ru":
+        return ("Сейчас я не могу надёжно обсудить этот результат. "
+                "Попробуй вернуться к нему позже.")
+    return ("I cannot reliably discuss this result right now. "
+            "Please try returning to it later.")
 
 
 def _dass21_extract_llm_text(response) -> str:
