@@ -123,11 +123,11 @@ def _press_info(uid, instrument_id):
 def test_catalog_is_generated_from_manifest():
     instruments = cat.public_catalog_instruments(_document())
     ids = {ci.instrument_id for ci in instruments}
-    # Exactly the 6 public-visible governance instruments, straight from the
+    # Exactly the public-visible governance instruments, straight from the
     # manifest -- not a hand-maintained list.
     # PR #55: dass became owner-only (public_catalog_visible=false) and left
-    # the public catalog; the other five governance instruments remain.
-    assert ids == {"bdi_ii", "hdrs", "zung_sas", "zung_sds", "epds"}
+    # the public catalog. GAD-7 is the approved runnable anxiety instrument.
+    assert ids == {"bdi_ii", "hdrs", "zung_sas", "zung_sds", "epds", "gad7"}
 
 
 def test_no_duplicate_manual_instrument_list_in_bot():

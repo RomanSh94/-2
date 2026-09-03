@@ -315,6 +315,118 @@
       "risk_contract_version": null
     },
     {
+      "instrument_id": "gad7",
+      "display_name_ru": "Опросник генерализованного тревожного расстройства — ГТР-7 (GAD-7)",
+      "display_name_en": "Generalized Anxiety Disorder-7 (GAD-7)",
+      "catalog_category_id": "anxiety",
+      "public_category_ids": [
+        "anxiety"
+      ],
+      "questionnaire_definition_id": "gad7_ru_zolotareva_2023",
+      "abbreviation": "GAD-7",
+      "instrument_family": "Generalized Anxiety Disorder-7",
+      "version": "GAD-7",
+      "identity_status": "verified",
+      "domain": "anxiety",
+      "administration_mode": "self_report",
+      "population": [
+        "adult"
+      ],
+      "reference_period": "past_2_weeks",
+      "item_count": 7,
+      "subscales": [],
+      "source_page": "https://psyjournals.ru/journals/cpp/archive/2023_n4/Zolotareva",
+      "evidence": [
+        {
+          "kind": "primary_source",
+          "title": "Spitzer RL, Kroenke K, Williams JBW, Löwe B. A Brief Measure for Assessing Generalized Anxiety Disorder: The GAD-7 (2006)",
+          "url": "https://jamanetwork.com/journals/jamainternalmedicine/fullarticle/410326",
+          "accessed_at": "2026-09-03",
+          "supports": [
+            "identity",
+            "administration_mode",
+            "official_scoring",
+            "official_cutoffs"
+          ]
+        },
+        {
+          "kind": "adaptation_publication",
+          "title": "Золотарева А.А. Адаптация русскоязычной версии шкалы генерализованного тревожного расстройства (Generalized Anxiety Disorder-7) (2023)",
+          "url": "https://psyjournals.ru/journals/cpp/archive/2023_n4/Zolotareva",
+          "accessed_at": "2026-09-03",
+          "supports": [
+            "identity",
+            "translation_use",
+            "digital_reproduction",
+            "commercial_use",
+            "population",
+            "reference_period",
+            "official_scoring",
+            "official_cutoffs"
+          ],
+          "notes": "The publication page identifies the Russian adaptation and licenses the publication under CC BY-NC 4.0. Activation is limited to attributed noncommercial/public use of the exact approved Russian wording; unrestricted commercial rights are not asserted."
+        }
+      ],
+      "translation_id": "zolotareva_ru_2023",
+      "rights": {
+        "digital_reproduction": {
+          "status": "allowed_with_conditions",
+          "evidence": [
+            {
+              "kind": "adaptation_publication",
+              "title": "Zolotareva 2023 publication page — CC BY-NC 4.0",
+              "url": "https://psyjournals.ru/journals/cpp/archive/2023_n4/Zolotareva",
+              "accessed_at": "2026-09-03",
+              "supports": [
+                "digital_reproduction"
+              ],
+              "notes": "Exact Russian wording reproduced with attribution for noncommercial/public use."
+            }
+          ]
+        },
+        "commercial_use": {
+          "status": "allowed_with_conditions",
+          "evidence": [
+            {
+              "kind": "adaptation_publication",
+              "title": "Zolotareva 2023 publication page — CC BY-NC 4.0",
+              "url": "https://psyjournals.ru/journals/cpp/archive/2023_n4/Zolotareva",
+              "accessed_at": "2026-09-03",
+              "supports": [
+                "commercial_use"
+              ],
+              "notes": "Noncommercial condition is binding; this does not assert unrestricted commercial use of the Russian adaptation."
+            }
+          ]
+        },
+        "translation_use": {
+          "status": "allowed_with_conditions",
+          "evidence": [
+            {
+              "kind": "adaptation_publication",
+              "title": "Zolotareva 2023 publication page — CC BY-NC 4.0",
+              "url": "https://psyjournals.ru/journals/cpp/archive/2023_n4/Zolotareva",
+              "accessed_at": "2026-09-03",
+              "supports": [
+                "translation_use"
+              ],
+              "notes": "Use is limited to the exact attributed 2023 Russian adaptation under its noncommercial license."
+            }
+          ]
+        }
+      },
+      "activation_status": "ready",
+      "public_catalog_visible": true,
+      "risk_item_metadata_status": "verified",
+      "score_direction": "higher_more_severe",
+      "trend_eligible": false,
+      "blockers": [],
+      "scoring_contract_id": "gad7_sum",
+      "scoring_version": "core_v1",
+      "risk_contract_id": null,
+      "risk_contract_version": null
+    },
+    {
       "instrument_id": "dass",
       "display_name_ru": "Шкалы депрессии, тревоги и стресса",
       "display_name_en": "Depression Anxiety Stress Scales",

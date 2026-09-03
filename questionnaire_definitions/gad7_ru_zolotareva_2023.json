@@ -1,0 +1,113 @@
+{
+  "id": "gad7_ru_zolotareva_2023",
+  "version": "GAD-7_ZOLOTAREVA_RU_2023",
+  "lang": "ru",
+  "title": "Опросник генерализованного тревожного расстройства — ГТР-7 (GAD-7)",
+  "description": "Опросник поможет оценить, как часто за последние 2 недели тебя беспокоили тревожные симптомы. Для каждого пункта выбери, насколько часто это происходило.",
+  "description_short": "7 вопросов · около 2 минут",
+  "estimated_minutes": 2,
+  "category": "anxiety",
+  "status": "active",
+  "legal_status": "licensed",
+  "result_policy": "user_visible_score",
+  "requires_gender": false,
+  "requires_age": false,
+  "contains_risk_items": false,
+  "reference_period": "past_2_weeks",
+  "instruction": "Оцените, пожалуйста, насколько часто следующие проблемы беспокоили вас\nв течение прошедших двух недель. Для ответов используйте следующую шкалу:",
+  "original_authors": [
+    "R. L. Spitzer",
+    "K. Kroenke",
+    "J. B. W. Williams",
+    "B. Löwe"
+  ],
+  "original_publication_year": 2006,
+  "russian_adaptation": "А. А. Золотарева, 2023",
+  "clinical_instrument": {
+    "instrument_id": "gad7",
+    "instrument_version": "GAD-7",
+    "translation_id": "zolotareva_ru_2023",
+    "administration_mode": "self_report",
+    "manifest_schema_version": 2,
+    "scoring_contract_id": "gad7_sum",
+    "scoring_version": "core_v1",
+    "risk_contract_id": null,
+    "risk_contract_version": null
+  },
+  "items": [
+    {
+      "id": "gad7_01",
+      "text": "Чувство тревоги или раздражения.",
+      "options": [
+        {"id": "a0", "label": "0 — Совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — В течение нескольких дней", "value": "1"},
+        {"id": "a2", "label": "2 — Более, чем половину этого времени", "value": "2"},
+        {"id": "a3", "label": "3 — Почти каждый день", "value": "3"}
+      ]
+    },
+    {
+      "id": "gad7_02",
+      "text": "Неспособность справиться со своим беспокойством.",
+      "options": [
+        {"id": "a0", "label": "0 — Совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — В течение нескольких дней", "value": "1"},
+        {"id": "a2", "label": "2 — Более, чем половину этого времени", "value": "2"},
+        {"id": "a3", "label": "3 — Почти каждый день", "value": "3"}
+      ]
+    },
+    {
+      "id": "gad7_03",
+      "text": "Чрезмерное беспокойство по разным поводам.",
+      "options": [
+        {"id": "a0", "label": "0 — Совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — В течение нескольких дней", "value": "1"},
+        {"id": "a2", "label": "2 — Более, чем половину этого времени", "value": "2"},
+        {"id": "a3", "label": "3 — Почти каждый день", "value": "3"}
+      ]
+    },
+    {
+      "id": "gad7_04",
+      "text": "Неспособность расслабляться.",
+      "options": [
+        {"id": "a0", "label": "0 — Совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — В течение нескольких дней", "value": "1"},
+        {"id": "a2", "label": "2 — Более, чем половину этого времени", "value": "2"},
+        {"id": "a3", "label": "3 — Почти каждый день", "value": "3"}
+      ]
+    },
+    {
+      "id": "gad7_05",
+      "text": "Ощущение такого беспокойства, что трудно найти себе место.",
+      "options": [
+        {"id": "a0", "label": "0 — Совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — В течение нескольких дней", "value": "1"},
+        {"id": "a2", "label": "2 — Более, чем половину этого времени", "value": "2"},
+        {"id": "a3", "label": "3 — Почти каждый день", "value": "3"}
+      ]
+    },
+    {
+      "id": "gad7_06",
+      "text": "Склонность быстро испытывать злость или раздражительность.",
+      "options": [
+        {"id": "a0", "label": "0 — Совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — В течение нескольких дней", "value": "1"},
+        {"id": "a2", "label": "2 — Более, чем половину этого времени", "value": "2"},
+        {"id": "a3", "label": "3 — Почти каждый день", "value": "3"}
+      ]
+    },
+    {
+      "id": "gad7_07",
+      "text": "Чувство страха, как будто может случиться что-то ужасное.",
+      "options": [
+        {"id": "a0", "label": "0 — Совсем нет", "value": "0"},
+        {"id": "a1", "label": "1 — В течение нескольких дней", "value": "1"},
+        {"id": "a2", "label": "2 — Более, чем половину этого времени", "value": "2"},
+        {"id": "a3", "label": "3 — Почти каждый день", "value": "3"}
+      ]
+    }
+  ],
+  "completion_message": {
+    "ru": "Опросник завершён.",
+    "en": "Questionnaire complete."
+  }
+}
