@@ -108,6 +108,16 @@ def _common(monkeypatch, tmp_db):
     monkeypatch.setattr(ac, "CLINICIAN_REVIEWER_IDS", set())
     monkeypatch.setattr(ac, "TESTER_REVIEWER_MAP", {})
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", False)
+    real_decide_push = scheduler.decide_push
+
+    def _decide_push_at_test_daytime(now, last_activity, **kwargs):
+        quiet_now = kwargs.get("quiet_now")
+        if quiet_now is not None:
+            kwargs["quiet_now"] = quiet_now.replace(
+                hour=12, minute=0, second=0, microsecond=0)
+        return real_decide_push(now, last_activity, **kwargs)
+
+    monkeypatch.setattr(scheduler, "decide_push", _decide_push_at_test_daytime)
     # A fresh module-level set per test -- the record_push-failure
     # suppression guard is process-local and must not leak state across
     # tests.
