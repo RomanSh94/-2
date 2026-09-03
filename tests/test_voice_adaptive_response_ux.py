@@ -69,6 +69,10 @@ class FakeFSM:
     simulates two DIFFERENT users/chats never sharing state."""
     def __init__(self, data=None):
         self._data = data or {}
+        self._state = None
+
+    async def get_state(self):
+        return self._state
 
     async def get_data(self):
         return dict(self._data)
@@ -77,7 +81,11 @@ class FakeFSM:
         self._data.update(kw)
 
     async def set_state(self, state):
-        pass
+        self._state = getattr(state, "state", state)
+
+    async def clear(self):
+        self._state = None
+        self._data.clear()
 
 
 def _async(value=None):

@@ -554,20 +554,73 @@ def dass21_discuss_topic_prompt(instrument_version: str, translation_id: str,
 
 
 def dass21_result_text(subscales, lang: str) -> str:
-    """PR #55 — owner-only DASS-21 completion screen: three numeric subscale
+    """DASS-21 completion screen: three numeric subscale
     values ONLY. Deliberately no overall total, no cutoffs, no severity
     labels, no probability, no diagnosis, no treatment plan, no LLM text."""
     dep, anx, stress = subscales["depression"], subscales["anxiety"], subscales["stress"]
     if lang == "en":
-        return (f"DASS-21 — self-report results\n\n"
-                f"Depression: {dep}\n"
-                f"Anxiety: {anx}\n"
-                f"Stress: {stress}\n\n"
-                "These are self-report results for the past week, not a diagnosis.\n"
-                "For clinical conclusions, please discuss the result with a specialist.")
-    return (f"DASS-21 — результаты самооценки\n\n"
-            f"Депрессия: {dep}\n"
-            f"Тревога: {anx}\n"
-            f"Стресс: {stress}\n\n"
-            "Это результаты самооценки за последнюю неделю, а не диагноз.\n"
-            "Для клинических выводов результат следует обсуждать со специалистом.")
+        return (f"DASS-21 — result\n\n"
+                f"Depression — {dep}\n"
+                f"Anxiety — {anx}\n"
+                f"Stress — {stress}\n\n"
+                "DASS-21 shows the intensity of three groups of experiences over "
+                "the past week.\n\n"
+                "To understand what may sit behind these scores and what may be "
+                "worth noticing, you can explore the result in more detail.\n\n"
+                "The result is not a diagnosis.")
+    return (f"DASS-21 — результат\n\n"
+            f"Депрессия — {dep}\n"
+            f"Тревога — {anx}\n"
+            f"Стресс — {stress}\n\n"
+            "DASS-21 показывает выраженность трёх групп проявлений за последнюю неделю.\n\n"
+            "Чтобы понять, что стоит за этими показателями и на что обратить внимание, "
+            "можно разобрать результат подробнее.\n\n"
+            "Результат не является диагнозом.")
+
+
+def dass21_discussion_intro_text(subscales, lang: str) -> str:
+    """Deterministic entry copy for free-text DASS-21 discussion."""
+    dep, anx, stress = subscales["depression"], subscales["anxiety"], subscales["stress"]
+    if lang == "en":
+        return ("💬 What DASS-21 showed\n\n"
+                "The questionnaire assesses three groups of experiences over the past week:\n\n"
+                "Depression — reduced ability to experience positive emotions, loss of "
+                "interest and involvement, hopelessness, and lack of initiative.\n\n"
+                "Anxiety — experiences of anxiety and fear, anxious reactions in certain "
+                "situations, and anxiety-related bodily reactions.\n\n"
+                "Stress — nervous tension, difficulty relaxing, irritability, and heightened "
+                "reactivity.\n\n"
+                f"Your results:\nDepression — {dep}\nAnxiety — {anx}\nStress — {stress}\n\n"
+                "These scores can help identify what may be worth exploring, but they do not "
+                "explain the cause and are not a diagnosis.\n\n"
+                "You can write any question about the result or simply describe what is "
+                "happening. I can help connect the result with your situation and consider "
+                "what may be worth noticing next.")
+    return ("💬 Что показал DASS-21\n\n"
+            "Опросник оценивает три группы проявлений за последнюю неделю:\n\n"
+            "Депрессия — снижение способности испытывать положительные эмоции, потерю "
+            "интереса и вовлечённости, безнадёжность и недостаток инициативы.\n\n"
+            "Тревога — переживание тревоги и страха, тревожные реакции в определённых "
+            "ситуациях и связанные с тревогой телесные реакции.\n\n"
+            "Стресс — нервное напряжение, трудности с расслаблением, раздражительность и "
+            "повышенную реактивность.\n\n"
+            f"Твои результаты:\nДепрессия — {dep}\nТревога — {anx}\nСтресс — {stress}\n\n"
+            "Эти показатели помогают понять, в каких проявлениях сейчас стоит разобраться "
+            "подробнее, но сами по себе не объясняют их причину и не являются диагнозом.\n\n"
+            "Можешь написать мне любой вопрос по результату или просто рассказать, что "
+            "сейчас происходит. Я помогу связать результат с твоей ситуацией и понять, на "
+            "что обратить внимание дальше.")
+
+
+def dass21_unknown_area_text(lang: str) -> str:
+    if lang == "en":
+        return ("You do not have to decide that right now.\n\n"
+                "Describe in your own words what is bothering you most or what changes you "
+                "have noticed in how you feel.\n\n"
+                "I will take into account your DASS-21 result and what you share to consider "
+                "what may be worth discussing or clarifying next.")
+    return ("Не обязательно определять это прямо сейчас.\n\n"
+            "Расскажи своими словами, что сейчас беспокоит тебя больше всего или какие "
+            "изменения в своём состоянии ты замечаешь.\n\n"
+            "Я учту твой результат DASS-21 и то, что ты расскажешь, чтобы понять, что стоит "
+            "обсудить или уточнить дальше.")

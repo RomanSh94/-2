@@ -52,6 +52,7 @@ class FakeUser:
     def __init__(self, uid):
         self.id = uid
         self.username = "user"
+        self.first_name = "User"
 
 
 class FakeMessage:
@@ -86,6 +87,30 @@ class FakeCallback:
 
     async def answer(self, *a, **kw):
         pass
+
+
+class FakeState:
+    def __init__(self):
+        self.current = None
+        self.data = {}
+        self.clear_count = 0
+
+    async def set_state(self, value):
+        self.current = value.state if hasattr(value, "state") else value
+
+    async def get_state(self):
+        return self.current
+
+    async def update_data(self, **values):
+        self.data.update(values)
+
+    async def get_data(self):
+        return dict(self.data)
+
+    async def clear(self):
+        self.current = None
+        self.data = {}
+        self.clear_count += 1
 
 
 def _async(value=None):
@@ -202,10 +227,35 @@ def test_discuss_button_absent_when_flag_off(flow, monkeypatch):
 def test_discuss_button_present_when_flag_on(flow):
     session_id, msg = _complete_dass(OWNER)
     assert _buttons(msg.answers[-1][1]) == [
-        ("💬 Обсудить результат", f"q:m:{session_id}"),
+        ("💬 Разобрать результат", f"q:m:{session_id}"),
         ("🧾 Отчёт для специалиста", f"q:o:{session_id}"),
-        ("🧠 Другой тест", "q:t"),
     ]
+
+
+def test_dass_result_copy_is_non_diagnostic_and_has_no_total():
+    text = questionnaire_ux.dass21_result_text(
+        {"depression": 12, "anxiety": 8, "stress": 16}, "ru")
+    assert text == (
+        "DASS-21 — результат\n\n"
+        "Депрессия — 12\nТревога — 8\nСтресс — 16\n\n"
+        "DASS-21 показывает выраженность трёх групп проявлений за последнюю неделю.\n\n"
+        "Чтобы понять, что стоит за этими показателями и на что обратить внимание, "
+        "можно разобрать результат подробнее.\n\n"
+        "Результат не является диагнозом.")
+    assert "общий" not in text.lower()
+    assert "тяжест" not in text.lower()
+
+
+def test_picker_button_requires_real_downstream_availability(monkeypatch):
+    hidden = bot._dass21_completion_keyboard(7, "ru", recommendation_available=False)
+    shown = bot._dass21_completion_keyboard(7, "ru", recommendation_available=True)
+    assert "q:pick:7" not in [cd for _, cd in _buttons({"reply_markup": hidden})]
+    assert ("🧪 Подобрать тест", "q:pick:7") in _buttons({"reply_markup": shown})
+    assert not any(text == "🧠 Другой тест" for text, _ in _buttons({"reply_markup": shown}))
+
+
+def test_current_catalog_has_no_downstream_recommendation(flow):
+    assert asyncio.run(bot._dass21_recommendation_options(OWNER)) == {}
 
 
 def test_public_mode_does_not_presentation_hide_authorized_discussion(flow, monkeypatch):
@@ -217,28 +267,209 @@ def test_public_mode_does_not_presentation_hide_authorized_discussion(flow, monk
     session_id, msg = _complete_dass(INVITED)
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
     assert f"q:m:{session_id}" in datas
-    menu = _press(bot.cb_questionnaire_discuss_menu, INVITED, f"q:m:{session_id}")
-    assert menu.answers[-1][0] == questionnaire_ux.discuss_menu_text("ru")
+    state = FakeState()
+    user = FakeUser(INVITED)
+    menu = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_discuss_menu(
+        FakeCallback(user, menu, data=f"q:m:{session_id}"), state))
+    assert menu.answers[-1][0] == questionnaire_ux.dass21_discussion_intro_text(
+        {"depression": 14, "anxiety": 14, "stress": 14}, "ru")
+    assert state.current == bot.Dass21Discussion.active.state
 
 
 def test_discuss_button_en_label(flow, monkeypatch):
     monkeypatch.setattr(bot, "get_user_language", _async("en"))
     session_id, msg = _complete_dass(OWNER)
     labels_by_data = {cd: text for text, cd in _buttons(msg.answers[-1][1])}
-    assert labels_by_data[f"q:m:{session_id}"] == "💬 Discuss the result"
+    assert labels_by_data[f"q:m:{session_id}"] == "💬 Explore the result"
 
 
 # ── menu open ─────────────────────────────────────────────────────────────────
 def test_discuss_menu_opens_for_completed_dass_session(flow):
     session_id, _ = _complete_dass(OWNER)
     msg = _press(bot.cb_questionnaire_discuss_menu, OWNER, f"q:m:{session_id}")
-    assert msg.answers[-1][0] == questionnaire_ux.discuss_menu_text("ru")
+    assert msg.answers[-1][0].startswith("💬 Что показал DASS-21")
+    assert "Депрессия — 14" in msg.answers[-1][0]
+    assert "Тревога — 14" in msg.answers[-1][0]
+    assert "Стресс — 14" in msg.answers[-1][0]
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
-    # Owner-review UX correction: "🏠 В меню"/menu:back removed from the DASS
-    # discuss menu (menu:back opens Help, not a questionnaire "home").
-    assert datas == [f"q:m:{session_id}:measures", f"q:m:{session_id}:relate",
-                      f"q:m:{session_id}:next", f"q:m:{session_id}:specialist",
-                      f"q:r:{session_id}"]
+    assert datas == [f"q:r:{session_id}"]
+
+
+def test_discuss_entry_binds_exact_session_in_fsm(flow):
+    session_id, _ = _complete_dass(OWNER)
+    state = FakeState()
+    user = FakeUser(OWNER)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_discuss_menu(
+        FakeCallback(user, msg, data=f"q:m:{session_id}"), state))
+    assert state.current == bot.Dass21Discussion.active.state
+    assert state.data == {"dass21_session_id": session_id}
+
+
+def test_discuss_entry_rebinds_from_old_dass_session_to_new_owned_session(flow):
+    session_a, _ = _complete_dass(OWNER, answer="a1")
+    session_b, _ = _complete_dass(OWNER, answer="a2")
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": session_a}
+    user = FakeUser(OWNER)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_discuss_menu(
+        FakeCallback(user, msg, data=f"q:m:{session_b}"), state))
+    assert state.current == bot.Dass21Discussion.active.state
+    assert state.data == {"dass21_session_id": session_b}
+    assert "Депрессия — 28" in msg.answers[-1][0]
+
+
+def test_back_to_result_clears_discussion_context(flow):
+    session_id, _ = _complete_dass(OWNER)
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": session_id}
+    user = FakeUser(OWNER)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_result(
+        FakeCallback(user, msg, data=f"q:r:{session_id}"), state))
+    assert state.current is None
+    assert state.clear_count == 1
+    assert "DASS-21 — результат" in msg.answers[-1][0]
+
+
+def test_starting_questionnaire_detail_clears_discussion_context(flow):
+    session_id, _ = _complete_dass(OWNER)
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": session_id}
+    user = FakeUser(OWNER)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_detail(
+        FakeCallback(user, msg, data=f"q:d:{QID}"), state))
+    assert state.current is None
+    assert state.clear_count == 1
+
+
+def test_picker_never_selects_from_highest_dass_score(monkeypatch):
+    options = {"anxiety": {"instrument_id": "future", "definition_id": "future_v1",
+                           "title_ru": "Будущий тест", "title_en": "Future test"}}
+    keyboard = bot._dass21_picker_keyboard(9, options, "ru")
+    assert _buttons({"reply_markup": keyboard}) == [
+        ("Тревога", "q:pick:9:anxiety"),
+        ("Не знаю", "q:pick:9:unknown"),
+        ("⬅️ Назад к результату", "q:r:9"),
+    ]
+
+
+def test_unknown_area_keeps_discussion_without_redundant_discuss_button(flow, monkeypatch):
+    session_id, _ = _complete_dass(OWNER)
+    fake_entry = {"instrument_id": "future", "definition_id": "future_v1",
+                  "title_ru": "Будущий тест", "title_en": "Future test"}
+    monkeypatch.setattr(bot, "_dass21_recommendation_options",
+                        _async({"anxiety": fake_entry}))
+    state = FakeState()
+    user = FakeUser(OWNER)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_dass21_pick_questionnaire(
+        FakeCallback(user, msg, data=f"q:pick:{session_id}:unknown"), state))
+    assert state.current == bot.Dass21Discussion.active.state
+    assert state.data["dass21_session_id"] == session_id
+    buttons = _buttons(msg.answers[-1][1])
+    assert buttons == [("⬅️ Назад к результату", f"q:r:{session_id}")]
+
+
+def _prepare_dass_pipeline(monkeypatch, captured_messages):
+    monkeypatch.setattr(bot, "_onboarding_blocks_ordinary_entry", _async(False))
+    monkeypatch.setattr(ac, "depression_disclosure_allowed_for", _async(False))
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", _async(False))
+    monkeypatch.setattr(ac, "professional_free_text_allowed_for", _async(False))
+    monkeypatch.setattr(ac, "core_rollout_allowed", _async(False))
+    monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(None))
+    monkeypatch.setattr(bot, "maybe_summarize", _async(None))
+    monkeypatch.setattr(bot, "_maybe_react", _async(None))
+    monkeypatch.setattr(bot, "maybe_update_profile", _async(None))
+    monkeypatch.setattr(bot, "check_sudden_improvement", _async(False))
+    monkeypatch.setattr(bot, "persist_influence_trace", _async(None))
+    monkeypatch.setattr(bot.bot, "send_chat_action", _async(None))
+    monkeypatch.setattr(bot.asyncio, "sleep", _async(None))
+
+    async def _completion(**kwargs):
+        captured_messages.append(kwargs["messages"])
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="Безопасный ответ о ситуации."))])
+
+    async def _deliver(message, uid, text, lang, **kwargs):
+        await message.answer(text, **kwargs)
+
+    monkeypatch.setattr(bot.client.chat.completions, "create", _completion)
+    monkeypatch.setattr(bot, "deliver_response", _deliver)
+
+
+def test_free_text_mode_survives_two_turns_and_revalidates_each(flow, monkeypatch):
+    session_id, _ = _complete_dass(OWNER)
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": session_id}
+    captured_messages = []
+    _prepare_dass_pipeline(monkeypatch, captured_messages)
+
+    calls = []
+    real_recompute = bot._dass21_discuss_gate_and_load
+
+    async def _count_recompute(session, lang):
+        calls.append(session["id"])
+        return await real_recompute(session, lang)
+
+    monkeypatch.setattr(bot, "_dass21_discuss_gate_and_load", _count_recompute)
+    for text in ("Наверное, из-за работы.", "Особенно перед созвонами."):
+        msg = FakeMessage(FakeUser(OWNER), text)
+        asyncio.run(bot.pipeline(msg, text, state))
+        assert msg.answers[-1][0] == "Безопасный ответ о ситуации."
+
+    assert calls == [session_id, session_id]
+    assert state.current == bot.Dass21Discussion.active.state
+    assert len(captured_messages) == 2
+    for messages in captured_messages:
+        system = messages[0]["content"]
+        assert "это не слова пользователя" in system
+        assert "депрессия=14" in system and "тревога=14" in system and "стресс=14" in system
+        assert REAL_ITEM_TEXT not in repr(messages)
+
+
+def test_free_text_mode_fails_closed_for_foreign_bound_session(flow, monkeypatch):
+    session_id, _ = _complete_dass(OWNER)
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": session_id}
+    captured_messages = []
+    _prepare_dass_pipeline(monkeypatch, captured_messages)
+
+    msg = FakeMessage(FakeUser(INVITED), "Что это значит?")
+    asyncio.run(bot.pipeline(msg, msg.text, state))
+    assert msg.answers[-1][0] == questionnaire_ux.not_available_text("ru")
+    assert captured_messages == []
+    assert state.current is None
+
+
+def test_crisis_precedes_dass_revalidation_and_clears_mode(flow, monkeypatch):
+    session_id, _ = _complete_dass(OWNER)
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": session_id}
+    called = []
+
+    async def _crisis(*args, **kwargs):
+        called.append(True)
+
+    async def _must_not_recompute(*args, **kwargs):
+        raise AssertionError("DASS recompute must not precede crisis handling")
+
+    monkeypatch.setattr(bot, "trigger_crisis", _crisis)
+    monkeypatch.setattr(bot, "_dass21_discuss_gate_and_load", _must_not_recompute)
+    text = "Я хочу покончить с собой"
+    asyncio.run(bot.pipeline(FakeMessage(FakeUser(OWNER), text), text, state))
+    assert called == [True]
+    assert state.current is None
 
 
 def test_discuss_menu_uses_dass_safe_labels_not_causal_generic_ones(flow):
@@ -246,15 +477,16 @@ def test_discuss_menu_uses_dass_safe_labels_not_causal_generic_ones(flow):
     msg = _press(bot.cb_questionnaire_discuss_menu, OWNER, f"q:m:{session_id}")
     labels = [text for text, _ in _buttons(msg.answers[-1][1])]
     assert "Почему так вышло?" not in labels
-    assert any("измеряют" in t for t in labels)
-    assert any("связано с последней неделей" in t for t in labels)
+    assert not any("измеряют" in t for t in labels)
+    assert not any("связано с последней неделей" in t for t in labels)
 
 
 def test_discuss_menu_double_tap_stable(flow):
     session_id, _ = _complete_dass(OWNER)
     msg1 = _press(bot.cb_questionnaire_discuss_menu, OWNER, f"q:m:{session_id}")
     msg2 = _press(bot.cb_questionnaire_discuss_menu, OWNER, f"q:m:{session_id}")
-    assert msg1.answers[-1][0] == msg2.answers[-1][0] == questionnaire_ux.discuss_menu_text("ru")
+    assert msg1.answers[-1][0] == msg2.answers[-1][0]
+    assert msg1.answers[-1][0].startswith("💬 Что показал DASS-21")
 
 
 def test_discuss_menu_blocked_when_flag_off(flow, monkeypatch):
@@ -292,6 +524,18 @@ def test_discuss_menu_blocked_when_invited_access_revoked(flow):
 def test_discuss_menu_blocked_when_integrity_fails(flow, monkeypatch):
     session_id, _ = _complete_dass(OWNER)
     monkeypatch.setattr(config, "DASS21_DEFINITION_SHA256", "0" * 64)
+    msg = _press(bot.cb_questionnaire_discuss_menu, OWNER, f"q:m:{session_id}")
+    assert msg.answers[-1][0] == questionnaire_ux.not_available_text("ru")
+
+
+def test_discuss_menu_blocked_when_session_version_mismatches(flow):
+    session_id, _ = _complete_dass(OWNER)
+    import sqlite3
+    con = sqlite3.connect(database.DB)
+    con.execute("UPDATE questionnaire_sessions SET questionnaire_version=? WHERE id=?",
+                ("stale-version", session_id))
+    con.commit()
+    con.close()
     msg = _press(bot.cb_questionnaire_discuss_menu, OWNER, f"q:m:{session_id}")
     assert msg.answers[-1][0] == questionnaire_ux.not_available_text("ru")
 
@@ -1011,9 +1255,9 @@ def test_results_history_browses_one_dynamic_card_and_pin_is_explicit(flow):
         FakeCallback(user, card, data=f"results:test:{older_id}")))
     assert len(card.edits) == 2
     assert card.answers == []
-    assert "Депрессия: 14" in card.edits[-1][0]
+    assert "Депрессия — 14" in card.edits[-1][0]
     assert _buttons(card.edits[-1][1]) == [
-        ("💬 Обсудить результат", f"q:m:{older_id}"),
+        ("💬 Разобрать результат", f"q:m:{older_id}"),
         ("🧾 Отчёт для специалиста", f"q:o:{older_id}"),
         ("📌 Оставить в чате", f"results:pin:{older_id}"),
         ("⬅️ К результатам", "results:tests"),
@@ -1023,7 +1267,7 @@ def test_results_history_browses_one_dynamic_card_and_pin_is_explicit(flow):
         FakeCallback(user, card, data=f"results:test:{newer_id}")))
     assert len(card.edits) == 3
     assert card.answers == []
-    assert "Депрессия: 28" in card.edits[-1][0]
+    assert "Депрессия — 28" in card.edits[-1][0]
 
     asyncio.run(bot.cb_results_tests(FakeCallback(user, card, data="results:tests")))
     assert len(card.edits) == 4
@@ -1036,7 +1280,7 @@ def test_results_history_browses_one_dynamic_card_and_pin_is_explicit(flow):
         FakeCallback(user, card, data=f"results:pin:{older_id}")))
     assert len(card.edits) == edits_before_pin
     assert len(card.answers) == 1
-    assert "Депрессия: 14" in card.answers[0][0]
+    assert "Депрессия — 14" in card.answers[0][0]
 
     for sid in (older_id, newer_id):
         assert asyncio.run(database.get_questionnaire_session(sid)) == session_before[sid]
@@ -1083,7 +1327,7 @@ def test_back_to_result_owner_succeeds_no_mutation(flow):
     session_id, _ = _complete_dass(OWNER, answer="a1")
     before = asyncio.run(database.get_questionnaire_session(session_id))
     msg = _press(bot.cb_questionnaire_result, OWNER, f"q:r:{session_id}")
-    assert "Депрессия: 14" in msg.answers[-1][0]
+    assert "Депрессия — 14" in msg.answers[-1][0]
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
     assert f"q:m:{session_id}" in datas
     after = asyncio.run(database.get_questionnaire_session(session_id))
@@ -1093,7 +1337,7 @@ def test_back_to_result_owner_succeeds_no_mutation(flow):
 def test_back_to_result_invited_succeeds(flow):
     session_id, _ = _complete_dass(INVITED, answer="a1")
     msg = _press(bot.cb_questionnaire_result, INVITED, f"q:r:{session_id}")
-    assert "Депрессия: 14" in msg.answers[-1][0]
+    assert "Депрессия — 14" in msg.answers[-1][0]
 
 
 def test_back_to_result_blocked_when_access_revoked(flow):
@@ -1146,7 +1390,7 @@ def test_back_to_result_flag_off_uses_plain_keyboard(flow, monkeypatch):
     msg = _press(bot.cb_questionnaire_result, OWNER, f"q:r:{session_id}")
     datas = [cd for _, cd in _buttons(msg.answers[-1][1])]
     assert f"q:m:{session_id}" not in datas
-    assert "Депрессия: 14" in msg.answers[-1][0]
+    assert "Депрессия — 14" in msg.answers[-1][0]
 
 
 # ── adapter-level malformed-row / malformed-manifest fail-closed handling ────

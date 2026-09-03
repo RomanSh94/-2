@@ -266,6 +266,9 @@ class EmotionJournal(StatesGroup):
 class CbtJournal(StatesGroup):
     active = State()
 
+class Dass21Discussion(StatesGroup):
+    active = State()
+
 bot                = Bot(token=BOT_TOKEN)
 dp                 = Dispatcher(storage=MemoryStorage())
 client             = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -827,20 +830,27 @@ _LOWER_MENU_CONTROL_LABELS = frozenset(
 
 
 async def _clear_active_journal_if_leaving(state: FSMContext = None) -> None:
-    """Abandon an unfinished EmotionJournal/CbtJournal FSM session when the
+    """Abandon an unfinished journal or DASS discussion when the
     user explicitly navigates away (a persistent-menu control, /help,
-    /start, or inline navigation). Touches ONLY these two journal states --
+    /start, or inline navigation). Touches ONLY the two journal states and
+    the ephemeral DASS discussion state --
     never onboarding, questionnaire sessions, InterventionStates,
     disclosure flows, or any other product FSM -- and never deletes an
-    already-SAVED journal entry; it only abandons the unsaved, in-progress
-    FSM step (jstep/jdata or cstep/cdata), exactly like /journal_cancel
-    already does today. state=None is a harmless no-op (some call sites are
+    already-SAVED journal entry or questionnaire result; it only abandons
+    unsaved journal progress or the in-memory DASS session binding.
+    state=None is a harmless no-op (some call sites are
     exercised directly in tests without a real FSMContext); aiogram always
     supplies a real one in production."""
     if state is None:
         return
     current = await state.get_state()
-    if current in (EmotionJournal.active.state, CbtJournal.active.state):
+    if current in (EmotionJournal.active.state, CbtJournal.active.state,
+                   Dass21Discussion.active.state):
+        await state.clear()
+
+
+async def _clear_dass21_discussion(state: FSMContext = None) -> None:
+    if state is not None and await state.get_state() == Dass21Discussion.active.state:
         await state.clear()
 
 
@@ -2122,6 +2132,9 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     # 1. Detect language (pure, no I/O — safe to run before any access check)
     lang = detect_language(user_text)
 
+    dass_discussion_result = None
+    dass_discussion_session_id = None
+
     # 2. Risk detection (pure, no I/O)
     risk = detect_risk(user_text, lang)
 
@@ -2139,6 +2152,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     try:
         active = await get_active_crisis(uid)
         if active and not (tg_user is not None):
+            await _clear_dass21_discussion(fsm_state)
             event_id, stage, alang = active
             lvl = classify(risk)
             # Default to the crisis screen. Only EXPLICITLY reassuring text (and not
@@ -2166,6 +2180,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # RED bypasses the product-access gate below entirely, for ANY role — the
         # crisis path must never be gated by access control.
         if classify(risk) == RED:
+            await _clear_dass21_discussion(fsm_state)
             await trigger_crisis(message, uid, username, user_text, risk, lang)
             return
 
@@ -2176,6 +2191,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # get the closed-test/tester-acknowledgment screen instead, and NOTHING
         # ordinary is written about them.
         if not await ensure_full_access_or_closed_test(message, uid):
+            await _clear_dass21_discussion(fsm_state)
             return
 
         # 4.2 Mandatory onboarding gate (spec item A) — strictly AFTER both crisis
@@ -2191,6 +2207,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         # without relying on a caller-specific signal to know whether the gate was
         # already checked.
         if await _onboarding_blocks_ordinary_entry(uid):
+            await _clear_dass21_discussion(fsm_state)
             await _resume_onboarding_card(message.chat.id, uid)
             return
 
@@ -2256,6 +2273,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                     await set_disclosure_prompt_message_id(flow["id"], uid, prompt_mid)
                 await save_message(uid, "assistant", text, "depression_disclosure", lang,
                                    source=MessageSource.ASSISTANT_DELIVERED)
+                await _clear_dass21_discussion(fsm_state)
                 return
             if active_flow is not None:
                 # §8: an unrelated ordinary message while a flow is pending is a
@@ -2295,6 +2313,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                                    source=MessageSource.ASSISTANT_DELIVERED)
                 await message.answer(disambig)
                 await log_disambiguation(uid, user_text, phrase, signal)
+                await _clear_dass21_discussion(fsm_state)
                 return
 
         # 3.5 Dependency monitor -- the ONE deterministic authority (Therapeutic
@@ -2311,6 +2330,21 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         if dep_msg:
             await message.answer(dep_msg)
             return
+
+        if (fsm_state is not None
+                and await fsm_state.get_state() == Dass21Discussion.active.state):
+            discussion_data = await fsm_state.get_data()
+            candidate_session_id = discussion_data.get("dass21_session_id")
+            session = None
+            if isinstance(candidate_session_id, int) and candidate_session_id > 0:
+                session = await _load_owned_completed_history_dass(candidate_session_id, uid)
+            if session is not None:
+                dass_discussion_result = await _dass21_discuss_gate_and_load(session, lang)
+            if dass_discussion_result is None:
+                await fsm_state.clear()
+                await message.answer(questionnaire_ux.not_available_text(lang))
+                return
+            dass_discussion_session_id = candidate_session_id
 
         # 4.3 Format meta-command detection (Voice and Adaptive Response UX) --
         # AFTER crisis/dependency handling, BEFORE ordinary therapeutic routing.
@@ -2449,7 +2483,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         core_reaction_category = ReactionCategory.NONE
         core_reaction_confidence = 0.0
         interaction_contract = detect_interaction_preference(user_text, lang)
-        if await access_control.therapist_core_v1_allowed_for(uid):
+        if (dass_discussion_result is None
+                and await access_control.therapist_core_v1_allowed_for(uid)):
             current_row_id = await save_message(
                 uid, "user", user_text, "therapist_core_v1", lang,
                 risk["score"], risk["categories"], source=MessageSource.USER_AUTHORED)
@@ -2457,7 +2492,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             core_reaction_category, core_reaction_confidence = select_reaction_category(
                 user_text, risk["categories"], detect_stage(user_text, lang), lang,
                 is_meta_command=False, is_dependency_redirect=False)
-        elif await access_control.professional_free_text_allowed_for(uid):
+        elif (dass_discussion_result is None
+              and await access_control.professional_free_text_allowed_for(uid)):
             current_row_id = await save_message(
                 uid, "user", user_text, "professional", lang,
                 risk["score"], risk["categories"], source=MessageSource.USER_AUTHORED)
@@ -2482,6 +2518,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             scenario = choose_scenario(state, risk["categories"], stage, readiness, capacity,
                                        variant, trajectory=trajectory,
                                        interaction_preference=interaction_contract)
+            if dass_discussion_result is not None:
+                scenario = "open_chat"
 
             # 9.4 First-turn eligibility (spec item D) -- computed only now that
             # scenario/stage/capacity/risk are all known; no lexical/topic
@@ -2498,7 +2536,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 and capacity >= FIRST_TURN_MIN_CAPACITY
                 and risk["level"] not in FIRST_TURN_EXCLUDED_RISK_LEVELS
             )
-            if is_ftm_eligible:
+            if is_ftm_eligible and dass_discussion_result is None:
                 claim_token = secrets.token_urlsafe(16)
                 ft_claimed = await claim_first_turn(uid, FIRST_TURN_CONTRACT_VERSION, claim_token, scenario)
 
@@ -2515,7 +2553,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             # later, OUTSIDE this lock (hardening §5) -- see
             # _controller_generate_and_deliver, invoked right after the `finally`
             # below releases it.
-            if not ft_claimed and await access_control.core_rollout_allowed(uid):
+            if (dass_discussion_result is None and not ft_claimed
+                    and await access_control.core_rollout_allowed(uid)):
                 controller_claim = await _controller_claim_turn(uid, user_text, lang, risk)
 
             # 9.5 Emotional reaction (Voice and Adaptive Response UX) -- best-effort,
@@ -2560,6 +2599,21 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                                    source=MessageSource.USER_AUTHORED)
     finally:
         _ingest_leave(uid, _ingest)
+
+    if dass_discussion_result is not None:
+        influence = Influence(
+            "questionnaire_result", dass_discussion_session_id,
+            f"reply drew on DASS-21 session {dass_discussion_session_id} subscales "
+            f"depression={dass_discussion_result.subscales['depression']} "
+            f"anxiety={dass_discussion_result.subscales['anxiety']} "
+            f"stress={dass_discussion_result.subscales['stress']}")
+        try:
+            await persist_influence_trace(
+                secrets.token_hex(16), uid,
+                [(influence.influence_type, influence.source_id, influence.human_readable)])
+        except Exception:
+            await message.answer(questionnaire_ux.not_available_text(lang))
+            return
 
     # Professional Free-Text Runtime V1: the SLOW half (up to three model
     # calls, validation, delivery) -- strictly AFTER the ingestion lock above
@@ -2641,6 +2695,8 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
 
     # 14. Build messages (recent already ends with the current user message)
     system_prompt = get_system_prompt(scenario, lang)
+    if dass_discussion_result is not None:
+        system_prompt += _dass21_free_text_system_context(dass_discussion_result, lang)
     messages = [{"role": "system", "content": system_prompt}]
     if summary:
         messages.append({"role": "system", "content": f"Context:\n{summary}"})
@@ -6575,6 +6631,35 @@ async def _available_questionnaire_catalog(uid: int) -> dict[str, list[dict]]:
     return catalog
 
 
+_DASS21_RECOMMENDATION_AREAS = (
+    ("anxiety", "anxiety", "Тревога", "Anxiety"),
+    ("mood", "depression", "Настроение", "Mood"),
+    ("stress", "stress_burnout", "Стресс и напряжение", "Stress and tension"),
+)
+
+
+async def _dass21_recommendation_options(uid: int) -> dict[str, dict]:
+    """Return at most one real downstream instrument per product area.
+
+    The existing availability catalog is the sole source of truth. DASS-21
+    itself is excluded so the router cannot recommend a loop back to the
+    questionnaire whose result the user is already viewing.
+    """
+    try:
+        catalog = await _available_questionnaire_catalog(uid)
+    except Exception as exc:
+        logging.warning("DASS recommendation availability failed (error_type=%s)",
+                        type(exc).__name__)
+        return {}
+    options = {}
+    for area_id, category_id, _ru, _en in _DASS21_RECOMMENDATION_AREAS:
+        downstream = [entry for entry in catalog.get(category_id, [])
+                      if entry.get("instrument_id") != "dass"]
+        if downstream:
+            options[area_id] = downstream[0]
+    return options
+
+
 # Telegram message text hard limit is 4096 chars; stay safely below it.
 _QUESTIONNAIRE_CARD_MAXLEN = 3900
 _COMPACT_BUTTON_MAXLEN = 16
@@ -6643,8 +6728,6 @@ def _questionnaire_list_keyboard(lang: str, catalog: dict[str, list]) -> InlineK
                                   callback_data=f"q:c:{key}")]
             for key, _, _ in questionnaire_ux.CATALOG_CATEGORIES
             if catalog.get(key)]
-    rows.append([InlineKeyboardButton(text=("🏠 В начало" if lang == "ru" else "🏠 Home"),
-                                      callback_data="menu:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -6707,13 +6790,13 @@ def _questionnaire_detail_keyboard(qid: str, lang: str, *, active_session: dict 
                 callback_data=f"q:s:{qid}")],
             [InlineKeyboardButton(text=("🔄 Начать заново" if lang == "ru" else "🔄 Start over"),
                                   callback_data=f"q:n:{active_session['id']}")],
-            [InlineKeyboardButton(text=("⬅️ К списку" if lang == "ru" else "⬅️ To the list"),
+            [InlineKeyboardButton(text=("← К тестам" if lang == "ru" else "← Back to tests"),
                                   callback_data="q:l")],
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=("▶️ Начать" if lang == "ru" else "▶️ Start"),
                               callback_data=f"q:s:{qid}")],
-        [InlineKeyboardButton(text=("⬅️ К списку" if lang == "ru" else "⬅️ To the list"),
+        [InlineKeyboardButton(text=("← К тестам" if lang == "ru" else "← Back to tests"),
                               callback_data="q:l")],
     ])
 
@@ -6734,22 +6817,20 @@ def _questionnaire_completion_keyboard(session_id: int, lang: str) -> InlineKeyb
     ])
 
 
-def _dass21_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
-    # Workstream B — same specialist-report row as _questionnaire_completion_
-    # keyboard, plus the discuss-result row (q:m:<sid>), gated entirely by
-    # config.DASS21_DISCUSSION_ENABLED at the _send_dass21_result call site
-    # (default off -- the plain _questionnaire_completion_keyboard is used
-    # instead). Owner-review UX correction: same q:t/no-menu:back treatment
-    # as _questionnaire_completion_keyboard, see its comment above.
-    rows = [[InlineKeyboardButton(
-        text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss the result"),
-        callback_data=f"q:m:{session_id}")]]
+def _dass21_completion_keyboard(session_id: int, lang: str, *,
+                                recommendation_available: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if config.DASS21_DISCUSSION_ENABLED:
+        rows.append([InlineKeyboardButton(
+            text=("💬 Разобрать результат" if lang == "ru" else "💬 Explore the result"),
+            callback_data=f"q:m:{session_id}")])
+    if recommendation_available:
+        rows.append([InlineKeyboardButton(
+            text=("🧪 Подобрать тест" if lang == "ru" else "🧪 Choose a questionnaire"),
+            callback_data=f"q:pick:{session_id}")])
     rows.append([InlineKeyboardButton(
         text=("🧾 Отчёт для специалиста" if lang == "ru" else "🧾 Specialist report"),
         callback_data=f"q:o:{session_id}")])
-    rows.append([InlineKeyboardButton(
-        text=("🧠 Другой тест" if lang == "ru" else "🧠 Another test"),
-        callback_data="q:t")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -6856,9 +6937,9 @@ async def _send_dass21_result(send, definition: dict, session_id: int, lang: str
             definition, _load_catalog_document(), responses, registry)
         # 5-6: only now mark completed, then render the complete result.
         await complete_questionnaire_session(session_id)
-        keyboard = (_dass21_completion_keyboard(session_id, lang)
-                    if config.DASS21_DISCUSSION_ENABLED
-                    else _questionnaire_completion_keyboard(session_id, lang))
+        recommendations = await _dass21_recommendation_options(uid)
+        keyboard = _dass21_completion_keyboard(
+            session_id, lang, recommendation_available=bool(recommendations))
         await send(questionnaire_ux.dass21_result_text(result.subscales, lang),
                    reply_markup=keyboard)
     except Exception:
@@ -6916,9 +6997,9 @@ async def _send_dass21_back_to_result(send, session: dict, lang: str,
         return
     keyboard = reply_markup_override
     if keyboard is None:
-        keyboard = (_dass21_completion_keyboard(session["id"], lang)
-                    if config.DASS21_DISCUSSION_ENABLED
-                    else _questionnaire_completion_keyboard(session["id"], lang))
+        recommendations = await _dass21_recommendation_options(session["user_id"])
+        keyboard = _dass21_completion_keyboard(
+            session["id"], lang, recommendation_available=bool(recommendations))
     await send(questionnaire_ux.dass21_result_text(result.subscales, lang), reply_markup=keyboard)
 
 
@@ -7031,7 +7112,7 @@ async def _compatible_active_session(uid: int, definition: dict) -> dict | None:
 
 
 @dp.message(Command("dass21"))
-async def cmd_dass21(message: Message):
+async def cmd_dass21(message: Message, state: FSMContext = None):
     """PR #55 — owner-only entry to the exact DASS-21 flow. Routes to the
     EXISTING q:d detail screen (never creates a session directly); every
     downstream step re-runs the same fresh gates. Disabled feature and
@@ -7040,6 +7121,7 @@ async def cmd_dass21(message: Message):
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(message, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     qid = dass21_runtime.DASS21_DEFINITION_ID
     if await _dass21_blocked(qid, uid):
         await message.answer(questionnaire_ux.not_available_text(lang))
@@ -7174,11 +7256,12 @@ async def cb_questionnaire_info(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("q:d:"))
-async def cb_questionnaire_detail(callback: CallbackQuery):
+async def cb_questionnaire_detail(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(callback, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     parts = callback.data.split(":")
     if len(parts) != 3:
         await callback.answer()
@@ -7216,11 +7299,12 @@ async def cb_questionnaire_detail(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("q:s:"))
-async def cb_questionnaire_start(callback: CallbackQuery):
+async def cb_questionnaire_start(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(callback, uid, lang):
         return
+    await _clear_active_journal_if_leaving(state)
     parts = callback.data.split(":")
     if len(parts) != 3:
         await callback.answer()
@@ -7565,7 +7649,7 @@ async def _load_owned_session(session_id: int, uid: int):
 
 
 @dp.callback_query(F.data.startswith("q:r:"))
-async def cb_questionnaire_result(callback: CallbackQuery):
+async def cb_questionnaire_result(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(callback, uid, lang):          # 1, 2
@@ -7582,9 +7666,12 @@ async def cb_questionnaire_result(callback: CallbackQuery):
         return
 
     if dass21_runtime.is_dass21_definition_id(session["questionnaire_id"]):
-        await _send_dass21_back_to_result(callback.message.answer, session, lang)
+        await _clear_active_journal_if_leaving(state)
+        await _send_dass21_back_to_result(_edit_or_answer(callback.message), session, lang)
         await callback.answer()
         return
+
+    await _clear_dass21_discussion(state)
 
     if not config.QUESTIONNAIRE_INTERPRETATION_ENABLED:              # 4
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
@@ -7820,19 +7907,13 @@ async def cb_questionnaire_specialist_report(callback: CallbackQuery):
     await callback.answer()
 
 
-# ── PR C2 — discuss-with-bot via A1 / traced_response_builder ───────────────
-# Callback format: q:m:<sid> bare menu (NO LLM call at all), q:m:<sid>:<topic>
-# ("why"|"next"|"specialist") ONE bounded traced LLM reply, no continuation.
-# The user never types free text in this flow -- each topic button sends
-# exactly one fixed, template-driven prompt (built from title/score/
-# intensity_label/topic_id, never raw stored answer text) and ends the flow.
-# Tapping another topic is a fresh independent callback. NO FSM, no multi-turn
-# state.
-#
-# Because there is no user-typed text anywhere in this flow, this code
-# deliberately does NOT call risk_detector.detect_risk anywhere -- a future PR
-# adding free-text continuation would need to add RED/ORANGE risk handling
-# THEN, not now. See CLAUDE.md / this PR's description for this scope note.
+# ── Questionnaire discussion ────────────────────────────────────────────────
+# Generic questionnaire q:m keeps the existing fixed topic flow below.
+# Bare q:m:<sid> for DASS now enters an ephemeral multi-turn FSM binding; each
+# typed turn then travels through pipeline(), whose crisis/risk checks precede
+# a fresh owned-session reload and validated DASS recomputation. Historical
+# four-part DASS topic callbacks remain accepted for already-sent keyboards,
+# but no current DASS screen renders those buttons.
 #
 # Gate order (identical structure to q:r/q:k/q:e/q:o above), for BOTH the bare
 # menu and every topic callback:
@@ -7869,35 +7950,17 @@ _DASS21_DISCUSS_TOPICS = frozenset({"measures", "relate", "next", "specialist"})
 _ALL_DISCUSS_TOPIC_TOKENS = _GENERIC_DISCUSS_TOPICS | _DASS21_DISCUSS_TOPICS
 
 
-def _dass21_discuss_menu_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
-    # Workstream B corrective pass — DASS-specific labels: unlike the generic
-    # "Why did this come out this way?" button, none of these imply the
-    # questionnaire result ESTABLISHES a cause (see questionnaire_ux.
-    # dass21_discuss_topic_prompt's non-causal boundary instruction).
-    #
-    # Owner-review UX correction: "🏠 В меню" is deliberately NOT a row here
-    # -- menu:back renders the Help card, not a questionnaire "home", and the
-    # persistent lower menu is already always visible/reachable. Only this
-    # DASS menu is touched; _discuss_menu_keyboard (generic, below) is
-    # unchanged/out of scope.
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=("📊 Что измеряют эти шкалы?" if lang == "ru" else "📊 What do these scales measure?"),
-            callback_data=f"q:m:{session_id}:measures")],
-        [InlineKeyboardButton(
-            text=("🔎 Как это может быть связано с последней неделей?" if lang == "ru"
-                  else "🔎 How might this relate to the past week?"),
-            callback_data=f"q:m:{session_id}:relate")],
-        [InlineKeyboardButton(
-            text=("➡️ Что можно сделать дальше?" if lang == "ru" else "➡️ What can I do next?"),
-            callback_data=f"q:m:{session_id}:next")],
-        [InlineKeyboardButton(
-            text=("👩‍⚕️ Вопросы специалисту" if lang == "ru" else "👩‍⚕️ Questions for a specialist"),
-            callback_data=f"q:m:{session_id}:specialist")],
-        [InlineKeyboardButton(
-            text=("⬅️ Назад к результату" if lang == "ru" else "⬅️ Back to result"),
-            callback_data=f"q:r:{session_id}")],
-    ])
+def _dass21_discuss_keyboard(session_id: int, lang: str, *,
+                             recommendation_available: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if recommendation_available:
+        rows.append([InlineKeyboardButton(
+            text=("🧪 Подобрать тест" if lang == "ru" else "🧪 Choose a questionnaire"),
+            callback_data=f"q:pick:{session_id}")])
+    rows.append([InlineKeyboardButton(
+        text=("⬅️ Назад к результату" if lang == "ru" else "⬅️ Back to result"),
+        callback_data=f"q:r:{session_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _discuss_menu_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
@@ -7999,7 +8062,7 @@ def _is_discuss_topic_data(data: str) -> bool:
 
 
 @dp.callback_query(lambda c: _is_bare_discuss_menu_data(c.data or ""))
-async def cb_questionnaire_discuss_menu(callback: CallbackQuery):
+async def cb_questionnaire_discuss_menu(callback: CallbackQuery, state: FSMContext = None):
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(callback, uid, lang):            # 1, 2
@@ -8017,19 +8080,146 @@ async def cb_questionnaire_discuss_menu(callback: CallbackQuery):
         return
 
     is_dass = dass21_runtime.is_dass21_definition_id(session["questionnaire_id"])
+    dass_result = None
     if is_dass:
-        ok = (await _dass21_discuss_gate_and_load(session, lang)) is not None
+        dass_result = await _dass21_discuss_gate_and_load(session, lang)
+        ok = dass_result is not None
     else:
+        await _clear_dass21_discussion(state)
         ok = (await _discuss_gate_and_load(session, lang)) is not None    # 4-6
     if not ok:
         await callback.message.answer(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
 
-    # Deterministic menu -- NO LLM call at all.
-    keyboard = (_dass21_discuss_menu_keyboard(session_id, lang) if is_dass
-                else _discuss_menu_keyboard(session_id, lang))
-    await callback.message.answer(questionnaire_ux.discuss_menu_text(lang), reply_markup=keyboard)
+    if is_dass:
+        if state is not None:
+            await state.set_state(Dass21Discussion.active)
+            await state.update_data(dass21_session_id=session_id)
+        recommendations = await _dass21_recommendation_options(uid)
+        await _edit_or_answer(callback.message)(
+            questionnaire_ux.dass21_discussion_intro_text(dass_result.subscales, lang),
+            reply_markup=_dass21_discuss_keyboard(
+                session_id, lang, recommendation_available=bool(recommendations)))
+        await callback.answer()
+        return
+
+    # Generic questionnaire discussion remains the existing deterministic menu.
+    await callback.message.answer(
+        questionnaire_ux.discuss_menu_text(lang),
+        reply_markup=_discuss_menu_keyboard(session_id, lang))
+    await callback.answer()
+
+
+def _dass21_picker_keyboard(session_id: int, options: dict[str, dict],
+                            lang: str) -> InlineKeyboardMarkup:
+    labels = {area_id: (ru if lang == "ru" else en)
+              for area_id, _category, ru, en in _DASS21_RECOMMENDATION_AREAS}
+    rows = [[InlineKeyboardButton(
+        text=labels[area_id], callback_data=f"q:pick:{session_id}:{area_id}")]
+        for area_id in labels if area_id in options]
+    if rows:
+        rows.append([InlineKeyboardButton(
+            text=("Не знаю" if lang == "ru" else "I'm not sure"),
+            callback_data=f"q:pick:{session_id}:unknown")])
+    rows.append([InlineKeyboardButton(
+        text=("⬅️ Назад к результату" if lang == "ru" else "⬅️ Back to result"),
+        callback_data=f"q:r:{session_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _dass21_picker_text(lang: str) -> str:
+    if lang == "en":
+        return ("🧪 What would be useful to explore in more detail?\n\n"
+                "DASS-21 provided an overall snapshot of how you have been feeling.\n\n"
+                "Choose what concerns you most right now, and I will suggest one suitable "
+                "questionnaire to assess that area in more detail.")
+    return ("🧪 Что стоит уточнить подробнее?\n\n"
+            "DASS-21 дал общий срез твоего состояния.\n\n"
+            "Выбери, что сейчас беспокоит тебя больше всего, и я предложу один подходящий "
+            "опросник, чтобы подробнее оценить эту область.")
+
+
+def _dass21_recommendation_keyboard(session_id: int, entry: dict,
+                                    lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=(("Начать " + entry["title_ru"]) if lang == "ru"
+                  else ("Start " + entry["title_en"])),
+            callback_data=f"q:d:{entry['definition_id']}")],
+        [InlineKeyboardButton(
+            text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
+            callback_data=f"q:pick:{session_id}")],
+    ])
+
+
+def _dass21_recommendation_text(entry: dict, lang: str) -> str:
+    title = entry["title_ru"] if lang == "ru" else entry["title_en"]
+    if lang == "en":
+        return (f"🧪 {title}\n\nThis approved questionnaire is available to explore the "
+                "selected area in more detail. Its result will remain an aid for "
+                "self-observation, not a diagnosis.")
+    return (f"🧪 {title}\n\nЭтот доступный проверенный опросник поможет подробнее "
+            "оценить выбранную область. Его результат остаётся ориентиром для "
+            "самонаблюдения, а не диагнозом.")
+
+
+@dp.callback_query(F.data.startswith("q:pick:"))
+async def cb_dass21_pick_questionnaire(callback: CallbackQuery,
+                                       state: FSMContext = None):
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    parts = callback.data.split(":")
+    if len(parts) not in (3, 4) or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+    session = await _load_owned_completed_history_dass(session_id, uid)
+    if session is None:
+        await callback.answer()
+        return
+    dass_result = await _dass21_recompute_result_or_none(session)
+    if dass_result is None:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    options = await _dass21_recommendation_options(uid)
+    if not options:
+        await callback.message.answer(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    if len(parts) == 3:
+        # Conservative V1: DASS scores alone never auto-select an instrument.
+        await _edit_or_answer(callback.message)(
+            _dass21_picker_text(lang),
+            reply_markup=_dass21_picker_keyboard(session_id, options, lang))
+        await callback.answer()
+        return
+
+    area_id = parts[3]
+    if area_id == "unknown":
+        if state is not None:
+            await state.set_state(Dass21Discussion.active)
+            await state.update_data(dass21_session_id=session_id)
+        await _edit_or_answer(callback.message)(
+            questionnaire_ux.dass21_unknown_area_text(lang),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text=("⬅️ Назад к результату" if lang == "ru" else "⬅️ Back to result"),
+                    callback_data=f"q:r:{session_id}")]]))
+        await callback.answer()
+        return
+
+    entry = options.get(area_id)
+    if entry is None:
+        await callback.answer()
+        return
+    await _edit_or_answer(callback.message)(
+        _dass21_recommendation_text(entry, lang),
+        reply_markup=_dass21_recommendation_keyboard(session_id, entry, lang))
     await callback.answer()
 
 
@@ -8086,6 +8276,29 @@ async def _discuss_build_response(title: str, score: int, max_score: int,
 # via transition_dass21_discuss_claim immediately before ever contacting
 # Telegram, independent of how long the build took.
 _DASS21_LLM_TIMEOUT_SECONDS = 20.0
+
+
+def _dass21_free_text_system_context(dass_result, lang: str) -> str:
+    """Data-minimized trusted context, explicitly distinct from user speech."""
+    dep = dass_result.subscales["depression"]
+    anx = dass_result.subscales["anxiety"]
+    stress = dass_result.subscales["stress"]
+    if lang == "ru":
+        return ("\n\nДОВЕРЕННЫЙ ВНУТРЕННИЙ КОНТЕКСТ ОПРОСНИКА (это не слова пользователя): "
+                f"инструмент={dass_result.instrument_version}; "
+                f"translation_id={dass_result.translation_id}; "
+                f"депрессия={dep}; тревога={anx}; стресс={stress}. "
+                "Используй показатели только как дополнительный ориентир для обсуждения "
+                "проявлений за последнюю неделю. Не выводи из них причины, диагноз, "
+                "вероятность расстройства, общий балл, степень тяжести или выбор метода "
+                "терапии. Не утверждай, что пользователь сам сообщил эти числа.")
+    return ("\n\nTRUSTED INTERNAL QUESTIONNAIRE CONTEXT (not user-authored): "
+            f"instrument={dass_result.instrument_version}; "
+            f"translation_id={dass_result.translation_id}; "
+            f"depression={dep}; anxiety={anx}; stress={stress}. "
+            "Use these scores only as supporting context for discussing experiences over "
+            "the past week. Do not infer causes, diagnosis, disorder probability, a total "
+            "score, severity, or a therapy choice. Do not claim the user stated the scores.")
 
 
 def _dass21_extract_llm_text(response) -> str:
@@ -8719,7 +8932,7 @@ def _results_history_result_keyboard(session_id: int, lang: str) -> InlineKeyboa
     rows = []
     if config.DASS21_DISCUSSION_ENABLED:
         rows.append([InlineKeyboardButton(
-            text=("💬 Обсудить результат" if lang == "ru" else "💬 Discuss the result"),
+            text=("💬 Разобрать результат" if lang == "ru" else "💬 Explore the result"),
             callback_data=f"q:m:{session_id}")])
     rows.extend([
         [InlineKeyboardButton(

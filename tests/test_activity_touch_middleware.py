@@ -297,6 +297,16 @@ def test_valid_push_v1_button_tap_resets_consecutive_unanswered(monkeypatch):
     import config
     import scheduler
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", False)
+    real_decide_push = scheduler.decide_push
+
+    def _decide_push_at_test_daytime(now, last_activity, **kwargs):
+        quiet_now = kwargs.get("quiet_now")
+        if quiet_now is not None:
+            kwargs["quiet_now"] = quiet_now.replace(
+                hour=12, minute=0, second=0, microsecond=0)
+        return real_decide_push(now, last_activity, **kwargs)
+
+    monkeypatch.setattr(scheduler, "decide_push", _decide_push_at_test_daytime)
 
     async def _fake_contextual_push(uid, lang, anchor_turn_id, model_client):
         # This test is about ActivityTouchMiddleware + the real push

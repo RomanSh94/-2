@@ -171,15 +171,28 @@ def test_questionnaire_active_crisis_gate_runs_before_product_gate(monkeypatch):
 
 
 # ── list / category / detail screens ─────────────────────────────────────────
-def test_questionnaire_list_hides_categories_without_proven_ready_instruments():
+def test_questionnaire_list_root_has_no_help_bound_home_button():
     user = FakeUser(1)
     msg = FakeMessage(user)
     asyncio.run(bot.cmd_questionnaire(msg))
     text, kw = msg.answers[0]
     assert "Психологические тесты" in text
     kb = kw["reply_markup"]
-    callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
-    assert callback_datas == ["menu:back"]
+    buttons = [(btn.text, btn.callback_data) for row in kb.inline_keyboard for btn in row]
+    assert not any(text == "🏠 В начало" for text, _ in buttons)
+    assert not any(callback_data == "menu:back" for _, callback_data in buttons)
+
+
+def test_q_l_renders_questionnaire_list_not_help():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    asyncio.run(bot.cb_questionnaire_list(FakeCallback(user, msg, data="q:l")))
+    text, kw = msg.answers[-1]
+    assert text == bot.questionnaire_ux.list_text("ru")
+    assert text != bot.navigation.help_text("ru")
+    buttons = [(btn.text, btn.callback_data)
+               for row in kw["reply_markup"].inline_keyboard for btn in row]
+    assert ("🏠 В начало", "menu:back") not in buttons
 
 
 # NOTE: synthetic registry demos now live under the professional catalog's
@@ -243,9 +256,11 @@ def test_detail_screen_shows_start_and_back_buttons():
     assert "Demo Anxiety Check" in text
     assert "Это не диагноз" in text
     kb = kw["reply_markup"]
-    callback_datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    buttons = [(btn.text, btn.callback_data) for row in kb.inline_keyboard for btn in row]
+    callback_datas = [callback_data for _, callback_data in buttons]
     assert "q:s:demo_anxiety_v1" in callback_datas
-    assert "q:l" in callback_datas
+    assert ("← К тестам", "q:l") in buttons
+    assert "menu:back" not in callback_datas
 
 
 def test_default_requires_gender_and_age_are_false():
@@ -567,7 +582,8 @@ def test_detail_screen_offers_continue_and_restart_with_active_session():
     assert any("вопрос 2 из 5" in t.lower() for t in button_texts)
     assert "q:s:demo_anxiety_v1" in datas   # Continue still routes through the existing resume path
     assert f"q:n:{session_id}" in datas
-    assert "q:l" in datas
+    assert ("← К тестам", "q:l") in [
+        (b.text, b.callback_data) for row in kb.inline_keyboard for b in row]
     assert str(session_id) not in text
     assert all(str(session_id) not in t for t in button_texts)
 

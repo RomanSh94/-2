@@ -223,7 +223,7 @@ def test_completion_result_edits_the_card(flow):
     for step in range(21):
         asyncio.run(bot.cb_questionnaire_answer(
             FakeCallback(user, msg, data=f"q:a:{session_id}:{step}:a0")))
-    assert "Депрессия: 0" in msg.edits[-1][0]
+    assert "Депрессия — 0" in msg.edits[-1][0]
     assert msg.answers == []
 
 
