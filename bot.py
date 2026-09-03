@@ -6892,6 +6892,15 @@ async def _send_questionnaire_active_conflict(send, active_session: dict,
             active_session, target, lang))
 
 
+def _my_results_button(lang: str) -> InlineKeyboardButton:
+    """Shared by every completed-questionnaire keyboard (generic + DASS-21)
+    so the label/callback can't drift between them -- reuses the existing
+    results:tests route (cb_results_tests) rather than adding a second one."""
+    return InlineKeyboardButton(
+        text=("📊 Мои результаты" if lang == "ru" else "📊 My results"),
+        callback_data="results:tests")
+
+
 def _questionnaire_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
     # Owner-review UX correction: a completed result is a historical artifact
     # (it must stay visible in chat), so "another questionnaire" no longer
@@ -6905,6 +6914,7 @@ def _questionnaire_completion_keyboard(session_id: int, lang: str) -> InlineKeyb
                               callback_data=f"q:o:{session_id}")],
         [InlineKeyboardButton(text=("🧠 Другой тест" if lang == "ru" else "🧠 Another test"),
                               callback_data="q:t")],
+        [_my_results_button(lang)],
     ])
 
 
@@ -6922,6 +6932,7 @@ def _dass21_completion_keyboard(session_id: int, lang: str, *,
     rows.append([InlineKeyboardButton(
         text=("🧾 Отчёт для специалиста" if lang == "ru" else "🧾 Specialist report"),
         callback_data=f"q:o:{session_id}")])
+    rows.append([_my_results_button(lang)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -9617,6 +9628,47 @@ async def cb_results_hub(callback: CallbackQuery, state: FSMContext = None):
     await callback.answer()
 
 
+def _is_questionnaire_completion_card(reply_markup) -> bool:
+    """Stateless classifier: does the CURRENT keyboard on a message belong to
+    a questionnaire completion card (generic/GAD-7 or DASS-21)? Reused by
+    cb_results_tests below to decide whether pressing its "My results"
+    button (results:tests) may safely edit that message in place, or must
+    preserve it as the historical artifact it is (see
+    _questionnaire_completion_keyboard's own docstring for that invariant).
+
+    Classifies purely from callback_data namespaces already on the message
+    Telegram hands back with every CallbackQuery -- never from visible text,
+    never from any stored/transient marker -- so this works for ANY
+    completion card still sitting in the chat (old or new, created before or
+    after a bot restart) with zero extra state.
+
+    q:o:<sid> (specialist report) is present on EVERY completion keyboard --
+    both _questionnaire_completion_keyboard and _dass21_completion_keyboard,
+    regardless of which OPTIONAL DASS buttons (q:m:<sid> discuss,
+    q:pick:<sid> recommendation) happen to be present -- so its presence
+    alone is the one stable, always-true signal; not "the whole keyboard
+    equals this exact list", which optional buttons would break.
+    results:pin:<sid> is the marker unique to the REOPENED historical-result
+    screens (_results_history_result_keyboard / _gad7_history_result_
+    keyboard), which also carry q:o: -- excluding it keeps those screens
+    (whose own "⬅️ К результатам" -> results:tests is intentionally still an
+    in-place edit; that's what the opt-in "📌 Оставить в чате" pin button
+    there is for) from being misclassified as completion cards. Neither
+    signal is present on the plain Results Hub or the history LIST screen."""
+    if reply_markup is None:
+        return False
+    has_specialist_report = False
+    has_pin = False
+    for row in reply_markup.inline_keyboard:
+        for button in row:
+            data = button.callback_data or ""
+            if data.startswith("q:o:"):
+                has_specialist_report = True
+            elif data.startswith("results:pin:"):
+                has_pin = True
+    return has_specialist_report and not has_pin
+
+
 @dp.callback_query(F.data == "results:tests")
 async def cb_results_tests(callback: CallbackQuery):
     uid = callback.from_user.id
@@ -9632,11 +9684,12 @@ async def cb_results_tests(callback: CallbackQuery):
         if (dass21_runtime.is_dass21_definition_id(session["questionnaire_id"])
             or gad7_core.is_gad7_definition_id(session["questionnaire_id"]))
     ]
-    await _answer_target(
-        callback,
-        navigation.questionnaire_history_text(bool(visible_sessions), lang),
-        reply_markup=_results_tests_keyboard(visible_sessions, lang),
-    )
+    text = navigation.questionnaire_history_text(bool(visible_sessions), lang)
+    keyboard = _results_tests_keyboard(visible_sessions, lang)
+    if _is_questionnaire_completion_card(callback.message.reply_markup):
+        await callback.message.answer(text, reply_markup=keyboard)
+    else:
+        await _answer_target(callback, text, reply_markup=keyboard)
     await callback.answer()
 
 

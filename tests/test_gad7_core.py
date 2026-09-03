@@ -50,10 +50,19 @@ class FakeUser:
 
 
 class FakeCardMessage:
-    def __init__(self, user):
+    def __init__(self, user, reply_markup=None):
         self.from_user = user
         self.chat = types.SimpleNamespace(id=user.id)
         self.text = ""
+        # Mirrors real Telegram: edit_text mutates THIS message's own current
+        # keyboard (used by _is_questionnaire_completion_card to classify it);
+        # answer() sends a genuinely separate message and must NOT touch it.
+        # The optional constructor arg lets a test hand in an arbitrary
+        # pre-existing keyboard directly -- simulating an old completion card
+        # already sitting in the chat, with no code-level connection to how
+        # it got there (see test_results_tests_preserves_any_historical_
+        # completion_card_with_no_prior_context, the restart-survival proof).
+        self.reply_markup = reply_markup
         self.answers = []
         self.edits = []
 
@@ -62,6 +71,7 @@ class FakeCardMessage:
 
     async def edit_text(self, text, **kwargs):
         self.edits.append((text, kwargs))
+        self.reply_markup = kwargs.get("reply_markup")
 
     async def edit_reply_markup(self, **kwargs):
         pass
@@ -623,6 +633,146 @@ def test_completion_replaces_card_has_no_discussion_and_no_score_crisis(flow, mo
     callback_data = [data for _text, data in _buttons(message.edits[-1])]
     assert f"q:o:{session_id}" in callback_data
     assert not any(data.startswith("q:m:") for data in callback_data)
+    # GAD-7 completion goes through the shared generic completion keyboard
+    # (_questionnaire_completion_keyboard) -- no GAD-7-specific duplicate of
+    # the "My results" button was added, it just falls out of that reuse.
+    assert ("📊 Мои результаты", "results:tests") in _buttons(message.edits[-1])
+
+
+# ── owner-review fix v3: results:tests must not overwrite a completion card.
+# STATELESS classifier (bot._is_questionnaire_completion_card), driven only
+# by the pressed message's OWN current keyboard -- no FSM, no DB, so it
+# works identically for a card from a second ago or from before the last
+# bot restart. See bot.py's _is_questionnaire_completion_card docstring for
+# the exact q:o:/results:pin: signal it relies on.
+def test_completion_card_classifier_matches_generic_and_dass_not_hub_or_history(monkeypatch):
+    """Direct unit coverage of the classifier across every real keyboard
+    shape in the app -- including all 4 DASS discussion/recommendation
+    combinations -- so a future keyboard change that breaks the signal fails
+    here, not only in the end-to-end tests below."""
+    sid = 42
+    assert bot._is_questionnaire_completion_card(
+        bot._questionnaire_completion_keyboard(sid, "ru")) is True
+
+    for discussion in (False, True):
+        monkeypatch.setattr(config, "DASS21_DISCUSSION_ENABLED", discussion)
+        for recommendation in (False, True):
+            dass_kb = bot._dass21_completion_keyboard(
+                sid, "ru", recommendation_available=recommendation)
+            assert bot._is_questionnaire_completion_card(dass_kb) is True, (
+                f"discussion={discussion} recommendation={recommendation}")
+
+    assert bot._is_questionnaire_completion_card(bot._results_hub_keyboard("ru")) is False
+    assert bot._is_questionnaire_completion_card(bot._results_tests_keyboard([], "ru")) is False
+    assert bot._is_questionnaire_completion_card(
+        bot._results_history_result_keyboard(sid, "ru")) is False
+    assert bot._is_questionnaire_completion_card(
+        bot._gad7_history_result_keyboard(sid, "ru")) is False
+    assert bot._is_questionnaire_completion_card(None) is False
+    # Not "any q:*" -- an unrelated real app keyboard carrying a DIFFERENT
+    # q:-namespaced callback (q:r:<sid>, "back to result") and no q:o: at all
+    # must not be classified as a completion card either.
+    assert bot._is_questionnaire_completion_card(
+        bot._questionnaire_back_to_result_keyboard(sid, "ru")) is False
+    # And a synthetic keyboard makes the rule's narrowness explicit: some
+    # arbitrary q:-prefixed callback alone (not q:o:) is not enough.
+    arbitrary_q_prefix_kb = bot.InlineKeyboardMarkup(inline_keyboard=[
+        [bot.InlineKeyboardButton(text="x", callback_data=f"q:z:{sid}")],
+    ])
+    assert bot._is_questionnaire_completion_card(arbitrary_q_prefix_kb) is False
+
+
+def test_results_tests_from_gad7_completion_card_sends_new_message(flow):
+    """(A) Real cb_questionnaire_answer -> cb_results_tests round trip for
+    generic/GAD-7 completion: history is sent as a new message, the
+    completion card is never touched again."""
+    message = _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _active_session(1)["id"]
+    for step in range(6):
+        _press(bot.cb_questionnaire_answer, 1, f"q:a:{session_id}:{step}:a1", message)
+    edits_before_last_answer = len(message.edits)
+    _press(bot.cb_questionnaire_answer, 1, f"q:a:{session_id}:6:a1", message)
+    assert len(message.edits) == edits_before_last_answer + 1  # the completion card itself
+    completion_edit = message.edits[-1]
+    assert message.answers == []
+
+    _press(bot.cb_results_tests, 1, "results:tests", message)
+
+    # the completion card was NOT touched again -- no new edit, content identical
+    assert len(message.edits) == edits_before_last_answer + 1
+    assert message.edits[-1] == completion_edit
+    # the history screen was sent as a brand-new message instead
+    assert len(message.answers) == 1
+    history_text, history_kwargs = message.answers[-1]
+    assert history_text == bot.navigation.questionnaire_history_text(True, "ru")
+    assert any(btn.callback_data == f"results:test:{session_id}"
+               for row in history_kwargs["reply_markup"].inline_keyboard for btn in row)
+
+
+def test_results_tests_from_dass_completion_card_sends_new_message(flow, monkeypatch):
+    """(B) DASS completion with the busiest keyboard variant -- discussion
+    AND recommendation both present -- still correctly preserved."""
+    monkeypatch.setattr(config, "DASS21_DISCUSSION_ENABLED", True)
+    message = FakeCardMessage(FakeUser(1), reply_markup=bot._dass21_completion_keyboard(
+        7, "ru", recommendation_available=True))
+
+    _press(bot.cb_results_tests, 1, "results:tests", message)
+
+    assert message.edits == []
+    assert len(message.answers) == 1
+
+
+def test_two_different_historical_completion_cards_each_independently_preserved(flow):
+    """(C) Two separate old completion cards in the same chat -- pressing one
+    preserves only that one, not a third-party global marker."""
+    card_a = FakeCardMessage(FakeUser(1), reply_markup=bot._questionnaire_completion_keyboard(1, "ru"))
+    card_b = FakeCardMessage(FakeUser(1), reply_markup=bot._dass21_completion_keyboard(2, "ru"))
+
+    _press(bot.cb_results_tests, 1, "results:tests", card_a)
+    _press(bot.cb_results_tests, 1, "results:tests", card_b)
+
+    assert card_a.edits == [] and len(card_a.answers) == 1
+    assert card_b.edits == [] and len(card_b.answers) == 1
+
+
+def test_results_tests_preserves_historical_completion_card_with_no_prior_context(flow):
+    """(D) Restart-survival proof: a completion card built directly, with NO
+    prior call to cb_questionnaire_start/cb_questionnaire_answer in this test
+    and no state object of any kind involved -- exactly what a message still
+    sitting in the chat looks like to a freshly started process after a bot
+    restart. Still correctly preserved."""
+    old_card = FakeCardMessage(FakeUser(1), reply_markup=bot._questionnaire_completion_keyboard(999, "ru"))
+
+    _press(bot.cb_results_tests, 1, "results:tests", old_card)
+
+    assert old_card.edits == []
+    assert len(old_card.answers) == 1
+
+
+def test_results_tests_from_results_hub_still_edits_in_place(flow):
+    """(E) Ordinary Results Hub -> results:tests navigation is untouched."""
+    hub_message = _press(bot.cb_results_hub, 1, "results:hub")
+
+    _press(bot.cb_results_tests, 1, "results:tests", hub_message)
+
+    assert hub_message.answers == []
+    assert hub_message.edits  # history rendered by editing the hub card in place
+    history_text, _ = hub_message.edits[-1]
+    assert history_text == bot.navigation.questionnaire_history_text(False, "ru")
+
+
+def test_results_tests_from_reopened_history_card_still_edits_in_place(flow):
+    """(F) The reopened-historical-result screen's own "⬅️ К результатам"
+    also reuses results:tests, but that screen carries results:pin: -- it
+    must NOT be misclassified as a completion card (it already has its own
+    explicit opt-in "keep in chat" affordance, 📌 results:pin, for a user who
+    wants to preserve it)."""
+    history_card = FakeCardMessage(FakeUser(1), reply_markup=bot._gad7_history_result_keyboard(5, "ru"))
+
+    _press(bot.cb_results_tests, 1, "results:tests", history_card)
+
+    assert history_card.answers == []
+    assert history_card.edits
 
 
 def test_result_copy_low_and_high_is_non_diagnostic():

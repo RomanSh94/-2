@@ -61,6 +61,7 @@ class FakeMessage:
         self.text = text
         self.chat = types.SimpleNamespace(id=user.id)
         self.message_id = next(_next_message_id)
+        self.reply_markup = None
         self.answers = []
 
     async def answer(self, text, **kw):
@@ -77,6 +78,7 @@ class FakeEditableMessage(FakeMessage):
 
     async def edit_text(self, text, **kw):
         self.edits.append((text, kw))
+        self.reply_markup = kw.get("reply_markup")
 
 
 class FakeCallback:
@@ -229,6 +231,7 @@ def test_discuss_button_present_when_flag_on(flow):
     assert _buttons(msg.answers[-1][1]) == [
         ("💬 Разобрать результат", f"q:m:{session_id}"),
         ("🧾 Отчёт для специалиста", f"q:o:{session_id}"),
+        ("📊 Мои результаты", "results:tests"),
     ]
 
 

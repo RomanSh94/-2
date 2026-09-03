@@ -278,6 +278,7 @@ def test_completed_dass_result_keyboard_with_discussion_enabled(flow, monkeypatc
     assert buttons == [
         ("💬 Разобрать результат", f"q:m:{session_id}"),
         ("🧾 Отчёт для специалиста", f"q:o:{session_id}"),
+        ("📊 Мои результаты", "results:tests"),
     ]
     assert not any("В меню" in text for text, _ in buttons)
 
@@ -622,7 +623,7 @@ def test_dass21_completion_keyboard_missing_qm_button_tracked_gap(flow, monkeypa
     assert f"q:m:{session_id}" not in datas
     # DASS-specific completion remains useful without discussion, while the
     # old generic "another test" route is no longer exposed here.
-    assert datas == [f"q:o:{session_id}"]
+    assert datas == [f"q:o:{session_id}", "results:tests"]
     # Independent confirmation of WHY: the real DASS definition fails the
     # generic sum-score eligibility gate that q:m depends on.
     definition = json.loads(FIXTURE.read_text(encoding="utf-8"))

@@ -31,6 +31,7 @@ class FakeMessage:
         self.from_user = user
         self.text = text
         self.chat = types.SimpleNamespace(id=user.id)
+        self.reply_markup = None
         self.answers = []
 
     async def answer(self, text, **kw):
