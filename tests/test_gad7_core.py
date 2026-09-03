@@ -4,6 +4,7 @@ import json
 import pathlib
 import sqlite3
 import types
+from unittest.mock import ANY
 
 import pytest
 
@@ -22,6 +23,8 @@ QID = gad7_core.GAD7_DEFINITION_ID
 DEFINITION_PATH = (
     pathlib.Path(__file__).parents[1]
     / "questionnaire_definitions" / "gad7_ru_zolotareva_2023.json")
+SYNTHETIC_DEFINITION_PATH = (
+    pathlib.Path(__file__).parent / "fixtures" / "registry" / "demo_anxiety_v1.json")
 
 ITEMS = [
     "Чувство тревоги или раздражения.",
@@ -103,6 +106,13 @@ def _active_session(uid):
     return asyncio.run(database.get_active_questionnaire_session(uid))
 
 
+def _session_rows(uid):
+    with sqlite3.connect(database.DB) as connection:
+        return connection.execute(
+            "SELECT id, questionnaire_id, questionnaire_version, status, current_index "
+            "FROM questionnaire_sessions WHERE user_id=? ORDER BY id", (uid,)).fetchall()
+
+
 def _score(values):
     definition = _definition()
     responses = [clinical_scoring.ClinicalResponse(
@@ -138,6 +148,8 @@ def flow(tmp_path, monkeypatch):
     asyncio.run(database.init_db())
     private = tmp_path / "private_questionnaires"
     private.mkdir()
+    (private / SYNTHETIC_DEFINITION_PATH.name).write_text(
+        SYNTHETIC_DEFINITION_PATH.read_text(encoding="utf-8"), encoding="utf-8")
     monkeypatch.setattr(questionnaires, "PRIVATE_QUESTIONNAIRES_DIR", private)
     monkeypatch.setattr(bot, "get_user_language", _async("ru"))
     monkeypatch.setattr(bot, "journal_guard", _async(("ok", None)))
@@ -145,6 +157,353 @@ def flow(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "CallbackQuery", FakeCallback)
     monkeypatch.setattr(access_control, "DEPLOYMENT_MODE", "public")
     return _definition()
+
+
+def _start_synthetic_with_answer(uid=1):
+    message = _press(bot.cb_questionnaire_start, uid, "q:s:demo_anxiety_v1")
+    session = _active_session(uid)
+    _press(bot.cb_questionnaire_answer, uid,
+           f"q:a:{session['id']}:0:a1", message)
+    return session["id"], message
+
+
+def test_gad7_category_button_uses_short_ru_and_en_labels(flow):
+    entry = {
+        "instrument_id": "gad7",
+        "title_ru": flow["title"],
+        "title_en": "Generalized Anxiety Disorder-7 (GAD-7)",
+        "definition_id": QID,
+    }
+    assert _buttons(("", {"reply_markup": bot._questionnaire_category_keyboard(
+        [entry], "ru")}))[0] == ("ГТР-7 (GAD-7)", f"q:d:{QID}")
+    assert _buttons(("", {"reply_markup": bot._questionnaire_category_keyboard(
+        [entry], "en")}))[0] == ("GAD-7", f"q:d:{QID}")
+
+
+def test_stale_gad_start_with_different_active_test_shows_conflict(flow):
+    source_id, _ = _start_synthetic_with_answer()
+
+    message = _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+
+    text, kwargs = message.edits[-1]
+    assert text == (
+        "У тебя есть незавершённый тест\n\n"
+        "Продолжи его или начни новый. В этом случае незавершённый тест будет отменён.")
+    buttons = _buttons((text, kwargs))
+    assert buttons == [
+        ("▶️ Продолжить тест", f"q:v:{source_id}"),
+        ("✖️ Отменить и начать новый", ANY),
+        ("← К тестам", "q:l"),
+    ]
+    assert "опросник" not in text.lower()
+    assert "опросник" not in " ".join(label.lower() for label, _data in buttons)
+    assert questionnaire_ux.not_available_text("ru") not in text
+    assert _active_session(1)["id"] == source_id
+
+
+def test_different_active_test_detail_shows_conflict_without_cancelling(flow):
+    source_id, _ = _start_synthetic_with_answer()
+
+    message = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+
+    text, kwargs = message.edits[-1]
+    assert text == questionnaire_ux.active_test_conflict_text("ru")
+    assert _buttons((text, kwargs)) == [
+        ("▶️ Продолжить тест", f"q:v:{source_id}"),
+        ("✖️ Отменить и начать новый", ANY),
+        ("← К тестам", "q:l"),
+    ]
+    source = asyncio.run(database.get_questionnaire_session(source_id))
+    assert source["status"] == "active" and source["current_index"] == 1
+    assert questionnaire_ux.active_test_conflict_text("en") == (
+        "You have an unfinished test\n\n"
+        "Continue it or start a new one. In that case, the unfinished test will be cancelled.")
+
+
+def test_same_gad_session_preserves_existing_resume_and_restart_detail(flow):
+    _press(bot.cb_questionnaire_start, 1, f"q:s:{QID}")
+    session_id = _active_session(1)["id"]
+    message = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+
+    assert message.edits[-1][0] == gad7_ux.detail_text("ru")
+    assert _buttons(message.edits[-1]) == [
+        ("▶️ Продолжить — вопрос 1 из 7", f"q:s:{QID}"),
+        ("🔄 Начать заново", f"q:n:{session_id}"),
+        ("← К тестам", "q:l"),
+    ]
+
+
+def test_conflict_continue_reuses_session_index_and_answers(flow):
+    source_id, _ = _start_synthetic_with_answer()
+    before = asyncio.run(database.get_questionnaire_responses(source_id))
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    continue_data = _buttons(conflict.edits[-1])[0][1]
+
+    _press(bot.cb_questionnaire_resume_session, 1, continue_data, conflict)
+
+    active = _active_session(1)
+    assert active["id"] == source_id
+    assert active["current_index"] == 1
+    assert asyncio.run(database.get_questionnaire_responses(source_id)) == before
+    assert "Вопрос 2 из 5" in conflict.edits[-1][0]
+    assert len(_session_rows(1)) == 1
+
+
+def test_conflict_continue_old_version_fails_closed_without_loop(flow):
+    source_id = asyncio.run(database.start_questionnaire_session(
+        1, QID, "obsolete-version"))
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    continue_data = _buttons(conflict.edits[-1])[0][1]
+    assert continue_data == f"q:v:{source_id}"
+
+    _press(bot.cb_questionnaire_resume_session, 1, continue_data, conflict)
+
+    assert conflict.edits[-1][0] == questionnaire_ux.not_available_text("ru")
+    source = asyncio.run(database.get_questionnaire_session(source_id))
+    assert source["status"] == "active" and source["current_index"] == 0
+    assert asyncio.run(database.get_questionnaire_responses(source_id)) == []
+    assert len(_session_rows(1)) == 1
+
+
+@pytest.mark.parametrize("terminal_status", ["cancelled", "completed"])
+def test_conflict_continue_wrong_user_and_terminal_session_are_silent(
+        flow, terminal_status):
+    source_id, _ = _start_synthetic_with_answer()
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    continue_data = _buttons(conflict.edits[-1])[0][1]
+
+    wrong_user = _press(bot.cb_questionnaire_resume_session, 2, continue_data)
+    assert wrong_user.edits == [] and wrong_user.answers == []
+    source = asyncio.run(database.get_questionnaire_session(source_id))
+    assert source["status"] == "active" and source["current_index"] == 1
+
+    if terminal_status == "cancelled":
+        asyncio.run(database.cancel_questionnaire_session(source_id))
+    else:
+        asyncio.run(database.complete_questionnaire_session(source_id))
+    stale = _press(bot.cb_questionnaire_resume_session, 1, continue_data)
+    assert stale.edits == [] and stale.answers == []
+    assert len(_session_rows(1)) == 1
+
+
+def test_old_continue_card_cannot_resume_a_newer_active_session(flow):
+    source_id, _ = _start_synthetic_with_answer()
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    continue_data = _buttons(conflict.edits[-1])[0][1]
+    asyncio.run(database.cancel_questionnaire_session(source_id))
+    newer_id = asyncio.run(database.start_questionnaire_session(
+        1, "demo_anxiety_v1", "1"))
+
+    stale = _press(bot.cb_questionnaire_resume_session, 1, continue_data)
+
+    assert stale.edits == [] and stale.answers == []
+    newer = asyncio.run(database.get_questionnaire_session(newer_id))
+    assert newer["status"] == "active" and newer["current_index"] == 0
+    assert len(_session_rows(1)) == 2
+
+
+def test_successful_switch_cancels_source_starts_one_gad_and_renders_first_item(flow):
+    source_id, _ = _start_synthetic_with_answer()
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    switch_data = _buttons(conflict.edits[-1])[1][1]
+    assert len(switch_data.encode("utf-8")) <= 64
+
+    _press(bot.cb_questionnaire_switch, 1, switch_data, conflict)
+
+    rows = _session_rows(1)
+    source = next(row for row in rows if row[0] == source_id)
+    assert source[3] == "cancelled"
+    active = [row for row in rows if row[3] == "active"]
+    assert len(active) == 1
+    assert active[0][1:3] == (QID, flow["version"])
+    assert active[0][4] == 0
+    assert conflict.edits[-1][0].startswith("ГТР-7 · 1 из 7\n\n" + ITEMS[0])
+
+
+def test_concurrent_double_switch_creates_exactly_one_active_target(flow):
+    source_id, _ = _start_synthetic_with_answer()
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    switch_data = _buttons(conflict.edits[-1])[1][1]
+
+    async def _double_tap():
+        user = FakeUser(1)
+        callbacks = [
+            FakeCallback(user, FakeCardMessage(user), switch_data),
+            FakeCallback(user, FakeCardMessage(user), switch_data),
+        ]
+        await asyncio.gather(
+            *(bot.cb_questionnaire_switch(callback) for callback in callbacks))
+
+    asyncio.run(_double_tap())
+
+    rows = _session_rows(1)
+    source = next(row for row in rows if row[0] == source_id)
+    targets = [row for row in rows if row[1] == QID]
+    active = [row for row in rows if row[3] == "active"]
+    assert source[3] == "cancelled"
+    assert len(targets) == 1
+    assert len(active) == 1
+    assert active[0][0] == targets[0][0]
+    assert active[0][1:3] == (QID, flow["version"])
+    assert active[0][4] == 0
+
+
+def test_atomic_switch_rolls_back_source_when_target_insert_fails(flow):
+    source_id, _ = _start_synthetic_with_answer()
+    before = asyncio.run(database.get_questionnaire_responses(source_id))
+    with sqlite3.connect(database.DB) as connection:
+        connection.execute(
+            "CREATE TRIGGER force_target_insert_failure "
+            "BEFORE INSERT ON questionnaire_sessions "
+            f"WHEN NEW.questionnaire_id='{QID}' "
+            "BEGIN SELECT RAISE(ABORT, 'forced target insert failure'); END")
+        connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        asyncio.run(database.switch_active_questionnaire_session(
+            1, source_id, QID, flow["version"]))
+
+    source = asyncio.run(database.get_questionnaire_session(source_id))
+    rows = _session_rows(1)
+    assert source["status"] == "active"
+    assert source["current_index"] == 1
+    assert asyncio.run(database.get_questionnaire_responses(source_id)) == before
+    assert not any(row[1] == QID for row in rows)
+    assert len([row for row in rows if row[3] == "active"]) == 1
+
+
+def test_atomic_switch_fails_closed_with_multiple_preexisting_active_sessions(flow):
+    source_id, _ = _start_synthetic_with_answer()
+    second_id = asyncio.run(database.start_questionnaire_session(
+        1, "demo_anxiety_v1", "1"))
+
+    result = asyncio.run(database.switch_active_questionnaire_session(
+        1, source_id, QID, flow["version"]))
+
+    rows = _session_rows(1)
+    assert result is None
+    assert [row[0] for row in rows if row[3] == "active"] == [source_id, second_id]
+    assert not any(row[1] == QID for row in rows)
+
+
+def test_switch_wrong_user_and_stale_source_are_non_destructive(flow):
+    source_id, _ = _start_synthetic_with_answer()
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    switch_data = _buttons(conflict.edits[-1])[1][1]
+
+    _press(bot.cb_questionnaire_switch, 2, switch_data)
+    assert asyncio.run(database.get_questionnaire_session(source_id))["status"] == "active"
+    assert _active_session(2) is None
+
+    asyncio.run(database.cancel_questionnaire_session(source_id))
+    _press(bot.cb_questionnaire_switch, 1, switch_data)
+    assert _active_session(1) is None
+    assert len(_session_rows(1)) == 1
+
+
+def test_stale_switch_cannot_cancel_newer_active_session(flow):
+    source_id, _ = _start_synthetic_with_answer()
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    switch_data = _buttons(conflict.edits[-1])[1][1]
+    asyncio.run(database.cancel_questionnaire_session(source_id))
+    newer_id = asyncio.run(database.start_questionnaire_session(
+        1, "demo_anxiety_v1", "1"))
+
+    _press(bot.cb_questionnaire_switch, 1, switch_data)
+
+    newer = asyncio.run(database.get_questionnaire_session(newer_id))
+    assert newer["status"] == "active"
+    assert newer["current_index"] == 0
+    assert _active_session(1)["id"] == newer_id
+
+
+def test_switch_rechecks_current_session_after_target_validation(flow, monkeypatch):
+    source_id, _ = _start_synthetic_with_answer()
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    switch_data = _buttons(conflict.edits[-1])[1][1]
+    registry = bot._load_registry_fresh()
+    original_combined_can_start = registry.combined_can_start
+    changed = {"newer_id": None}
+
+    def _change_current_during_validation(qid, manifest):
+        if qid == QID and changed["newer_id"] is None:
+            with sqlite3.connect(database.DB) as connection:
+                connection.execute(
+                    "UPDATE questionnaire_sessions SET status='cancelled' WHERE id=?",
+                    (source_id,))
+                cursor = connection.execute(
+                    "INSERT INTO questionnaire_sessions "
+                    "(user_id, questionnaire_id, questionnaire_version, status, current_index) "
+                    "VALUES (?, ?, ?, 'active', 0)",
+                    (1, "demo_anxiety_v1", "1"))
+                changed["newer_id"] = cursor.lastrowid
+                connection.commit()
+        return original_combined_can_start(qid, manifest)
+
+    registry.combined_can_start = _change_current_during_validation
+    monkeypatch.setattr(bot, "_load_registry_fresh", lambda: registry)
+
+    _press(bot.cb_questionnaire_switch, 1, switch_data)
+
+    assert _active_session(1)["id"] == changed["newer_id"]
+    assert asyncio.run(database.get_questionnaire_session(
+        changed["newer_id"]))["status"] == "active"
+    assert not any(row[1] == QID for row in _session_rows(1))
+
+
+def test_switch_callback_is_version_aware_and_within_telegram_limit(flow):
+    active = {
+        "id": 9223372036854775807,
+        "questionnaire_id": "demo_anxiety_v1",
+        "questionnaire_version": "1",
+    }
+    keyboard = bot._questionnaire_active_conflict_keyboard(active, flow, "ru")
+    buttons = _buttons(("", {"reply_markup": keyboard}))
+    switch_data = buttons[1][1]
+    changed_version = dict(flow, version="next-version")
+
+    assert len(switch_data.encode("utf-8")) == 64
+    assert len(buttons[0][1].encode("utf-8")) <= 64
+    assert buttons[0][1] == f"q:v:{active['id']}"
+    assert (bot._questionnaire_switch_target_token(flow)
+            != bot._questionnaire_switch_target_token(changed_version))
+
+
+def test_invalid_switch_target_preserves_current_session(flow, monkeypatch):
+    source_id, _ = _start_synthetic_with_answer()
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    switch_data = _buttons(conflict.edits[-1])[1][1]
+    registry_without_target = bot._load_registry_fresh()
+    registry_without_target.by_id.pop(QID)
+    monkeypatch.setattr(bot, "_load_registry_fresh",
+                        lambda: registry_without_target)
+
+    message = _press(bot.cb_questionnaire_switch, 1, switch_data)
+
+    source = asyncio.run(database.get_questionnaire_session(source_id))
+    assert source["status"] == "active" and source["current_index"] == 1
+    assert message.edits[-1][0] == questionnaire_ux.not_available_text("ru")
+    assert len(_session_rows(1)) == 1
+
+
+def test_governance_invalid_switch_target_preserves_current_session(flow, monkeypatch):
+    source_id, _ = _start_synthetic_with_answer()
+    conflict = _press(bot.cb_questionnaire_detail, 1, f"q:d:{QID}")
+    switch_data = _buttons(conflict.edits[-1])[1][1]
+    monkeypatch.setattr(bot, "_load_catalog_document", lambda: None)
+
+    async def _unexpected_atomic_switch(*args, **kwargs):
+        raise AssertionError("target validation must finish before the DB switch")
+
+    monkeypatch.setattr(bot, "switch_active_questionnaire_session",
+                        _unexpected_atomic_switch)
+
+    message = _press(bot.cb_questionnaire_switch, 1, switch_data)
+
+    source = asyncio.run(database.get_questionnaire_session(source_id))
+    assert source["status"] == "active" and source["current_index"] == 1
+    assert message.edits[-1][0] == questionnaire_ux.not_available_text("ru")
+    assert len(_session_rows(1)) == 1
 
 
 def test_definition_preserves_exact_content_options_and_reference_period(flow):

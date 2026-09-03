@@ -241,6 +241,14 @@ def not_available_text(lang: str = "ru") -> str:
     return "This questionnaire is not available right now."
 
 
+def active_test_conflict_text(lang: str = "ru") -> str:
+    if lang == "ru":
+        return ("У тебя есть незавершённый тест\n\n"
+                "Продолжи его или начни новый. В этом случае незавершённый тест будет отменён.")
+    return ("You have an unfinished test\n\n"
+            "Continue it or start a new one. In that case, the unfinished test will be cancelled.")
+
+
 def cancelled_text(lang: str = "ru") -> str:
     if lang == "ru":
         return "Опрос прерван."

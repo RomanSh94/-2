@@ -7,6 +7,7 @@ X20 Bot — Основной файл
   Notifications → OutcomeTracking → User
 """
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -137,6 +138,7 @@ from database import (
     log_crisis_delivery,
     get_tester_acknowledged, set_tester_acknowledged,
     start_questionnaire_session, get_active_questionnaire_session,
+    switch_active_questionnaire_session,
     get_questionnaire_session, get_completed_questionnaire_sessions,
     record_questionnaire_response,
     advance_questionnaire_session, complete_questionnaire_session,
@@ -6586,6 +6588,9 @@ async def cmd_journal_delete(message: Message, state: FSMContext):
 #   q:c:<cat>              category
 #   q:d:<qid>              detail card
 #   q:s:<qid>              start
+#   q:v:<sid>              resume this exact owned/current active session
+#   q:w:<sid>:<target>     explicitly cancel the current active session and
+#                          switch to the validated target definition/version
 #   q:a:<sid>:<step>:<aid> answer
 #   q:b:<sid>              back
 #   q:p:<sid>              pause/continue later (the ONLY exit action exposed
@@ -6768,7 +6773,9 @@ def _questionnaire_list_keyboard(lang: str, catalog: dict[str, list]) -> InlineK
 
 def _questionnaire_category_keyboard(entries: list[dict], lang: str) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
-                text=entry["title_ru"] if lang == "ru" else entry["title_en"],
+                text=(gad7_ux.catalog_button_label(lang)
+                      if entry.get("instrument_id") == "gad7"
+                      else entry["title_ru"] if lang == "ru" else entry["title_en"]),
                 callback_data=f"q:d:{entry['definition_id']}")]
             for entry in entries]
     rows.append([InlineKeyboardButton(text=("⬅️ Назад" if lang == "ru" else "⬅️ Back"),
@@ -6837,6 +6844,52 @@ def _questionnaire_detail_keyboard(qid: str, lang: str, *, active_session: dict 
         [InlineKeyboardButton(text=("← К тестам" if lang == "ru" else "← Back to tests"),
                               callback_data="q:l")],
     ])
+
+
+def _questionnaire_switch_target_token(definition: dict) -> str:
+    """Compact, version-aware identity for q:w callbacks.
+
+    The target id itself can already consume most of Telegram's 64-byte
+    callback_data limit. A deterministic digest keeps the destructive switch
+    callback bounded while fresh resolution below still requires one exact
+    current definition id+version match.
+    """
+    identity = f"{definition['id']}\0{definition['version']}".encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()[:40]
+
+
+def _resolve_questionnaire_switch_target(registry: questionnaires.Registry,
+                                         token: str) -> dict | None:
+    matches = [definition for definition in registry.by_id.values()
+               if _questionnaire_switch_target_token(definition) == token]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _questionnaire_active_conflict_keyboard(active_session: dict, target: dict,
+                                            lang: str) -> InlineKeyboardMarkup:
+    switch_data = (
+        f"q:w:{active_session['id']}:{_questionnaire_switch_target_token(target)}")
+    if len(switch_data.encode("utf-8")) > 64:
+        raise ValueError("questionnaire switch callback exceeds Telegram limit")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("▶️ Продолжить тест" if lang == "ru" else "▶️ Continue test"),
+            callback_data=f"q:v:{active_session['id']}")],
+        [InlineKeyboardButton(
+            text=("✖️ Отменить и начать новый" if lang == "ru"
+                  else "✖️ Cancel and start new"),
+            callback_data=switch_data)],
+        [InlineKeyboardButton(text=("← К тестам" if lang == "ru" else "← Back to tests"),
+                              callback_data="q:l")],
+    ])
+
+
+async def _send_questionnaire_active_conflict(send, active_session: dict,
+                                              target: dict, lang: str) -> None:
+    await send(
+        questionnaire_ux.active_test_conflict_text(lang),
+        reply_markup=_questionnaire_active_conflict_keyboard(
+            active_session, target, lang))
 
 
 def _questionnaire_completion_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
@@ -7397,7 +7450,16 @@ async def cb_questionnaire_detail(callback: CallbackQuery, state: FSMContext = N
         await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
         await callback.answer()
         return
-    active_session = await _compatible_active_session(uid, definition)
+    active = await get_active_questionnaire_session(uid)
+    active_session = (active if active
+                      and active["questionnaire_id"] == definition["id"]
+                      and active["questionnaire_version"] == definition["version"]
+                      else None)
+    if active is not None and active_session is None:
+        await _send_questionnaire_active_conflict(
+            _edit_or_answer(callback.message), active, definition, lang)
+        await callback.answer()
+        return
     detail = (gad7_ux.detail_text(lang)
               if gad7_core.is_gad7_definition(definition)
               else questionnaire_ux.detail_text(definition, lang))
@@ -7444,7 +7506,8 @@ async def cb_questionnaire_start(callback: CallbackQuery, state: FSMContext = No
     if active:
         if (active["questionnaire_id"] != definition["id"]
                 or active["questionnaire_version"] != definition["version"]):
-            await callback.message.answer(questionnaire_ux.not_available_text(lang))
+            await _send_questionnaire_active_conflict(
+                _edit_or_answer(callback.message), active, definition, lang)
             await callback.answer()
             return
         await _send_questionnaire_step(_edit_or_answer(callback.message), definition, active["id"],
@@ -7466,6 +7529,106 @@ async def _load_owned_active_session(session_id: int, uid: int):
     if not session or session["user_id"] != uid or session["status"] != "active":
         return None
     return session
+
+
+@dp.callback_query(F.data.startswith("q:v:"))
+async def cb_questionnaire_resume_session(callback: CallbackQuery,
+                                          state: FSMContext = None):
+    """Resume one exact owned/current active session without creating state."""
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    await _clear_active_journal_if_leaving(state)
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    session_id = int(parts[2])
+    session = await _load_owned_active_session(session_id, uid)
+    current = await get_active_questionnaire_session(uid)
+    if session is None or current is None or current["id"] != session_id:
+        await callback.answer()
+        return
+
+    registry = _load_registry_fresh()
+    manifest_document = _load_catalog_document()
+    definition = registry.get(session["questionnaire_id"])
+    if (definition is None
+            or definition["version"] != session["questionnaire_version"]
+            or not registry.combined_can_start(definition["id"], manifest_document)):
+        await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    if await _dass21_blocked(definition["id"], uid):
+        await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+
+    session = await _load_owned_active_session(session_id, uid)
+    current = await get_active_questionnaire_session(uid)
+    if session is None or current is None or current["id"] != session_id:
+        await callback.answer()
+        return
+    await _send_questionnaire_step(
+        _edit_or_answer(callback.message), definition, session_id,
+        session["current_index"], lang)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("q:w:"))
+async def cb_questionnaire_switch(callback: CallbackQuery, state: FSMContext = None):
+    """Explicitly cancel the supplied current session and start a fresh target.
+
+    Target governance is revalidated before the old session is touched. The
+    source is then re-read and compared with the user's current active session
+    immediately before cancellation, so stale cards cannot cancel a newer
+    session.
+    """
+    uid = callback.from_user.id
+    lang = await get_user_language(uid)
+    if not await _questionnaire_gate(callback, uid, lang):
+        return
+    await _clear_active_journal_if_leaving(state)
+    parts = callback.data.split(":")
+    if (len(parts) != 4 or not parts[2].isdigit()
+            or len(parts[3]) != 40
+            or any(char not in "0123456789abcdef" for char in parts[3])):
+        await callback.answer()
+        return
+    source_session_id = int(parts[2])
+    target_token = parts[3]
+
+    source = await _load_owned_active_session(source_session_id, uid)
+    current = await get_active_questionnaire_session(uid)
+    if source is None or current is None or current["id"] != source_session_id:
+        await callback.answer()
+        return
+
+    registry = _load_registry_fresh()
+    manifest_document = _load_catalog_document()
+    target = _resolve_questionnaire_switch_target(registry, target_token)
+    if target is None or not registry.combined_can_start(target["id"], manifest_document):
+        await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    if await _dass21_blocked(target["id"], uid):
+        await _edit_or_answer(callback.message)(questionnaire_ux.not_available_text(lang))
+        await callback.answer()
+        return
+    if (source["questionnaire_id"] == target["id"]
+            and source["questionnaire_version"] == target["version"]):
+        await callback.answer()
+        return
+
+    new_session_id = await switch_active_questionnaire_session(
+        uid, source_session_id, target["id"], target["version"])
+    if new_session_id is None:
+        await callback.answer()
+        return
+    await _send_questionnaire_step(
+        _edit_or_answer(callback.message), target, new_session_id, 0, lang)
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("q:a:"))
