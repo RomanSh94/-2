@@ -5,6 +5,11 @@ module. This module contains no scoring, persistence, Telegram, or LLM logic.
 """
 
 
+def catalog_button_label(lang: str = "ru") -> str:
+    """Short label for the category-list button only."""
+    return "ГТР-7 (GAD-7)" if lang == "ru" else "GAD-7"
+
+
 def detail_text(lang: str = "ru") -> str:
     if lang != "ru":
         return ("Generalized Anxiety Disorder-7 (GAD-7)\n\n"

@@ -3629,6 +3629,58 @@ async def start_questionnaire_session(uid: int, questionnaire_id: str, version: 
         return cur.lastrowid
 
 
+async def switch_active_questionnaire_session(
+        uid: int, source_session_id: int,
+        target_questionnaire_id: str,
+        target_questionnaire_version: str) -> int | None:
+    """Atomically replace the caller's sole active questionnaire session.
+
+    Clinical and product authorization remain the caller's responsibility.
+    This helper only guards the persistence transition so concurrent switch
+    callbacks cannot both replace the same source with separate active rows.
+    """
+    async with aiosqlite.connect(DB) as db:
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT user_id, status FROM questionnaire_sessions WHERE id=?",
+                (source_session_id,))
+            source = await cur.fetchone()
+            if source is None or source[0] != uid or source[1] != "active":
+                await db.rollback()
+                return None
+
+            cur = await db.execute(
+                "SELECT id FROM questionnaire_sessions "
+                "WHERE user_id=? AND status='active' ORDER BY id",
+                (uid,))
+            active_rows = await cur.fetchall()
+            if len(active_rows) != 1 or active_rows[0][0] != source_session_id:
+                await db.rollback()
+                return None
+
+            cur = await db.execute(
+                "UPDATE questionnaire_sessions "
+                "SET status='cancelled', completed_at=datetime('now') "
+                "WHERE id=? AND user_id=? AND status='active'",
+                (source_session_id, uid))
+            if cur.rowcount != 1:
+                await db.rollback()
+                return None
+
+            cur = await db.execute(
+                "INSERT INTO questionnaire_sessions "
+                "(user_id, questionnaire_id, questionnaire_version, status, current_index) "
+                "VALUES (?,?,?, 'active', 0)",
+                (uid, target_questionnaire_id, target_questionnaire_version))
+            new_session_id = cur.lastrowid
+            await db.commit()
+            return new_session_id
+        except Exception:
+            await db.rollback()
+            raise
+
+
 async def get_active_questionnaire_session(uid: int) -> dict | None:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
