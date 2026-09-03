@@ -371,16 +371,16 @@ def test_no_current_real_manifest_risk_mapping():
     assert risk_mapped == []
 
 
-def test_only_dass_ready_and_no_real_risk_mapping():
-    # PR #55: dass is ready (owner-only, no risk items per the official UNSW
-    # overview) -- and still NO real instrument carries a risk contract.
+def test_ready_real_instruments_have_no_risk_mapping():
+    # The intended ready instruments contain no self-harm item and neither
+    # carries a score-based risk contract. Message crisis routing stays global.
     doc = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-    ready = [x["instrument_id"] for x in doc["instruments"]
+    ready = [x for x in doc["instruments"]
              if x.get("activation_status") == "ready"]
-    assert ready == ["dass"]
-    dass = next(x for x in doc["instruments"] if x["instrument_id"] == "dass")
-    assert dass["risk_contract_id"] is None
-    assert dass["risk_contract_version"] is None
+    assert {x["instrument_id"] for x in ready} == {"dass", "gad7"}
+    for instrument in ready:
+        assert instrument["risk_contract_id"] is None
+        assert instrument["risk_contract_version"] is None
 
 
 # ── determinism / immutability ────────────────────────────────────────────────

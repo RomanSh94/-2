@@ -72,7 +72,7 @@ def _minimal_valid(**overrides):
 def test_manifest_loads():
     document = _load_document()
     assert document["schema_version"] == 2
-    assert len(document["instruments"]) == 8
+    assert len(document["instruments"]) == 9
 
 
 def test_instrument_ids_are_unique():
@@ -86,18 +86,19 @@ def test_every_owner_supplied_url_is_represented():
         assert url in source_pages, f"missing manifest entry for owner-supplied URL {url}"
 
 
-def test_only_dass_is_ready_and_only_with_documented_evidence():
-    # PR #55: dass (DASS-21, Fattakhov RU, official UNSW public-domain source)
-    # is the ONLY ready instrument; readiness passed the full evidence
-    # validator. Every other instrument stays non-ready.
+def test_only_approved_clinical_instruments_are_ready_with_documented_evidence():
     ready = [i["instrument_id"] for i in _instruments()
              if i["activation_status"] == "ready"]
-    assert ready == ["dass"]
+    assert ready == ["gad7", "dass"]
+    for instrument_id in ready:
+        instrument = _by_id(instrument_id)
+        for key in RIGHTS_KEYS:
+            assert instrument["rights"][key]["status"] in (
+                "allowed", "allowed_with_conditions")
+            assert instrument["rights"][key]["evidence"], (instrument_id, key)
     dass = _by_id("dass")
-    for key in RIGHTS_KEYS:
-        assert dass["rights"][key]["status"] in ("allowed", "allowed_with_conditions")
-        assert dass["rights"][key]["evidence"], key
     assert dass["public_catalog_visible"] is False  # owner-only, never public
+    assert _by_id("gad7")["public_catalog_visible"] is True
 
 
 # ── v6 corrections: rights are tri-state enums, never booleans ───────────────
@@ -203,10 +204,7 @@ def test_dass_exact_version_verified_fattakhov_ru():
 # ── v6 corrections: no executable risk metadata before exact version ─────────
 def test_risk_item_runtime_metadata_unverified_without_definition():
     for item in _instruments():
-        if item["instrument_id"] == "dass":
-            # PR #55: verified from the official UNSW overview -- "none of the
-            # DASS items refers to suicidal tendencies"; contains no risk
-            # items and carries no risk contract.
+        if item["instrument_id"] in {"dass", "gad7"}:
             assert item["risk_item_metadata_status"] == "verified"
         else:
             assert item["risk_item_metadata_status"] == "unverified", (

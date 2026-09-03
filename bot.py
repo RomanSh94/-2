@@ -238,6 +238,8 @@ import clinical_scoring
 import dass21_runtime
 import dass21_access
 import dass21_scorer
+import gad7_core
+import gad7_ux
 import discussion_adapters
 import aiosqlite
 import navigation
@@ -6687,7 +6689,7 @@ async def _dass21_recommendation_options(uid: int) -> dict[str, dict]:
     options = {}
     for area_id, category_id, _ru, _en in _DASS21_RECOMMENDATION_AREAS:
         downstream = [entry for entry in catalog.get(category_id, [])
-                      if entry.get("instrument_id") != "dass"]
+                      if entry.get("instrument_id") not in {"dass", "gad7"}]
         if downstream:
             options[area_id] = downstream[0]
     return options
@@ -6826,8 +6828,11 @@ def _questionnaire_detail_keyboard(qid: str, lang: str, *, active_session: dict 
             [InlineKeyboardButton(text=("← К тестам" if lang == "ru" else "← Back to tests"),
                                   callback_data="q:l")],
         ])
+    start_text = (("Начать" if lang == "ru" else "Start")
+                  if gad7_core.is_gad7_definition_id(qid)
+                  else ("▶️ Начать" if lang == "ru" else "▶️ Start"))
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=("▶️ Начать" if lang == "ru" else "▶️ Start"),
+        [InlineKeyboardButton(text=start_text,
                               callback_data=f"q:s:{qid}")],
         [InlineKeyboardButton(text=("← К тестам" if lang == "ru" else "← Back to tests"),
                               callback_data="q:l")],
@@ -7036,6 +7041,66 @@ async def _send_dass21_back_to_result(send, session: dict, lang: str,
     await send(questionnaire_ux.dass21_result_text(result.subscales, lang), reply_markup=keyboard)
 
 
+def _gad7_score(definition: dict, response_rows: list[dict]):
+    """Run the exact GAD-7 scorer through the shared clinical validator."""
+    responses = [clinical_scoring.ClinicalResponse(
+        row["item_id"], row["answer_id"], int(row["answer_value"]))
+        for row in response_rows]
+    registry = clinical_scoring.ClinicalScorerRegistry()
+    registry.register(gad7_core.Gad7Scorer())
+    return clinical_scoring.score_validated_clinical_definition(
+        definition, _load_catalog_document(), responses, registry)
+
+
+async def _send_gad7_result(send, definition: dict, session_id: int, lang: str) -> None:
+    """Validate, score, complete, and render one GAD-7 session fail-closed."""
+    try:
+        rows = await get_questionnaire_responses(session_id)
+        result = _gad7_score(definition, rows)
+        score = int(result.raw_total)
+        await complete_questionnaire_session(session_id)
+        await send(
+            gad7_ux.result_text(
+                score, gad7_core.band_label_ru(score), lang),
+            reply_markup=_questionnaire_completion_keyboard(session_id, lang))
+    except Exception:
+        logging.exception("gad7 scoring failed (session_id=%s)", session_id)
+        await send(questionnaire_ux.not_available_text(lang))
+
+
+async def _gad7_recompute_result_or_none(session: dict):
+    """Read-only exact-version GAD-7 reconstruction for history/report."""
+    if session.get("status") != "completed":
+        return None
+    try:
+        registry = _load_registry_fresh()
+        definition = registry.get(session["questionnaire_id"])
+        if (not gad7_core.is_gad7_definition(definition)
+                or definition.get("version") != session["questionnaire_version"]):
+            return None
+        rows = await get_questionnaire_responses(session["id"])
+        return definition, _gad7_score(definition, rows)
+    except (aiosqlite.Error, OSError, ValueError, TypeError,
+            clinical_scoring.ClinicalScoringError):
+        return None
+
+
+async def _send_gad7_historical_result(send, session: dict, lang: str,
+                                       *, reply_markup=None) -> None:
+    reconstructed = await _gad7_recompute_result_or_none(session)
+    if reconstructed is None:
+        await send(questionnaire_ux.not_available_text(lang))
+        return
+    _definition, result = reconstructed
+    score = int(result.raw_total)
+    await send(
+        gad7_ux.result_text(
+            score, gad7_core.band_label_ru(score), lang),
+        reply_markup=(reply_markup
+                      if reply_markup is not None
+                      else _questionnaire_completion_keyboard(session["id"], lang)))
+
+
 async def _questionnaire_gate(entity, uid: int, lang: str) -> bool:
     """Same two gates as _nav_gate (journal_guard THEN
     ensure_full_access_or_closed_test), in the same order. A separate
@@ -7107,6 +7172,9 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
             # result, neutral text. Never reaches the generic PR B path.
             await _send_dass21_result(send, definition, session_id, lang)
             return
+        if gad7_core.is_gad7_definition(definition):
+            await _send_gad7_result(send, definition, session_id, lang)
+            return
         await complete_questionnaire_session(session_id)
         # PR B: kill-switch + eligibility gate on the completion branch. When
         # the flag is off (default) or the definition isn't eligible, this is
@@ -7119,14 +7187,21 @@ async def _send_questionnaire_step(send, definition: dict, session_id: int, step
                    reply_markup=_questionnaire_completion_keyboard(session_id, lang))
         return
     total = len(definition.get("items", []))
-    text = questionnaire_ux.question_text(step, total, item["text"], lang,
-                                          options=item.get("options"))
+    if gad7_core.is_gad7_definition(definition):
+        text = gad7_ux.question_text(
+            step, total, item["text"], item.get("options", []), lang)
+    else:
+        text = questionnaire_ux.question_text(step, total, item["text"], lang,
+                                              options=item.get("options"))
     keyboard = _questionnaire_item_keyboard(definition, session_id, step, item, lang)
     if len(text) > _QUESTIONNAIRE_CARD_MAXLEN:
         # Deterministic safe fallback (never a silent truncation of the
         # protected wording): drop the in-card legend and show the FULL labels
         # on the buttons instead -- the pre-#57 layout.
-        text = questionnaire_ux.question_text(step, total, item["text"], lang)
+        text = (gad7_ux.question_text(
+                    step, total, item["text"], [], lang)
+                if gad7_core.is_gad7_definition(definition)
+                else questionnaire_ux.question_text(step, total, item["text"], lang))
         keyboard = _questionnaire_full_label_keyboard(definition, session_id, step, item, lang)
     await send(text, reply_markup=keyboard)
 
@@ -7323,8 +7398,11 @@ async def cb_questionnaire_detail(callback: CallbackQuery, state: FSMContext = N
         await callback.answer()
         return
     active_session = await _compatible_active_session(uid, definition)
+    detail = (gad7_ux.detail_text(lang)
+              if gad7_core.is_gad7_definition(definition)
+              else questionnaire_ux.detail_text(definition, lang))
     await _edit_or_answer(callback.message)(
-        questionnaire_ux.detail_text(definition, lang),
+        detail,
         reply_markup=_questionnaire_detail_keyboard(
             qid, lang, active_session=active_session,
             total_items=len(definition.get("items", []))))
@@ -7704,6 +7782,13 @@ async def cb_questionnaire_result(callback: CallbackQuery, state: FSMContext = N
         await callback.answer()
         return
 
+    if gad7_core.is_gad7_definition_id(session["questionnaire_id"]):
+        await _clear_dass21_discussion(state)
+        await _send_gad7_historical_result(
+            _edit_or_answer(callback.message), session, lang)
+        await callback.answer()
+        return
+
     await _clear_dass21_discussion(state)
 
     if not config.QUESTIONNAIRE_INTERPRETATION_ENABLED:              # 4
@@ -7930,6 +8015,23 @@ async def cb_questionnaire_specialist_report(callback: CallbackQuery):
             subscale_lines = (
                 [f"Депрессия: {dep}", f"Тревога: {anx}", f"Стресс: {stress}"] if lang == "ru"
                 else [f"Depression: {dep}", f"Anxiety: {anx}", f"Stress: {stress}"])
+
+    if gad7_core.is_gad7_definition_id(session["questionnaire_id"]):
+        reconstructed = await _gad7_recompute_result_or_none(session)
+        if reconstructed is None:
+            await callback.message.answer(questionnaire_ux.not_available_text(lang))
+            await callback.answer()
+            return
+        _gad_definition, gad_result = reconstructed
+        gad_score = int(gad_result.raw_total)
+        band = gad7_core.band_label_ru(gad_score)
+        subscale_lines = (
+            [f"Общий балл: {gad_score} / 21",
+             f"Выраженность тревожных симптомов: {band}",
+             "Период оценки: последние 2 недели"] if lang == "ru"
+            else [f"Total score: {gad_score} / 21",
+                  f"Anxiety symptom level: {band}",
+                  "Reference period: past 2 weeks"])
 
     completed_at = session.get("completed_at") if isinstance(session, dict) else None
 
@@ -9271,11 +9373,14 @@ def _results_hub_keyboard(lang: str) -> InlineKeyboardMarkup:
 def _results_tests_keyboard(sessions: list[dict], lang: str) -> InlineKeyboardMarkup:
     rows = []
     for session in sessions:
-        if not dass21_runtime.is_dass21_definition_id(session["questionnaire_id"]):
+        if not (dass21_runtime.is_dass21_definition_id(session["questionnaire_id"])
+                or gad7_core.is_gad7_definition_id(session["questionnaire_id"])):
             continue
         completed_at = session.get("completed_at") or ""
         date = completed_at[:10]
-        label = f"DASS-21 · {date}" if date else "DASS-21"
+        name = ("DASS-21" if dass21_runtime.is_dass21_definition_id(
+            session["questionnaire_id"]) else "GAD-7")
+        label = f"{name} · {date}" if date else name
         rows.append([InlineKeyboardButton(
             text=label, callback_data=f"results:test:{session['id']}")])
     rows.append([InlineKeyboardButton(
@@ -9304,11 +9409,35 @@ def _results_history_result_keyboard(session_id: int, lang: str) -> InlineKeyboa
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _gad7_history_result_keyboard(session_id: int, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("🧾 Отчёт для специалиста" if lang == "ru" else "🧾 Specialist report"),
+            callback_data=f"q:o:{session_id}")],
+        [InlineKeyboardButton(
+            text=("📌 Оставить в чате" if lang == "ru" else "📌 Leave in chat"),
+            callback_data=f"results:pin:{session_id}")],
+        [InlineKeyboardButton(
+            text=("⬅️ К результатам" if lang == "ru" else "⬅️ Back to results"),
+            callback_data="results:tests")],
+    ])
+
+
 async def _load_owned_completed_history_dass(session_id: int, uid: int):
     session = await _load_owned_session(session_id, uid)
     if session is None or session.get("status") != "completed":
         return None
     if not dass21_runtime.is_dass21_definition_id(session["questionnaire_id"]):
+        return None
+    return session
+
+
+async def _load_owned_completed_history_result(session_id: int, uid: int):
+    session = await _load_owned_session(session_id, uid)
+    if session is None or session.get("status") != "completed":
+        return None
+    if not (dass21_runtime.is_dass21_definition_id(session["questionnaire_id"])
+            or gad7_core.is_gad7_definition_id(session["questionnaire_id"])):
         return None
     return session
 
@@ -9337,7 +9466,8 @@ async def cb_results_tests(callback: CallbackQuery):
         sessions = []
     visible_sessions = [
         session for session in sessions
-        if dass21_runtime.is_dass21_definition_id(session["questionnaire_id"])
+        if (dass21_runtime.is_dass21_definition_id(session["questionnaire_id"])
+            or gad7_core.is_gad7_definition_id(session["questionnaire_id"]))
     ]
     await _answer_target(
         callback,
@@ -9358,13 +9488,18 @@ async def cb_results_test(callback: CallbackQuery):
         await callback.answer()
         return
     session_id = int(parts[2])
-    session = await _load_owned_completed_history_dass(session_id, uid)
+    session = await _load_owned_completed_history_result(session_id, uid)
     if session is None:
         await callback.answer()
         return
-    await _send_dass21_back_to_result(
-        _edit_or_answer(callback.message), session, lang,
-        reply_markup_override=_results_history_result_keyboard(session_id, lang))
+    if gad7_core.is_gad7_definition_id(session["questionnaire_id"]):
+        await _send_gad7_historical_result(
+            _edit_or_answer(callback.message), session, lang,
+            reply_markup=_gad7_history_result_keyboard(session_id, lang))
+    else:
+        await _send_dass21_back_to_result(
+            _edit_or_answer(callback.message), session, lang,
+            reply_markup_override=_results_history_result_keyboard(session_id, lang))
     await callback.answer()
 
 
@@ -9379,11 +9514,14 @@ async def cb_results_pin(callback: CallbackQuery):
         await callback.answer()
         return
     session_id = int(parts[2])
-    session = await _load_owned_completed_history_dass(session_id, uid)
+    session = await _load_owned_completed_history_result(session_id, uid)
     if session is None:
         await callback.answer()
         return
-    await _send_dass21_back_to_result(callback.message.answer, session, lang)
+    if gad7_core.is_gad7_definition_id(session["questionnaire_id"]):
+        await _send_gad7_historical_result(callback.message.answer, session, lang)
+    else:
+        await _send_dass21_back_to_result(callback.message.answer, session, lang)
     await callback.answer()
 
 

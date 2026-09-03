@@ -10,11 +10,9 @@ ambiguous" rule no longer applies -- multiple files are the normal case now;
 each is validated and keyed by its own `id`. See the module docstring in the
 git history / PR description for the full behavioral-parity write-up.
 
-This module does NOT compute scores, does NOT interpret answers, and does NOT
-contain any real questionnaire text -- only synthetic/demo fixture content
-(see tests/fixtures/*.json) is ever loaded in tests, and real/licensed
-instrument text (if it ever exists) would live only under the gitignored
-`private_questionnaires/` directory, never under tests/fixtures/.
+This module does NOT compute scores or interpret answers. Approved governed
+definitions may live in `questionnaire_definitions/`; private/hash-pinned
+definitions remain in the gitignored `private_questionnaires/` directory.
 
 Risk-item handling (unchanged guarantee from PR #1, still fail-closed, no
 fuzzy matching): a definition is rejected outright if its top-level
@@ -27,6 +25,8 @@ import re
 import pathlib
 
 PRIVATE_QUESTIONNAIRES_DIR = pathlib.Path("private_questionnaires")
+APPROVED_QUESTIONNAIRES_DIR = pathlib.Path(__file__).with_name(
+    "questionnaire_definitions")
 
 _REQUIRED_TOP_LEVEL_FIELDS = (
     "id", "title", "version", "lang", "description",
@@ -236,8 +236,23 @@ class Registry:
                 if self.combined_can_start(d["id"], manifest_document)]
 
 
-def load_registry(directory: str | pathlib.Path = PRIVATE_QUESTIONNAIRES_DIR) -> Registry:
-    return Registry(directory)
+def load_registry(directory: str | pathlib.Path | None = None) -> Registry:
+    """Load one explicit directory for tests/callers, or the production union.
+
+    The default production registry reuses the same validation/lookup engine
+    for approved tracked definitions and private definitions. Duplicate ids
+    across the two sources fail closed by being omitted entirely.
+    """
+    if directory is not None:
+        return Registry(directory)
+    registry = Registry(PRIVATE_QUESTIONNAIRES_DIR)
+    approved = Registry(APPROVED_QUESTIONNAIRES_DIR)
+    for definition_id, definition in approved.by_id.items():
+        if definition_id in registry.by_id:
+            registry.by_id.pop(definition_id, None)
+            continue
+        registry.by_id[definition_id] = definition
+    return registry
 
 
 def get_item(definition: dict, index: int) -> dict | None:
