@@ -390,6 +390,7 @@ def _prepare_dass_pipeline(monkeypatch, captured_messages):
     monkeypatch.setattr(bot, "maybe_update_profile", _async(None))
     monkeypatch.setattr(bot, "check_sudden_improvement", _async(False))
     monkeypatch.setattr(bot, "persist_influence_trace", _async(None))
+    monkeypatch.setattr(bot, "claim_first_turn", _async(False))
     monkeypatch.setattr(bot.bot, "send_chat_action", _async(None))
     monkeypatch.setattr(bot.asyncio, "sleep", _async(None))
 
@@ -403,6 +404,290 @@ def _prepare_dass_pipeline(monkeypatch, captured_messages):
 
     monkeypatch.setattr(bot.client.chat.completions, "create", _completion)
     monkeypatch.setattr(bot, "deliver_response", _deliver)
+
+
+def _trusted_dass_result(depression=28, anxiety=32, stress=32):
+    return types.SimpleNamespace(
+        subscales={"depression": depression, "anxiety": anxiety, "stress": stress},
+        instrument_version="DASS-21",
+        translation_id="fattakhov_ru_2024",
+    )
+
+
+def test_free_text_context_contains_trusted_28_32_32_ordering_and_stays_minimized():
+    context = bot._dass21_free_text_system_context(_trusted_dass_result(), "ru")
+
+    assert "тревога=32 = стресс=32 > депрессия=28" in context
+    assert "тревога и стресс (равные значения)" in context
+    assert "исправь неверную сравнительную предпосылку" in context
+    assert "последняя неделя" in context
+    assert REAL_ITEM_TEXT not in context
+    assert "dass21_01" not in context
+    assert "answer_id" not in context
+    assert "92" not in context  # forbidden would-be total 28+32+32
+
+
+def test_live_comparison_prefix_corrects_false_premise_and_names_tie():
+    user_text = "Почему у меня тревога выше остальных показателей и что это означает?"
+
+    assert bot._dass21_has_comparison_intent(user_text, "ru") is True
+    prefix = bot._dass21_comparison_prefix(_trusted_dass_result(), "ru")
+
+    assert prefix.startswith("По этим результатам тревога не выше стресса:")
+    assert "тревога и стресс одинаковы — по 32" in prefix
+    assert "депрессия — 28" in prefix
+
+
+def test_dass_validator_rejects_unsafe_live_style_output():
+    text = ("Повышенная тревога может означать, что ты находишься в состоянии "
+            "постоянного беспокойства или напряжения.")
+    ok, reason = bot._validate_dass21_free_text_response(
+        text, _trusted_dass_result(), "Что это значит?", "ru")
+    assert ok is False
+    assert "severity" in reason
+
+
+def test_dass_validator_rejects_wrong_comparison():
+    ok, reason = bot._validate_dass21_free_text_response(
+        "Тревога выше стресса.", _trusted_dass_result(), "Что выше?", "ru")
+    assert ok is False
+    assert "comparison" in reason
+
+
+@pytest.mark.parametrize(("text", "lang"), [
+    ("Тревога выше остальных показателей.", "ru"),
+    ("Тревога выше всех остальных.", "ru"),
+    ("Стресс выше всех остальных.", "ru"),
+    ("Стресс ниже всех остальных.", "ru"),
+    ("Anxiety is higher than the others.", "en"),
+    ("Anxiety is higher than all the other scores.", "en"),
+    ("Stress is higher than all the others.", "en"),
+    ("Stress is lower than all the others.", "en"),
+])
+def test_dass_validator_rejects_false_comparison_to_other_scales(text, lang):
+    ok, reason = bot._validate_dass21_free_text_response(
+        text, _trusted_dass_result(), "Что выше?", lang)
+    assert ok is False
+    assert "comparison" in reason
+
+
+@pytest.mark.parametrize(("text", "lang"), [
+    ("Тревога выше депрессии.", "ru"),
+    ("Стресс выше депрессии.", "ru"),
+    ("Тревога и стресс выше депрессии.", "ru"),
+    ("Депрессия ниже остальных показателей.", "ru"),
+    ("Anxiety is higher than depression.", "en"),
+    ("Depression is lower than the other scores.", "en"),
+])
+def test_dass_validator_accepts_true_comparison_to_named_or_other_scales(text, lang):
+    assert bot._validate_dass21_free_text_response(
+        text, _trusted_dass_result(), "Что выше?", lang) == (True, None)
+
+
+@pytest.mark.parametrize("text", [
+    "Самый высокий показатель — тревога.",
+    "Самый высокий балл — тревога.",
+    "Самая высокая шкала — тревога.",
+    "Тревога — самый высокий показатель.",
+    "Тревога — единственный самый высокий показатель.",
+])
+def test_dass_validator_rejects_unique_highest_claim_in_both_ru_directions(text):
+    ok, reason = bot._validate_dass21_free_text_response(
+        text, _trusted_dass_result(), "Что выше?", "ru")
+    assert ok is False
+    assert "highest-scale" in reason
+
+
+@pytest.mark.parametrize("text", [
+    "The highest score is anxiety.",
+    "Anxiety is the highest score.",
+    "The highest scale is stress.",
+])
+def test_dass_validator_rejects_unique_highest_claim_in_both_en_directions(text):
+    ok, reason = bot._validate_dass21_free_text_response(
+        text, _trusted_dass_result(), "What is highest?", "en")
+    assert ok is False
+    assert "highest-scale" in reason
+
+
+def test_dass_validator_accepts_correct_tie_and_relative_order():
+    result = _trusted_dass_result()
+    for text in (
+        "Самые высокие показатели — тревога и стресс.",
+        "Тревога и стресс имеют самые высокие числовые значения.",
+        "Тревога и стресс равны — по 32.",
+        "Тревога и стресс равны по баллам.",
+        "Тревога и стресс выше депрессии.",
+        "Anxiety and stress are tied for the highest numeric score.",
+        "Anxiety and stress are both higher than depression.",
+        "Anxiety and stress are tied, and both are higher than depression.",
+    ):
+        lang = "en" if text.startswith("Anxiety") else "ru"
+        assert bot._validate_dass21_free_text_response(
+            text, result, "Что выше?", lang) == (True, None)
+
+
+@pytest.mark.parametrize(("text", "lang"), [
+    ("У тебя высокий уровень тревоги.", "ru"),
+    ("Умеренная депрессия.", "ru"),
+    ("Тяжёлый уровень стресса.", "ru"),
+    ("Elevated anxiety.", "en"),
+    ("Your anxiety score is high.", "en"),
+    ("Moderate depression.", "en"),
+    ("Severe stress.", "en"),
+])
+def test_dass_validator_rejects_unsupported_severity(text, lang):
+    ok, reason = bot._validate_dass21_free_text_response(
+        text, _trusted_dass_result(), "Что это значит?", lang)
+    assert ok is False
+    assert "severity" in reason
+
+
+def test_dass_validator_does_not_ban_construct_description_wording():
+    assert bot._validate_dass21_free_text_response(
+        "Шкала стресса описывает в том числе повышенную реактивность.",
+        _trusted_dass_result(), "Что измеряет стресс?", "ru") == (True, None)
+
+
+@pytest.mark.parametrize(("text", "lang"), [
+    ("Этот показатель означает постоянное беспокойство.", "ru"),
+    ("По результату видно, что ты постоянно напряжён.", "ru"),
+    ("The score means you are constantly anxious.", "en"),
+    ("The result shows chronic stress.", "en"),
+])
+def test_dass_validator_rejects_permanence_from_score(text, lang):
+    ok, reason = bot._validate_dass21_free_text_response(
+        text, _trusted_dass_result(), "Что это значит?", lang)
+    assert ok is False
+    assert "persistent" in reason
+
+
+@pytest.mark.parametrize(("text", "lang"), [
+    ("Этот балл показывает, что причина тревоги — работа.", "ru"),
+    ("Высокий показатель вызван одиночеством.", "ru"),
+    ("The score shows that work is the cause.", "en"),
+])
+def test_dass_validator_rejects_score_to_cause_assertion(text, lang):
+    ok, reason = bot._validate_dass21_free_text_response(
+        text, _trusted_dass_result(), "Почему так?", lang)
+    assert ok is False
+    assert reason is not None
+
+
+def test_dass_validator_accepts_qualified_user_narrative_hypothesis():
+    text = ("Сам балл не показывает причину. Если тревога чаще появляется перед "
+            "рабочими созвонами, это можно рассматривать как возможную связь.")
+    assert bot._validate_dass21_free_text_response(
+        text, _trusted_dass_result(), "Я тревожусь перед созвонами", "ru") == (True, None)
+
+
+def test_live_unsafe_model_answer_uses_safe_fallback_and_keeps_session(flow, monkeypatch):
+    session_id, _ = _complete_dass(OWNER)
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": session_id}
+    captured_messages = []
+    _prepare_dass_pipeline(monkeypatch, captured_messages)
+    result = _trusted_dass_result()
+    monkeypatch.setattr(bot, "_dass21_discuss_gate_and_load", _async(result))
+    unsafe = ("Повышенная тревога может означать, что ты находишься в состоянии "
+              "постоянного беспокойства или напряжения.")
+
+    async def _unsafe_completion(**kwargs):
+        captured_messages.append(kwargs["messages"])
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content=unsafe))])
+
+    monkeypatch.setattr(bot.client.chat.completions, "create", _unsafe_completion)
+    user_text = "Почему у меня тревога выше остальных показателей и что это означает?"
+    msg = FakeMessage(FakeUser(OWNER), user_text)
+
+    asyncio.run(bot.pipeline(msg, user_text, state))
+
+    delivered = msg.answers[-1][0]
+    assert delivered.startswith("По этим результатам тревога не выше стресса:")
+    assert "тревога и стресс одинаковы — по 32" in delivered
+    assert "депрессия — 28" in delivered
+    assert "последнюю неделю" in delivered
+    assert unsafe not in delivered
+    assert state.current == bot.Dass21Discussion.active.state
+    assert state.data["dass21_session_id"] == session_id
+    risk = bot.detect_risk(user_text, "ru")
+    assert bot.validate_response_with_context(delivered, user_text, risk, "ru")[0] is True
+
+
+def test_live_revalidates_deterministic_fallback_with_both_guards(flow, monkeypatch):
+    session_id, _ = _complete_dass(OWNER)
+    state = FakeState()
+    state.current = bot.Dass21Discussion.active.state
+    state.data = {"dass21_session_id": session_id}
+    captured_messages = []
+    _prepare_dass_pipeline(monkeypatch, captured_messages)
+    result = _trusted_dass_result()
+    monkeypatch.setattr(bot, "_dass21_discuss_gate_and_load", _async(result))
+    model_answer = "Можно внимательно посмотреть, что происходило на этой неделе."
+
+    async def _completion(**kwargs):
+        captured_messages.append(kwargs["messages"])
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content=model_answer))])
+
+    real_global_validator = bot.validate_response_with_context
+    real_dass_validator = bot._validate_dass21_free_text_response
+    global_calls = []
+    dass_calls = []
+    model_global_calls = 0
+
+    def _reject_first_selected_candidate(text, user_text, risk, lang):
+        nonlocal model_global_calls
+        global_calls.append(text)
+        if text == model_answer:
+            model_global_calls += 1
+            if model_global_calls == 2:
+                return False, "forced candidate rejection"
+        return real_global_validator(text, user_text, risk, lang)
+
+    def _record_dass_validation(text, dass_result, user_text, lang):
+        validation = real_dass_validator(text, dass_result, user_text, lang)
+        dass_calls.append((text, validation[0]))
+        return validation
+
+    monkeypatch.setattr(bot.client.chat.completions, "create", _completion)
+    monkeypatch.setattr(
+        bot, "validate_response_with_context", _reject_first_selected_candidate)
+    monkeypatch.setattr(
+        bot, "_validate_dass21_free_text_response", _record_dass_validation)
+    user_text = "Что можно заметить по последней неделе?"
+    msg = FakeMessage(FakeUser(OWNER), user_text)
+
+    asyncio.run(bot.pipeline(msg, user_text, state))
+
+    delivered = msg.answers[-1][0]
+    risk = bot.detect_risk(user_text, "ru")
+    assert delivered != model_answer
+    assert delivered in global_calls
+    assert (delivered, True) in dass_calls
+    assert real_global_validator(delivered, user_text, risk, "ru")[0] is True
+    assert real_dass_validator(delivered, result, user_text, "ru")[0] is True
+
+
+def test_non_dass_free_text_path_does_not_apply_dass_guard(monkeypatch, flow):
+    state = FakeState()
+    captured_messages = []
+    _prepare_dass_pipeline(monkeypatch, captured_messages)
+    ordinary_answer = "Тревога выше стресса."
+
+    async def _ordinary_completion(**kwargs):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content=ordinary_answer))])
+
+    monkeypatch.setattr(bot.client.chat.completions, "create", _ordinary_completion)
+    user_text = "Расскажи подробнее о тревоге"
+    msg = FakeMessage(FakeUser(OWNER), user_text)
+
+    asyncio.run(bot.pipeline(msg, user_text, state))
+
+    assert msg.answers[-1][0] == ordinary_answer
 
 
 def test_free_text_mode_survives_two_turns_and_revalidates_each(flow, monkeypatch):
