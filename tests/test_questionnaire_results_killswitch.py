@@ -130,9 +130,45 @@ def test_flag_off_completion_has_specialist_report_and_another_test_buttons():
     # Owner-review UX correction: "Другой опросник"/q:l + "🏠 В меню"/menu:back
     # replaced by "🧠 Другой тест"/q:t (a completed card must not be
     # overwritten by q:l's in-place edit, and menu:back opens Help).
-    assert callback_datas == [f"q:o:{session_id}", "q:t"]
+    assert callback_datas == [f"q:o:{session_id}", "q:t", "results:tests"]
     session = asyncio.run(database.get_questionnaire_session(session_id))
     assert session["status"] == "completed"
+
+
+# ── "My results" direct link on the completed result card ────────────────────
+def test_completion_card_has_my_results_button_ru():
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    _complete_flow(user, msg)
+    _, kw = msg.answers[-1]
+    buttons = [(btn.text, btn.callback_data)
+               for row in kw["reply_markup"].inline_keyboard for btn in row]
+    assert ("📊 Мои результаты", "results:tests") in buttons
+
+
+def test_completion_card_has_my_results_button_en(monkeypatch):
+    monkeypatch.setattr(bot, "get_user_language", _async("en"))
+    user = FakeUser(1)
+    msg = FakeMessage(user)
+    _complete_flow(user, msg)
+    _, kw = msg.answers[-1]
+    buttons = [(btn.text, btn.callback_data)
+               for row in kw["reply_markup"].inline_keyboard for btn in row]
+    assert ("📊 My results", "results:tests") in buttons
+
+
+def test_my_results_button_text_identical_on_generic_and_dass_completion_keyboards():
+    """The results:tests button must not be independently re-implemented per
+    instrument -- both completion keyboards have to agree on its exact text
+    for a given language, so they can't silently drift apart."""
+    for lang in ("ru", "en"):
+        generic_texts = {btn.callback_data: btn.text
+                         for row in bot._questionnaire_completion_keyboard(1, lang).inline_keyboard
+                         for btn in row}
+        dass_texts = {btn.callback_data: btn.text
+                     for row in bot._dass21_completion_keyboard(1, lang).inline_keyboard
+                     for btn in row}
+        assert generic_texts["results:tests"] == dass_texts["results:tests"]
 
 
 # ── flag-false: q:r/q:k/q:e reveal nothing ───────────────────────────────────
@@ -474,7 +510,7 @@ def test_completion_keyboard_omits_q_l_and_menu_back():
     # button (q:o:<sid>) ahead of the nav buttons -- was ["q:l", "menu:back"].
     # Owner-review UX correction: see test_flag_off_completion_is_byte_
     # identical_to_pr_a above -- same q:t/no-menu:back shape.
-    assert callback_datas == [f"q:o:{session_id}", "q:t"]
+    assert callback_datas == [f"q:o:{session_id}", "q:t", "results:tests"]
 
 
 # ── PR C1.1 — specialist report button wired into result/completion keyboards
