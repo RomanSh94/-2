@@ -1,10 +1,32 @@
+# X20 CANONICAL SOURCE — READ FIRST
+
+Before any substantial X20 product, psychology, architecture, memory,
+method-selection, safety, questionnaire, UX, or therapeutic-runtime task,
+read `X20_PROJECT_CONSTITUTION.md` in full.
+
+Precedence:
+
+1. newest explicit owner decision;
+2. `X20_PROJECT_CONSTITUTION.md` for approved TARGET product doctrine,
+   psychological reasoning, knowledge-base rules, and architecture intent;
+3. current code + current tests for CURRENT implementation fact;
+4. older repository documents only where they do not conflict.
+
+Always distinguish CURRENT / TARGET / PROPOSED / SUPERSEDED.
+
+A TARGET statement does not authorize implementation.
+
+No material architecture change without explicit owner approval.
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project
 
-X20 is a Telegram bot providing AI-assisted emotional support, built on `aiogram 3.7` + OpenAI `gpt-4o-mini` + SQLite (via `aiosqlite`) + a Flask admin dashboard. Bilingual (RU/EN). Production compatibility target: Python 3.10.12. Code that may run in production, including Professional Core V2, must remain Python 3.10-compatible unless the runtime target is explicitly changed and verified. `.github/workflows/ci.yml` is authoritative for the interpreters currently exercised by CI.
+**TARGET:** X20 is being developed toward the owner-approved professional psychological system defined in [`X20_PROJECT_CONSTITUTION.md`](X20_PROJECT_CONSTITUTION.md) — capable of doing as much of the work of a strong psychologist as can be safely and technically supported, not a generic emotional-support chatbot. Read the Constitution in full before any substantial product, psychology, architecture, or safety task; treat it as TARGET doctrine, not a description of what is already implemented.
+
+**CURRENT:** the exact runtime implementation is described in the rest of this file, and must be verified against code/tests rather than assumed from the TARGET description above. Today, X20 is a Telegram bot providing AI-assisted emotional support, built on `aiogram 3.7` + OpenAI `gpt-4o-mini` + SQLite (via `aiosqlite`) + a Flask admin dashboard. Bilingual (RU/EN). Production compatibility target: Python 3.10.12. Code that may run in production, including Professional Core V2, must remain Python 3.10-compatible unless the runtime target is explicitly changed and verified. `.github/workflows/ci.yml` is authoritative for the interpreters currently exercised by CI.
 
 ## Commands
 
