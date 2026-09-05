@@ -25,6 +25,7 @@ from professional_turn_conversation_context import (
     ConversationTurnRole,
     ProfessionalConversationContext,
 )
+from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
 
 from professional_turn_response_renderer import (
     DEFAULT_RENDERER_MAX_OUTPUT_TOKENS,
@@ -567,7 +568,8 @@ def test_production_module_imports_only_allowed_modules():
     source = pathlib.Path(professional_turn_response_renderer.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     allowed_roots = {"__future__", "asyncio", "json", "dataclasses", "enum", "openai",
-                      "professional_turn_planner", "professional_turn_conversation_context"}
+                      "professional_turn_planner", "professional_turn_conversation_context",
+                      "professional_turn_runtime_context"}
     found_roots = set()
     imported_names = set()
     for node in ast.walk(tree):
@@ -690,30 +692,41 @@ def test_no_context_call_keeps_the_user_payload_in_its_pre_slice_shape():
 
 def test_explicit_none_context_is_identical_to_omitting_it():
     """Both sides of this comparison use the CURRENT (post-slice)
-    implementation -- this proves omitting conversation_context and
-    passing conversation_context=None explicitly produce the same request
+    implementation -- this proves omitting runtime_context and
+    passing runtime_context=None explicitly produce the same request
     under today's code, not that either matches pre-slice behavior."""
     plan = _sample_plan()
     client_a = _client_returning(_VALID_JSON)
     client_b = _client_returning(_VALID_JSON)
     _call(client_a, model="gpt-4o-mini", plan=plan, source_text="hi")
-    _call(client_b, model="gpt-4o-mini", plan=plan, source_text="hi", conversation_context=None)
+    _call(client_b, model="gpt-4o-mini", plan=plan, source_text="hi", runtime_context=None)
     assert (client_a.chat.completions.calls[0]["messages"]
             == client_b.chat.completions.calls[0]["messages"])
 
 
-def test_rejects_conversation_context_of_wrong_type():
+def test_rejects_runtime_context_of_wrong_type():
     client = _client_returning(_VALID_JSON)
     with pytest.raises(ValueError):
         _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="hi",
-              conversation_context="not a context")
+              runtime_context="not a context")
+
+
+def test_rejects_raw_conversation_context_passed_as_runtime_context():
+    """The pre-slice calling convention (a bare ProfessionalConversationContext)
+    must no longer be accepted -- only the ProfessionalTurnRuntimeContext
+    envelope is a valid runtime_context value now."""
+    context = _context(_u(1, "hi"))
+    client = _client_returning(_VALID_JSON)
+    with pytest.raises(ValueError):
+        _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="hi",
+              runtime_context=context)
 
 
 def test_context_is_serialized_as_a_structurally_separate_json_field():
     context = _context(_u(1, "PRIOR_USER_MARKER"), _a(2, "PRIOR_ASSISTANT_MARKER"))
     client = _client_returning(_VALID_JSON)
     _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="CURRENT_MARKER",
-          conversation_context=context)
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     call = client.chat.completions.calls[0]
     payload = json.loads([m for m in call["messages"] if m["role"] == "user"][0]["content"])
     assert payload["source_text"] == "CURRENT_MARKER"
@@ -731,7 +744,7 @@ def test_source_text_remains_exact_and_separate_with_context_present():
     original_source_text = "  Ровно этот текст, включая пробелы вокруг.  "
     client = _client_returning(_VALID_JSON)
     _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text=original_source_text,
-          conversation_context=context)
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     call = client.chat.completions.calls[0]
     payload = json.loads([m for m in call["messages"] if m["role"] == "user"][0]["content"])
     assert payload["source_text"] == original_source_text
@@ -741,13 +754,14 @@ def test_response_parsing_and_status_behavior_unchanged_with_context():
     context = _context(_u(1, "hi"))
     client = _client_returning(_VALID_JSON)
     result = _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="hello",
-                   conversation_context=context)
+                   runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     assert result.status is TurnResponseRenderStatus.CANDIDATE
     assert result.candidate_text == json.loads(_VALID_JSON)["candidate_text"]
 
     boom_client = _client_returning("not json")
     boom_result = _call(boom_client, model="gpt-4o-mini", plan=_sample_plan(),
-                        source_text="hello", conversation_context=context)
+                        source_text="hello",
+                        runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     assert boom_result.status is TurnResponseRenderStatus.STRUCTURALLY_INVALID_RESPONSE
     assert boom_result.candidate_text is None
 
@@ -756,7 +770,7 @@ def test_context_cannot_alter_the_required_output_schema():
     context = _context(_u(1, "hi"))
     client = _client_returning(_VALID_JSON)
     _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="hello",
-          conversation_context=context)
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     call = client.chat.completions.calls[0]
     assert call["response_format"] == {"type": "json_object"}
     assert call["model"] == "gpt-4o-mini"
@@ -770,7 +784,7 @@ def test_prompt_injection_inside_context_cannot_change_call_parameters():
     context = _context(_u(1, injection), _a(2, "ok"))
     client = _client_returning(_VALID_JSON)
     _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="hello",
-          conversation_context=context, max_output_tokens=123)
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context), max_output_tokens=123)
     call = client.chat.completions.calls[0]
     assert call["model"] == "gpt-4o-mini"
     assert call["temperature"] == RENDERER_TEMPERATURE
@@ -785,7 +799,7 @@ def test_prompt_injection_inside_context_is_treated_as_ordinary_data():
     context = _context(_u(1, injection))
     client = _client_returning(_VALID_JSON)
     result = _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="hello",
-                   conversation_context=context)
+                   runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     # The call still completes as an ordinary CANDIDATE render -- injection
     # content inside conversation_context never changes transport behavior.
     assert result.status is TurnResponseRenderStatus.CANDIDATE

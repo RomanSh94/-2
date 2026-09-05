@@ -39,6 +39,7 @@ from professional_turn_conversation_context import (
     ConversationTurnRole,
     ProfessionalConversationContext,
 )
+from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
 from therapeutic_domain import (
     ClarificationTarget,
     Intent,
@@ -773,7 +774,7 @@ def test_production_module_imports_only_allowed_modules():
     allowed_roots = {
         "__future__", "asyncio", "json", "dataclasses", "enum", "openai",
         "professional_turn_analysis", "professional_turn_planner", "therapeutic_domain",
-        "professional_turn_conversation_context"}
+        "professional_turn_conversation_context", "professional_turn_runtime_context"}
     found_roots = set()
     imported_names = set()
     for node in ast.walk(tree):
@@ -840,23 +841,34 @@ def test_no_context_call_keeps_the_user_payload_in_its_pre_slice_shape():
 
 def test_explicit_none_context_is_identical_to_omitting_it():
     """Both sides of this comparison use the CURRENT (post-slice)
-    implementation -- this proves omitting conversation_context and
-    passing conversation_context=None explicitly produce the same request
+    implementation -- this proves omitting runtime_context and
+    passing runtime_context=None explicitly produce the same request
     under today's code, not that either matches pre-slice behavior."""
     analysis_result = _turn_analysis_result()
     client_a = _client_returning(_VALID_JSON)
     client_b = _client_returning(_VALID_JSON)
     _call(client_a, model="gpt-4o-mini", analysis_result=analysis_result)
-    _call(client_b, model="gpt-4o-mini", analysis_result=analysis_result, conversation_context=None)
+    _call(client_b, model="gpt-4o-mini", analysis_result=analysis_result, runtime_context=None)
     assert (client_a.chat.completions.calls[0]["messages"]
             == client_b.chat.completions.calls[0]["messages"])
 
 
-def test_rejects_conversation_context_of_wrong_type():
+def test_rejects_runtime_context_of_wrong_type():
     client = _client_returning(_VALID_JSON)
     with pytest.raises(ValueError):
         _call(client, model="gpt-4o-mini", analysis_result=_turn_analysis_result(),
-              conversation_context={"not": "valid"})
+              runtime_context={"not": "valid"})
+
+
+def test_rejects_raw_conversation_context_passed_as_runtime_context():
+    """The pre-slice calling convention (a bare ProfessionalConversationContext)
+    must no longer be accepted -- only the ProfessionalTurnRuntimeContext
+    envelope is a valid runtime_context value now."""
+    context = _context(_u(1, "hi"))
+    client = _client_returning(_VALID_JSON)
+    with pytest.raises(ValueError):
+        _call(client, model="gpt-4o-mini", analysis_result=_turn_analysis_result(),
+              runtime_context=context)
 
 
 def test_context_is_serialized_as_a_structurally_separate_json_field():
@@ -864,7 +876,7 @@ def test_context_is_serialized_as_a_structurally_separate_json_field():
     analysis_result = _turn_analysis_result(source_text="Работа.")
     client = _client_returning(_VALID_JSON)
     _call(client, model="gpt-4o-mini", analysis_result=analysis_result,
-          conversation_context=context)
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     call = client.chat.completions.calls[0]
     payload = json.loads([m for m in call["messages"] if m["role"] == "user"][0]["content"])
     assert payload["source_text"] == "Работа."
@@ -879,7 +891,7 @@ def test_source_text_and_context_stay_structurally_separate_keys():
     analysis_result = _turn_analysis_result(source_text="CURRENT_MARKER_TEXT")
     client = _client_returning(_VALID_JSON)
     _call(client, model="gpt-4o-mini", analysis_result=analysis_result,
-          conversation_context=context)
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     call = client.chat.completions.calls[0]
     payload = json.loads([m for m in call["messages"] if m["role"] == "user"][0]["content"])
     assert payload["source_text"] == "CURRENT_MARKER_TEXT"
@@ -893,7 +905,7 @@ def test_upstream_failed_skip_never_touches_client_even_with_context():
     result = _call(
         client, model="gpt-4o-mini",
         analysis_result=TurnAnalysisResult(analysis=None),
-        conversation_context=context)
+        runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     assert result.status is TurnPlanProposerCallStatus.SKIPPED_UPSTREAM_FAILED
     assert client.chat.completions.calls == []
 

@@ -63,21 +63,28 @@ genuinely-grounded span -- that stays untrusted, downstream Producer
 business, same as any other analyzer output.
 
 OPTIONAL MULTI-TURN CONTEXT (V1 addition) -- call_turn_analyzer accepts an
-OPTIONAL keyword-only `conversation_context` (professional_turn_
-conversation_context.ProfessionalConversationContext | None, default
-None). Existing callers remain API-compatible: omitting this parameter, or
-passing None explicitly, keeps the USER-MESSAGE PAYLOAD in its pre-slice
-shape -- the model's user-message content is source_text directly,
-unwrapped, exactly as before, so every existing caller/test that never
-passes this parameter keeps working unchanged. This is a payload-shape
-compatibility claim ONLY, not a claim that the complete model request is
-byte-identical to this module's pre-slice behavior: the fixed system
+OPTIONAL keyword-only `runtime_context` (professional_turn_runtime_
+context.ProfessionalTurnRuntimeContext | None, default None). The
+model-facing payload field is still named `"conversation_context"` -- its
+value comes from `runtime_context.conversation` (a professional_turn_
+conversation_context.ProfessionalConversationContext), unwrapped once at
+the top of this function; runtime_context itself is never serialized as a
+whole. Omitting this parameter, or passing runtime_context=None
+explicitly, keeps the USER-MESSAGE PAYLOAD in its pre-slice shape -- the
+model's user-message content is source_text directly, unwrapped, exactly
+as before. This is a payload-shape compatibility claim ONLY for that
+None case, not a claim that the complete model request is byte-identical
+to this module's pre-slice behavior, and NOT a claim that the pre-
+envelope calling convention (passing a bare ProfessionalConversationContext
+directly as this parameter) still works -- that raw type is now rejected
+(ValueError) as a runtime_context value; only runtime_context=None or a
+genuine ProfessionalTurnRuntimeContext is valid. The fixed system
 instruction below was intentionally extended by this slice (to describe
 the optional payload shape, the provenance rule, and the correction-
 precedence rule below) and is sent on EVERY call, including a
-conversation_context=None call -- it is not conditionally restored to its
-old text just because context is absent. When a non-None context is
-supplied, the model's user-message content becomes a single JSON object
+runtime_context=None call -- it is not conditionally restored to its
+old text just because context is absent. When a non-None runtime_context
+is supplied, the model's user-message content becomes a single JSON object
 with exactly two keys, `"source_text"` and `"conversation_context"`, so
 the two remain structurally distinct fields in the payload -- they are
 NEVER concatenated into one string. conversation_context is DATA about
@@ -155,6 +162,7 @@ from professional_turn_producer import (
     UntrustedTurnAnalyzerOutput,
 )
 from professional_turn_conversation_context import ProfessionalConversationContext
+from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
 from therapeutic_domain import (
     EvidenceKind,
     Intent,
@@ -779,6 +787,13 @@ def _validate_conversation_context(value) -> None:
             f"ProfessionalConversationContext, got {type(value)!r}")
 
 
+def _validate_runtime_context(value) -> None:
+    if value is not None and type(value) is not ProfessionalTurnRuntimeContext:
+        raise ValueError(
+            "call_turn_analyzer: runtime_context must be None or a "
+            f"ProfessionalTurnRuntimeContext, got {type(value)!r}")
+
+
 def _validate_timeout_seconds(value) -> None:
     if type(value) is bool or type(value) not in (int, float):
         raise ValueError(
@@ -968,31 +983,40 @@ async def call_turn_analyzer(
         client,
         model: str,
         source_text: str,
-        conversation_context: ProfessionalConversationContext | None = None,
+        runtime_context: ProfessionalTurnRuntimeContext | None = None,
         timeout_seconds: float = DEFAULT_ANALYZER_TIMEOUT_SECONDS,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> TurnAnalyzerCallResult:
     """Deterministic call boundary: an injected client, one source_text,
-    one OPTIONAL conversation_context, one model call, one parse attempt.
+    one OPTIONAL runtime_context, one model call, one parse attempt.
     client is never constructed here and OPENAI_API_KEY/environment/config
     are never read by this module. A schema-valid result is not a proof of
     semantic correctness -- see the module docstring.
 
-    conversation_context=None (the default) keeps the USER-MESSAGE payload
+    runtime_context=None (the default) keeps the USER-MESSAGE payload
     in its pre-slice shape -- the model's user-message content is
     source_text directly, unwrapped. This is payload-shape API
     compatibility only, not a claim that the complete request (which also
     includes the fixed system instruction, intentionally extended by this
-    slice and sent on every call regardless of conversation_context) is
+    slice and sent on every call regardless of runtime_context) is
     byte-identical to this function's pre-slice behavior. A non-None
-    context switches the user-message content to a two-key JSON object
-    ({"source_text": ..., "conversation_context": [...]}) so the two stay
-    structurally distinct fields, never concatenated into one string --
+    runtime_context switches the user-message content to a two-key JSON
+    object ({"source_text": ..., "conversation_context": [...]}) so the two
+    stay structurally distinct fields, never concatenated into one string --
     see the module docstring's OPTIONAL MULTI-TURN CONTEXT and CURRENT/
     NEWER USER CORRECTION PRECEDENCE sections for the full trust/
-    provenance/precedence contract."""
+    provenance/precedence contract.
+
+    runtime_context is a ProfessionalTurnRuntimeContext (see
+    professional_turn_runtime_context.py) -- the single envelope threaded
+    through the whole Professional Free-Text Runtime chain. This function
+    only ever reads its `.conversation` field; the resulting local
+    conversation_context is then serialized exactly as before this slice."""
     _validate_model(model)
     _validate_source_text(source_text)
+    _validate_runtime_context(runtime_context)
+    conversation_context = (
+        runtime_context.conversation if runtime_context is not None else None)
     _validate_conversation_context(conversation_context)
     _validate_timeout_seconds(timeout_seconds)
     _validate_max_output_tokens(max_output_tokens)

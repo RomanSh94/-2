@@ -31,6 +31,7 @@ import database
 import safety_validator
 from interaction_preference import detect_interaction_preference
 import professional_free_text_runtime as pftr
+from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
 from professional_turn_analysis import TurnAnalysisStatus, AnalysisComponentStatus
 from professional_turn_analyzer import TurnAnalyzerFailureCategory, TurnAnalyzerStructuralFailureReason
 from professional_turn_plan_proposer import TurnPlanProposerCallResult, TurnPlanProposerCallStatus
@@ -446,7 +447,7 @@ def test_run_rejects_non_positive_row_id():
     async def go():
         await pftr.run_professional_free_text_turn(
             client=None, model="gpt-4o-mini", source_message_row_id=0,
-            source_text="hi", conversation_context=_empty_context(), risk_result={}, lang="ru")
+            source_text="hi", runtime_context=_empty_runtime_context(), risk_result={}, lang="ru")
     with pytest.raises(ValueError):
         run(go())
 
@@ -455,7 +456,19 @@ def test_run_rejects_wrong_context_type():
     async def go():
         await pftr.run_professional_free_text_turn(
             client=None, model="gpt-4o-mini", source_message_row_id=1,
-            source_text="hi", conversation_context="not a context", risk_result={}, lang="ru")
+            source_text="hi", runtime_context="not a context", risk_result={}, lang="ru")
+    with pytest.raises(ValueError):
+        run(go())
+
+
+def test_run_rejects_raw_conversation_context_passed_as_runtime_context():
+    """The pre-slice calling convention (a bare ProfessionalConversationContext)
+    must no longer be accepted -- only the ProfessionalTurnRuntimeContext
+    envelope is a valid runtime_context value now."""
+    async def go():
+        await pftr.run_professional_free_text_turn(
+            client=None, model="gpt-4o-mini", source_message_row_id=1,
+            source_text="hi", runtime_context=_empty_context(), risk_result={}, lang="ru")
     with pytest.raises(ValueError):
         run(go())
 
@@ -463,6 +476,11 @@ def test_run_rejects_wrong_context_type():
 def _empty_context():
     from professional_turn_conversation_context import EMPTY_CONVERSATION_CONTEXT
     return EMPTY_CONVERSATION_CONTEXT
+
+
+def _empty_runtime_context():
+    from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
+    return ProfessionalTurnRuntimeContext(conversation=_empty_context())
 
 
 def _monkeypatch_chain(monkeypatch, *, analyzer_failed=False,
@@ -567,18 +585,81 @@ def test_chain_success_returns_candidate_text(monkeypatch):
     _monkeypatch_chain(monkeypatch)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
     assert result.reply_text == "Что для тебя сейчас самое сложное?"
     assert result.failure_stage is None
     assert result.failure_reason is None
 
 
+def test_orchestrator_forwards_the_identical_runtime_context_object_to_all_three_stages(monkeypatch):
+    """The orchestrator must never unwrap runtime_context itself -- it
+    forwards the SAME ProfessionalTurnRuntimeContext object to
+    call_turn_analyzer, call_turn_plan_proposer, and render_turn_response.
+    Each fake below records exactly the object it received; identity (not
+    just equality) across all three proves no copy/rewrap happened at the
+    orchestrator boundary."""
+    received = {}
+
+    async def fake_analyzer(**kw):
+        received["analyzer"] = kw["runtime_context"]
+        return types.SimpleNamespace(
+            output=object(), failure_category=None, model=kw["model"],
+            structural_failure_reason=None, optional_context_recovery_used=False)
+    monkeypatch.setattr(pftr, "call_turn_analyzer", fake_analyzer)
+
+    def fake_produce(**kw):
+        return types.SimpleNamespace(
+            status=TurnAnalysisStatus.OK,
+            analysis=types.SimpleNamespace(
+                interaction=types.SimpleNamespace(status=AnalysisComponentStatus.VALIDATED)))
+    monkeypatch.setattr(pftr, "produce_turn_analysis", fake_produce)
+
+    proposal = UntrustedTurnPlanProposal(
+        objective=ProfessionalObjective.ESTABLISH_CONTACT,
+        move=PrimaryResponseMove.OPEN_INVITATION, clarification_target=None)
+
+    async def fake_proposer(**kw):
+        received["proposer"] = kw["runtime_context"]
+        return TurnPlanProposerCallResult(
+            status=TurnPlanProposerCallStatus.PROPOSAL, proposal=proposal, model=kw["model"])
+    monkeypatch.setattr(pftr, "call_turn_plan_proposer", fake_proposer)
+
+    def fake_govern(analysis_result, *, proposal):
+        return types.SimpleNamespace(
+            plan=types.SimpleNamespace(
+                objective=ProfessionalObjective.ESTABLISH_CONTACT,
+                move=PrimaryResponseMove.OPEN_INVITATION,
+                question_allowed=False, clarification_target=None),
+            abstention_reason=None, bounded_alternative_used=False)
+    monkeypatch.setattr(pftr, "govern_turn_plan", fake_govern)
+
+    async def fake_render(**kw):
+        received["renderer"] = kw["runtime_context"]
+        return TurnResponseRenderResult(
+            status=TurnResponseRenderStatus.CANDIDATE, candidate_text="ok", model=kw["model"])
+    monkeypatch.setattr(pftr, "render_turn_response", fake_render)
+
+    def fake_accept(**kw):
+        return ProfessionalResponseAcceptanceResult(
+            status=ProfessionalResponseAcceptanceStatus.ACCEPT, reason=None)
+    monkeypatch.setattr(pftr, "accept_professional_response", fake_accept)
+
+    the_runtime_context = _empty_runtime_context()
+    result = run(pftr.run_professional_free_text_turn(
+        client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
+        runtime_context=the_runtime_context, risk_result={"score": 0, "categories": []}, lang="ru"))
+    assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
+    assert received["analyzer"] is the_runtime_context
+    assert received["proposer"] is the_runtime_context
+    assert received["renderer"] is the_runtime_context
+
+
 def test_chain_analyzer_failure_yields_failed_analyzer_stage(monkeypatch):
     _monkeypatch_chain(monkeypatch, analyzer_failed=True)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
     assert result.reply_text is None
@@ -596,7 +677,7 @@ def test_chain_analyzer_failure_propagates_exact_bounded_category(monkeypatch, c
     _monkeypatch_chain(monkeypatch, analyzer_failed=True, analyzer_failure_category=category)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
     assert result.failure_reason is category
 
@@ -613,7 +694,7 @@ def test_chain_analyzer_structurally_invalid_propagates_exact_detail(monkeypatch
         analyzer_structural_failure_reason=TurnAnalyzerStructuralFailureReason.WRONG_REQUIRED_KEY_SET)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
     assert result.failure_reason is TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE
@@ -641,7 +722,7 @@ def test_chain_propagates_granular_candidate_text_bounds_detail(monkeypatch, det
         analyzer_structural_failure_reason=detail)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
     assert result.failure_reason is TurnAnalyzerFailureCategory.STRUCTURALLY_INVALID_RESPONSE
@@ -654,7 +735,7 @@ def test_chain_analyzer_provider_failure_has_no_detail(monkeypatch):
         analyzer_failure_category=TurnAnalyzerFailureCategory.PROVIDER_FAILURE)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ANALYZER
     assert result.failure_detail is None
 
@@ -671,7 +752,7 @@ def test_chain_non_analyzer_failures_never_carry_a_detail(monkeypatch):
         _monkeypatch_chain(monkeypatch, **kwargs)
         result = run(pftr.run_professional_free_text_turn(
             client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-            conversation_context=_empty_context(), risk_result={}, lang="ru"))
+            runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
         assert result.status is not pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
         assert result.failure_detail is None
 
@@ -680,7 +761,7 @@ def test_chain_success_has_no_detail(monkeypatch):
     _monkeypatch_chain(monkeypatch)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
     assert result.failure_detail is None
 
@@ -730,7 +811,7 @@ def test_success_trace_normal_success_exposes_accepted_decision(monkeypatch):
         bounded_alternative_used=False)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
     t = result.success_trace
     assert t.analysis_status is TurnAnalysisStatus.OK
@@ -759,7 +840,7 @@ def test_success_trace_bounded_alternative_success_exposes_true_and_accepted_alt
         bounded_alternative_used=True)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
     t = result.success_trace
     assert t.bounded_alternative_used is True
@@ -784,7 +865,7 @@ def test_success_trace_normal_establish_contact_not_falsely_labeled_bounded(monk
         bounded_alternative_used=False)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     t = result.success_trace
     assert t.objective is ProfessionalObjective.ESTABLISH_CONTACT
     assert t.primary_response_move is PrimaryResponseMove.OPEN_INVITATION
@@ -797,13 +878,13 @@ def test_success_trace_optional_context_recovery_flag_propagates(monkeypatch):
     _monkeypatch_chain(monkeypatch, optional_context_recovery_used=True)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     assert result.success_trace.optional_context_recovery_used is True
 
     _monkeypatch_chain(monkeypatch, optional_context_recovery_used=False)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     assert result.success_trace.optional_context_recovery_used is False
 
 
@@ -811,14 +892,14 @@ def test_success_trace_absent_on_failed_and_rejected(monkeypatch):
     _monkeypatch_chain(monkeypatch, analyzer_failed=True)
     failed_result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert failed_result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
     assert failed_result.success_trace is None
 
     _monkeypatch_chain(monkeypatch, accept_status=ProfessionalResponseAcceptanceStatus.REJECT)
     rejected_result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert rejected_result.status is pftr.ProfessionalFreeTextRuntimeStatus.REJECTED
     assert rejected_result.success_trace is None
 
@@ -864,7 +945,7 @@ def test_success_trace_no_duplicate_stage_execution(monkeypatch):
 
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
     assert calls == {"analyzer": 1, "produce": 1, "proposer": 1, "govern": 1, "render": 1, "accept": 1}
 
@@ -890,7 +971,7 @@ def test_success_trace_contains_no_raw_text(monkeypatch):
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1,
         source_text=_TRACE_PRIVACY_SENTINEL_SOURCE,
-        conversation_context=_empty_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
     trace_repr = repr(result.success_trace)
     assert _TRACE_PRIVACY_SENTINEL_SOURCE not in trace_repr
@@ -908,7 +989,7 @@ def test_chain_producer_failure_yields_failed_producer_stage_distinct_from_analy
     _monkeypatch_chain(monkeypatch, producer_failed=True)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.PRODUCER
     assert result.failure_stage is not pftr.ProfessionalFreeTextFailureStage.ANALYZER
@@ -924,7 +1005,7 @@ def test_chain_proposer_non_proposal_yields_failed_plan_proposer_stage(monkeypat
     _monkeypatch_chain(monkeypatch, proposer_status=status)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.PLAN_PROPOSER
     assert result.failure_reason is status
@@ -934,7 +1015,7 @@ def test_chain_governor_no_plan_yields_failed_planner_stage(monkeypatch):
     _monkeypatch_chain(monkeypatch, plan_none=True)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.PLANNER
     assert result.failure_reason is ProfessionalPlanAbstentionReason.NO_SEMANTIC_PROPOSAL
@@ -948,7 +1029,7 @@ def test_chain_renderer_failure_yields_failed_renderer_stage(monkeypatch, status
     _monkeypatch_chain(monkeypatch, render_status=status)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.FAILED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.RENDERER
     assert result.failure_reason is status
@@ -958,7 +1039,7 @@ def test_chain_acceptance_reject_yields_rejected_acceptance_stage(monkeypatch):
     _monkeypatch_chain(monkeypatch, accept_status=ProfessionalResponseAcceptanceStatus.REJECT)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.REJECTED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ACCEPTANCE
     assert result.reply_text is None
@@ -975,7 +1056,7 @@ def test_chain_acceptance_fidelity_rejection_propagates_fidelity_reason(monkeypa
     monkeypatch.setattr(pftr, "accept_professional_response", fake_accept)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.REJECTED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ACCEPTANCE
     assert isinstance(result.failure_reason, FidelityRejectionReason)
@@ -992,7 +1073,7 @@ def test_chain_acceptance_policy_rejection_propagates_policy_reason(monkeypatch)
     monkeypatch.setattr(pftr, "accept_professional_response", fake_accept)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.REJECTED
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ACCEPTANCE
     assert isinstance(result.failure_reason, PolicyRejectionReason)
@@ -1003,7 +1084,7 @@ def test_chain_acceptance_safety_rejection_propagates_safety_reason(monkeypatch)
     _monkeypatch_chain(monkeypatch, accept_status=ProfessionalResponseAcceptanceStatus.REJECT)
     result = run(pftr.run_professional_free_text_turn(
         client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-        conversation_context=_empty_context(), risk_result={}, lang="ru"))
+        runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
     assert result.failure_stage is pftr.ProfessionalFreeTextFailureStage.ACCEPTANCE
     assert result.failure_reason is AcceptanceSafetyRejectionReason.SAFETY_REJECTED
 
@@ -1024,7 +1105,7 @@ def test_failure_reason_never_carries_raw_text_for_any_stage(monkeypatch):
         _monkeypatch_chain(monkeypatch, **kwargs)
         result = run(pftr.run_professional_free_text_turn(
             client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
-            conversation_context=_empty_context(), risk_result={}, lang="ru"))
+            runtime_context=_empty_runtime_context(), risk_result={}, lang="ru"))
         assert result.status is not pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
         assert type(result.failure_reason) is not str
         assert isinstance(result.failure_reason, pftr.ProfessionalFreeTextFailureReason)
@@ -1907,6 +1988,41 @@ def test_persist_failure_after_send_does_not_send_a_second_reply(tmp_db, monkeyp
     run(bot.pipeline(msg, msg.text))
     assert len(msg.answers) == 1  # sent exactly once
     assert calls["n"] == 1  # attempted the assistant persist exactly once
+
+
+def test_professional_path_reads_history_exactly_once_and_wraps_it_in_runtime_context(
+        tmp_db, monkeypatch):
+    """Proves two things at once: (1) the existing DB read
+    (get_professional_conversation_history_rows) still happens exactly once
+    per Professional-claimed turn -- this slice introduces no new DB read;
+    (2) bot.py passes the orchestrator a ProfessionalTurnRuntimeContext
+    wrapping exactly the ProfessionalConversationContext built from those
+    same rows -- no context loss or divergence at the ownership boundary."""
+    from professional_turn_conversation_context import (
+        build_conversation_context_from_history_rows,
+    )
+    run(_seed_user(OWNER))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+
+    rows = [(1, "user", "Прошлое сообщение.", "USER_AUTHORED")]
+    read_calls = {"n": 0}
+
+    async def counting_get_rows(uid, current_row_id):
+        read_calls["n"] += 1
+        return list(rows)
+    monkeypatch.setattr(bot, "get_professional_conversation_history_rows", counting_get_rows)
+
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Текущее сообщение.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert read_calls["n"] == 1
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert isinstance(runtime_context, ProfessionalTurnRuntimeContext)
+    expected_conversation = build_conversation_context_from_history_rows(rows)
+    assert runtime_context.conversation == expected_conversation
 
 
 def test_no_double_assistant_reply_on_success(tmp_db, monkeypatch):
