@@ -32,7 +32,7 @@ HARD_NO_ADVICE_SIGNALS: Dict[str, List[str]] = {
 # B. Explicit request to understand the mechanism/reason before advice.
 # "мне интересно понять/разобраться" and "мне хочется понять/разобраться"
 # (production-incident hotfix) are deliberately narrow, first-person,
-# explicit-desire formulations -- NOT a broad standalone "что происходит"/
+# explicit-desire phrases -- NOT a broad standalone "что происходит"/
 # "почему" trigger, which would false-positive on ordinary curiosity or
 # meta-questions with no genuine understand-before-advice request behind them.
 UNDERSTAND_SIGNALS: Dict[str, List[str]] = {
