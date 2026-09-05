@@ -2490,8 +2490,13 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
         core_reaction_category = ReactionCategory.NONE
         core_reaction_confidence = 0.0
         interaction_contract = detect_interaction_preference(user_text, lang)
-        if (dass_discussion_result is None
-                and await access_control.therapist_core_v1_allowed_for(uid)):
+        # Phase 1B -- the resolver is not even called for a DASS-discussion
+        # turn, exactly preserving the pre-Phase-1B behavior of skipping
+        # both checks in that case (neither gate is awaited at all here).
+        turn_owner_resolution = (
+            await access_control.resolve_psychological_turn_owner(uid)
+            if dass_discussion_result is None else "none")
+        if turn_owner_resolution == "therapist_core_v1":
             current_row_id = await save_message(
                 uid, "user", user_text, "therapist_core_v1", lang,
                 risk["score"], risk["categories"], source=MessageSource.USER_AUTHORED)
@@ -2499,8 +2504,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
             core_reaction_category, core_reaction_confidence = select_reaction_category(
                 user_text, risk["categories"], detect_stage(user_text, lang), lang,
                 is_meta_command=False, is_dependency_redirect=False)
-        elif (dass_discussion_result is None
-              and await access_control.professional_free_text_allowed_for(uid)):
+        elif turn_owner_resolution == "professional":
             current_row_id = await save_message(
                 uid, "user", user_text, "professional", lang,
                 risk["score"], risk["categories"], source=MessageSource.USER_AUTHORED)

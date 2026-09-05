@@ -167,6 +167,53 @@ async def therapist_core_v1_allowed_for(uid: int) -> bool:
     return await has_full_access(uid)
 
 
+async def resolve_psychological_turn_owner(uid: int) -> str:
+    """Phase 1B -- the ONE centralized precedence decision between Therapist
+    Core V1 and Professional Free-Text for an ordinary psychological turn.
+    Returns exactly one of "therapist_core_v1", "professional", "none" --
+    "none" means neither is eligible; the caller (bot.py) falls through to
+    its own existing legacy/First-Turn/Controller routing unchanged.
+
+    Composes config.UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED (checked fresh,
+    never cached) with the two existing, UNMODIFIED eligibility gates above
+    -- it invents no new eligibility rule of its own and grants no rollout
+    population beyond what those two gates already decide.
+
+    Short-circuiting by construction: at most ONE of the two gates below is
+    ever awaited when its outcome already decides the answer, and each is
+    awaited AT MOST ONCE per call -- never both when the first result is
+    already conclusive, never the same one twice. This is not "zero new DB
+    reads under the flag": Professional-first order (flag true) means a
+    Professional-ineligible-but-Therapist-eligible turn now genuinely
+    evaluates professional_free_text_allowed_for() where Therapist-first
+    order previously short-circuited before ever reaching it -- that is an
+    intentional, necessary consequence of the reordering itself, not a
+    duplicate-evaluation defect. What this function guarantees is narrower
+    and still load-bearing: neither gate is EVER evaluated twice within one
+    call, in either flag state.
+
+    Flag false (default): Therapist-first, professional second -- same
+    order/short-circuit/outcome as bot.py's pre-Phase-1B inline check, for
+    every input combination.
+    Flag true: Professional-first -- a Professional-eligible uid is
+    "professional" unconditionally (Therapist Core is never even checked,
+    so it structurally cannot claim that turn); otherwise falls through to
+    Therapist Core's own existing eligibility.
+    """
+    import config
+    if config.UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED:
+        if await professional_free_text_allowed_for(uid):
+            return "professional"
+        if await therapist_core_v1_allowed_for(uid):
+            return "therapist_core_v1"
+        return "none"
+    if await therapist_core_v1_allowed_for(uid):
+        return "therapist_core_v1"
+    if await professional_free_text_allowed_for(uid):
+        return "professional"
+    return "none"
+
+
 def resolved_reviewers_for(tester_uid: int) -> list[int]:
     """Reviewers explicitly mapped to this tester.
 
