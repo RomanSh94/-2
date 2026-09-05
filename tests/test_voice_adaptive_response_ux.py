@@ -748,17 +748,17 @@ def test_listen_button_creates_no_database_row(tmp_db):
 
 # ── §23 Reactions ────────────────────────────────────────────────────────────
 # Emotional Reactions V1: the owner-approved product contract allows exactly
-# four visible Telegram reactions (❤️ support, 💔 explicit heartbreak/loss,
-# 🤗 effort/progress, 🎉 celebration/good news) or none. Categories outside
-# this contract (confusion, anger, gratitude, relief, fear/shock) remain
-# detectable -- reusable signal infrastructure -- but are never mapped to a
-# visible emoji; see REACTION_MAP in reaction_selector.py.
+# five visible Telegram reactions (❤️ support, 💔 explicit heartbreak/loss,
+# 🤗 effort/progress, 🎉 celebration/good news, 😢 anxiety/worry) or none.
+# Categories outside this contract (confusion, anger, gratitude, relief, fear/
+# shock) remain detectable -- reusable signal infrastructure -- but are never
+# mapped to a visible emoji; see REACTION_MAP in reaction_selector.py.
 
 @pytest.mark.parametrize("category,expected", [
     (rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, ("❤",)),
     (rs.ReactionCategory.TEARS_WELLING, ("❤",)),
     (rs.ReactionCategory.LONELINESS_OR_REJECTION, ("❤",)),
-    (rs.ReactionCategory.ANXIETY_OR_WORRY, ("❤",)),
+    (rs.ReactionCategory.ANXIETY_OR_WORRY, ("😢",)),
     (rs.ReactionCategory.EXHAUSTION_OR_OVERWHELM, ("❤",)),
     (rs.ReactionCategory.HEARTBREAK_OR_LOSS, ("💔",)),
     (rs.ReactionCategory.PROGRESS_OR_ACHIEVEMENT, ("🤗",)),
@@ -902,7 +902,8 @@ def test_omitted_available_reactions_means_all_standard_allowed():
     assert ChatFullInfo.model_fields["available_reactions"].default is None
     assert rs.pick_supported_emoji(rs.ReactionCategory.HEARTBREAK_OR_LOSS, None) == "💔"
     assert rs.pick_supported_emoji(rs.ReactionCategory.SADNESS_OR_DISAPPOINTMENT, None) == "❤"
-    # A category outside the four approved product reactions is never sent,
+    assert rs.pick_supported_emoji(rs.ReactionCategory.ANXIETY_OR_WORRY, None) == "😢"
+    # A category outside the five approved product reactions is never sent,
     # regardless of what the chat allows.
     assert rs.pick_supported_emoji(rs.ReactionCategory.RELIEF_OR_CALM, None) is None
 
@@ -912,11 +913,10 @@ def test_reaction_category_is_never_persisted():
     assert "INSERT" not in src.upper() or "reaction" not in src.lower()
 
 
-# ── §23a Emotional Reactions V1 -- four-reaction product contract ──────────
+# ── §23a Emotional Reactions V1 -- five-reaction product contract ──────────
 
 @pytest.mark.parametrize("phrase", [
     "Мне одиноко",
-    "Мне тревожно из-за работы",
     "Мне грустно",
     "Я очень устал и нет сил",
 ])
@@ -924,6 +924,25 @@ def test_heart_support_rule_selects_heart(phrase):
     cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
     assert conf >= config.EMOTIONAL_REACTION_MIN_CONFIDENCE
     assert rs.pick_supported_emoji(cat, None) == "❤"
+
+
+@pytest.mark.parametrize("phrase", [
+    "Мне тревожно из-за работы",
+    "Сегодня меня накрывает тревога из-за мелочей.",
+])
+def test_anxiety_rule_selects_crying_face(phrase):
+    # Production-incident hotfix (owner decision): anxiety/worry gets its own
+    # visibly-concerned reaction, distinct from the general ❤️ support used
+    # by sadness/loneliness/exhaustion.
+    cat, conf = rs.select_reaction_category(phrase, [], "OPEN", "ru")
+    assert cat == rs.ReactionCategory.ANXIETY_OR_WORRY
+    assert conf >= config.EMOTIONAL_REACTION_MIN_CONFIDENCE
+    assert rs.pick_supported_emoji(cat, None) == "😢"
+
+
+def test_anxiety_reaction_map_and_supported_emoji_are_exactly_crying_face():
+    assert rs.REACTION_MAP[rs.ReactionCategory.ANXIETY_OR_WORRY] == ("😢",)
+    assert rs.pick_supported_emoji(rs.ReactionCategory.ANXIETY_OR_WORRY, None) == "😢"
 
 
 @pytest.mark.parametrize("phrase", [
@@ -1010,7 +1029,7 @@ def test_unsupported_reaction_in_available_reactions_is_noop():
     assert rs.pick_supported_emoji(cat, ["🎉"]) is None  # never substitutes, even for another approved emoji
 
 
-_ALL_APPROVED_OR_NONE = {"❤", "💔", "🤗", "🎉", None}
+_ALL_APPROVED_OR_NONE = {"❤", "💔", "🤗", "🎉", "😢", None}
 _RETIRED_EMOJI = {"😔", "🥹", "😨", "🤔", "🔥", "👍", "🫂", "😟", "😮‍💨", "😤", "😌"}
 
 
@@ -1020,10 +1039,10 @@ _RETIRED_EMOJI = {"😔", "🥹", "😨", "🤔", "🔥", "👍", "🫂", "😟"
     ("Я сделал первый шаг.", [], "GROWTH"),
     ("Я сдал экзамен.", [], "OPEN"),
     ("Расскажи коротко, как работает этот бот.", [], "OPEN"),
-    ("Спасибо!", [], "OPEN"),  # detectable category, but outside the four approved
+    ("Спасибо!", [], "OPEN"),  # detectable category, but outside the five approved
     ("текст", ["suicide"], "ACUTE_DISTRESS"),
 ])
-def test_output_boundary_only_four_approved_emoji_or_none(phrase, risk_categories, stage):
+def test_output_boundary_only_approved_emoji_or_none(phrase, risk_categories, stage):
     cat, _ = rs.select_reaction_category(phrase, risk_categories, stage, "ru")
     emoji = rs.pick_supported_emoji(cat, None)
     assert emoji in _ALL_APPROVED_OR_NONE
@@ -1034,7 +1053,7 @@ def test_no_retired_emoji_anywhere_in_reaction_map():
     for candidates in rs.REACTION_MAP.values():
         for emoji in candidates:
             assert emoji not in _RETIRED_EMOJI
-            assert emoji in {"❤", "💔", "🤗", "🎉"}
+            assert emoji in {"❤", "💔", "🤗", "🎉", "😢"}
 
 
 # ── §23b Reactions must be occasional (owner correction) ───────────────────

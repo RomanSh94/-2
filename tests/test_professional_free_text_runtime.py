@@ -19,6 +19,7 @@ No raw model/network access anywhere in this file -- every OpenAI call site
 is monkeypatched.
 """
 import asyncio
+import inspect
 import types
 from dataclasses import fields
 
@@ -1490,8 +1491,6 @@ _OLD_BAD_FALLBACK = "Давай проще. Что сейчас в этой си
 
 
 @pytest.mark.parametrize("contract,expected_ru", [
-    ("UNDERSTAND", "Я прочитал то, что ты написал. Не буду просить повторять. "
-                   "Давай разбираться из того, что уже есть и попробуем связать это в одну картину."),
     ("JUST_TALK", "Я прочитал то, что ты написал. Не буду просить повторять. "
                   "Можешь продолжить с этого места — я буду держать нить разговора."),
     ("ACTION", "Я прочитал то, что ты написал. Не буду просить повторять. "
@@ -1509,8 +1508,6 @@ def test_therapist_core_fallback_low_risk_ru_by_contract(contract, expected_ru):
 
 
 @pytest.mark.parametrize("contract,expected_en", [
-    ("UNDERSTAND", "I've read what you wrote. I won't ask you to repeat it. "
-                   "Let's work with what's already here and try to connect it into one picture."),
     ("JUST_TALK", "I've read what you wrote. I won't ask you to repeat it. "
                   "You can continue from here — I'll keep track of the thread."),
     ("ACTION", "I've read what you wrote. I won't ask you to repeat it. "
@@ -1520,6 +1517,92 @@ def test_therapist_core_fallback_low_risk_ru_by_contract(contract, expected_ru):
 ])
 def test_therapist_core_fallback_low_risk_en_by_contract(contract, expected_en):
     assert bot._therapist_core_fallback({"level": "low"}, contract, "en") == expected_en
+
+
+# ── Production-incident hotfix: UNDERSTAND fallback is now a substantive
+# synthesis-shaped static reply, not the shared "Не буду просить повторять"
+# acknowledgement boilerplate the other three contracts still use ──────────
+_NEW_UNDERSTAND_FALLBACK_RU = (
+    "Если ты хочешь понять, что здесь происходит, я бы не начинал с общего "
+    "совета. Полезнее посмотреть на саму последовательность: что запускает "
+    "реакцию, какая мысль или ожидание появляется первой, что происходит "
+    "дальше и что меняется после этого. Если такая цепочка уже видна из "
+    "твоего описания, можно разбирать её; если пока нет — не буду её "
+    "додумывать. Какой последний конкретный эпизод лучше всего показывает "
+    "эту реакцию?"
+)
+_NEW_UNDERSTAND_FALLBACK_EN = (
+    "If you want to understand what's going on here, I wouldn't start "
+    "with generic advice. It's more useful to look at the sequence "
+    "itself: what triggers the reaction, which thought or expectation "
+    "shows up first, what happens next, and what changes afterward. If "
+    "that sequence is already visible from what you've described, we "
+    "can work through it; if not yet, I won't invent it. What's the "
+    "most recent concrete episode that best shows this reaction?"
+)
+
+
+def test_therapist_core_fallback_understand_low_risk_ru_is_substantive_synthesis():
+    text = bot._therapist_core_fallback({"level": "low"}, "UNDERSTAND", "ru")
+    assert text == _NEW_UNDERSTAND_FALLBACK_RU
+    assert text != _OLD_BAD_FALLBACK
+    none_text = bot._therapist_core_fallback({"level": "low"}, "NONE", "ru")
+    assert len(text.split()) > len(none_text.split())  # more substantive than acknowledgement-only
+    assert len(text.split()) <= 150  # shared safety_validator word ceiling
+    ok, reason = safety_validator.validate_response(text, "ru")
+    assert ok, reason
+
+
+def test_therapist_core_fallback_understand_low_risk_en_is_substantive_synthesis():
+    text = bot._therapist_core_fallback({"level": "low"}, "UNDERSTAND", "en")
+    assert text == _NEW_UNDERSTAND_FALLBACK_EN
+    none_text = bot._therapist_core_fallback({"level": "low"}, "NONE", "en")
+    assert len(text.split()) > len(none_text.split())
+    assert len(text.split()) <= 150
+    ok, reason = safety_validator.validate_response(text, "en")
+    assert ok, reason
+
+
+def test_therapist_core_fallback_understand_still_never_asks_to_repeat():
+    for lang in ("ru", "en"):
+        text = bot._therapist_core_fallback({"level": "low"}, "UNDERSTAND", lang)
+        assert "повторять" not in text.lower()  # no longer uses that literal opener...
+        assert "repeat it" not in text.lower() and "repeat yourself" not in text.lower()
+        # ...but never actually asks the user to restate what they wrote either.
+        assert "расскажи" not in text.lower() and "tell me again" not in text.lower()
+
+
+def test_therapist_core_fallback_makes_no_model_or_client_call():
+    src = inspect.getsource(bot._therapist_core_fallback)
+    assert "client" not in src
+    assert "await" not in src
+
+
+# ── Corrective pass: the fallback must be truthful for BOTH rich and sparse
+# UNDERSTAND turns -- it is one static string, so it must never assert that a
+# sequence/material already exists, only offer to examine one IF visible ────
+def test_therapist_core_fallback_understand_does_not_assert_material_already_exists():
+    for lang, unconditional_claim in (
+        ("ru", "уже есть материал"),
+        ("en", "there's already enough material"),
+    ):
+        text = bot._therapist_core_fallback({"level": "low"}, "UNDERSTAND", lang)
+        assert unconditional_claim not in text.lower()
+
+
+def test_therapist_core_fallback_understand_valid_for_sparse_input_too():
+    # Same static string regardless of whether the actual turn was rich or
+    # sparse: it conditions any sequence-examination on the sequence
+    # actually being visible ("если такая цепочка уже видна" / "if that
+    # sequence is already visible"), explicitly refuses to invent one when
+    # it isn't ("не буду её додумывать" / "i won't invent it"), and asks
+    # exactly one question inviting a concrete episode either way.
+    ru = bot._therapist_core_fallback({"level": "low"}, "UNDERSTAND", "ru")
+    en = bot._therapist_core_fallback({"level": "low"}, "UNDERSTAND", "en")
+    assert ru.count("?") == 1 and en.count("?") == 1
+    assert "если пока нет" in ru.lower() and "додумывать" in ru.lower()
+    assert "if not yet" in en.lower() and "invent it" in en.lower()
+    assert "конкретный эпизод" in ru.lower() and "concrete episode" in en.lower()
 
 
 def test_therapist_core_fallback_elevated_risk_unchanged():

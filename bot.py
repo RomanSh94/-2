@@ -1921,8 +1921,13 @@ def _strip_leaked_bold_markdown(text: str) -> str:
 _THERAPIST_CORE_LOW_RISK_FALLBACK = {
     "ru": {
         "UNDERSTAND": (
-            "Я прочитал то, что ты написал. Не буду просить повторять. "
-            "Давай разбираться из того, что уже есть и попробуем связать это в одну картину."),
+            "Если ты хочешь понять, что здесь происходит, я бы не начинал с общего "
+            "совета. Полезнее посмотреть на саму последовательность: что запускает "
+            "реакцию, какая мысль или ожидание появляется первой, что происходит "
+            "дальше и что меняется после этого. Если такая цепочка уже видна из "
+            "твоего описания, можно разбирать её; если пока нет — не буду её "
+            "додумывать. Какой последний конкретный эпизод лучше всего показывает "
+            "эту реакцию?"),
         "JUST_TALK": (
             "Я прочитал то, что ты написал. Не буду просить повторять. "
             "Можешь продолжить с этого места — я буду держать нить разговора."),
@@ -1935,8 +1940,13 @@ _THERAPIST_CORE_LOW_RISK_FALLBACK = {
     },
     "en": {
         "UNDERSTAND": (
-            "I've read what you wrote. I won't ask you to repeat it. "
-            "Let's work with what's already here and try to connect it into one picture."),
+            "If you want to understand what's going on here, I wouldn't start "
+            "with generic advice. It's more useful to look at the sequence "
+            "itself: what triggers the reaction, which thought or expectation "
+            "shows up first, what happens next, and what changes afterward. If "
+            "that sequence is already visible from what you've described, we "
+            "can work through it; if not yet, I won't invent it. What's the "
+            "most recent concrete episode that best shows this reaction?"),
         "JUST_TALK": (
             "I've read what you wrote. I won't ask you to repeat it. "
             "You can continue from here — I'll keep track of the thread."),
