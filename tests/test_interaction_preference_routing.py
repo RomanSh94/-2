@@ -70,6 +70,79 @@ def test_understand_ru_natural_requests(text):
     assert detect_interaction_preference(text, "ru") == "UNDERSTAND"
 
 
+# ── Production-incident hotfix: narrow first-person "curiosity/desire to
+# understand" formulations, distinct from the existing "хочу"/"важно" wording
+# above ────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("text", [
+    "Мне интересно понять, почему у меня так работает голова.",
+    "Мне интересно разобраться, что именно здесь происходит.",
+    "Мне хочется понять, откуда берётся эта реакция.",
+    "Мне хочется разобраться в этом, а не просто получить совет.",
+])
+def test_understand_ru_curiosity_and_desire_requests(text):
+    assert detect_interaction_preference(text, "ru") == "UNDERSTAND"
+
+
+@pytest.mark.parametrize("text", [
+    "I'm curious to understand why I react this way.",
+    "I'm curious to figure out what's actually happening here.",
+    "I'd like to understand where this reaction comes from.",
+    "I'd like to figure out why this keeps happening, not just get advice.",
+])
+def test_understand_en_curiosity_and_desire_requests(text):
+    assert detect_interaction_preference(text, "en") == "UNDERSTAND"
+
+
+# The exact message from the production incident audit (rich, explicit
+# mechanism-seeking anxiety message that previously resolved to NONE because
+# "мне интересно понять" was not yet a recognized signal).
+_INCIDENT_MESSAGE_RU = (
+    "Последнее время меня постоянно накрывает тревога из-за каких-то мелочей.\n"
+    "Например, начальник может написать «зайди ко мне позже», и я сразу начинаю\n"
+    "думать, что сделал что-то не так или меня хотят уволить. Если девушка долго\n"
+    "не отвечает, первая мысль тоже почему-то не «занята», а что она охладела ко\n"
+    "мне или я её чем-то обидел.\n\n"
+    "Я начинаю перечитывать переписку, проверять телефон, вспоминать, что мог\n"
+    "сказать не так, иногда даже заранее извиняюсь, хотя сам не понимаю за что.\n"
+    "Когда получаю подтверждение, что всё нормально, меня отпускает, но ненадолго —\n"
+    "потом появляется следующая ситуация.\n\n"
+    "Головой я понимаю, что обычно никаких доказательств плохого нет, но в моменте\n"
+    "это вообще не помогает.\n\n"
+    "В детстве тоже помню это ощущение: если отец становился молчаливым или\n"
+    "холодным, я сразу пытался понять, что сделал неправильно.\n\n"
+    "Я не хочу сейчас просто дыхательные упражнения или советы «отвлекись».\n"
+    "Мне интересно понять, почему у меня так работает голова и что именно здесь\n"
+    "происходит."
+)
+
+
+def test_exact_production_incident_message_resolves_to_understand():
+    assert detect_interaction_preference(_INCIDENT_MESSAGE_RU, "ru") == "UNDERSTAND"
+
+
+# Broad standalone phrasing must NOT become a new UNDERSTAND trigger -- the
+# hotfix is deliberately narrow to the explicit first-person phrases above,
+# not a general "what's happening"/"why" curiosity detector.
+@pytest.mark.parametrize("text", [
+    "Что происходит?",
+    "Что здесь происходит?",
+    "Почему?",
+])
+def test_broad_standalone_phrases_do_not_trigger_understand(text):
+    assert detect_interaction_preference(text, "ru") == "NONE"
+
+
+def test_new_understand_phrase_does_not_leak_through_natural_negation():
+    # "мне не хочется понять" breaks the new "мне хочется понять" signal's
+    # contiguity (the negation sits inside the phrase itself, in the natural
+    # Russian dative-subject negation position, not immediately before it),
+    # so it correctly never matches UNDERSTAND via this signal and instead
+    # falls through to whatever other signal genuinely applies here.
+    assert detect_interaction_preference(
+        "Мне не хочется понять, почему так происходит, просто хочу выговориться",
+        "ru") == "JUST_TALK"
+
+
 @pytest.mark.parametrize("text", [
     "I want to understand why I do this.",
     "Why does this happen almost every day?",

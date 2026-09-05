@@ -150,6 +150,71 @@ def test_constitution_carries_evidence_correction_and_stronger_later_rules():
     assert "Do not diagnose" in text
 
 
+# ── Production-incident hotfix: UNDERSTAND depth + explicit length budget ──
+def test_constitution_understand_depth_synthesizes_rich_material():
+    text = " ".join(core.THERAPIST_CORE_V1_CONSTITUTION.split())
+    assert "rich concrete material" in text
+    assert "collapsing into acknowledgment" in text
+    assert "asking the user to repeat what they already wrote" in text
+
+
+def test_constitution_understand_depth_calibrates_fact_vs_hypothesis():
+    text = " ".join(core.THERAPIST_CORE_V1_CONSTITUTION.split())
+    assert "distinguish a directly observed pattern from a hypothesis" in text
+    assert "plausible working hypothesis" in text
+    assert "never a proven root cause" in text
+
+
+# ── Corrective pass: childhood/family naming is conditional on the user
+# actually having supplied relevant material -- never primed unconditionally ──
+def test_constitution_childhood_family_linkage_is_conditional_on_user_material():
+    text = " ".join(core.THERAPIST_CORE_V1_CONSTITUTION.split())
+    assert "only when the user has supplied relevant childhood or family material" in text.lower()
+    assert "may a possible link to the current pattern be named" in text.lower()
+    assert "never raise childhood or family when the user supplied no such material" in text.lower()
+
+
+def test_constitution_understand_depth_explains_maintaining_loop_without_inventing_causality():
+    text = " ".join(core.THERAPIST_CORE_V1_CONSTITUTION.split())
+    assert "maintaining loop" in text
+    assert "synthesize that loop using only elements actually present in the user's material" in text
+    assert "do not inject a preselected loop, behavior, consequence, or causal model" in text
+
+
+# ── Corrective pass: no incident-specific mechanism examples (the earlier
+# draft's "(for example: trigger, checking, short-term relief, reinforcement)"
+# parenthetical directly named the production incident's own mechanism --
+# checking the phone / seeking reassurance / relief on confirmation) ────────
+def test_constitution_maintaining_loop_has_no_incident_specific_mechanism_examples():
+    text = core.THERAPIST_CORE_V1_CONSTITUTION.lower()
+    for leaked_mechanism in ("trigger", "checking", "reassurance", "short-term relief", "reinforcement"):
+        assert leaked_mechanism not in text
+
+
+def test_constitution_does_not_hardcode_the_incident():
+    # The behavioral instruction is general -- it must never name the
+    # specific incident's people, roles or content (boss/girlfriend/father/
+    # checking phone), only the general mechanism-synthesis contract.
+    text = core.THERAPIST_CORE_V1_CONSTITUTION.lower()
+    for leaked in ("начальник", "девушка", "отец", "телефон", "boss", "girlfriend"):
+        assert leaked not in text
+
+
+def test_constitution_length_contract_visible_to_model():
+    text = " ".join(core.THERAPIST_CORE_V1_CONSTITUTION.split())
+    assert "150 words" in text
+    assert "90 to 130" in text
+    assert "never intentionally" in text and "140" in text
+
+
+def test_constitution_discriminating_question_not_mandatory_every_turn():
+    text = " ".join(core.THERAPIST_CORE_V1_CONSTITUTION.split())
+    # Global rule (applies to every contract, UNDERSTAND included): at most
+    # one discriminating question, never mandatory on every reply.
+    assert "use one discriminating question when useful" in text
+    assert "do not end every reply with a question" in text
+
+
 def test_exact_three_turn_understand_regression_builds_one_trusted_request():
     first_user = (
         "Даже если я разбиваю дело на совсем маленький шаг, сопротивление часто всё равно "

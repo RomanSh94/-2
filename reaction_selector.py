@@ -32,7 +32,7 @@ class ReactionCategory(str, Enum):
     NONE = "NONE"
 
 
-# Emotional Reactions V1 -- owner-approved four-reaction product contract.
+# Emotional Reactions V1 -- owner-approved five-reaction product contract.
 # These are the ONLY visible Telegram reactions this module may ever emit.
 # A category not listed here (confusion, anger, gratitude, relief, fear/
 # shock) is still detectable by select_reaction_category -- kept as signal
@@ -44,13 +44,15 @@ class ReactionCategory(str, Enum):
 # doesn't support the approved emoji, no reaction is sent -- an unrelated
 # emoji is never substituted (see pick_supported_emoji).
 REACTION_MAP: dict[ReactionCategory, tuple[str, ...]] = {
-    # ❤️ general emotional support: sadness, loneliness, anxiety, tears,
+    # ❤️ general emotional support: sadness, loneliness, tears,
     # exhaustion/overwhelm when clearly personal.
     ReactionCategory.SADNESS_OR_DISAPPOINTMENT: ("❤",),
     ReactionCategory.TEARS_WELLING: ("❤",),
     ReactionCategory.LONELINESS_OR_REJECTION: ("❤",),
-    ReactionCategory.ANXIETY_OR_WORRY: ("❤",),
     ReactionCategory.EXHAUSTION_OR_OVERWHELM: ("❤",),
+    # 😢 anxiety/worry -- owner decision (production-incident hotfix):
+    # visibly concerned rather than the general ❤️ support reaction.
+    ReactionCategory.ANXIETY_OR_WORRY: ("😢",),
     # 💔 explicit heartbreak/loss only -- breakup, bereavement, betrayal.
     # Deliberately narrow and separate from ❤️: ordinary sadness, anxiety,
     # loneliness or tiredness must never earn this reaction.
@@ -66,9 +68,9 @@ REACTION_MAP: dict[ReactionCategory, tuple[str, ...]] = {
 # documented by the installed aiogram ReactionTypeEmoji transport. This list
 # is used only when Telegram omits available_reactions (meaning all standard
 # reactions are allowed). Explicit chat lists remain authoritative. Owner
-# confirmed all four approved emoji are present in Telegram's actual
+# confirmed all five approved emoji are present in Telegram's actual
 # reaction picker.
-_STANDARD_MAPPED_REACTIONS = frozenset(("❤", "💔", "🤗", "🎉"))
+_STANDARD_MAPPED_REACTIONS = frozenset(("❤", "💔", "🤗", "🎉", "😢"))
 
 # Risk categories that must NEVER receive a decorative reaction, regardless
 # of confidence or flag state — a crisis/acute-danger message is handled by
