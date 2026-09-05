@@ -35,6 +35,7 @@ from professional_turn_conversation_context import (
     ConversationTurnRole,
     ProfessionalConversationContext,
 )
+from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
 
 from professional_turn_analyzer import (
     ANALYZER_TEMPERATURE,
@@ -890,30 +891,41 @@ def test_no_context_call_keeps_the_user_payload_in_its_pre_slice_shape():
 
 def test_explicit_none_context_is_identical_to_omitting_it():
     """Both sides of this comparison use the CURRENT (post-slice)
-    implementation -- this proves omitting conversation_context and
-    passing conversation_context=None explicitly produce the same request
+    implementation -- this proves omitting runtime_context and
+    passing runtime_context=None explicitly produce the same request
     under today's code, not that either matches pre-slice behavior."""
     client_a = _client_returning(_VALID_JSON)
     client_b = _client_returning(_VALID_JSON)
     _call(client_a, model="gpt-4o-mini", source_text="hello world")
-    _call(client_b, model="gpt-4o-mini", source_text="hello world", conversation_context=None)
+    _call(client_b, model="gpt-4o-mini", source_text="hello world", runtime_context=None)
     call_a = client_a.chat.completions.calls[0]
     call_b = client_b.chat.completions.calls[0]
     assert call_a["messages"] == call_b["messages"]
 
 
-def test_rejects_conversation_context_of_wrong_type():
+def test_rejects_runtime_context_of_wrong_type():
     client = _client_returning(_VALID_JSON)
     with pytest.raises(ValueError):
-        _call(client, model="gpt-4o-mini", source_text="hi", conversation_context=[])
+        _call(client, model="gpt-4o-mini", source_text="hi", runtime_context=[])
     with pytest.raises(ValueError):
-        _call(client, model="gpt-4o-mini", source_text="hi", conversation_context="not a context")
+        _call(client, model="gpt-4o-mini", source_text="hi", runtime_context="not a context")
+
+
+def test_rejects_raw_conversation_context_passed_as_runtime_context():
+    """The pre-slice calling convention (a bare ProfessionalConversationContext)
+    must no longer be accepted -- only the ProfessionalTurnRuntimeContext
+    envelope is a valid runtime_context value now."""
+    context = _context(_u(1, "hi"))
+    client = _client_returning(_VALID_JSON)
+    with pytest.raises(ValueError):
+        _call(client, model="gpt-4o-mini", source_text="hi", runtime_context=context)
 
 
 def test_context_is_serialized_as_a_structurally_separate_json_field():
     context = _context(_u(1, "У меня тревога."), _a(2, "Что именно тревожит?"))
     client = _client_returning(_VALID_JSON)
-    _call(client, model="gpt-4o-mini", source_text="Работа.", conversation_context=context)
+    _call(client, model="gpt-4o-mini", source_text="Работа.",
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     call = client.chat.completions.calls[0]
     user_message = [m for m in call["messages"] if m["role"] == "user"][0]
     payload = json.loads(user_message["content"])
@@ -929,7 +941,7 @@ def test_source_text_and_context_are_never_concatenated():
     context = _context(_u(1, "PRIOR_MARKER_TEXT"))
     client = _client_returning(_VALID_JSON)
     _call(client, model="gpt-4o-mini", source_text="CURRENT_MARKER_TEXT",
-          conversation_context=context)
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     call = client.chat.completions.calls[0]
     user_message = [m for m in call["messages"] if m["role"] == "user"][0]
     payload = json.loads(user_message["content"])
@@ -943,7 +955,8 @@ def test_source_text_and_context_are_never_concatenated():
 def test_empty_context_still_serializes_the_wrapped_shape():
     context = _context()
     client = _client_returning(_VALID_JSON)
-    _call(client, model="gpt-4o-mini", source_text="hi", conversation_context=context)
+    _call(client, model="gpt-4o-mini", source_text="hi",
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     call = client.chat.completions.calls[0]
     user_message = [m for m in call["messages"] if m["role"] == "user"][0]
     payload = json.loads(user_message["content"])
@@ -954,7 +967,8 @@ def test_empty_context_still_serializes_the_wrapped_shape():
 def test_context_roles_round_trip_exactly_through_serialization():
     context = _context(_u(1, "первое"), _a(2, "второе"), _u(3, "третье"))
     client = _client_returning(_VALID_JSON)
-    _call(client, model="gpt-4o-mini", source_text="hi", conversation_context=context)
+    _call(client, model="gpt-4o-mini", source_text="hi",
+          runtime_context=ProfessionalTurnRuntimeContext(conversation=context))
     call = client.chat.completions.calls[0]
     payload = json.loads([m for m in call["messages"] if m["role"] == "user"][0]["content"])
     assert [entry["role"] for entry in payload["conversation_context"]] == [

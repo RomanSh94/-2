@@ -15,9 +15,22 @@ V2 the sole psychological conversation owner for an eligible claimed turn.
 bot.py decides eligibility, persists the current USER row, builds the
 trusted prior ProfessionalConversationContext (via database.py and
 professional_turn_conversation_context.py, both unmodified by this slice),
-and then calls run_professional_free_text_turn exactly once with everything
-already prepared. This module's only job is to run the chain and return one
-of exactly three closed outcomes.
+wraps it in a ProfessionalTurnRuntimeContext (professional_turn_runtime_
+context.py), and then calls run_professional_free_text_turn exactly once
+with everything already prepared. This module's only job is to run the
+chain and return one of exactly three closed outcomes.
+
+RUNTIME CONTEXT ENVELOPE -- this module accepts a single typed
+runtime_context: ProfessionalTurnRuntimeContext and forwards that SAME
+object without unwrapping it to call_turn_analyzer,
+call_turn_plan_proposer, and render_turn_response -- each of those three
+stages reads `.conversation` off the envelope itself, right where it
+previously read a raw ProfessionalConversationContext parameter. This
+orchestrator never unwraps runtime_context; see professional_turn_runtime_
+context.py's own module docstring for why the envelope is threaded whole
+rather than unwrapped once here (a future Canonical Case Context field is
+added to that envelope without any signature change at any of these four
+call boundaries).
 
 PLANNER V1 AUTHORITY BOUNDARY -- this module does not expand the Planner. It
 only ever consumes whatever move/plan professional_turn_planner.govern_
@@ -92,9 +105,10 @@ Professional Core V2 modules (professional_turn_analyzer,
 professional_turn_producer, professional_turn_analysis,
 professional_turn_plan_proposer, professional_turn_planner,
 professional_turn_response_renderer, professional_turn_response_acceptance,
-professional_turn_conversation_context). No bot.py import, no database
-import, no Telegram import, no legacy-routing import (state_engine,
-conversation_controller, prompts). Python 3.10 target (prod 3.10.12).
+professional_turn_conversation_context, professional_turn_runtime_context).
+No bot.py import, no database import, no Telegram import, no legacy-routing
+import (state_engine, conversation_controller, prompts). Python 3.10 target
+(prod 3.10.12).
 """
 from __future__ import annotations
 
@@ -121,7 +135,7 @@ from professional_turn_response_acceptance import (
     ProfessionalResponseAcceptanceStatus,
     AcceptanceRejectionReason,
 )
-from professional_turn_conversation_context import ProfessionalConversationContext
+from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
 
 
 class ProfessionalFreeTextRuntimeStatus(str, Enum):
@@ -458,7 +472,7 @@ async def run_professional_free_text_turn(
         model: str,
         source_message_row_id: int,
         source_text: str,
-        conversation_context: ProfessionalConversationContext,
+        runtime_context: ProfessionalTurnRuntimeContext,
         risk_result: dict,
         lang: str,
 ) -> ProfessionalFreeTextRuntimeResult:
@@ -469,7 +483,7 @@ async def run_professional_free_text_turn(
     OPENAI_API_KEY/environment/config are never read by this module.
 
     Deliberately does NOT catch every exception: a genuine caller/adapter
-    type defect (e.g. conversation_context of the wrong type) is expected to
+    type defect (e.g. runtime_context of the wrong type) is expected to
     raise ValueError here exactly as it would inside the stage that detects
     it, per each stage's own documented contract -- this is a programming
     defect, not an ordinary runtime failure, and must not be silently
@@ -491,14 +505,14 @@ async def run_professional_free_text_turn(
         raise ValueError(
             "run_professional_free_text_turn: source_text must be a non-empty, "
             "non-whitespace-only str")
-    if type(conversation_context) is not ProfessionalConversationContext:
+    if type(runtime_context) is not ProfessionalTurnRuntimeContext:
         raise ValueError(
-            "run_professional_free_text_turn: conversation_context must be "
-            f"exactly a ProfessionalConversationContext, got {type(conversation_context)!r}")
+            "run_professional_free_text_turn: runtime_context must be "
+            f"exactly a ProfessionalTurnRuntimeContext, got {type(runtime_context)!r}")
 
     analyzer_result = await call_turn_analyzer(
         client=client, model=model, source_text=source_text,
-        conversation_context=conversation_context)
+        runtime_context=runtime_context)
     analysis_result = produce_turn_analysis(
         source_message_row_id=source_message_row_id, source_text=source_text,
         analyzer_output=analyzer_result.output)
@@ -522,7 +536,7 @@ async def run_professional_free_text_turn(
 
     proposer_result = await call_turn_plan_proposer(
         client=client, model=model, analysis_result=analysis_result,
-        conversation_context=conversation_context)
+        runtime_context=runtime_context)
     if proposer_result.status is not TurnPlanProposerCallStatus.PROPOSAL:
         return _failed(ProfessionalFreeTextFailureStage.PLAN_PROPOSER, proposer_result.status)
 
@@ -535,7 +549,7 @@ async def run_professional_free_text_turn(
 
     render_result = await render_turn_response(
         client=client, model=model, plan=plan_result.plan, source_text=source_text,
-        conversation_context=conversation_context)
+        runtime_context=runtime_context)
     if render_result.status is not TurnResponseRenderStatus.CANDIDATE:
         return _failed(ProfessionalFreeTextFailureStage.RENDERER, render_result.status)
 

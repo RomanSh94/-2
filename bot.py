@@ -218,6 +218,7 @@ from database import get_trusted_conversation_history_through_anchor
 from professional_turn_conversation_context import (
     build_conversation_context_from_history_rows, ConversationTurnRole,
 )
+from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
 from professional_free_text_runtime import (
     run_professional_free_text_turn,
     ProfessionalFreeTextRuntimeStatus,
@@ -2056,10 +2057,11 @@ async def _run_professional_free_text_and_deliver(
     try:
         rows = await get_professional_conversation_history_rows(uid, current_row_id)
         context = build_conversation_context_from_history_rows(rows)
+        runtime_context = ProfessionalTurnRuntimeContext(conversation=context)
         result = await run_professional_free_text_turn(
             client=client, model="gpt-4o-mini",
             source_message_row_id=current_row_id, source_text=user_text,
-            conversation_context=context, risk_result=risk, lang=lang)
+            runtime_context=runtime_context, risk_result=risk, lang=lang)
     except Exception as e:
         _dispatch_log(f"cid={cid} stage=professional_failed error_type={type(e).__name__}")
         result = None

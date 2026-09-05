@@ -32,18 +32,28 @@ decision, and nothing upstream of it should be re-examined or re-interpreted
 at this boundary.
 
 OPTIONAL MULTI-TURN CONTEXT (V1 addition) -- render_turn_response accepts an
-OPTIONAL keyword-only `conversation_context`
-(professional_turn_conversation_context.ProfessionalConversationContext |
-None, default None). Existing callers remain API-compatible: omitting this
-parameter, or passing None explicitly, keeps the serialized USER PAYLOAD in
-its pre-slice shape -- exactly its original keys, unchanged. This is a
-payload-shape compatibility claim ONLY, not a claim that the complete model
-request is byte-identical to this module's pre-slice behavior: the fixed
-system instruction below was intentionally, substantially rewritten by this
-slice (see the quality-bar and correction-precedence paragraphs below) and is
-sent on EVERY call, including a conversation_context=None call -- it is not
-conditionally restored to its old text just because context is absent. When
-a non-None context is supplied, the payload gains one additional top-level
+OPTIONAL keyword-only `runtime_context`
+(professional_turn_runtime_context.ProfessionalTurnRuntimeContext |
+None, default None). The model-facing payload field is still named
+`"conversation_context"` -- its value comes from
+`runtime_context.conversation` (a professional_turn_conversation_context.
+ProfessionalConversationContext), unwrapped once at the top of this
+function; runtime_context itself is never serialized as a whole. Omitting
+this parameter, or passing runtime_context=None explicitly, keeps the
+serialized USER PAYLOAD in its pre-slice shape -- exactly its original
+keys, unchanged. This is a payload-shape compatibility claim ONLY for
+that None case, not a claim that the complete model request is
+byte-identical to this module's pre-slice behavior, and NOT a claim that
+the pre-envelope calling convention (passing a bare
+ProfessionalConversationContext directly as this parameter) still works --
+that raw type is now rejected (ValueError) as a runtime_context value;
+only runtime_context=None or a genuine ProfessionalTurnRuntimeContext is
+valid. The fixed system instruction below was intentionally, substantially
+rewritten by this slice (see the quality-bar and correction-precedence
+paragraphs below) and is sent on EVERY call, including a
+runtime_context=None call -- it is not conditionally restored to its old
+text just because context is absent. When a non-None runtime_context is
+supplied, the payload gains one additional top-level
 key, `"conversation_context"` -- an array of prior turns -- kept structurally
 separate from `"source_text"`, never merged or concatenated into it. This
 module remains a wording renderer only: it does not re-plan, does not change
@@ -126,6 +136,7 @@ import openai
 
 from professional_turn_planner import ProfessionalTurnPlan
 from professional_turn_conversation_context import ProfessionalConversationContext
+from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
 
 # -- Engineering V1 hard caps -----------------------------------------------
 # Frozen V1 engineering limits, not clinical/empirical values. timeout_seconds
@@ -355,6 +366,13 @@ def _validate_conversation_context(value) -> None:
         raise ValueError(
             "render_turn_response: conversation_context must be None or a "
             f"ProfessionalConversationContext, got {type(value)!r}")
+
+
+def _validate_runtime_context(value) -> None:
+    if value is not None and type(value) is not ProfessionalTurnRuntimeContext:
+        raise ValueError(
+            "render_turn_response: runtime_context must be None or a "
+            f"ProfessionalTurnRuntimeContext, got {type(value)!r}")
 
 
 # -- Fixed system instruction ------------------------------------------------
@@ -592,35 +610,44 @@ async def render_turn_response(
         model: str,
         plan: ProfessionalTurnPlan,
         source_text: str,
-        conversation_context: ProfessionalConversationContext | None = None,
+        runtime_context: ProfessionalTurnRuntimeContext | None = None,
         timeout_seconds: float = DEFAULT_RENDERER_TIMEOUT_SECONDS,
         max_output_tokens: int = DEFAULT_RENDERER_MAX_OUTPUT_TOKENS,
 ) -> TurnResponseRenderResult:
     """Deterministic call boundary: an injected client, one trusted
     ProfessionalTurnPlan, one current-turn source_text, one OPTIONAL
-    conversation_context, at most one model call, one parse attempt.
+    runtime_context, at most one model call, one parse attempt.
     client is never constructed here and OPENAI_API_KEY/environment/config
     are never read by this module. This function never calls
     govern_turn_plan, call_turn_plan_proposer, safety_validator, or
     traced_response_builder -- it owns transport and structure only, and
     still performs no semantic validation of its own output.
 
-    conversation_context=None (the default) keeps the serialized USER
+    runtime_context=None (the default) keeps the serialized USER
     payload in its pre-slice shape -- exactly its original keys. This is
     payload-shape API compatibility only, not a claim that the complete
     request (which also includes the fixed system instruction,
     intentionally rewritten by this slice and sent on every call
-    regardless of conversation_context) is byte-identical to this
+    regardless of runtime_context) is byte-identical to this
     function's pre-slice behavior. See the module docstring's OPTIONAL
     MULTI-TURN CONTEXT and CURRENT/NEWER USER CORRECTION PRECEDENCE
     sections for the full contract, and the rewritten system instruction
     for the actual product quality bar this renderer is now asked to
-    follow."""
+    follow.
+
+    runtime_context is a ProfessionalTurnRuntimeContext (see
+    professional_turn_runtime_context.py) -- the single envelope threaded
+    through the whole Professional Free-Text Runtime chain. This function
+    only ever reads its `.conversation` field; the resulting local
+    conversation_context is then serialized exactly as before this slice."""
     if not isinstance(plan, ProfessionalTurnPlan):
         raise ValueError(
             f"render_turn_response: plan must be a ProfessionalTurnPlan, got {type(plan)!r}")
     _validate_model(model)
     _validate_source_text(source_text)
+    _validate_runtime_context(runtime_context)
+    conversation_context = (
+        runtime_context.conversation if runtime_context is not None else None)
     _validate_conversation_context(conversation_context)
     _validate_timeout_seconds(timeout_seconds)
     _validate_max_output_tokens(max_output_tokens)
