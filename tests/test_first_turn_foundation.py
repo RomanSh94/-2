@@ -820,6 +820,26 @@ def test_validator_allows_short_non_overlapping_response():
     assert ok is True
 
 
+def test_validator_rejects_shared_forbidden_phrase():
+    # Structurally a valid first-turn shape (one question, short, no
+    # first-turn-specific phrase/overlap issue) but contains a phrase from
+    # the shared FORBIDDEN_PHRASES list -- must still be rejected by the
+    # baseline safety invariant every other reply path already enforces.
+    ok, reason = sv.validate_first_turn_response(
+        "Гарантирую что это пройдёт. Что чувствуешь?", "тест", "ru")
+    assert ok is False
+    assert reason is not None and reason.startswith("Forbidden phrase:")
+
+
+def test_validator_accepts_ordinary_response_with_shared_check_applied():
+    # An ordinary, otherwise-valid first-turn candidate must still pass now
+    # that validate_response runs as part of validate_first_turn_response.
+    ok, reason = sv.validate_first_turn_response(
+        "Сейчас важно понять, что именно тяжелее в этой ситуации?", "тест", "ru")
+    assert ok is True
+    assert reason is None
+
+
 def test_validator_rejects_too_long_response():
     # exactly one question mark, so the length check (not the question-count
     # check) is what fires here

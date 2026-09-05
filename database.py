@@ -3629,6 +3629,41 @@ async def start_questionnaire_session(uid: int, questionnaire_id: str, version: 
         return cur.lastrowid
 
 
+async def start_questionnaire_session_if_none_active(
+        uid: int, questionnaire_id: str, version: str) -> int | None:
+    """Atomically start a fresh session, but only if the user currently has
+    no active session of any kind.
+
+    Guards the same one-active-session-per-user invariant
+    switch_active_questionnaire_session enforces, for the case where there is
+    no existing active session to switch FROM (an ordinary fresh start).
+    Re-verifies "no active row" immediately before inserting, inside one
+    BEGIN IMMEDIATE transaction, so two concurrent fresh-start callbacks for
+    the same user cannot both succeed. Returns None if a concurrent request
+    already holds (or just created) an active session -- the caller must then
+    treat this exactly like an ordinary already-active conflict.
+    """
+    async with aiosqlite.connect(DB) as db:
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT id FROM questionnaire_sessions WHERE user_id=? AND status='active'",
+                (uid,))
+            if await cur.fetchone() is not None:
+                await db.rollback()
+                return None
+            cur = await db.execute(
+                "INSERT INTO questionnaire_sessions "
+                "(user_id, questionnaire_id, questionnaire_version, status, current_index) "
+                "VALUES (?,?,?, 'active', 0)", (uid, questionnaire_id, version))
+            new_session_id = cur.lastrowid
+            await db.commit()
+            return new_session_id
+        except Exception:
+            await db.rollback()
+            raise
+
+
 async def switch_active_questionnaire_session(
         uid: int, source_session_id: int,
         target_questionnaire_id: str,

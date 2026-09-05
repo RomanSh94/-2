@@ -137,7 +137,8 @@ from database import (
     export_journals, delete_journals,
     log_crisis_delivery,
     get_tester_acknowledged, set_tester_acknowledged,
-    start_questionnaire_session, get_active_questionnaire_session,
+    start_questionnaire_session, start_questionnaire_session_if_none_active,
+    get_active_questionnaire_session,
     switch_active_questionnaire_session,
     get_questionnaire_session, get_completed_questionnaire_sessions,
     record_questionnaire_response,
@@ -7514,6 +7515,19 @@ async def cb_questionnaire_start(callback: CallbackQuery, state: FSMContext = No
     definition = registry.get(qid)
 
     active = await get_active_questionnaire_session(uid)
+    if active is None:
+        session_id = await start_questionnaire_session_if_none_active(
+            uid, definition["id"], definition["version"])
+        if session_id is not None:
+            await _send_questionnaire_step(_edit_or_answer(callback.message), definition, session_id, 0, lang)
+            await callback.answer()
+            return
+        # Lost a concurrent race to create this user's first active session
+        # (e.g. a double-tap dispatched as two overlapping updates) -- re-
+        # resolve against whichever session actually won, exactly as if this
+        # request had observed it as already active from the start.
+        active = await get_active_questionnaire_session(uid)
+
     if active:
         if (active["questionnaire_id"] != definition["id"]
                 or active["questionnaire_version"] != definition["version"]):
@@ -7526,8 +7540,10 @@ async def cb_questionnaire_start(callback: CallbackQuery, state: FSMContext = No
         await callback.answer()
         return
 
-    session_id = await start_questionnaire_session(uid, definition["id"], definition["version"])
-    await _send_questionnaire_step(_edit_or_answer(callback.message), definition, session_id, 0, lang)
+    # Exceptionally unlikely: the session that won the race was itself
+    # cancelled/completed again before this re-read. Silent no-op, the same
+    # convention every other "nothing left to safely act on" case in this
+    # handler family already uses (e.g. _load_owned_active_session).
     await callback.answer()
 
 
@@ -7853,13 +7869,18 @@ async def cb_questionnaire_restart(callback: CallbackQuery):
     session is cancelled -- a failed gate leaves the original session
     untouched (active, same current_index), never destroyed for nothing.
 
-    Only after that does it reuse cancel_questionnaire_session (same
-    function q:x uses) on the caller's OWN session, then start_questionnaire_
-    session for a fresh one at step 0. Old-session ownership isolation falls
-    out of reusing these exact primitives -- once cancelled, the old
-    session_id fails _load_owned_active_session's status=='active' check, so
-    any stale q:a/q:b/q:p/q:x/q:n callback still carrying it is a silent
-    no-op, same as any other superseded session today."""
+    Only after that does it replace the caller's OWN session with a fresh one
+    at step 0, via switch_active_questionnaire_session -- the SAME atomic
+    (BEGIN IMMEDIATE, re-verified) primitive cb_questionnaire_switch (q:w:)
+    uses, here targeting the same questionnaire the source session was
+    already for. This closes the race a plain cancel-then-start would leave
+    open under concurrent dispatch (two overlapping restarts, or a restart
+    racing a fresh q:s: start), the same way q:w: is already race-safe.
+    Old-session ownership isolation falls out of reusing this primitive --
+    once cancelled, the old session_id fails _load_owned_active_session's
+    status=='active' check, so any stale q:a/q:b/q:p/q:x/q:n callback still
+    carrying it is a silent no-op, same as any other superseded session
+    today."""
     uid = callback.from_user.id
     lang = await get_user_language(uid)
     if not await _questionnaire_gate(callback, uid, lang):
@@ -7888,8 +7909,15 @@ async def cb_questionnaire_restart(callback: CallbackQuery):
         return
     definition = registry.get(qid)
 
-    await cancel_questionnaire_session(session_id)
-    new_session_id = await start_questionnaire_session(uid, definition["id"], definition["version"])
+    new_session_id = await switch_active_questionnaire_session(
+        uid, session_id, definition["id"], definition["version"])
+    if new_session_id is None:
+        # Lost a concurrent race for this exact session (e.g. it was already
+        # switched/cancelled/restarted by another in-flight callback) --
+        # silent no-op, the same convention cb_questionnaire_switch already
+        # uses for this exact return value.
+        await callback.answer()
+        return
     # The immediate re-render below (_edit_or_answer -> edit_text) replaces
     # this card's text AND keyboard together -- no separate best-effort
     # edit_reply_markup(None) needed first; see _edit_or_answer's own narrow

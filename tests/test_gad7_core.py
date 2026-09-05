@@ -358,6 +358,201 @@ def test_concurrent_double_switch_creates_exactly_one_active_target(flow):
     assert active[0][4] == 0
 
 
+def _rendezvous(n=2):
+    """A deterministic barrier: the returned coroutine blocks until it has
+    been awaited `n` times, then releases every waiter together in the same
+    scheduler tick. No sleep, no timing assumption -- callers only proceed
+    once ALL of them have reached this exact point, so any code placed
+    before the barrier is PROVEN to have run for every contender before any
+    of them is allowed to move on to what comes after it.
+
+    Safe without a lock: asyncio only switches tasks at an `await`, so the
+    plain `arrived += 1` below cannot be interleaved by another task."""
+    state = {"arrived": 0}
+    released = asyncio.Event()
+
+    async def _wait():
+        state["arrived"] += 1
+        if state["arrived"] >= n:
+            released.set()
+        await released.wait()
+
+    return _wait
+
+
+def test_concurrent_fresh_start_creates_exactly_one_active_session(flow, monkeypatch):
+    """Barrier-forced: both callbacks are proven (via the REAL read, not
+    assumed scheduling luck) to have observed "no active session" before
+    either is released to attempt session creation -- the atomic insert
+    itself, not incidental asyncio interleaving, is what must then guarantee
+    only one session survives."""
+    real_get_active = database.get_active_questionnaire_session
+    barrier = _rendezvous(2)
+
+    async def synced_get_active(uid):
+        result = await real_get_active(uid)
+        await barrier()
+        return result
+
+    monkeypatch.setattr(bot, "get_active_questionnaire_session", synced_get_active)
+
+    async def _double_tap():
+        user = FakeUser(1)
+        callbacks = [
+            FakeCallback(user, FakeCardMessage(user), "q:s:demo_anxiety_v1"),
+            FakeCallback(user, FakeCardMessage(user), "q:s:demo_anxiety_v1"),
+        ]
+        await asyncio.gather(
+            *(bot.cb_questionnaire_start(callback) for callback in callbacks))
+
+    asyncio.run(_double_tap())
+
+    rows = _session_rows(1)
+    active = [row for row in rows if row[3] == "active"]
+    assert len(active) == 1
+    assert active[0][1:3] == ("demo_anxiety_v1", "1")
+    assert active[0][4] == 0
+
+
+def test_barrier_proves_old_unconditional_insert_would_have_raced(flow, monkeypatch):
+    """Counter-proof: substitutes the exact pre-fix behavior at this call
+    site (a bare unconditional INSERT, no re-check, no transaction -- what
+    start_questionnaire_session alone used to do here) under the SAME forced
+    rendezvous the test above uses, and confirms it DOES produce two active
+    sessions. Demonstrates the barrier methodology has real discriminating
+    power -- the test above is not passing merely because nothing under a
+    forced simultaneous release could ever create two rows."""
+    real_get_active = database.get_active_questionnaire_session
+    barrier = _rendezvous(2)
+
+    async def synced_get_active(uid):
+        result = await real_get_active(uid)
+        await barrier()
+        return result
+
+    async def old_unconditional_insert(uid, questionnaire_id, version):
+        return await database.start_questionnaire_session(uid, questionnaire_id, version)
+
+    monkeypatch.setattr(bot, "get_active_questionnaire_session", synced_get_active)
+    monkeypatch.setattr(bot, "start_questionnaire_session_if_none_active", old_unconditional_insert)
+
+    async def _double_tap():
+        user = FakeUser(1)
+        callbacks = [
+            FakeCallback(user, FakeCardMessage(user), "q:s:demo_anxiety_v1"),
+            FakeCallback(user, FakeCardMessage(user), "q:s:demo_anxiety_v1"),
+        ]
+        await asyncio.gather(
+            *(bot.cb_questionnaire_start(callback) for callback in callbacks))
+
+    asyncio.run(_double_tap())
+
+    rows = _session_rows(1)
+    active = [row for row in rows if row[3] == "active"]
+    assert len(active) == 2
+
+
+def test_single_fresh_start_still_creates_one_active_session(flow):
+    _press(bot.cb_questionnaire_start, 1, "q:s:demo_anxiety_v1")
+
+    rows = _session_rows(1)
+    active = [row for row in rows if row[3] == "active"]
+    assert len(active) == 1
+    assert active[0][1:3] == ("demo_anxiety_v1", "1")
+    assert active[0][4] == 0
+
+
+def test_concurrent_restart_creates_exactly_one_active_session(flow, monkeypatch):
+    """Barrier-forced: both restart callbacks are proven to have observed
+    the SAME source session as active before either is released to perform
+    the replacement -- the atomic switch itself, not scheduling luck, is
+    what must then guarantee only one replacement session survives."""
+    source_id, _ = _start_synthetic_with_answer()
+    real_load_owned = bot._load_owned_active_session
+    barrier = _rendezvous(2)
+
+    async def synced_load_owned(session_id, uid):
+        result = await real_load_owned(session_id, uid)
+        await barrier()
+        return result
+
+    monkeypatch.setattr(bot, "_load_owned_active_session", synced_load_owned)
+
+    async def _double_tap():
+        user = FakeUser(1)
+        callbacks = [
+            FakeCallback(user, FakeCardMessage(user), f"q:n:{source_id}"),
+            FakeCallback(user, FakeCardMessage(user), f"q:n:{source_id}"),
+        ]
+        await asyncio.gather(
+            *(bot.cb_questionnaire_restart(callback) for callback in callbacks))
+
+    asyncio.run(_double_tap())
+
+    rows = _session_rows(1)
+    source = next(row for row in rows if row[0] == source_id)
+    active = [row for row in rows if row[3] == "active"]
+    assert source[3] == "cancelled"
+    assert len(active) == 1
+    assert active[0][1:3] == ("demo_anxiety_v1", "1")
+    assert active[0][4] == 0
+
+
+def test_barrier_proves_old_cancel_then_start_would_have_raced(flow, monkeypatch):
+    """Counter-proof: substitutes the exact pre-fix behavior (two separate,
+    non-atomic calls -- cancel_questionnaire_session then
+    start_questionnaire_session, with no transaction spanning them) under
+    the SAME forced rendezvous the test above uses, and confirms it DOES
+    produce two active sessions."""
+    source_id, _ = _start_synthetic_with_answer()
+    real_load_owned = bot._load_owned_active_session
+    barrier = _rendezvous(2)
+
+    async def synced_load_owned(session_id, uid):
+        result = await real_load_owned(session_id, uid)
+        await barrier()
+        return result
+
+    async def old_cancel_then_start(uid, source_session_id, target_id, target_version):
+        await database.cancel_questionnaire_session(source_session_id)
+        return await database.start_questionnaire_session(uid, target_id, target_version)
+
+    monkeypatch.setattr(bot, "_load_owned_active_session", synced_load_owned)
+    monkeypatch.setattr(bot, "switch_active_questionnaire_session", old_cancel_then_start)
+
+    async def _double_tap():
+        user = FakeUser(1)
+        callbacks = [
+            FakeCallback(user, FakeCardMessage(user), f"q:n:{source_id}"),
+            FakeCallback(user, FakeCardMessage(user), f"q:n:{source_id}"),
+        ]
+        await asyncio.gather(
+            *(bot.cb_questionnaire_restart(callback) for callback in callbacks))
+
+    asyncio.run(_double_tap())
+
+    rows = _session_rows(1)
+    source = next(row for row in rows if row[0] == source_id)
+    active = [row for row in rows if row[3] == "active"]
+    assert source[3] == "cancelled"
+    assert len(active) == 2
+
+
+def test_single_restart_still_creates_one_fresh_active_session(flow):
+    source_id, _ = _start_synthetic_with_answer()
+
+    _press(bot.cb_questionnaire_restart, 1, f"q:n:{source_id}")
+
+    rows = _session_rows(1)
+    source = next(row for row in rows if row[0] == source_id)
+    active = [row for row in rows if row[3] == "active"]
+    assert source[3] == "cancelled"
+    assert len(active) == 1
+    assert active[0][0] != source_id
+    assert active[0][1:3] == ("demo_anxiety_v1", "1")
+    assert active[0][4] == 0
+
+
 def test_atomic_switch_rolls_back_source_when_target_insert_fails(flow):
     source_id, _ = _start_synthetic_with_answer()
     before = asyncio.run(database.get_questionnaire_responses(source_id))

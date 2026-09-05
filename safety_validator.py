@@ -418,7 +418,15 @@ def _phrase_overlap_exceeds_bound(candidate: str, user_text: str, n: int = 5,
 def validate_first_turn_response(candidate: str, user_text: str,
                                  lang: str = "ru") -> tuple[bool, str | None]:
     """Deterministic checks only -- no LLM re-prompt, no semantic analysis.
-    Returns (is_valid, reason_if_invalid)."""
+    Returns (is_valid, reason_if_invalid).
+
+    Also enforces the same baseline safety invariant every other reply path
+    enforces (validate_response: forbidden phrases, length, certainty
+    claims) -- a first-turn reply is not exempt from it just because it has
+    its own, stricter, additional first-turn-specific rules below."""
+    shared_ok, shared_reason = validate_response(candidate, lang)
+    if not shared_ok:
+        return False, shared_reason
     if candidate.count("?") != 1:
         return False, "first-turn response must contain exactly one question"
     if len(candidate.split()) > 120:
