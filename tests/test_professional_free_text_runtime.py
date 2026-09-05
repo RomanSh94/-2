@@ -109,6 +109,7 @@ def _flags_default(monkeypatch):
     monkeypatch.setattr(config, "THERAPEUTIC_CORE_ROLLOUT_MODE", "off")
     monkeypatch.setattr(config, "THERAPIST_CORE_V1_ENABLED", False)
     monkeypatch.setattr(config, "THERAPIST_CORE_V1_MODEL", "")
+    monkeypatch.setattr(config, "UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED", False)
 
 
 async def _seed_user(uid: int):
@@ -1244,6 +1245,170 @@ def test_therapist_core_claims_once_precedes_professional_and_validates_once(
     run(bot.pipeline(msg, msg.text))
     assert calls == {"generation": 1, "validation": 1}
     assert len(msg.answers) == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# D. Phase 1B — access_control.resolve_psychological_turn_owner precedence
+# ══════════════════════════════════════════════════════════════════════════
+# UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED default False: preserved-behavior
+# proof for the OFF+Therapist-eligible+Professional-eligible cell already
+# exists above (test_therapist_core_claims_once_precedes_professional_and_
+# validates_once) and is untouched by this slice -- it still passes.
+
+def _counting_stub(value):
+    calls = {"n": 0}
+    async def fake(uid):
+        calls["n"] += 1
+        return value
+    return fake, calls
+
+
+@pytest.mark.parametrize(
+    "unified_on, professional_eligible, therapist_eligible, expected_owner",
+    [
+        (False, False, False, "none"),
+        (False, False, True, "therapist_core_v1"),
+        (False, True, False, "professional"),
+        (False, True, True, "therapist_core_v1"),
+        (True, False, False, "none"),
+        (True, False, True, "therapist_core_v1"),
+        (True, True, False, "professional"),
+        (True, True, True, "professional"),
+    ],
+)
+def test_resolver_truth_table_and_each_gate_at_most_once(
+        monkeypatch, unified_on, professional_eligible, therapist_eligible, expected_owner):
+    monkeypatch.setattr(config, "UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED", unified_on)
+    professional_fake, professional_calls = _counting_stub(professional_eligible)
+    therapist_fake, therapist_calls = _counting_stub(therapist_eligible)
+    monkeypatch.setattr(ac, "professional_free_text_allowed_for", professional_fake)
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", therapist_fake)
+
+    result = run(ac.resolve_psychological_turn_owner(1))
+
+    assert result == expected_owner
+    assert professional_calls["n"] <= 1
+    assert therapist_calls["n"] <= 1
+
+
+def test_resolver_off_therapist_eligible_never_probes_professional(monkeypatch):
+    """Short-circuit proof for the OFF/preserved order: when Therapist Core
+    already decides the answer, Professional's gate is never even awaited --
+    not just called <=1 time, literally zero times."""
+    monkeypatch.setattr(config, "UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED", False)
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", _async(True))
+    monkeypatch.setattr(
+        ac, "professional_free_text_allowed_for",
+        _raise_if_called("professional_free_text_allowed_for"))
+    assert run(ac.resolve_psychological_turn_owner(1)) == "therapist_core_v1"
+
+
+def test_resolver_on_professional_eligible_never_probes_therapist(monkeypatch):
+    """Short-circuit proof for the ON/migration order: a Professional-owned
+    turn structurally never reaches Therapist Core's own eligibility check,
+    let alone its claim -- Therapist Core cannot claim this turn."""
+    monkeypatch.setattr(config, "UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED", True)
+    monkeypatch.setattr(ac, "professional_free_text_allowed_for", _async(True))
+    monkeypatch.setattr(
+        ac, "therapist_core_v1_allowed_for",
+        _raise_if_called("therapist_core_v1_allowed_for"))
+    assert run(ac.resolve_psychological_turn_owner(1)) == "professional"
+
+
+def test_resolver_makes_no_direct_model_or_client_calls():
+    """Scoped to resolve_psychological_turn_owner's OWN source only (not the
+    whole access_control.py module, which is a separate, broader claim this
+    test does not make) -- it calls only the two existing eligibility gates
+    and never a model/provider/client surface itself."""
+    import inspect
+    source = inspect.getsource(ac.resolve_psychological_turn_owner)
+    assert "OpenAI(" not in source
+    assert "AsyncOpenAI(" not in source
+    assert "chat.completions" not in source
+    assert "client" not in source
+
+
+def test_dass_discussion_active_never_calls_resolver(tmp_db, monkeypatch):
+    """DASS-discussion turns must skip the resolver entirely -- neither
+    eligibility gate is awaited -- exactly preserving the pre-Phase-1B
+    behavior of skipping both inline checks in this case.
+
+    A DASS-active turn legitimately continues through the ordinary legacy/
+    open_chat machinery afterward (dass_discussion_result only forces its
+    scenario, per bot.py's own existing, unmodified logic) -- so unlike the
+    Professional/Therapist tests above, legacy machinery here must be
+    allowed to run, not raise-guarded; only the resolver itself is guarded."""
+    run(_seed_user(OWNER))
+    monkeypatch.setattr(bot, "_onboarding_blocks_ordinary_entry", _async(False))
+    monkeypatch.setattr(ac, "depression_disclosure_allowed_for", _async(False))
+    monkeypatch.setattr(bot.dependency_monitor, "record_message", _async(None))
+    monkeypatch.setattr(bot.dependency_monitor, "assess", _async(None))
+    monkeypatch.setattr(bot, "maybe_summarize", _async(None))
+    monkeypatch.setattr(bot, "_maybe_react", _async(None))
+    monkeypatch.setattr(bot, "maybe_update_profile", _async(None))
+    monkeypatch.setattr(bot, "check_sudden_improvement", _async(False))
+    monkeypatch.setattr(bot, "persist_influence_trace", _async(None))
+    monkeypatch.setattr(bot, "claim_first_turn", _async(False))
+    monkeypatch.setattr(bot.bot, "send_chat_action", _async(None))
+    monkeypatch.setattr(bot.asyncio, "sleep", _async(None))
+
+    async def fake_completion(**kwargs):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="Безопасный ответ о ситуации."))])
+    monkeypatch.setattr(bot.client.chat.completions, "create", fake_completion)
+
+    monkeypatch.setattr(bot, "_load_owned_completed_history_dass", _async(object()))
+
+    class _FakeDassResult:
+        subscales = {"depression": 10, "anxiety": 10, "stress": 10}
+        instrument_version = "DASS-21"
+        translation_id = "test"
+
+    monkeypatch.setattr(bot, "_dass21_discuss_gate_and_load", _async(_FakeDassResult()))
+    monkeypatch.setattr(
+        ac, "resolve_psychological_turn_owner",
+        _raise_if_called("resolve_psychological_turn_owner"))
+
+    class _FakeFSMState:
+        def __init__(self, data):
+            self._data = data
+        async def get_state(self):
+            return bot.Dass21Discussion.active.state
+        async def get_data(self):
+            return dict(self._data)
+        async def update_data(self, **kwargs):
+            self._data.update(kwargs)
+        async def clear(self):
+            self._data = {}
+
+    state = _FakeFSMState({"dass21_session_id": 1})
+    msg = FakeMessage(FakeUser(OWNER), "Почему так вышло?")
+    run(bot.pipeline(msg, msg.text, state))
+    # Reaching here (no AssertionError from the resolver stub) is the proof;
+    # the turn still gets an ordinary reply through the legacy path.
+    assert msg.answers
+
+
+def test_unified_on_both_eligible_professional_owns_therapist_never_generates(
+        tmp_db, monkeypatch):
+    """End-to-end (not just resolver-level): with both eligible and the
+    switch on, Professional's own delivery path runs and Therapist Core's
+    generation function is never invoked -- a Professional-owned turn never
+    also reaches Therapist."""
+    run(_seed_user(OWNER))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_history(monkeypatch, rows=())
+    monkeypatch.setattr(config, "UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED", True)
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", _async(True))
+    monkeypatch.setattr(ac, "professional_free_text_allowed_for", _async(True))
+    monkeypatch.setattr(
+        bot, "generate_therapist_core_v1",
+        _raise_if_called("generate_therapist_core_v1"))
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне тяжело сегодня.")
+    run(bot.pipeline(msg, msg.text))
+    assert msg.answers and msg.answers[0][0] == SUCCESS_RESULT.reply_text
 
 
 def test_therapist_core_v1_strips_leaked_bold_markdown_delimiters():

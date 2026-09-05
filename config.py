@@ -258,6 +258,35 @@ THERAPIST_CORE_V1_MODEL = os.getenv("THERAPIST_CORE_V1_MODEL", "").strip()
 THERAPIST_CORE_V1_MAX_COMPLETION_TOKENS = _bounded_positive_int_env(
     "THERAPIST_CORE_V1_MAX_COMPLETION_TOKENS", 1200, 8192)
 
+# Phase 1B — Unified Psychological Ownership migration switch. Default OFF,
+# own flag, separate from THERAPIST_CORE_V1_ENABLED/PROFESSIONAL_FREE_TEXT_
+# RUNTIME_ENABLED/THERAPEUTIC_CORE_ROLLOUT_MODE (never overloads their
+# meaning). This flag governs the EVALUATION ORDER/precedence between
+# Therapist Core V1 and Professional Free-Text for every ordinary turn --
+# it grants no eligibility of its own and enables no broader rollout. The
+# SELECTED owner only actually changes for a turn where both would
+# otherwise be eligible (Professional wins instead of Therapist Core);
+# every other combination resolves to the same owner (or none) in both
+# states. Flag false => access_control.resolve_psychological_turn_owner
+# keeps today's Therapist-Core-first evaluation order, same routing/
+# ownership semantics as the pre-Phase-1B inline check. Flag true =>
+# Professional-first: a Professional-eligible user is owned by Professional
+# (Therapist Core never claims that turn); a Professional-ineligible but
+# Therapist-eligible user still gets Therapist Core, preserved during
+# migration; neither eligible falls through to the existing legacy/First-
+# Turn/Controller routing, unchanged either way. Professional-first
+# evaluation order (flag true) means a Professional-ineligible-but-
+# Therapist-eligible turn now genuinely performs an existing eligibility
+# lookup (professional_free_text_allowed_for) that the flag-false
+# Therapist-first short-circuit previously skipped entirely -- an
+# intentional consequence of the reordering, not a duplicate evaluation;
+# see resolve_psychological_turn_owner's own docstring for the exact
+# call-count guarantee.
+UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED = (
+    os.getenv("UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
 
 def _validate_feedback_chat_url(raw: str) -> str:
     """Return a renderable HTTPS/TG feedback URL, or hide it as empty."""
