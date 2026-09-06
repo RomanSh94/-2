@@ -987,20 +987,49 @@ def _safe_concise_version(text: str, lang: str) -> str:
     return candidate if is_safe else text
 
 
-async def _synthesize_and_send_voice(target, uid: int, text: str, lang: str) -> bool:
+async def _synthesize_and_send_voice(
+        target, uid: int, text: str, lang: str, *,
+        strict_single_attempt: bool = False) -> bool:
     """Synthesizes `text` (already Safety-Validator-approved) and sends ONE
-    voice message via `target` (a Message, exposing .answer_voice). Returns
-    True on success, False on ANY failure (TTS or Telegram send) -- never
-    raises, and the temporary audio file is always removed."""
+    voice message via `target` (a Message, exposing .answer_voice).
+
+    Default behavior (strict_single_attempt=False, every existing caller):
+    returns True on success, False on ANY failure (TTS or Telegram send) --
+    never raises, and the temporary audio file is always removed. Unchanged
+    by the addition below.
+
+    strict_single_attempt (Codex PHASE1C-001 fix, Professional first-turn-
+    entry callers only): the ordinary False-on-any-failure contract cannot
+    distinguish "TTS failed before any Telegram call was made" (zero actual
+    Telegram attempts so far -- a text fallback is still safe) from
+    "target.answer_voice(...) was actually invoked and then raised" (the
+    one allowed Telegram-attempt budget is already spent -- the client-side
+    exception is delivery-ambiguous, so a text fallback after it would risk
+    a second real Telegram send). When True, this function still returns
+    False for the first case (TTS/pre-send failure -- answer_voice was
+    never reached), but RE-RAISES the original exception for the second
+    case (answer_voice itself raised) instead of swallowing it -- the
+    caller (deliver_response, and above it
+    _run_professional_free_text_and_deliver) already treats an exception
+    from the delivery boundary as "stop, no further send, one
+    delivery_uncertain transition" (see _run_professional_free_text_and_
+    deliver's own POST-SEND handling), so re-raising here is sufficient to
+    guarantee at most one actual Telegram attempt -- no new retry/
+    compensation logic is added here or anywhere else."""
     if not await _voice_ux_enabled_for(uid):
         return False
     path = None
+    voice_attempted = False
     try:
         path = await synthesize_speech(client, text, lang)
-        await target.answer_voice(FSInputFile(path))
+        voice_file = FSInputFile(path)
+        voice_attempted = True
+        await target.answer_voice(voice_file)
         return True
     except Exception as e:
         print(f"[tts] uid={uid}: {type(e).__name__}")
+        if strict_single_attempt and voice_attempted:
+            raise
         return False
     finally:
         if path:
@@ -1014,7 +1043,8 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
                             *, one_shot_voice: bool = False,
                             one_shot_concise: bool = False,
                             reply_markup=None,
-                            preserve_exact_text: bool = False) -> Message | None:
+                            preserve_exact_text: bool = False,
+                            strict_single_attempt: bool = False) -> Message | None:
     """The SINGLE shared point where a final, Safety-Validator-approved
     response is delivered — text / voice / voice_and_concise_text, from the
     user's stored preference or a one-shot meta-command override. Flag OFF
@@ -1037,7 +1067,24 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
     ``preserve_exact_text`` remains accepted for call-site compatibility.
     Public-beta delivery no longer shortens an already-approved answer in the
     presentation layer: both full-text modes and voice synthesis receive the
-    exact complete answer."""
+    exact complete answer.
+
+    strict_single_attempt (Codex PHASE1C-001 fix, default False -- every
+    existing caller and every existing Voice UX behavior is byte-for-byte
+    unchanged): forwarded only to the voice-fmt branch's
+    _synthesize_and_send_voice call. When True and the voice attempt has
+    actually reached target.answer_voice(...) before failing, that helper
+    re-raises instead of returning False, so the `if not ok:` text-fallback
+    below is never reached for that case -- the exception instead
+    propagates out of this function uncaught (this function wraps nothing
+    in its own try/except), exactly matching the caller contract
+    _run_professional_free_text_and_deliver already relies on for any
+    deliver_response exception (stop, no further send, exactly one
+    delivery_uncertain transition). When the voice attempt fails BEFORE
+    answer_voice is ever reached (plain TTS synthesis failure), the helper
+    still returns False here exactly as in the non-strict case, so the text
+    fallback below still runs -- a pre-Telegram-attempt failure may still
+    safely fall back to text even in strict mode."""
     is_private = getattr(message.chat, "type", "private") == "private"
     if reply_markup is not None:
         return await message.answer(answer, reply_markup=reply_markup)
@@ -1056,7 +1103,8 @@ async def deliver_response(message: Message, uid: int, answer: str, lang: str,
         return await message.answer(answer, reply_markup=_listen_kb(uid, lang))
 
     # fmt == "voice"
-    ok = await _synthesize_and_send_voice(message, uid, answer, lang)
+    ok = await _synthesize_and_send_voice(
+        message, uid, answer, lang, strict_single_attempt=strict_single_attempt)
     if not ok:
         return await message.answer(
             answer, reply_markup=persistent_lower_menu_kb(lang))
@@ -2038,10 +2086,34 @@ async def _run_therapist_core_v1_and_deliver(
         return
 
 
+async def _professional_first_turn_transition(
+        uid: int, claim_token: str, from_status: str, to_status: str,
+        turn_id: int | None, cid: str) -> bool:
+    """Returns the transition's ACTUAL success/failure -- an exception is
+    NEVER treated as success; it is logged and reported as False, exactly
+    like a guard-mismatch False result. This helper decides nothing about
+    delivery: the caller alone decides what a False result means (a PRE-
+    SEND gate that blocks the send, or a POST-SEND terminal attempt that
+    is never retried/compensated either way) -- see
+    _run_professional_free_text_and_deliver's own PRE-SEND/POST-SEND
+    handling. claim_token is required (non-None); the caller only invokes
+    this when a first-turn claim is actually active for this turn."""
+    try:
+        return await transition_first_turn_claim(
+            uid, FIRST_TURN_CONTRACT_VERSION, claim_token, from_status, to_status,
+            turn_id=turn_id)
+    except Exception as e:
+        _dispatch_log(
+            f"cid={cid} stage=professional_first_turn_transition_failed "
+            f"from={from_status} to={to_status} error_type={type(e).__name__}")
+        return False
+
+
 async def _run_professional_free_text_and_deliver(
         message: Message, uid: int, current_row_id: int, user_text: str,
         risk: dict, lang: str, turn_gen: int, cid: str,
-        one_shot_voice: bool = False, one_shot_concise: bool = False) -> None:
+        one_shot_voice: bool = False, one_shot_concise: bool = False,
+        first_turn_claim_token: str | None = None) -> None:
     """The SLOW half of a Professional-claimed turn -- called strictly AFTER
     the per-user ingestion lock has been released (same contract as
     _controller_generate_and_deliver: Professional's up-to-three model calls
@@ -2062,12 +2134,28 @@ async def _run_professional_free_text_and_deliver(
     Professional text or the technical fallback; the concise PRESENTATION
     request is silently inert for V1, per the frozen exact-content rule,
     while the psychological content is still fully handled by Professional
-    (never diverted to legacy)."""
+    (never diverted to legacy).
+
+    first_turn_claim_token (Phase 1C, corrected): non-None iff pipeline()
+    already won the one-shot first-turn claim for THIS turn. Feeds
+    ProfessionalTurnRuntimeContext.first_turn_entry_active (an input signal
+    to the Renderer's wording only -- it means "the entry policy is
+    active," never "this is the user's first-ever message"; conversation
+    history is populated exactly as on any other turn regardless) and
+    drives the PRE-SEND/POST-SEND lifecycle transitions below. PRE-SEND
+    (pending_before_llm->generated, generated->send_started) are GATES: if
+    either fails (returns False or the helper catches an exception), this
+    function stops -- no send, no further transition, no compensation, per
+    owner decision. POST-SEND (after the one real send attempt) is never
+    gated and never retried/compensated -- Telegram send happens at most
+    once regardless of what any transition reports."""
     _dispatch_log(f"cid={cid} stage=professional_claimed")
+    first_turn_entry_active = first_turn_claim_token is not None
     try:
         rows = await get_professional_conversation_history_rows(uid, current_row_id)
         context = build_conversation_context_from_history_rows(rows)
-        runtime_context = ProfessionalTurnRuntimeContext(conversation=context)
+        runtime_context = ProfessionalTurnRuntimeContext(
+            conversation=context, first_turn_entry_active=first_turn_entry_active)
         result = await run_professional_free_text_turn(
             client=client, model="gpt-4o-mini",
             source_message_row_id=current_row_id, source_text=user_text,
@@ -2104,27 +2192,90 @@ async def _run_professional_free_text_and_deliver(
             f"pro_stage={result.failure_stage.value} reason={result.failure_reason.value}{_detail_part}")
         reply_text = _professional_technical_fallback_text(lang)
 
+    # Phase 1C (corrected) -- PRE-SEND GATE 1: reply_text is resolved (a
+    # SUCCESS candidate or the bounded technical fallback -- either way
+    # real content ready to send). Only when a first-turn claim is active
+    # for this turn: this transition must succeed before any send is even
+    # considered. Owner decision: on failure, stop this delivery path
+    # entirely -- no send, no further transition, no compensation.
+    if first_turn_entry_active:
+        ok = await _professional_first_turn_transition(
+            uid, first_turn_claim_token, "pending_before_llm", "generated", None, cid)
+        if not ok:
+            _dispatch_log(
+                f"cid={cid} stage=professional_first_turn_gate_failed "
+                f"at=pending_before_llm_to_generated")
+            return
+
     # Final stale check, as late as possible -- right before the point of no
     # return (send) -- same timing convention the legacy path already uses
     # (see the identical check in pipeline() before its own assistant save).
     if _user_generation_superseded(uid, turn_gen):
         _dispatch_log(f"cid={cid} stage=professional_stale_dropped")
+        # A genuinely legitimate "no send was attempted" case -- the ONLY
+        # place this function ever records failed_before_send, and only
+        # here, before any send is attempted. Single attempt; no
+        # compensation if it fails -- still no send either way.
+        if first_turn_entry_active:
+            await _professional_first_turn_transition(
+                uid, first_turn_claim_token, "generated", "failed_before_send", None, cid)
         return
 
+    # PRE-SEND GATE 2.
+    if first_turn_entry_active:
+        ok = await _professional_first_turn_transition(
+            uid, first_turn_claim_token, "generated", "send_started", None, cid)
+        if not ok:
+            _dispatch_log(
+                f"cid={cid} stage=professional_first_turn_gate_failed "
+                f"at=generated_to_send_started")
+            return
+
+    # POST-SEND: exactly one Telegram send attempt. Once this is reached,
+    # no further first-turn transition may ever block or repeat the send --
+    # every transition attempt below is a single, non-compensated,
+    # non-retried terminal bookkeeping attempt describing what already
+    # happened, per owner decision (no transactional outbox, no new
+    # statuses, no retry queue in this slice).
     try:
         await deliver_response(message, uid, reply_text, lang,
                                one_shot_voice=one_shot_voice, one_shot_concise=one_shot_concise,
-                               preserve_exact_text=True)
+                               preserve_exact_text=True,
+                               strict_single_attempt=first_turn_entry_active)
     except Exception as e:
         _dispatch_log(f"cid={cid} stage=professional_send_failed error_type={type(e).__name__}")
+        if first_turn_entry_active:
+            await _professional_first_turn_transition(
+                uid, first_turn_claim_token, "send_started", "delivery_uncertain", None, cid)
         return
 
     try:
-        await save_message(uid, "assistant", reply_text, "professional", lang,
-                           source=MessageSource.ASSISTANT_DELIVERED)
+        turn_id = await save_message(uid, "assistant", reply_text, "professional", lang,
+                                     source=MessageSource.ASSISTANT_DELIVERED)
     except Exception as e:
         _dispatch_log(f"cid={cid} stage=professional_persist_failed error_type={type(e).__name__}")
+        # The reply WAS delivered to the user (send already succeeded);
+        # only its own persistence failed, so this is not send_started's
+        # "no send happened" case either -- delivered_context_missing
+        # (existing status, no turn_id required) is the truthful terminal
+        # attempt here, exactly once, never compensated.
+        if first_turn_entry_active:
+            await _professional_first_turn_transition(
+                uid, first_turn_claim_token, "send_started", "delivered_context_missing", None, cid)
         return
+
+    # Professional has no button/keyboard concept of its own (unlike the
+    # legacy first-turn flow) -- "delivered_without_buttons" is the correct,
+    # already-legal terminal state for a fully successful delivery here,
+    # reusing the exact same transition edge the legacy "buttons not
+    # allowed" branch already uses (see _deliver_first_turn_response) rather
+    # than adding any new edge to FIRST_TURN_CLAIM_TRANSITIONS. Exactly one
+    # attempt; if it returns False or raises, the last confirmed status
+    # stays send_started -- an explicitly accepted bounded limitation
+    # (owner decision), never compensated, never retried.
+    if first_turn_entry_active:
+        await _professional_first_turn_transition(
+            uid, first_turn_claim_token, "send_started", "delivered_without_buttons", turn_id, cid)
 
 
 async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | None = None,
@@ -2519,6 +2670,63 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
                 uid, "user", user_text, "professional", lang,
                 risk["score"], risk["categories"], source=MessageSource.USER_AUTHORED)
             psychological_owner = "professional"
+            # Phase 1C (owner-approved Alternative B) -- governed first-turn
+            # ENTRY-POLICY signal only, reusing the existing one-shot
+            # first-turn claim/version/lifecycle (database.py) exactly
+            # as-is: never a second persistence system. Whether the CLAIM
+            # itself succeeds or fails never affects whether Professional
+            # owns/processes this turn -- that is decided entirely by
+            # turn_owner_resolution above, unconditionally. A successful
+            # claim only shapes the RESPONSE via ProfessionalTurnRuntime
+            # Context.first_turn_entry_active (semantics: "the one-shot
+            # entry policy is active for this turn" -- never "this is the
+            # user's first-ever message"; see
+            # professional_turn_runtime_context.py). Owner decision 5,
+            # separately: once a claim IS active for this turn, its own
+            # PRE-SEND lifecycle transitions (in
+            # _run_professional_free_text_and_deliver) are fail-closed
+            # GATES that can, on a rare bookkeeping failure, suppress that
+            # one send -- an explicit, accepted trade-off, not a bug.
+            #
+            # detect_stage is a fresh, stateless, already-precedented call
+            # (the therapist_core_v1 branch above already calls it the same
+            # way, at line ~2515, for reaction selection) -- NOT
+            # choose_scenario/load_state, which Professional's own claim
+            # path must never touch (see
+            # test_professional_claim_never_calls_choose_scenario_or_load_state).
+            # scenario/capacity are deliberately excluded from this
+            # Professional-specific entry-policy formula -- an explicit
+            # owner-approved architectural divergence (Alternative B) from
+            # the legacy 4-condition formula below, NOT a claim that
+            # stage+risk reproduce everything scenario+capacity
+            # represented. Truthfully: this formula does not preserve
+            # legacy scenario semantics, and does not preserve the
+            # capacity check, at all. What stage + risk-level + the
+            # unconditional crisis override (which already ran before this
+            # branch was ever reached) DO protect is the relevant
+            # CURRENT-TURN acute-distress/risk boundary this one-shot entry
+            # policy is scoped to -- all three are single-turn signals.
+            # capacity is different in kind: it can reflect accumulated
+            # overload or history across many turns that no signal computed
+            # here reproduces. That gap is real, known, and not silently
+            # dropped -- it is explicitly owner-accepted for Phase 1C,
+            # because deriving it here would require importing legacy
+            # state/scenario machinery (load_state/choose_scenario/
+            # get_capacity) into Professional's claim path, which would
+            # violate the Professional ownership boundary this branch must
+            # not cross (see
+            # test_professional_claim_never_calls_choose_scenario_or_load_state
+            # above). This is not a regression Phase 1C introduces:
+            # Professional's own ordinary (non-entry-policy) runtime is
+            # already capacity-blind today.
+            pro_stage = detect_stage(user_text, lang)
+            if (pro_stage not in FIRST_TURN_EXCLUDED_STAGES
+                    and risk["level"] not in FIRST_TURN_EXCLUDED_RISK_LEVELS):
+                claim_token = secrets.token_urlsafe(16)
+                ft_claimed = await claim_first_turn(
+                    uid, FIRST_TURN_CONTRACT_VERSION, claim_token, "professional")
+                if not ft_claimed:
+                    claim_token = None
         else:
             # 5. Update state
             state = await load_state(uid) or dict(DEFAULT_STATE)
@@ -2654,7 +2862,7 @@ async def pipeline(message: Message, user_text: str, fsm_state: FSMContext | Non
     if psychological_owner == "professional":
         await _run_professional_free_text_and_deliver(
             message, uid, current_row_id, user_text, risk, lang, _turn_gen, _cid,
-            one_shot_voice, one_shot_concise)
+            one_shot_voice, one_shot_concise, first_turn_claim_token=claim_token)
         return
 
     # PR #73 request-changes §6: best-effort, restart-safe recovery for any

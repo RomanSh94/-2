@@ -19,11 +19,29 @@ ProfessionalTurnRuntimeContext is the single envelope every one of those call
 sites accepts instead, so a future context kind is added as a new field on
 this dataclass -- never as a new parameter on any of the functions above.
 
-V1 SCOPE -- deliberately narrow. The envelope carries exactly one field
-today, `conversation`, an unmodified ProfessionalConversationContext (see
+V1 SCOPE -- deliberately narrow. The envelope carries exactly two fields:
+`conversation`, an unmodified ProfessionalConversationContext (see
 professional_turn_conversation_context.py for that type's own bounds and
-trust semantics -- nothing about that type changes here). This module does
-NOT define, store, or reserve a schema for:
+trust semantics -- nothing about that type changes here); and
+`first_turn_entry_active`, a plain bool (default False) -- a governed,
+one-shot, current-turn-only signal meaning bot.py's existing first-turn
+claim mechanism (database.claim_first_turn) succeeded for this exact turn.
+
+Owner-clarified semantics (Phase 1C correction pass): this field means
+ONLY "the one-shot First-Turn entry policy is active for this Professional
+turn." It does NOT mean, and must never be treated as meaning, that this is
+the user's first-ever message, that no previous conversation exists, that
+no conversation history is available, or that the account/user is new. A
+user may have earlier usable history and only now reach Professional
+ownership (their claim is consumed on this later turn) -- `conversation`
+above is populated from that real history exactly as on any other turn;
+this field never forces it to an empty/None state and never licenses the
+Renderer to assert "no earlier conversation" as fact (see
+professional_turn_response_renderer.py's own first-turn entry-policy
+system note). It carries no scenario, no legacy state, and no capacity/
+stage value.
+
+This module does NOT define, store, or reserve a schema for:
   - confirmed facts or corrections;
   - hypotheses or case conceptualization;
   - memory lifecycle (CANDIDATE/PROPOSED/CONFIRMED/etc.);
@@ -61,14 +79,19 @@ from professional_turn_conversation_context import ProfessionalConversationConte
 @dataclass(frozen=True)
 class ProfessionalTurnRuntimeContext:
     """The single typed context parameter threaded through the Professional
-    Free-Text Runtime chain. Exactly one field in this V1 slice -- see the
-    module docstring's V1 SCOPE and FUTURE EXTENSION POINT sections. Fails
-    closed (raises ValueError) rather than silently coercing or wrapping a
-    value of the wrong type."""
+    Free-Text Runtime chain. Two fields in this slice -- see the module
+    docstring's V1 SCOPE and FUTURE EXTENSION POINT sections. Fails closed
+    (raises ValueError) rather than silently coercing or wrapping a value of
+    the wrong type."""
     conversation: ProfessionalConversationContext
+    first_turn_entry_active: bool = False
 
     def __post_init__(self):
         if type(self.conversation) is not ProfessionalConversationContext:
             raise ValueError(
                 "ProfessionalTurnRuntimeContext.conversation must be exactly a "
                 f"ProfessionalConversationContext, got {type(self.conversation)!r}")
+        if type(self.first_turn_entry_active) is not bool:
+            raise ValueError(
+                "ProfessionalTurnRuntimeContext.first_turn_entry_active must be "
+                f"exactly bool, got {type(self.first_turn_entry_active)!r}")
