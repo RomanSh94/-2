@@ -5821,27 +5821,162 @@ async def add_core_memory_item(user_id: int, item: _core.MemoryItem) -> int:
         return cur.lastrowid
 
 
+def _decode_and_verify_core_memory_row(
+        row_id, sql_category: str, sql_lifecycle: str, memory_json: str) -> _core.MemoryItem:
+    """Shared row-integrity decoder for every core_memory_items reader AND
+    writer (Phase 2A corrections P2-1 content guard + P1 lifecycle/category
+    coherence guard).
+
+    core_memory_items stores category and lifecycle TWICE -- once as a
+    plain SQL column (for cheap filtering) and once inside memory_json
+    (the full serialized MemoryItem) -- and nothing elsewhere in this
+    codebase guarantees, for a pre-existing/historical row, that the two
+    can never diverge. This function never assumes they agree: it decodes
+    memory_json, then requires that the SQL column, the raw JSON value, and
+    the value the deserialized MemoryItem ends up with are all EXACTLY
+    identical, for each of category, lifecycle, and content. Any
+    disagreement -- a structurally malformed payload, a non-str raw
+    content, or a mismatch between any of the three representations of
+    category/lifecycle/content -- raises ValueError immediately; the row
+    is never returned, never reshaped, never resolved by silently
+    preferring one representation over another. The exception message
+    never includes memory content, category, or lifecycle values -- only
+    the row id.
+
+    A row written through add_core_memory_item (the only supported write
+    path until now) or through update_core_memory_item_lifecycle's own
+    atomic transition below always satisfies this by construction; this
+    check exists for whatever a legacy/direct-SQL/corrupted row might
+    contain."""
+    payload = json.loads(memory_json)
+    if type(payload) is not dict or "content" not in payload:
+        raise ValueError(f"core_memory_items row id={row_id}: malformed persisted payload")
+    raw_content = payload["content"]
+    if type(raw_content) is not str:
+        raise ValueError(f"core_memory_items row id={row_id}: raw persisted content is not a str")
+    raw_category = payload.get("category")
+    raw_lifecycle = payload.get("lifecycle")
+    item = _core.MemoryItem.from_dict(payload)
+    if item.content != raw_content:
+        raise ValueError(
+            f"core_memory_items row id={row_id}: deserialized content does not "
+            "exactly match raw persisted content")
+    if not (sql_category == raw_category == item.category.value):
+        raise ValueError(
+            f"core_memory_items row id={row_id}: category is inconsistent across "
+            "the SQL column, raw JSON, and the deserialized MemoryItem")
+    if not (sql_lifecycle == raw_lifecycle == item.lifecycle.value):
+        raise ValueError(
+            f"core_memory_items row id={row_id}: lifecycle is inconsistent across "
+            "the SQL column, raw JSON, and the deserialized MemoryItem")
+    return item
+
+
 async def list_core_memory_items(user_id: int, *, influencing_only: bool = False
                                   ) -> list[_core.MemoryItem]:
     """influencing_only=True returns only CONFIRMED/CORRECTED items (SS14.12 --
-    REJECTED/EXPIRED items must never influence a response)."""
+    REJECTED/EXPIRED items must never influence a response).
+
+    ROW-INTEGRITY VERIFICATION (Phase 2A correction, P1-B): every row is
+    decoded through _decode_and_verify_core_memory_row BEFORE
+    influencing_only filtering ever runs -- a structurally inconsistent row
+    (e.g. SQL lifecycle disagreeing with memory_json's own lifecycle, or
+    content silently reshaped) raises ValueError rather than being
+    silently included OR excluded one way or another. influencing_only
+    filtering only ever sees already-verified items."""
     async with aiosqlite.connect(DB) as db:
         rows = await (await db.execute(
-            "SELECT memory_json FROM core_memory_items WHERE user_id=? ORDER BY id",
+            "SELECT id, category, lifecycle, memory_json FROM core_memory_items "
+            "WHERE user_id=? ORDER BY id",
             (user_id,))).fetchall()
-    items = [_core.MemoryItem.from_dict(json.loads(r[0])) for r in rows]
+    items = [_decode_and_verify_core_memory_row(row_id, category, lifecycle, memory_json)
+             for row_id, category, lifecycle, memory_json in rows]
     if influencing_only:
         items = [i for i in items if i.influences_responses]
     return items
 
 
+async def list_core_memory_item_records(user_id: int, *, influencing_only: bool = False
+                                         ) -> list[tuple[int, _core.MemoryItem]]:
+    """Like list_core_memory_items, but also returns each row's real
+    core_memory_items.id (provenance) paired with its deserialized
+    MemoryItem -- list_core_memory_items itself discards that id. Read-only;
+    no new table, no schema change. Used by professional_case_context.py's
+    builder (Phase 2A), which independently re-checks influences_responses
+    on every record regardless of `influencing_only` here (defense in
+    depth).
+
+    ROW-INTEGRITY VERIFICATION (Phase 2A corrections P2-1 + P1-B): every
+    row is decoded through _decode_and_verify_core_memory_row BEFORE
+    influencing_only filtering -- see that function's own docstring for
+    the exact category/lifecycle/content coherence contract it enforces.
+    A structurally inconsistent or malformed row raises ValueError
+    immediately -- the row is never returned, not even in a reshaped form,
+    and this is never caught locally here. The exception message never
+    includes memory content, category, or lifecycle values."""
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            "SELECT id, category, lifecycle, memory_json FROM core_memory_items "
+            "WHERE user_id=? ORDER BY id",
+            (user_id,))).fetchall()
+    records = [(row_id, _decode_and_verify_core_memory_row(row_id, category, lifecycle, memory_json))
+               for row_id, category, lifecycle, memory_json in rows]
+    if influencing_only:
+        records = [(row_id, item) for row_id, item in records if item.influences_responses]
+    return records
+
+
 async def update_core_memory_item_lifecycle(item_id: str, user_id: int,
                                              lifecycle: _core.MemoryLifecycle) -> bool:
+    """Atomically transitions a core_memory_items row's lifecycle (Phase 2A
+    correction, P1-A) -- the SQL `lifecycle` column and memory_json's own
+    "lifecycle" key are updated together in ONE UPDATE statement, never one
+    write followed by a second independent write. Returns False (zero
+    mutation) if no row matches this (item_id, user_id), preserving the
+    prior not-found contract.
+
+    FAIL-CLOSED PRE-TRANSITION CHECK: before any mutation, the existing row
+    is decoded and verified via _decode_and_verify_core_memory_row (the
+    same category/lifecycle/content coherence contract every reader now
+    enforces). A row that is ALREADY divergent or malformed raises
+    ValueError immediately, with zero lifecycle mutation performed -- this
+    function never silently repairs a pre-existing divergence as a side
+    effect of a transition; it refuses to transition it at all.
+
+    BOUNDED CONCURRENCY GUARD: the UPDATE additionally requires the SQL
+    `lifecycle` column to still equal the just-verified prior value (a
+    compare-and-swap predicate on the single UPDATE's own WHERE clause) --
+    if the row changed between the read and the write, rowcount is 0 and
+    this function returns False rather than silently overwriting a value
+    it never actually observed. No new persistence architecture, no
+    additional table, no second query.
+
+    Every memory_json field other than "lifecycle" is preserved exactly
+    (the existing payload is parsed once and only its "lifecycle" key is
+    replaced). No memory content, category, or lifecycle value is ever
+    placed in an exception message."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            """UPDATE core_memory_items SET lifecycle=?, updated_at=datetime('now')
-               WHERE id=? AND user_id=?""",
-            (lifecycle.value, item_id, user_id))
+            "SELECT category, lifecycle, memory_json FROM core_memory_items "
+            "WHERE id=? AND user_id=?",
+            (item_id, user_id))
+        row = await cur.fetchone()
+        if row is None:
+            return False
+        sql_category, prior_sql_lifecycle, memory_json = row
+        # Fail-closed pre-transition check -- raises, with zero mutation,
+        # if this row is already internally inconsistent.
+        _decode_and_verify_core_memory_row(item_id, sql_category, prior_sql_lifecycle, memory_json)
+
+        payload = json.loads(memory_json)
+        payload["lifecycle"] = lifecycle.value
+        new_memory_json = json.dumps(payload)
+
+        cur = await db.execute(
+            """UPDATE core_memory_items SET lifecycle=?, memory_json=?,
+               updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND lifecycle=?""",
+            (lifecycle.value, new_memory_json, item_id, user_id, prior_sql_lifecycle))
         await db.commit()
         return cur.rowcount > 0
 
