@@ -287,6 +287,140 @@ def test_payload_contains_no_forbidden_context_fields():
     assert forbidden_keys.isdisjoint(payload.keys())
 
 
+# ── Phase 1C: first-turn entry-policy framing (additive, off by default,
+# corrected per owner decision -- see the module docstring's FIRST-TURN
+# ENTRY POLICY FRAMING section) ─────────────────────────────────────────────
+
+def test_payload_omits_first_turn_entry_active_key_by_default():
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="A regular turn.",
+          runtime_context=ProfessionalTurnRuntimeContext(
+              conversation=ProfessionalConversationContext(turns=())))
+    sent = client.chat.completions.calls[0]
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert "first_turn_entry_active" not in payload
+    assert len([m for m in sent["messages"] if m["role"] == "system"]) == 1
+
+
+def test_payload_carries_first_turn_entry_active_true_when_signaled():
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="Мне нужно поговорить.",
+          runtime_context=ProfessionalTurnRuntimeContext(
+              conversation=ProfessionalConversationContext(turns=()),
+              first_turn_entry_active=True))
+    sent = client.chat.completions.calls[0]
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["first_turn_entry_active"] is True
+    # A real (non-None) envelope always adds "conversation_context" too
+    # (even with zero turns) -- unrelated to this signal, unchanged by
+    # this slice. No other, unexpected key sneaks in alongside them.
+    assert set(payload.keys()) == {
+        "objective", "move", "clarification_target", "question_allowed",
+        "source_text", "conversation_context", "first_turn_entry_active"}
+
+
+def test_additional_system_message_appended_only_when_entry_policy_active():
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="Мне нужно поговорить.",
+          runtime_context=ProfessionalTurnRuntimeContext(
+              conversation=ProfessionalConversationContext(turns=()),
+              first_turn_entry_active=True))
+    sent = client.chat.completions.calls[0]
+    system_messages = [m for m in sent["messages"] if m["role"] == "system"]
+    assert len(system_messages) == 2
+    assert system_messages[0]["content"] == professional_turn_response_renderer._SYSTEM_INSTRUCTION
+    assert system_messages[1]["content"] == (
+        professional_turn_response_renderer._FIRST_TURN_ENTRY_SYSTEM_NOTE)
+    # The user message is always last, after both system messages.
+    assert sent["messages"][-1]["role"] == "user"
+
+
+def test_entry_policy_inactive_or_none_runtime_context_never_appends_note():
+    for rc in (
+        None,
+        ProfessionalTurnRuntimeContext(conversation=ProfessionalConversationContext(turns=())),
+        ProfessionalTurnRuntimeContext(
+            conversation=ProfessionalConversationContext(turns=()),
+            first_turn_entry_active=False),
+    ):
+        client = _client_returning(_VALID_JSON)
+        _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="A regular turn.",
+              runtime_context=rc)
+        sent = client.chat.completions.calls[0]
+        assert len([m for m in sent["messages"] if m["role"] == "system"]) == 1
+
+
+def test_entry_note_does_not_relax_question_allowed_false():
+    # The added system message is framing only -- it must not smuggle
+    # permission for a question when the (unmodified) plan forbids one.
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", plan=_establish_contact_plan(question_allowed=False),
+          source_text="Мне нужно поговорить.",
+          runtime_context=ProfessionalTurnRuntimeContext(
+              conversation=ProfessionalConversationContext(turns=()),
+              first_turn_entry_active=True))
+    sent = client.chat.completions.calls[0]
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["question_allowed"] is False
+    note = professional_turn_response_renderer._FIRST_TURN_ENTRY_SYSTEM_NOTE
+    assert "exactly one question" not in note.lower()
+    assert "120 word" not in note.lower() and "120-word" not in note.lower()
+
+
+# Owner decision 2/4 (corrected semantics): the note must never assert, as
+# fact, that this is the user's first-ever message or that no earlier
+# conversation exists -- both are false for a delayed-entry user whose
+# claim only succeeds after real prior history already accumulated.
+def test_entry_note_never_asserts_first_ever_message_or_no_history_as_fact():
+    note = professional_turn_response_renderer._FIRST_TURN_ENTRY_SYSTEM_NOTE.lower()
+    for overclaim in (
+        "first message", "first-ever", "no earlier conversation",
+        "there is no earlier", "no history", "no previous conversation",
+    ):
+        assert overclaim not in note
+    assert "may be absent" in note
+    assert "may be supplied" in note
+
+
+# Final pre-commit hardening: the note must not rely on positional wording
+# ("above"/"below") to describe where conversation_context may appear. It
+# cannot truthfully say context is supplied "above" this note, because this
+# note is appended as a system message BEFORE the later user-role payload
+# message that actually carries conversation_context (see
+# test_additional_system_message_appended_only_when_entry_policy_active --
+# the user message is always last, after both system messages) -- when
+# context exists, it is supplied AFTER this note, never above it.
+def test_entry_note_uses_no_positional_language_for_context_placement():
+    note = professional_turn_response_renderer._FIRST_TURN_ENTRY_SYSTEM_NOTE.lower()
+    for positional_word in ("above", "below"):
+        assert positional_word not in note
+    assert "may be absent" in note
+    assert "may be supplied" in note
+
+
+def test_entry_policy_active_still_includes_real_conversation_context():
+    # Owner decision 3: the entry policy must never force conversation_
+    # context to empty/None -- real supplied history is used exactly as on
+    # any other turn.
+    history = ProfessionalConversationContext(turns=(
+        ConversationTurn(message_row_id=1, role=ConversationTurnRole.USER,
+                         content="Раньше я уже писал про работу."),
+        ConversationTurn(message_row_id=2, role=ConversationTurnRole.ASSISTANT,
+                         content="Что именно происходило?"),
+    ))
+    client = _client_returning(_VALID_JSON)
+    _call(client, model="gpt-4o-mini", plan=_sample_plan(), source_text="Продолжаю то же самое.",
+          runtime_context=ProfessionalTurnRuntimeContext(
+              conversation=history, first_turn_entry_active=True))
+    sent = client.chat.completions.calls[0]
+    payload = json.loads([m for m in sent["messages"] if m["role"] == "user"][0]["content"])
+    assert payload["first_turn_entry_active"] is True
+    assert payload["conversation_context"] == [
+        {"role": "USER", "content": "Раньше я уже писал про работу."},
+        {"role": "ASSISTANT", "content": "Что именно происходило?"},
+    ]
+
+
 # ── C. Client / call-configuration boundary ─────────────────────────────────
 
 def test_call_configuration_is_exact_and_frozen():

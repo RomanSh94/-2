@@ -74,6 +74,35 @@ list, or any other deterministic mechanism; this module remains pure
 transport and still performs no semantic validation of its own output
 whatsoever.
 
+FIRST-TURN ENTRY POLICY FRAMING (Phase 1C addition, corrected) --
+runtime_context now also carries a `first_turn_entry_active: bool` field
+(professional_turn_runtime_context.py). Its meaning is narrow and
+owner-clarified: the one-shot First-Turn entry policy is active for this
+Professional turn -- it does NOT mean this is the user's first-ever
+message, that no previous conversation exists, or that no history is
+available. A user may have earlier usable history and only reach
+Professional ownership later; conversation_context is populated from real
+history exactly as on any other turn and is never forced to absent/None
+because this field is True. When True, the payload gains one additional
+top-level key, `"first_turn_entry_active": true` (omitted entirely, not
+`false`, when the signal is absent -- so a runtime_context=None or
+first_turn_entry_active=False call keeps the payload in its exact prior
+shape), and exactly one additional system message is appended after the
+fixed system instruction (_FIRST_TURN_ENTRY_SYSTEM_NOTE) -- a truthful
+entry-policy instruction: current message is primary evidence, earlier
+context may be absent or may already be supplied, use only what is
+actually given, engage directly with rich input, stay open with sparse
+input, never invent history, never ask the user to repeat information
+already present in supplied context, avoid a scripted onboarding tone.
+This is semantic framing only: it does not change plan.objective/move/
+clarification_target/question_allowed (still exclusively the Planner's
+decision), does not relax question_allowed's own exactly-one-or-none-
+question rule, and does not import any separate word-count ceiling of its
+own -- length remains governed the same way every other Professional
+reply's length already is, by the shared safety_validator ceiling inside
+Acceptance (professional_turn_response_acceptance.py), unchanged by this
+addition.
+
 CURRENT/NEWER USER CORRECTION PRECEDENCE (V1 addition) -- the system
 instruction now tells the model that current source_text is the most
 recent user-authored material for this turn, and that wording must not be
@@ -555,10 +584,41 @@ def _build_system_instruction() -> str:
 
 _SYSTEM_INSTRUCTION = _build_system_instruction()
 
+# -- First-turn entry policy framing (Phase 1C addition, corrected) ---------
+# Purely additive: appended as a SEPARATE system message only when
+# first_turn_entry_active is True, never merged into or replacing _SYSTEM_
+# INSTRUCTION above, so the fixed instruction and its cached value stay
+# byte-identical for every non-entry-policy call (the overwhelming
+# majority, including every call before this addition existed). Corrected
+# per owner decision: does NOT assert "this is the user's first message" or
+# "there is no earlier conversation" -- neither is guaranteed by the
+# one-shot claim (a user may have earlier usable history and only now
+# reach Professional ownership). Truthful instead: earlier context may be
+# absent OR may be supplied elsewhere in this request; use only what is
+# actually given. Deliberately NON-positional wording ("elsewhere in this
+# request", never "above"/"below"): this note is one system message
+# appended BEFORE the later user-role payload message that carries
+# conversation_context (see the messages list built in render_turn_
+# response below), so a claim that context is supplied "above" this note
+# would be structurally false -- when context exists, it is supplied
+# AFTER this note, not above it.
+_FIRST_TURN_ENTRY_SYSTEM_NOTE = (
+    "This turn is using the first-turn entry policy: treat the current "
+    "message as primary evidence. Earlier conversation context may be "
+    "absent, or may be supplied elsewhere in this request -- use only "
+    "what is actually given here, never assume or invent history that "
+    "was not provided. If the current message already gives concrete, "
+    "substantive material, engage with it directly; if it gives little "
+    "to work with, stay open and inviting. Never ask the user to repeat "
+    "information already present in the supplied conversation context. "
+    "Avoid a generic or scripted onboarding tone."
+)
+
 
 def _build_payload(
         plan: ProfessionalTurnPlan, source_text: str,
-        conversation_context: ProfessionalConversationContext | None = None) -> dict:
+        conversation_context: ProfessionalConversationContext | None = None,
+        first_turn_entry_active: bool = False) -> dict:
     payload = {
         "objective": plan.objective.value,
         "move": plan.move.value,
@@ -572,14 +632,19 @@ def _build_payload(
         payload["conversation_context"] = [
             {"role": turn.role.value, "content": turn.content}
             for turn in conversation_context.turns]
+    if first_turn_entry_active:
+        # Omitted entirely (never `false`) when absent, so the payload's
+        # pre-Phase-1C shape is byte-identical for every existing caller.
+        payload["first_turn_entry_active"] = True
     return payload
 
 
 def _serialize_payload(
         plan: ProfessionalTurnPlan, source_text: str,
-        conversation_context: ProfessionalConversationContext | None = None) -> str:
+        conversation_context: ProfessionalConversationContext | None = None,
+        first_turn_entry_active: bool = False) -> str:
     return json.dumps(
-        _build_payload(plan, source_text, conversation_context),
+        _build_payload(plan, source_text, conversation_context, first_turn_entry_active),
         ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -639,7 +704,16 @@ async def render_turn_response(
     professional_turn_runtime_context.py) -- the single envelope threaded
     through the whole Professional Free-Text Runtime chain. This function
     only ever reads its `.conversation` field; the resulting local
-    conversation_context is then serialized exactly as before this slice."""
+    conversation_context is then serialized exactly as before this slice.
+
+    first_turn_entry_active (read off runtime_context.first_turn_entry_
+    active, False when runtime_context is None) appends exactly one
+    additional system message (_FIRST_TURN_ENTRY_SYSTEM_NOTE) and one
+    additional payload key ("first_turn_entry_active": true) -- see the
+    module docstring's FIRST-TURN ENTRY POLICY FRAMING section. Both are
+    omitted, not falsy-present, when False. This flag never suppresses or
+    clears conversation_context -- real prior history (when the caller
+    supplied any) is used exactly as on any other turn."""
     if not isinstance(plan, ProfessionalTurnPlan):
         raise ValueError(
             f"render_turn_response: plan must be a ProfessionalTurnPlan, got {type(plan)!r}")
@@ -648,14 +722,20 @@ async def render_turn_response(
     _validate_runtime_context(runtime_context)
     conversation_context = (
         runtime_context.conversation if runtime_context is not None else None)
+    first_turn_entry_active = (
+        runtime_context.first_turn_entry_active if runtime_context is not None else False)
     _validate_conversation_context(conversation_context)
     _validate_timeout_seconds(timeout_seconds)
     _validate_max_output_tokens(max_output_tokens)
 
-    messages = [
-        {"role": "system", "content": _SYSTEM_INSTRUCTION},
-        {"role": "user", "content": _serialize_payload(plan, source_text, conversation_context)},
-    ]
+    messages = [{"role": "system", "content": _SYSTEM_INSTRUCTION}]
+    if first_turn_entry_active:
+        messages.append({"role": "system", "content": _FIRST_TURN_ENTRY_SYSTEM_NOTE})
+    messages.append({
+        "role": "user",
+        "content": _serialize_payload(
+            plan, source_text, conversation_context, first_turn_entry_active),
+    })
 
     try:
         # asyncio.wait_for is the SOLE timeout owner in this V1 slice -- the

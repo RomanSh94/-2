@@ -66,10 +66,14 @@ class FakeMessage:
         self.chat = types.SimpleNamespace(id=user.id, type="private")
         self.message_id = message_id
         self.answers = []
+        self.voices = []
 
     async def answer(self, text, **kw):
         self.answers.append((text, kw))
         return types.SimpleNamespace(message_id=self.message_id + 1)
+
+    async def answer_voice(self, *a, **kw):
+        self.voices.append((a, kw))
 
     async def edit_reply_markup(self, **kw):
         pass
@@ -950,6 +954,69 @@ def test_success_trace_no_duplicate_stage_execution(monkeypatch):
         runtime_context=_empty_runtime_context(), risk_result={"score": 0, "categories": []}, lang="ru"))
     assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
     assert calls == {"analyzer": 1, "produce": 1, "proposer": 1, "govern": 1, "render": 1, "accept": 1}
+
+
+# Codex model-call-count correction: a full successful run makes exactly 3
+# REAL provider calls -- call_turn_analyzer, call_turn_plan_proposer, and
+# render_turn_response each perform their own client.chat.completions.
+# create call (verified directly against each module's source); produce_
+# turn_analysis, govern_turn_plan, and accept_professional_response are
+# confirmed pure Python with no such call anywhere in their source modules.
+# The prior report of "1 provider call" (counting only the Renderer) was
+# incorrect -- the true total is 3, both with and without the entry-policy
+# signal. Only render_turn_response's own single call ever reads
+# runtime_context.first_turn_entry_active at all (to add one extra system
+# message + one extra payload key to that SAME one call) -- neither the
+# Analyzer's nor the Plan Proposer's source references that field anywhere,
+# so this test proves the entry-policy signal adds NO FOURTH provider call
+# and causes no stage to run more than once -- same proof shape as
+# test_success_trace_no_duplicate_stage_execution above, with
+# first_turn_entry_active=True instead of the default False.
+def test_entry_policy_active_adds_no_fourth_provider_call(monkeypatch):
+    calls = {"analyzer": 0, "produce": 0, "proposer": 0, "govern": 0, "render": 0, "accept": 0}
+    _monkeypatch_chain(monkeypatch)
+    orig_analyzer = pftr.call_turn_analyzer
+    orig_produce = pftr.produce_turn_analysis
+    orig_proposer = pftr.call_turn_plan_proposer
+    orig_govern = pftr.govern_turn_plan
+    orig_render = pftr.render_turn_response
+    orig_accept = pftr.accept_professional_response
+
+    async def counting_analyzer(**kw):
+        calls["analyzer"] += 1
+        return await orig_analyzer(**kw)
+    def counting_produce(**kw):
+        calls["produce"] += 1
+        return orig_produce(**kw)
+    async def counting_proposer(**kw):
+        calls["proposer"] += 1
+        return await orig_proposer(**kw)
+    def counting_govern(*a, **kw):
+        calls["govern"] += 1
+        return orig_govern(*a, **kw)
+    async def counting_render(**kw):
+        calls["render"] += 1
+        return await orig_render(**kw)
+    def counting_accept(**kw):
+        calls["accept"] += 1
+        return orig_accept(**kw)
+
+    monkeypatch.setattr(pftr, "call_turn_analyzer", counting_analyzer)
+    monkeypatch.setattr(pftr, "produce_turn_analysis", counting_produce)
+    monkeypatch.setattr(pftr, "call_turn_plan_proposer", counting_proposer)
+    monkeypatch.setattr(pftr, "govern_turn_plan", counting_govern)
+    monkeypatch.setattr(pftr, "render_turn_response", counting_render)
+    monkeypatch.setattr(pftr, "accept_professional_response", counting_accept)
+
+    entry_active_context = ProfessionalTurnRuntimeContext(
+        conversation=_empty_context(), first_turn_entry_active=True)
+    result = run(pftr.run_professional_free_text_turn(
+        client=object(), model="gpt-4o-mini", source_message_row_id=1, source_text="hi",
+        runtime_context=entry_active_context, risk_result={"score": 0, "categories": []}, lang="ru"))
+    assert result.status is pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS
+    assert calls == {"analyzer": 1, "produce": 1, "proposer": 1, "govern": 1, "render": 1, "accept": 1}
+    # Exactly 3 real provider-call-making stages total -- no fourth call.
+    assert calls["analyzer"] + calls["proposer"] + calls["render"] == 3
 
 
 _TRACE_PRIVACY_SENTINEL_SOURCE = "SENTINEL_SOURCE_TEXT_9f2c7ab1"
@@ -2420,7 +2487,7 @@ def test_professional_stored_voice_mode_tts_input_and_persisted_exact(tmp_db, mo
     _stub_runtime_result(monkeypatch, LONG_SUCCESS_RESULT)
 
     tts_calls = []
-    async def fake_tts(target, uid, text, lang_):
+    async def fake_tts(target, uid, text, lang_, **kw):
         tts_calls.append(text)
         return True
     monkeypatch.setattr(bot, "_synthesize_and_send_voice", fake_tts)
@@ -2444,7 +2511,7 @@ def test_professional_stored_voice_and_concise_text_mode_all_exact(tmp_db, monke
     _stub_runtime_result(monkeypatch, LONG_SUCCESS_RESULT)
 
     tts_calls = []
-    async def fake_tts(target, uid, text, lang_):
+    async def fake_tts(target, uid, text, lang_, **kw):
         tts_calls.append(text)
         return True
     monkeypatch.setattr(bot, "_synthesize_and_send_voice", fake_tts)
@@ -2473,7 +2540,7 @@ def test_professional_stored_concise_preference_does_not_shorten(tmp_db, monkeyp
         OWNER, response_format="voice", response_length="concise"))
 
     tts_calls = []
-    async def fake_tts(target, uid, text, lang_):
+    async def fake_tts(target, uid, text, lang_, **kw):
         tts_calls.append(text)
         return True
     monkeypatch.setattr(bot, "_synthesize_and_send_voice", fake_tts)
@@ -2493,7 +2560,7 @@ def test_professional_one_shot_concise_does_not_shorten(tmp_db, monkeypatch):
     run(database.set_response_preference(OWNER, response_format="voice"))
 
     tts_calls = []
-    async def fake_tts(target, uid, text, lang_):
+    async def fake_tts(target, uid, text, lang_, **kw):
         tts_calls.append(text)
         return True
     monkeypatch.setattr(bot, "_synthesize_and_send_voice", fake_tts)
@@ -2520,7 +2587,7 @@ def test_professional_mixed_voice_command_still_selects_voice_transport(tmp_db, 
     _stub_runtime_result(monkeypatch, LONG_SUCCESS_RESULT)
 
     tts_calls = []
-    async def fake_tts(target, uid, text, lang_):
+    async def fake_tts(target, uid, text, lang_, **kw):
         tts_calls.append(text)
         return True
     monkeypatch.setattr(bot, "_synthesize_and_send_voice", fake_tts)
@@ -2561,7 +2628,7 @@ def test_safe_concise_version_never_called_when_preserve_exact_text(tmp_db, monk
     run(database.set_response_preference(
         OWNER, response_format="voice_and_concise_text", response_length="concise"))
 
-    async def fake_tts(target, uid, text, lang_):
+    async def fake_tts(target, uid, text, lang_, **kw):
         return True
     monkeypatch.setattr(bot, "_synthesize_and_send_voice", fake_tts)
 
@@ -2569,3 +2636,1011 @@ def test_safe_concise_version_never_called_when_preserve_exact_text(tmp_db, monk
     run(bot.deliver_response(msg, OWNER, LONG_REPLY_TEXT, "ru",
                              one_shot_concise=True, preserve_exact_text=True))
     assert calls["n"] == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Phase 1C -- First-Turn as a governed ENTRY-POLICY signal inside
+# Professional Free-Text. Corrected per the owner's architectural review
+# gate: Alternative B (stage+risk eligibility, no legacy scenario/capacity)
+# is approved; the runtime signal is named first_turn_entry_active with
+# narrow "the one-shot entry policy is active" semantics -- never "this is
+# the user's first-ever message" / "no history exists"; conversation
+# history is never suppressed by this signal; PRE-SEND lifecycle
+# transitions (pending_before_llm->generated, generated->send_started) are
+# fail-closed GATES -- a failure blocks the send entirely, never
+# compensated; POST-SEND terminal transitions are attempted exactly once,
+# never retried/compensated, regardless of outcome.
+# ══════════════════════════════════════════════════════════════════════════
+
+async def _first_turn_claim_row(uid):
+    async with database.aiosqlite.connect(database.DB) as conn:
+        conn.row_factory = database.aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT status, scenario, turn_id FROM first_turn_claims "
+            "WHERE user_id=? AND contract_version=?",
+            (uid, config.FIRST_TURN_CONTRACT_VERSION))
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+def _wrap_transition_first_turn_claim(monkeypatch, fail_at_call=None, mode="return_false"):
+    """Delegates to the REAL database.transition_first_turn_claim for every
+    call except the `fail_at_call`-th (1-indexed, None means never fail),
+    which either returns False or raises WITHOUT touching the DB -- so the
+    row's real confirmed status stays exactly whatever the previous (real)
+    call left it at. Records every (from_status, to_status) attempted, so
+    a test can assert precisely how many transition calls were made and
+    that none happened after a failure."""
+    calls = []
+    async def fake(uid, contract_version, claim_token, from_status, to_status, turn_id=None):
+        calls.append((from_status, to_status))
+        if fail_at_call is not None and len(calls) == fail_at_call:
+            if mode == "raise":
+                raise RuntimeError("simulated transition failure")
+            return False
+        return await database.transition_first_turn_claim(
+            uid, contract_version, claim_token, from_status, to_status, turn_id=turn_id)
+    monkeypatch.setattr(bot, "transition_first_turn_claim", fake)
+    return calls
+
+
+# ── Items 1-4: PRE-SEND transitions (pending_before_llm->generated,
+# generated->send_started) are fail-closed GATES -- a failure blocks the
+# Telegram send entirely and no further transition is attempted. ──────────
+
+def test_pending_to_generated_returns_false_blocks_send_entirely(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    calls = _wrap_transition_first_turn_claim(monkeypatch, fail_at_call=1, mode="return_false")
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    assert msg.answers == []
+    assert len(calls) == 1
+    assert calls[0] == ("pending_before_llm", "generated")
+
+
+def test_pending_to_generated_raises_blocks_send_entirely(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    calls = _wrap_transition_first_turn_claim(monkeypatch, fail_at_call=1, mode="raise")
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise -- the helper catches it, returns False
+
+    assert msg.answers == []
+    assert len(calls) == 1
+
+
+def test_generated_to_send_started_returns_false_blocks_send(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    calls = _wrap_transition_first_turn_claim(monkeypatch, fail_at_call=2, mode="return_false")
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert msg.answers == []
+    assert len(calls) == 2
+    assert calls[1] == ("generated", "send_started")
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None and row["status"] == "generated"  # last REAL confirmed state
+
+
+def test_generated_to_send_started_raises_blocks_send(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    calls = _wrap_transition_first_turn_claim(monkeypatch, fail_at_call=2, mode="raise")
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert msg.answers == []
+    assert len(calls) == 2
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None and row["status"] == "generated"
+
+
+# ── Items 5-7: normal SUCCESS / REJECTED / FAILED all reach exactly one
+# real send and the correct truthful delivered terminal state. ────────────
+
+def test_first_turn_entry_success_delivers_and_signals_entry_active(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)  # _first_turn_generate_and_validate raises if called
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER),
+                       "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    assert calls["n"] == 1
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert runtime_context.first_turn_entry_active is True
+
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None
+    assert row["scenario"] == "professional"
+    assert row["status"] == "delivered_without_buttons"
+    assert row["turn_id"] is not None
+
+
+@pytest.mark.parametrize("result", [REJECTED_RESULT, FAILED_RESULT])
+def test_first_turn_entry_rejected_or_failed_fallback_delivered_once(tmp_db, monkeypatch, result):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, result)
+
+    msg = FakeMessage(FakeUser(OWNER), "Расскажи мне про свои чувства.")
+    run(bot.pipeline(msg, msg.text))
+
+    fallback = bot._professional_technical_fallback_text("ru")
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == fallback
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None
+    assert row["status"] == "delivered_without_buttons"
+
+
+# ── Item 8: Telegram send exception -- exactly one send attempt,
+# delivery_uncertain attempted exactly once, no retry/double-send. ────────
+
+def test_telegram_send_exception_delivery_uncertain_once_no_retry(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    send_calls = {"n": 0}
+    async def fake_deliver_response(*a, **kw):
+        send_calls["n"] += 1
+        raise RuntimeError("telegram down")
+    monkeypatch.setattr(bot, "deliver_response", fake_deliver_response)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    assert send_calls["n"] == 1
+    assert msg.answers == []
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None and row["status"] == "delivery_uncertain"
+
+
+# ── Items 9-10: a failing/raising TERMINAL transition never triggers a
+# second send or any compensating transition -- the user already has their
+# one reply; the last confirmed lifecycle state is the accepted, bounded
+# residual limitation (send_started), never silently "fixed" by a retry. ──
+
+def test_terminal_transition_returns_false_no_double_send(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    calls = _wrap_transition_first_turn_claim(monkeypatch, fail_at_call=3, mode="return_false")
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert len(msg.answers) == 1  # already delivered -- exactly once
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    assert len(calls) == 3
+    assert calls[2] == ("send_started", "delivered_without_buttons")
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None and row["status"] == "send_started"  # accepted residual limitation
+
+
+def test_terminal_transition_raises_no_double_send(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    calls = _wrap_transition_first_turn_claim(monkeypatch, fail_at_call=3, mode="raise")
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    assert len(calls) == 3
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None and row["status"] == "send_started"
+
+
+# ── Item 11: stale/superseded turn before send -- zero sends,
+# failed_before_send attempted exactly once, nothing further attempted. ───
+
+def test_stale_turn_before_send_zero_sends_failed_before_send_once(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    monkeypatch.setattr(bot, "_user_generation_superseded", lambda uid, gen: True)
+    calls = _wrap_transition_first_turn_claim(monkeypatch)  # never forced to fail -- real DB
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert msg.answers == []
+    assert len(calls) == 2  # pending_before_llm->generated, then generated->failed_before_send
+    assert calls[1] == ("generated", "failed_before_send")
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None and row["status"] == "failed_before_send"
+
+
+# ── Item 12 (owner decision 3): a user with real earlier usable history
+# (persisted before Professional ownership ever applied to them) whose
+# one-shot claim only succeeds NOW must keep that history available to
+# Professional -- the entry policy must never force conversation_context
+# to empty/None, and it must not claim "no earlier conversation" as fact. ──
+
+def test_delayed_entry_preserves_existing_conversation_history(tmp_db, monkeypatch):
+    # config.FIRST_TURN_CONTRACT_VERSION == config.FIRST_TURN_INITIAL_
+    # ROLLOUT_VERSION == "v1" today, and claim_first_turn's own v1-only
+    # bootstrap rule auto-exempts (never claims) a user who already has a
+    # prior ASSISTANT-authored message -- a separate, legitimate, existing
+    # mechanism, not the scenario this test targets. This repo's own
+    # comment on FIRST_TURN_CONTRACT_VERSION documents the intended future:
+    # "A later FIRST_TURN_CONTRACT_VERSION bump makes legacy-exemption
+    # bootstrap apply only to v1" -- i.e. a real claim succeeding for a user
+    # with genuine prior history is exactly the NORMAL case once the
+    # contract version has moved past the initial rollout. Simulating that
+    # (rather than the v1-only bootstrap edge case) is what actually
+    # isolates owner decision 3's concern.
+    monkeypatch.setattr(bot, "FIRST_TURN_CONTRACT_VERSION", "v2-test-only")
+    run(database.upsert_user(OWNER, "u", "U"))
+    # Real prior history under a DIFFERENT (non-"professional") scenario --
+    # simulates a user who conversed before ever reaching Professional
+    # ownership. Deliberately NOT using _stub_history here: the real
+    # get_professional_conversation_history_rows must run against these
+    # actually-persisted rows.
+    run(database.save_message(OWNER, "user", "Мне давно тяжело на работе.",
+                              "open_chat", "ru", source=database.MessageSource.USER_AUTHORED))
+    run(database.save_message(OWNER, "assistant", "Что именно происходит?",
+                              "open_chat", "ru", source=database.MessageSource.ASSISTANT_DELIVERED))
+
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Сегодня опять было тяжело.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert msg.answers
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert runtime_context.first_turn_entry_active is True
+    assert len(runtime_context.conversation.turns) == 2
+    assert runtime_context.conversation.turns[0].content == "Мне давно тяжело на работе."
+    assert runtime_context.conversation.turns[1].content == "Что именно происходит?"
+
+
+# ── Item 13: a genuinely new user (no history) -- entry-policy active,
+# absence of history remains valid, and sparse/rich replies both remain
+# adaptive (no exact-one-question / <=120-word constraint is imported). ───
+
+def test_first_turn_entry_never_imports_old_first_turn_validation():
+    src = (inspect.getsource(bot._run_professional_free_text_and_deliver)
+           + inspect.getsource(bot._professional_first_turn_transition))
+    assert "validate_first_turn_response" not in src
+    assert "get_first_turn_fallback" not in src
+    assert "_first_turn_generate_and_validate" not in src
+
+
+@pytest.mark.parametrize("reply_text", [
+    "Ясно.",  # sparse -- must not be forced longer or rejected
+    " ".join(["слово"] * 130),  # rich -- over the OLD 120-word cap, under the shared 150-word ceiling
+])
+def test_new_user_no_history_sparse_and_rich_replies_remain_adaptive(tmp_db, monkeypatch, reply_text):
+    result = pftr.ProfessionalFreeTextRuntimeResult(
+        status=pftr.ProfessionalFreeTextRuntimeStatus.SUCCESS,
+        reply_text=reply_text, failure_stage=None, failure_reason=None,
+        failure_detail=None, success_trace=_success_trace())
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, result)
+
+    msg = FakeMessage(FakeUser(OWNER), "Привет, вот что у меня происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert msg.answers[0][0] == reply_text
+    assert calls["kwargs"]["runtime_context"].first_turn_entry_active is True
+
+
+# ── Item 14: a later turn for the same user carries no entry-policy
+# signal -- the one-shot claim was already consumed. ───────────────────────
+
+def test_later_professional_turn_carries_no_entry_policy_signal(tmp_db, monkeypatch):
+    run(_seed_user(OWNER))  # pre-consumes the one-shot claim, same as every other test here
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Продолжим то, о чём говорили.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert msg.answers
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert runtime_context.first_turn_entry_active is False
+
+
+# ── Item 15: a Professional-ineligible user keeps the existing lower-path
+# (legacy/First-Turn) behavior unaffected. ─────────────────────────────────
+
+def test_professional_ineligible_user_still_reaches_legacy_first_turn_path(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_professional_eligible(monkeypatch, False)
+    monkeypatch.setattr(ac, "therapist_core_v1_allowed_for", _async(False))
+    called = {"n": 0}
+
+    async def fake_first_turn(*a, **kw):
+        called["n"] += 1
+        return "ok", True
+    monkeypatch.setattr(bot, "_first_turn_generate_and_validate", fake_first_turn)
+    _stub_legacy_machinery_allow_legacy(monkeypatch)
+    monkeypatch.setattr(bot, "get_emotional_trajectory", _async(types.SimpleNamespace(
+        trend="stable", hopelessness_streak=0, yellow_plus_streak=0, messages_analyzed=0)))
+    monkeypatch.setattr(bot, "_controller_claim_turn", _async(None))
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert called["n"] == 1
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None and row["scenario"] != "professional"
+
+
+# ── Item 16: DASS/crisis precedence unchanged -- already covered by the
+# existing, unmodified Phase 1B test_dass_discussion_active_never_calls_
+# resolver above, which proves the resolver (and therefore this slice's
+# professional-branch entry-policy code, which lives strictly inside that
+# resolver's "professional" arm) is never even reached for a DASS-active
+# turn, and already stubs claim_first_turn itself. Crisis needs no new test
+# either: crisis handling returns from pipeline() far earlier, before
+# risk-based owner resolution runs at all -- unchanged, untouched by this
+# slice, and exercised by the existing crisis test suite.
+
+# ── Item 17: unified ownership default-OFF semantics remain unchanged. ────
+
+def test_unified_ownership_default_off_untouched_by_this_slice():
+    assert config.UNIFIED_PSYCHOLOGICAL_OWNERSHIP_ENABLED is False
+
+
+# ── Item 18: no additional provider/model call -- run_professional_free_
+# text_turn is still called exactly once per turn regardless of entry-
+# policy status (already asserted by calls["n"] == 1 in the tests above),
+# and the transition helper itself makes no client/model call. The Renderer
+# still makes exactly one client.chat.completions.create call whether or
+# not first_turn_entry_active is set -- proven directly in
+# tests/test_professional_turn_response_renderer.py (unchanged file
+# structure, just the renamed field/payload key), not re-proven here to
+# avoid duplicating that unit-level assertion.
+
+def test_first_turn_transition_helper_makes_no_model_or_client_call():
+    src = inspect.getsource(bot._professional_first_turn_transition)
+    assert "client" not in src
+    assert "openai" not in src.lower()
+
+
+# The Professional-specific entry-policy eligibility formula (stage + risk
+# only, no scenario/capacity -- owner-approved Alternative B) must still
+# exclude acute-distress-shaped and high/critical-risk messages, exactly as
+# the legacy 4-condition First-Turn formula did for those two conditions.
+def test_entry_policy_excluded_for_high_risk_message(tmp_db, monkeypatch):
+    # Verified directly (not assumed): detect_risk on this exact message
+    # returns level="high", categories=["hopelessness", "panic"] -- high
+    # risk WITHOUT suicide/self_harm, so the crisis override does not fire
+    # and this turn genuinely reaches the Professional branch, letting this
+    # test isolate the risk-level exclusion specifically.
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    monkeypatch.setattr(bot, "get_active_crisis", _async(None))
+
+    msg = FakeMessage(FakeUser(OWNER), (
+        "У меня паническая атака, сердце колотится, не могу дышать, и всё "
+        "безнадёжно, ничего не изменится никогда, я чувствую себя "
+        "оторванным от реальности, будто это происходит не со мной."))
+    run(bot.pipeline(msg, msg.text))
+
+    assert calls["kwargs"] is not None
+    assert calls["kwargs"]["runtime_context"].first_turn_entry_active is False
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Final pre-commit hardening (post-review correction pass) -- narrow
+# documentation/truthfulness fixes plus the missing regression proofs below.
+# No eligibility/DB/schema/transition-vocabulary/ownership change.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Item 3: the Professional-specific entry-policy formula (stage + risk only)
+# must exclude ACUTE_DISTRESS-classified turns exactly as it excludes
+# high/critical risk turns. Deterministically stubbing detect_stage (rather
+# than hand-picking a message hoped to classify as ACUTE_DISTRESS) proves
+# the branch CONDITION itself, independent of any real stage classifier
+# behavior -- the message text below is otherwise low-risk and, absent this
+# stub, is already proven (by test_first_turn_entry_success_delivers_and_
+# signals_entry_active, which reuses it verbatim) to leave
+# first_turn_entry_active True.
+
+def test_entry_policy_excluded_for_acute_distress_stage(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)  # _first_turn_generate_and_validate raises if called
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    # Deterministic stage stub -- isolates the stage-exclusion branch
+    # condition itself, independent of real stage-classifier behavior.
+    monkeypatch.setattr(bot, "detect_stage", lambda text, lang: "ACUTE_DISTRESS")
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    # Professional still owns and processes the turn -- exactly one
+    # orchestrator call, exactly one delivered reply -- only the
+    # entry-policy signal is off.
+    assert calls["n"] == 1
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    assert calls["kwargs"]["runtime_context"].first_turn_entry_active is False
+
+    # No first-turn claim was ever created/won for this turn.
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is None
+
+
+# Item 4: POST-SEND persistence failure -- Telegram delivery succeeds, but
+# the subsequent ASSISTANT-row save_message call raises. send_started->
+# delivered_context_missing must be attempted exactly once (the transition
+# mechanism itself works normally here -- only the unrelated persistence
+# call fails), with no second send and no compensating transition. The
+# inbound/current USER save (already completed earlier in pipeline(),
+# before this function's own logic ever runs) is unaffected.
+
+def test_post_send_persistence_failure_delivered_context_missing_once(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    send_calls = {"n": 0}
+    async def fake_deliver_response(*a, **kw):
+        send_calls["n"] += 1
+        return None  # Telegram delivery succeeds
+    monkeypatch.setattr(bot, "deliver_response", fake_deliver_response)
+
+    save_calls = []
+    async def fake_save_message(*a, **kw):
+        save_calls.append(a[1])  # role
+        if a[1] == "assistant":
+            raise RuntimeError("simulated assistant persistence failure")
+        return await database.save_message(*a, **kw)
+    monkeypatch.setattr(bot, "save_message", fake_save_message)
+
+    calls = _wrap_transition_first_turn_claim(monkeypatch)  # never forced to fail -- real DB
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    # The inbound USER save still succeeded normally.
+    assert "user" in save_calls
+    # Exactly one Telegram send -- no second/compensating send.
+    assert send_calls["n"] == 1
+    # Claim reached send_started before the send (the two real PRE-SEND
+    # gate transitions), then the terminal attempt -- exactly once.
+    assert len(calls) == 3
+    assert calls[0] == ("pending_before_llm", "generated")
+    assert calls[1] == ("generated", "send_started")
+    assert calls[2] == ("send_started", "delivered_context_missing")
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None and row["status"] == "delivered_context_missing"
+
+
+# Item 5: a bookkeeping failure on the delivery_uncertain TERMINAL
+# transition itself (after Telegram delivery already failed) must never
+# trigger a retry of the send or any compensating transition -- the last
+# confirmable DB state is whatever the previous REAL transition left it at
+# (send_started), exactly the same non-compensated discipline already
+# proven above for the delivered_without_buttons terminal transition
+# (test_terminal_transition_returns_false_no_double_send /
+# test_terminal_transition_raises_no_double_send).
+
+@pytest.mark.parametrize("mode", ["return_false", "raise"])
+def test_delivery_uncertain_terminal_transition_failure_no_retry(tmp_db, monkeypatch, mode):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    send_calls = {"n": 0}
+    async def fake_deliver_response(*a, **kw):
+        send_calls["n"] += 1
+        raise RuntimeError("telegram down")
+    monkeypatch.setattr(bot, "deliver_response", fake_deliver_response)
+
+    calls = _wrap_transition_first_turn_claim(monkeypatch, fail_at_call=3, mode=mode)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    assert send_calls["n"] == 1  # exactly one attempt -- no retry
+    assert msg.answers == []  # no reply -- the send genuinely failed
+    assert len(calls) == 3  # no further/compensating transition attempted
+    assert calls[2] == ("send_started", "delivery_uncertain")
+    row = run(_first_turn_claim_row(OWNER))
+    # The delivery_uncertain transition attempt itself failed, so the last
+    # confirmed DB state is whatever the previous REAL transition left --
+    # send_started -- never silently advanced despite the failed attempt.
+    assert row is not None and row["status"] == "send_started"
+    # No other owner/reply was produced for this turn.
+    assert len(msg.answers) == 0
+
+
+# Item 6: a bookkeeping failure on the failed_before_send TERMINAL
+# transition itself (for a stale/superseded turn, before any Telegram send
+# is attempted) must never trigger a compensating transition or a send --
+# the last confirmable DB state is whatever the previous REAL transition
+# left it at (generated), exactly the non-compensated discipline items 1-4
+# and item 5 above already establish for every other terminal edge.
+
+@pytest.mark.parametrize("mode", ["return_false", "raise"])
+def test_stale_turn_failed_before_send_transition_failure_no_compensation(tmp_db, monkeypatch, mode):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    monkeypatch.setattr(bot, "_user_generation_superseded", lambda uid, gen: True)
+    calls = _wrap_transition_first_turn_claim(monkeypatch, fail_at_call=2, mode=mode)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    assert msg.answers == []  # zero Telegram send attempts
+    assert len(calls) == 2  # no further/compensating transition attempted
+    assert calls[1] == ("generated", "failed_before_send")
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None and row["status"] == "generated"  # last REAL confirmed state
+
+
+# Item 7: claim_first_turn itself raising a simulated DB/bookkeeping
+# exception is fail-closed by PROPAGATION -- the professional branch's
+# claim attempt is not wrapped in its own try/except (only _run_
+# professional_free_text_and_deliver's later PRE-SEND/POST-SEND
+# transitions are, via _professional_first_turn_transition), and the outer
+# try/finally in pipeline() (which only releases the per-user ingestion
+# lock -- see _ingest_leave) carries no matching except clause, so this
+# exception propagates all the way out of pipeline() uncaught. It is never
+# silently swallowed into a fallback owner: no Professional runtime/model
+# call and no Telegram send happen after it, and no legacy/Controller/
+# First-Turn fallback runs either (each is separately stubbed by
+# _stub_legacy_machinery to raise AssertionError if ever reached, which
+# would surface as a different, attributable failure here).
+
+def test_claim_exception_is_fail_closed_by_propagation(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    runtime_calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    async def fake_claim_first_turn(*a, **kw):
+        raise RuntimeError("simulated claim bookkeeping failure")
+    monkeypatch.setattr(bot, "claim_first_turn", fake_claim_first_turn)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    with pytest.raises(RuntimeError, match="simulated claim bookkeeping failure"):
+        run(bot.pipeline(msg, msg.text))
+
+    # No Professional runtime/model call after the claim exception.
+    assert runtime_calls["n"] == 0
+    # No Telegram psychological reply of any kind was sent.
+    assert msg.answers == []
+    # The claim itself never committed -- no first_turn_claims row exists.
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Codex PHASE1C-001 fix -- STRICT SINGLE-TELEGRAM-ATTEMPT for a
+# first_turn_entry_active Professional turn whose transport selects voice.
+# Independent review proved a real production-reachable trace where a
+# first-turn-entry Professional delivery could make TWO actual Telegram
+# send attempts (answer_voice raises -> swallowed by _synthesize_and_send_
+# voice -> deliver_response falls back to message.answer). The fix adds an
+# explicit, defaulted `strict_single_attempt` bool to _synthesize_and_send_
+# voice and deliver_response (default False -- every existing caller and
+# every existing Voice UX behavior is unchanged); bot.py's Professional
+# first-turn-entry path is the only caller that ever passes True (wired as
+# strict_single_attempt=first_turn_entry_active at the one deliver_response
+# call site in _run_professional_free_text_and_deliver).
+#
+# These tests exercise the REAL deliver_response / _synthesize_and_send_
+# voice transport end to end through bot.pipeline() -- deliver_response
+# itself is never stubbed/replaced. Only the external synthesize_speech TTS
+# provider call is mocked (exactly as every existing Voice UX test in
+# tests/test_voice_adaptive_response_ux.py already does), and the upstream
+# run_professional_free_text_turn orchestrator is stubbed via
+# _stub_runtime_result exactly as every other Phase 1C test in this file
+# already does -- neither stub touches deliver_response or answer_voice.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _enable_voice_ux_and_prefer_voice(monkeypatch, uid):
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
+    run(database.set_response_preference(uid, response_format="voice"))
+
+
+# TEST 1 -- strict entry policy + answer_voice exception. TTS synthesis
+# succeeds deterministically; the actual message.answer_voice(...) raises
+# an ambiguous Telegram/network exception. Exactly one real Telegram
+# attempt total (the voice attempt itself); no text fallback follows it;
+# the Phase 1C boundary's existing exception handling (unchanged by this
+# fix) takes over from there.
+def test_strict_entry_policy_answer_voice_exception_single_attempt(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    _enable_voice_ux_and_prefer_voice(monkeypatch, OWNER)
+
+    async def fake_synth(client_, text, lang):
+        return "/tmp/fake_phase1c_voice_exc.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", fake_synth)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    async def boom_answer_voice(*a, **kw):
+        msg.voices.append((a, kw))
+        raise RuntimeError("ambiguous telegram/network failure")
+    msg.answer_voice = boom_answer_voice
+
+    run(bot.pipeline(msg, msg.text))  # must not raise -- caught by the existing Phase 1C boundary
+
+    assert len(msg.voices) == 1  # answer_voice calls == 1
+    assert msg.answers == []  # no text/answer fallback after the voice attempt
+    # total actual Telegram send attempts == 1 (voices + answers combined)
+    assert len(msg.voices) + len(msg.answers) == 1
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None
+    # lifecycle reached send_started (both real PRE-SEND gates), then
+    # exactly one send_started -> delivery_uncertain terminal attempt --
+    # no assistant ASSISTANT_DELIVERED persistence, no compensation.
+    assert row["status"] == "delivery_uncertain"
+
+
+# TEST 2 -- strict entry policy + TTS pre-send failure. Synthesis itself
+# fails BEFORE answer_voice is ever called -- zero actual Telegram attempts
+# so far, so a text fallback is still safe and allowed even in strict mode.
+def test_strict_entry_policy_tts_presend_failure_text_fallback_allowed(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    _enable_voice_ux_and_prefer_voice(monkeypatch, OWNER)
+
+    async def failing_synth(client_, text, lang):
+        raise RuntimeError("tts provider down")
+    monkeypatch.setattr(bot, "synthesize_speech", failing_synth)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert msg.voices == []  # answer_voice calls == 0 -- never reached
+    assert len(msg.answers) == 1  # text answer calls == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    assert len(msg.voices) + len(msg.answers) == 1  # total actual Telegram attempts == 1
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None
+    assert row["status"] == "delivered_without_buttons"  # text succeeded -> normal lifecycle
+    assert row["turn_id"] is not None
+
+
+# Codex final P2 -- the attempt marker must be set only once execution has
+# actually reached the answer_voice invocation point, never merely upon
+# finishing preparation of its argument. FSInputFile(path) construction
+# raising BEFORE answer_voice is ever called is a zero-Telegram-attempt
+# failure exactly like TTS pre-send failure above -- a text fallback is
+# still safe, and it must NOT be misclassified as an ambiguous post-attempt
+# failure (which would incorrectly suppress the fallback and end in
+# delivery_uncertain instead of delivered_without_buttons).
+def test_strict_entry_policy_fsinputfile_construction_failure_text_fallback_allowed(
+        tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    _enable_voice_ux_and_prefer_voice(monkeypatch, OWNER)
+
+    async def fake_synth(client_, text, lang):
+        return "/tmp/fake_phase1c_fsinputfile_exc.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", fake_synth)
+
+    def boom_fsinputfile(path):
+        raise RuntimeError("FSInputFile construction failed")
+    monkeypatch.setattr(bot, "FSInputFile", boom_fsinputfile)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    assert msg.voices == []  # answer_voice calls == 0 -- never reached
+    assert len(msg.answers) == 1  # text answer calls == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    assert len(msg.voices) + len(msg.answers) == 1  # total actual Telegram attempts == 1
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None
+    assert row["status"] == "delivered_without_buttons"  # NOT delivery_uncertain
+    assert row["turn_id"] is not None  # assistant ASSISTANT_DELIVERED persistence == YES
+
+
+# TEST 3 -- existing NON-strict Voice UX preserved. A later Professional
+# turn for the same user (one-shot claim already consumed elsewhere, so
+# first_turn_entry_active is False here) must keep the pre-existing
+# swallow-and-fall-back-to-text behavior when answer_voice raises --
+# this fix must never silently change Voice UX for a non-entry-policy
+# caller.
+def test_non_strict_later_professional_turn_voice_ux_unchanged(tmp_db, monkeypatch):
+    run(_seed_user(OWNER))  # pre-consumes the one-shot claim -- no entry-policy signal
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    _enable_voice_ux_and_prefer_voice(monkeypatch, OWNER)
+
+    async def fake_synth(client_, text, lang):
+        return "/tmp/fake_phase1c_nonstrict.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", fake_synth)
+
+    msg = FakeMessage(FakeUser(OWNER), "Продолжим то, о чём говорили.")
+    async def boom_answer_voice(*a, **kw):
+        msg.voices.append((a, kw))
+        raise RuntimeError("ambiguous telegram/network failure")
+    msg.answer_voice = boom_answer_voice
+
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    assert calls["kwargs"]["runtime_context"].first_turn_entry_active is False
+    assert len(msg.voices) == 1  # the one voice attempt, exactly as before this fix
+    # The existing fallback still occurs -- unchanged Voice UX for a
+    # non-strict (non-entry-policy) caller, unlike TEST 1 above.
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+
+
+# TEST 4 -- strict voice success. answer_voice succeeds on the first and
+# only attempt -- no text sent, normal successful lifecycle.
+def test_strict_entry_policy_voice_success_single_attempt(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    _enable_voice_ux_and_prefer_voice(monkeypatch, OWNER)
+
+    async def fake_synth(client_, text, lang):
+        return "/tmp/fake_phase1c_voice_ok.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", fake_synth)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    assert len(msg.voices) == 1  # answer_voice == 1
+    assert msg.answers == []  # text answer == 0
+    assert len(msg.voices) + len(msg.answers) == 1  # total actual Telegram attempts == 1
+    row = run(_first_turn_claim_row(OWNER))
+    assert row is not None
+    assert row["status"] == "delivered_without_buttons"
+    assert row["turn_id"] is not None
+
+
+# Direct unit-level proof (Codex PHASE1C-001, complementary to the four
+# pipeline-level tests above): _synthesize_and_send_voice's own contract at
+# the point where the strict/non-strict behaviors actually diverge.
+def test_synthesize_and_send_voice_strict_raises_only_after_voice_attempted(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    monkeypatch.setattr(config, "VOICE_REPLIES_ENABLED", True)
+    monkeypatch.setattr(config, "ELEVENLABS_TTS_ENABLED", True)
+
+    class BoomMessage(FakeMessage):
+        async def answer_voice(self, *a, **kw):
+            raise RuntimeError("telegram send failed")
+
+    async def fake_synth(client_, text, lang):
+        return "/tmp/fake_phase1c_unit.opus"
+    monkeypatch.setattr(bot, "synthesize_speech", fake_synth)
+
+    msg = BoomMessage(FakeUser(OWNER), "hi")
+    # Non-strict (default): swallowed, returns False -- unchanged contract.
+    ok = run(bot._synthesize_and_send_voice(msg, OWNER, "text", "ru"))
+    assert ok is False
+    # Strict: answer_voice WAS reached before the exception -> re-raised.
+    with pytest.raises(RuntimeError, match="telegram send failed"):
+        run(bot._synthesize_and_send_voice(
+            msg, OWNER, "text", "ru", strict_single_attempt=True))
+
+    async def failing_synth(client_, text, lang):
+        raise RuntimeError("tts down")
+    monkeypatch.setattr(bot, "synthesize_speech", failing_synth)
+    # Strict, but answer_voice never reached (TTS itself failed) -> still
+    # returns False, never raises -- a pre-Telegram-attempt failure is safe.
+    ok = run(bot._synthesize_and_send_voice(
+        msg, OWNER, "text", "ru", strict_single_attempt=True))
+    assert ok is False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Codex PHASE1C-003 -- pipeline-level concurrency proof. The DB primitive
+# itself already has a direct atomic claim test (database.py's own
+# claim_first_turn/transition_first_turn_claim tests) -- this is NOT that
+# test and does not replace it. This proves the bot.py INTEGRATION wiring:
+# that two concurrent pipeline() turns for the SAME user correctly produce
+# exactly one winning first_turn_entry_active=True runtime_context and one
+# first_turn_entry_active=False runtime_context, that only one
+# first_turn_claims row is ever created, and that no lifecycle transition
+# for the losing turn ever touches the winner's claim.
+#
+# Orchestration (deterministic, compatible with the real per-user ingestion
+# asyncio.Lock -- never requires both turns inside that lock at once):
+#   1. Launch turn A.
+#   2. A wins the one-shot claim (inside the locked section) and leaves the
+#      ingestion lock (_run_professional_free_text_and_deliver is only ever
+#      called strictly AFTER that lock is released -- see its own
+#      docstring) before this test's fake orchestrator pauses it.
+#   3. A pauses deep inside the slow Professional runtime, immediately
+#      after its runtime_context has been captured.
+#   4. Turn B is launched only now -- the lock is free (A already released
+#      it), so B enters the ingestion section uncontended and observes the
+#      claim already consumed (real PRIMARY KEY-enforced DB behavior, not
+#      stubbed).
+#   5. B runs to completion first (never blocked on A).
+#   6. A is resumed and finishes.
+#
+# Truthful accounting of the EXISTING turn-generation stale mechanism
+# (unchanged, not bypassed): pipeline() bumps a per-uid generation counter
+# at the very start of EVERY call. B's own bump happens strictly after A's
+# (B starts only once A is already paused), so by the time A resumes, A's
+# own captured generation is stale relative to B's -- A's own unchanged
+# stale check correctly drops it (generated->failed_before_send), and only
+# B (the ordinary, non-entry-policy turn) actually delivers. This is the
+# real, correct outcome given real concurrent traffic for one user, not a
+# test artifact -- the goal is claim/signal/lifecycle isolation, not
+# forcing two sends, and this test does not weaken or bypass that
+# mechanism to make both replies deliver.
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_pipeline_concurrent_professional_turns_same_user_claim_isolation(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+
+    claim_attempts = []  # (claim_token, won)
+    real_claim_first_turn = database.claim_first_turn
+    async def wrapped_claim(uid, contract_version, claim_token, scenario):
+        won = await real_claim_first_turn(uid, contract_version, claim_token, scenario)
+        claim_attempts.append((claim_token, won))
+        return won
+    monkeypatch.setattr(bot, "claim_first_turn", wrapped_claim)
+
+    transition_calls = []  # (claim_token, from_status, to_status, ok)
+    real_transition = database.transition_first_turn_claim
+    async def wrapped_transition(uid, contract_version, claim_token, from_status, to_status,
+                                  turn_id=None):
+        ok = await real_transition(
+            uid, contract_version, claim_token, from_status, to_status, turn_id=turn_id)
+        transition_calls.append((claim_token, from_status, to_status, ok))
+        return ok
+    monkeypatch.setattr(bot, "transition_first_turn_claim", wrapped_transition)
+
+    captured_contexts = []
+    a_paused = asyncio.Event()
+    a_resume = asyncio.Event()
+    call_count = {"n": 0}
+
+    async def fake_run(**kwargs):
+        call_count["n"] += 1
+        captured_contexts.append(kwargs["runtime_context"])
+        if call_count["n"] == 1:
+            # Turn A: runtime_context is captured; pause here, strictly
+            # AFTER the ingestion lock was already released (this function
+            # is only ever reached via _run_professional_free_text_and_
+            # deliver, called strictly after that release).
+            a_paused.set()
+            await a_resume.wait()
+        return SUCCESS_RESULT
+    monkeypatch.setattr(bot, "run_professional_free_text_turn", fake_run)
+
+    same_text = "Мне нужно с кем-то поговорить о том, что происходит."
+    msg_a = FakeMessage(FakeUser(OWNER), same_text, message_id=101)
+    msg_b = FakeMessage(FakeUser(OWNER), same_text, message_id=102)
+
+    async def orchestrate():
+        task_a = asyncio.create_task(bot.pipeline(msg_a, msg_a.text))
+        await a_paused.wait()
+        task_b = asyncio.create_task(bot.pipeline(msg_b, msg_b.text))
+        await task_b
+        a_resume.set()
+        await task_a
+
+    run(orchestrate())
+
+    # --- claim/signal isolation: exactly one runtime_context of each kind ---
+    assert call_count["n"] == 2
+    assert captured_contexts[0].first_turn_entry_active is True   # A: won the claim
+    assert captured_contexts[1].first_turn_entry_active is False  # B: claim already consumed
+
+    assert len(claim_attempts) == 2  # both turns attempted a claim (real DB, not stubbed)
+    won = [tok for tok, ok in claim_attempts if ok]
+    lost = [tok for tok, ok in claim_attempts if not ok]
+    assert len(won) == 1 and len(lost) == 1
+    winning_token = won[0]
+
+    # --- only one first_turn_claims row exists, and it belongs to the winner ---
+    async def _claim_row_with_token():
+        async with database.aiosqlite.connect(database.DB) as conn:
+            conn.row_factory = database.aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT claim_token, status, scenario, turn_id FROM first_turn_claims "
+                "WHERE user_id=? AND contract_version=?",
+                (OWNER, config.FIRST_TURN_CONTRACT_VERSION))
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+    rows = run(_claim_row_with_token())
+    assert len(rows) == 1
+    assert rows[0]["claim_token"] == winning_token
+    assert rows[0]["scenario"] == "professional"
+
+    # --- every lifecycle transition ever attempted (by EITHER turn) used
+    # ONLY the winning token -- the losing (B) turn never transitions the
+    # winner's claim (B's first_turn_entry_active is False, so bot.py never
+    # even calls the transition helper for B at all -- no cross-token
+    # mutation is attempted, let alone possible). ---
+    assert transition_calls
+    for tok, _from, _to, _ok in transition_calls:
+        assert tok == winning_token
+
+    # --- truthful stale-mechanism accounting (see block comment above):
+    # A is correctly dropped as stale once resumed; B, the ordinary turn,
+    # delivers normally. Not forced, not bypassed. ---
+    assert msg_a.answers == []
+    assert len(msg_b.answers) == 1
+    assert [(f, t) for _, f, t, _ in transition_calls] == [
+        ("pending_before_llm", "generated"), ("generated", "failed_before_send")]
+    assert rows[0]["status"] == "failed_before_send"
+
+    # --- no legacy/Controller/Therapist Core fallback ever owned either
+    # Professional-resolved turn: both reached the real Professional
+    # orchestrator (call_count == 2 above); _stub_legacy_machinery makes
+    # any fallback raise AssertionError immediately if ever reached, which
+    # would have surfaced as a test failure here rather than a silent pass.

@@ -51,9 +51,9 @@ def test_is_immutable():
         runtime_context.conversation = _context()
 
 
-def test_has_exactly_the_one_documented_field():
+def test_has_exactly_the_two_documented_fields():
     fields = {f for f in ProfessionalTurnRuntimeContext.__dataclass_fields__}
-    assert fields == {"conversation"}
+    assert fields == {"conversation", "first_turn_entry_active"}
 
 
 # ── Scope discipline (V1 SCOPE / FUTURE EXTENSION POINT documented) ──────
