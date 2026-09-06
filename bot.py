@@ -219,6 +219,14 @@ from professional_turn_conversation_context import (
     build_conversation_context_from_history_rows, ConversationTurnRole,
 )
 from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
+# Phase 2A -- Canonical Case Context foundation. Read-only, offline builder
+# plus the DB accessor that preserves core_memory_items.id provenance;
+# consumer wiring into Analyzer/Plan Proposer/Renderer is explicitly out of
+# scope for this slice (see professional_case_context.py's own docstring).
+from database import list_core_memory_item_records
+from professional_case_context import (
+    build_canonical_case_context_from_memory_records, EMPTY_CANONICAL_CASE_CONTEXT,
+)
 from professional_free_text_runtime import (
     run_professional_free_text_turn,
     ProfessionalFreeTextRuntimeStatus,
@@ -2148,14 +2156,43 @@ async def _run_professional_free_text_and_deliver(
     function stops -- no send, no further transition, no compensation, per
     owner decision. POST-SEND (after the one real send attempt) is never
     gated and never retried/compensated -- Telegram send happens at most
-    once regardless of what any transition reports."""
+    once regardless of what any transition reports.
+
+    Phase 2A (foundation only): also loads real, already-CONFIRMED/CORRECTED
+    core_memory_items via list_core_memory_item_records + builds a
+    CanonicalCaseContext (professional_case_context.py), threaded into
+    ProfessionalTurnRuntimeContext.case_context. Isolated in its own inner
+    try/except -- a failure there never degrades this turn to the generic
+    technical fallback; it substitutes EMPTY_CANONICAL_CASE_CONTEXT and the
+    turn proceeds normally. No model-facing stage reads this field yet
+    (consumer wiring is a separately authorized Phase 2B); this slice is
+    transport only."""
     _dispatch_log(f"cid={cid} stage=professional_claimed")
     first_turn_entry_active = first_turn_claim_token is not None
     try:
         rows = await get_professional_conversation_history_rows(uid, current_row_id)
         context = build_conversation_context_from_history_rows(rows)
+        # Phase 2A -- Canonical Case Context foundation. Isolated in its own
+        # try/except, deliberately separate from the outer one below: a
+        # case-context-specific failure must never be misattributed as a
+        # whole-turn "professional_failed" event (which would produce the
+        # generic technical fallback instead of a real reply). On any
+        # failure here (DB read, deserialization, or builder validation),
+        # this turn continues normally with EMPTY_CANONICAL_CASE_CONTEXT --
+        # never a fallback to legacy, never an extra model call. Only the
+        # fixed stage name and the exception TYPE are logged -- never memory
+        # content or any user fact.
+        try:
+            memory_records = await list_core_memory_item_records(uid, influencing_only=True)
+            case_context = build_canonical_case_context_from_memory_records(memory_records)
+        except Exception as case_exc:
+            _dispatch_log(
+                f"cid={cid} stage=professional_case_context_failed "
+                f"error_type={type(case_exc).__name__}")
+            case_context = EMPTY_CANONICAL_CASE_CONTEXT
         runtime_context = ProfessionalTurnRuntimeContext(
-            conversation=context, first_turn_entry_active=first_turn_entry_active)
+            conversation=context, first_turn_entry_active=first_turn_entry_active,
+            case_context=case_context)
         result = await run_professional_free_text_turn(
             client=client, model="gpt-4o-mini",
             source_message_row_id=current_row_id, source_text=user_text,

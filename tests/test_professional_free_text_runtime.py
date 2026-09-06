@@ -20,6 +20,7 @@ is monkeypatched.
 """
 import asyncio
 import inspect
+import json
 import types
 from dataclasses import fields
 
@@ -44,7 +45,10 @@ from professional_turn_response_acceptance import (
     ProfessionalResponseAcceptanceResult, ProfessionalResponseAcceptanceStatus,
     AcceptanceSafetyRejectionReason,
 )
-from therapeutic_domain import PrimaryResponseMove, ProfessionalObjective
+from therapeutic_domain import (
+    PrimaryResponseMove, ProfessionalObjective, MemoryCategory, MemoryItem, MemoryLifecycle,
+)
+from professional_case_context import CanonicalCaseContext, EMPTY_CANONICAL_CASE_CONTEXT
 
 run = asyncio.run
 
@@ -3644,3 +3648,307 @@ def test_pipeline_concurrent_professional_turns_same_user_claim_isolation(tmp_db
     # orchestrator (call_count == 2 above); _stub_legacy_machinery makes
     # any fallback raise AssertionError immediately if ever reached, which
     # would have surfaced as a test failure here rather than a silent pass.
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Phase 2A -- Canonical Case Context foundation wired into
+# _run_professional_free_text_and_deliver. Transport only: no model-facing
+# stage reads case_context yet (that is a separately authorized Phase 2B).
+# These tests prove the runtime envelope is correctly populated from real,
+# already-CONFIRMED/CORRECTED core_memory_items, that a case-context-
+# specific failure degrades to EMPTY_CANONICAL_CASE_CONTEXT without
+# affecting the rest of the turn, and that conversation_context/
+# first_turn_entry_active remain completely unaffected.
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_case_context_populated_from_real_confirmed_memory(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    confirmed = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
+                           lifecycle=MemoryLifecycle.CONFIRMED, content="works night shifts")
+    candidate = MemoryItem(category=MemoryCategory.HYPOTHESIS,
+                           lifecycle=MemoryLifecycle.CANDIDATE, content="maybe anxious about work")
+    confirmed_id = run(database.add_core_memory_item(OWNER, confirmed))
+    run(database.add_core_memory_item(OWNER, candidate))
+
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert type(runtime_context.case_context) is CanonicalCaseContext
+    assert len(runtime_context.case_context.items) == 1  # the CANDIDATE item is excluded
+    item = runtime_context.case_context.items[0]
+    assert item.memory_item_id == confirmed_id
+    assert item.content == "works night shifts"
+    assert item.lifecycle is MemoryLifecycle.CONFIRMED
+    assert item.category is MemoryCategory.EXPLICIT_FACT
+
+
+def test_case_context_empty_when_no_memory_items(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    runtime_context = calls["kwargs"]["runtime_context"]
+    # Equal-value empty context (built fresh by the builder from zero real
+    # records) -- not necessarily the same object as the shared singleton,
+    # which is reserved for the explicit failure path below.
+    assert runtime_context.case_context == EMPTY_CANONICAL_CASE_CONTEXT
+    assert runtime_context.case_context.items == ()
+
+
+def test_case_context_db_read_failure_yields_empty_turn_continues(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    async def failing_records(uid, *, influencing_only=False):
+        raise RuntimeError("simulated DB read failure")
+    monkeypatch.setattr(bot, "list_core_memory_item_records", failing_records)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    # Turn continues normally -- the real SUCCESS reply is delivered, NOT
+    # the generic technical fallback -- proving the case-context failure
+    # was isolated, never misattributed as a whole-turn "professional_
+    # failed" event.
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert runtime_context.case_context is EMPTY_CANONICAL_CASE_CONTEXT
+
+
+def test_case_context_builder_failure_yields_empty_turn_continues(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    def failing_builder(records):
+        raise RuntimeError("simulated builder failure")
+    monkeypatch.setattr(bot, "build_canonical_case_context_from_memory_records", failing_builder)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert runtime_context.case_context is EMPTY_CANONICAL_CASE_CONTEXT
+
+
+def test_case_context_adds_no_additional_model_call(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    confirmed = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
+                           lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
+    run(database.add_core_memory_item(OWNER, confirmed))
+
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    # run_professional_free_text_turn (the sole orchestrator entry point for
+    # every provider-calling stage) is still invoked exactly once, whether
+    # or not real case-context memory is populated -- Phase 2A adds no
+    # model/provider call anywhere.
+    assert calls["n"] == 1
+
+
+def test_conversation_context_unaffected_by_case_context(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    confirmed = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
+                           lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
+    run(database.add_core_memory_item(OWNER, confirmed))
+
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    history_rows = (
+        (1, "user", "Ранее я говорил про работу.", "USER_AUTHORED"),
+        (2, "assistant", "Что именно происходило?", "ASSISTANT_DELIVERED"),
+    )
+    _stub_history(monkeypatch, rows=history_rows)
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    runtime_context = calls["kwargs"]["runtime_context"]
+    # Conversation history is exactly what the (unrelated) history rows
+    # produce -- case_context's presence never merges into or alters it.
+    assert len(runtime_context.conversation.turns) == 2
+    assert runtime_context.conversation.turns[0].content == "Ранее я говорил про работу."
+    assert runtime_context.conversation.turns[1].content == "Что именно происходило?"
+    # case_context is populated independently, from a completely separate
+    # source (core_memory_items, not messages).
+    assert len(runtime_context.case_context.items) == 1
+    assert runtime_context.case_context.items[0].content == "a confirmed fact"
+
+
+def test_first_turn_entry_active_orthogonal_to_case_context_true_case(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    confirmed = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
+                           lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
+    run(database.add_core_memory_item(OWNER, confirmed))
+
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))
+
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert runtime_context.first_turn_entry_active is True  # fresh user -> entry policy active
+    assert len(runtime_context.case_context.items) == 1  # unaffected, independently populated
+
+
+def test_first_turn_entry_active_orthogonal_to_case_context_false_case(tmp_db, monkeypatch):
+    run(_seed_user(OWNER))  # pre-consumes the one-shot claim, same as every other test here
+    confirmed = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
+                           lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
+    run(database.add_core_memory_item(OWNER, confirmed))
+
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+
+    msg = FakeMessage(FakeUser(OWNER), "Продолжим то, о чём говорили.")
+    run(bot.pipeline(msg, msg.text))
+
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert runtime_context.first_turn_entry_active is False  # claim already consumed
+    assert len(runtime_context.case_context.items) == 1  # still populated independently
+
+
+# Phase 2A correction (P2-1/P2-2 integration proof): a real, directly-
+# persisted corrupted core_memory_items row (raw content over the 1000-char
+# bound that MemoryItem's own _clip would otherwise silently reshape) sits
+# alongside one genuinely valid CONFIRMED row. Exercises the REAL DB
+# accessor (database.list_core_memory_item_records) and the REAL builder
+# (build_canonical_case_context_from_memory_records) -- neither is
+# monkeypatched here, unlike the generic isolation tests above, which
+# already prove the isolation mechanism itself against a mocked failure.
+# This proves the two real production functions actually raise together
+# with bot.py's isolated boundary, and that the failure degrades the WHOLE
+# case context to empty -- the valid record must never survive alone.
+def test_real_persisted_corruption_yields_complete_empty_case_context(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    valid = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
+                       lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
+    valid_id = run(database.add_core_memory_item(OWNER, valid))
+
+    corrupted_payload = json.dumps({
+        "category": MemoryCategory.EXPLICIT_FACT.value,
+        "lifecycle": MemoryLifecycle.CONFIRMED.value,
+        "content": "x" * 1001,  # over MemoryItem's own 1000-char _clip bound
+        "confidence": 0.0,
+        "source_event_ids": [],
+    })
+
+    async def _insert_corrupted_row():
+        async with database.aiosqlite.connect(database.DB) as db:
+            await db.execute(
+                "INSERT INTO core_memory_items (user_id, category, lifecycle, memory_json) "
+                "VALUES (?,?,?,?)",
+                (OWNER, MemoryCategory.EXPLICIT_FACT.value, MemoryLifecycle.CONFIRMED.value,
+                 corrupted_payload))
+            await db.commit()
+    run(_insert_corrupted_row())
+
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    # Deliberately NOT monkeypatching list_core_memory_item_records or
+    # build_canonical_case_context_from_memory_records -- the real
+    # production functions must be exercised end to end.
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    # Professional turn still succeeds -- the real SUCCESS reply, not the
+    # generic technical fallback -- proving the case-context failure was
+    # isolated, never misattributed as a whole-turn "professional_failed"
+    # event.
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    # Exactly one Professional runtime invocation -- no extra model call.
+    assert calls["n"] == 1
+    runtime_context = calls["kwargs"]["runtime_context"]
+    # Complete empty fallback -- the literal shared singleton, exactly what
+    # bot.py's isolated except-clause assigns on failure. The valid record
+    # (valid_id) must never survive as a partial, still-trusted context.
+    assert runtime_context.case_context is EMPTY_CANONICAL_CASE_CONTEXT
+    assert runtime_context.case_context.items == ()
+    assert valid_id > 0  # sanity: the valid row really was persisted
+
+
+# Phase 2A V3 correction (P1 integration proof, item 4): a real,
+# lifecycle-divergent core_memory_items row (SQL lifecycle disagrees with
+# its own memory_json lifecycle) sits alongside one genuinely valid
+# CONFIRMED row. Exercises the REAL DB readers and REAL builder end to
+# end -- proves the valid record can never survive as a partially trusted
+# result merely because a sibling row happens to be corrupted.
+def test_real_lifecycle_divergent_row_yields_complete_empty_case_context(tmp_db, monkeypatch):
+    run(database.upsert_user(OWNER, "u", "U"))
+    valid = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
+                       lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
+    valid_id = run(database.add_core_memory_item(OWNER, valid))
+
+    # SQL lifecycle says REJECTED; the row's own memory_json still says
+    # CONFIRMED -- structurally inconsistent persisted state.
+    divergent_payload = json.dumps({
+        "category": MemoryCategory.EXPLICIT_FACT.value,
+        "lifecycle": MemoryLifecycle.CONFIRMED.value,
+        "content": "a divergent record",
+        "confidence": 0.0,
+        "source_event_ids": [],
+    })
+
+    async def _insert_divergent_row():
+        async with database.aiosqlite.connect(database.DB) as db:
+            await db.execute(
+                "INSERT INTO core_memory_items (user_id, category, lifecycle, memory_json) "
+                "VALUES (?,?,?,?)",
+                (OWNER, MemoryCategory.EXPLICIT_FACT.value, MemoryLifecycle.REJECTED.value,
+                 divergent_payload))
+            await db.commit()
+    run(_insert_divergent_row())
+
+    _stub_legacy_machinery(monkeypatch)
+    _stub_professional_eligible(monkeypatch, True)
+    _stub_history(monkeypatch, rows=())
+    calls = _stub_runtime_result(monkeypatch, SUCCESS_RESULT)
+    # Deliberately NOT monkeypatching list_core_memory_item_records or
+    # build_canonical_case_context_from_memory_records -- the real
+    # production functions must be exercised end to end.
+
+    msg = FakeMessage(FakeUser(OWNER), "Мне нужно с кем-то поговорить о том, что происходит.")
+    run(bot.pipeline(msg, msg.text))  # must not raise
+
+    assert len(msg.answers) == 1
+    assert msg.answers[0][0] == SUCCESS_RESULT.reply_text
+    assert calls["n"] == 1  # no extra model call
+    runtime_context = calls["kwargs"]["runtime_context"]
+    assert runtime_context.case_context is EMPTY_CANONICAL_CASE_CONTEXT
+    assert runtime_context.case_context.items == ()
+    assert valid_id > 0  # sanity: the valid row really was persisted

@@ -11,6 +11,7 @@ import pathlib
 import pytest
 
 import professional_turn_runtime_context as rc
+from professional_case_context import CanonicalCaseContext, EMPTY_CANONICAL_CASE_CONTEXT
 from professional_turn_conversation_context import ProfessionalConversationContext
 from professional_turn_runtime_context import ProfessionalTurnRuntimeContext
 
@@ -51,19 +52,73 @@ def test_is_immutable():
         runtime_context.conversation = _context()
 
 
-def test_has_exactly_the_two_documented_fields():
+def test_has_exactly_the_three_documented_fields():
     fields = {f for f in ProfessionalTurnRuntimeContext.__dataclass_fields__}
-    assert fields == {"conversation", "first_turn_entry_active"}
+    assert fields == {"conversation", "first_turn_entry_active", "case_context"}
 
 
-# ── Scope discipline (V1 SCOPE / FUTURE EXTENSION POINT documented) ──────
+# ── Phase 2A: case_context field ─────────────────────────────────────────
 
-def test_module_docstring_states_no_case_context_field_yet():
+def test_case_context_defaults_to_the_empty_constant():
+    runtime_context = ProfessionalTurnRuntimeContext(conversation=_context())
+    assert runtime_context.case_context is EMPTY_CANONICAL_CASE_CONTEXT
+
+
+def test_accepts_a_non_empty_case_context():
+    from professional_case_context import CanonicalCaseItem
+    from therapeutic_domain import MemoryCategory, MemoryLifecycle
+    item = CanonicalCaseItem(
+        memory_item_id=1, category=MemoryCategory.EXPLICIT_FACT,
+        lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact",
+        source_event_ids=(1,))
+    case_context = CanonicalCaseContext(items=(item,))
+    runtime_context = ProfessionalTurnRuntimeContext(
+        conversation=_context(), case_context=case_context)
+    assert runtime_context.case_context is case_context
+    assert runtime_context.case_context.items == (item,)
+
+
+def test_rejects_wrong_type_for_case_context():
+    with pytest.raises(ValueError):
+        ProfessionalTurnRuntimeContext(conversation=_context(), case_context=[])
+    with pytest.raises(ValueError):
+        ProfessionalTurnRuntimeContext(conversation=_context(), case_context="not a context")
+    with pytest.raises(ValueError):
+        ProfessionalTurnRuntimeContext(conversation=_context(), case_context=None)
+
+
+def test_case_context_never_merged_into_conversation():
+    # Structural separateness: constructing with a non-empty case_context
+    # must never mutate or extend `conversation` in any way.
+    from professional_case_context import CanonicalCaseItem
+    from therapeutic_domain import MemoryCategory, MemoryLifecycle
+    item = CanonicalCaseItem(
+        memory_item_id=1, category=MemoryCategory.EXPLICIT_FACT,
+        lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact",
+        source_event_ids=(1,))
+    empty_conversation = _context()
+    runtime_context = ProfessionalTurnRuntimeContext(
+        conversation=empty_conversation, case_context=CanonicalCaseContext(items=(item,)))
+    assert runtime_context.conversation is empty_conversation
+    assert runtime_context.conversation.turns == ()
+
+
+def test_backwards_compatible_construction_without_case_context():
+    # Existing call sites that never pass case_context must keep working
+    # byte-for-byte, with first_turn_entry_active semantics unchanged.
+    runtime_context = ProfessionalTurnRuntimeContext(
+        conversation=_context(), first_turn_entry_active=True)
+    assert runtime_context.first_turn_entry_active is True
+    assert runtime_context.case_context is EMPTY_CANONICAL_CASE_CONTEXT
+
+
+# ── Scope discipline (V1 SCOPE / PHASE 2A ADDITION documented) ───────────
+
+def test_module_docstring_documents_case_context_and_deferred_consumer_wiring():
     doc = rc.__doc__
-    # The actual docstring line-wraps this phrase mid-sentence, so it is
-    # split across two assertions rather than one combined substring check.
-    assert "This module does" in doc
-    assert "NOT define, store, or reserve a schema for" in doc
+    assert "PHASE 2A ADDITION" in doc
+    assert "case_context" in doc
+    assert "Phase 2B" in doc
     assert "FUTURE EXTENSION POINT" in doc
 
 
@@ -78,7 +133,10 @@ def test_module_performs_no_io():
 def test_module_imports_only_allowed_roots():
     source = pathlib.Path(rc.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
-    allowed_roots = {"__future__", "dataclasses", "professional_turn_conversation_context"}
+    allowed_roots = {
+        "__future__", "dataclasses",
+        "professional_turn_conversation_context", "professional_case_context",
+    }
     found_roots = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

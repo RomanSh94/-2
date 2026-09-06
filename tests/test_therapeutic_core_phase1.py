@@ -14,6 +14,7 @@ no user-facing effect (Phase 1 ships storage only, nothing in bot.pipeline()
 calls into it yet).
 """
 import asyncio
+import json
 import sqlite3
 
 import pytest
@@ -296,6 +297,249 @@ def test_rejected_memory_excluded_from_influencing_query(tmp_db):
         contents = {m.content for m in influencing}
         assert keep.content in contents
         assert drop.content not in contents
+    run(go())
+
+
+# Phase 2A -- list_core_memory_item_records preserves real DB id provenance
+# (list_core_memory_items itself discards it) and applies the same
+# influencing_only filter.
+def test_list_core_memory_item_records_preserves_db_id_and_filters(tmp_db):
+    async def go():
+        await _seed_user(70)
+        keep = core.MemoryItem(category=core.MemoryCategory.EXPLICIT_FACT,
+                               lifecycle=core.MemoryLifecycle.CONFIRMED, content="confirmed fact")
+        drop = core.MemoryItem(category=core.MemoryCategory.PREFERENCE,
+                               lifecycle=core.MemoryLifecycle.CANDIDATE, content="unconfirmed guess")
+        keep_id = await database.add_core_memory_item(70, keep)
+        drop_id = await database.add_core_memory_item(70, drop)
+        assert keep_id > 0 and drop_id > 0 and drop_id != keep_id
+
+        all_records = await database.list_core_memory_item_records(70)
+        assert [rid for rid, _item in all_records] == [keep_id, drop_id]
+
+        influencing = await database.list_core_memory_item_records(70, influencing_only=True)
+        assert len(influencing) == 1
+        record_id, record_item = influencing[0]
+        assert record_id == keep_id
+        assert record_item.content == keep.content
+        assert record_item.lifecycle is core.MemoryLifecycle.CONFIRMED
+    run(go())
+
+
+# P2-1 correction: a real, directly-persisted (not MemoryItem-constructed)
+# core_memory_items row whose raw content would be silently reshaped by
+# MemoryItem.__post_init__'s own _clip(...,1000) bound must make
+# list_core_memory_item_records raise, never silently return the reshaped
+# (1000-char) value.
+def test_list_core_memory_item_records_raises_on_persisted_content_over_1000_chars(tmp_db):
+    async def go():
+        import json as _json
+        await _seed_user(80)
+        raw_content = "x" * 1001
+        payload = _json.dumps({
+            "category": core.MemoryCategory.EXPLICIT_FACT.value,
+            "lifecycle": core.MemoryLifecycle.CONFIRMED.value,
+            "content": raw_content,
+            "confidence": 0.0,
+            "source_event_ids": [],
+        })
+        async with database.aiosqlite.connect(database.DB) as db:
+            await db.execute(
+                "INSERT INTO core_memory_items (user_id, category, lifecycle, memory_json) "
+                "VALUES (?,?,?,?)",
+                (80, core.MemoryCategory.EXPLICIT_FACT.value,
+                 core.MemoryLifecycle.CONFIRMED.value, payload))
+            await db.commit()
+
+        with pytest.raises(ValueError):
+            await database.list_core_memory_item_records(80)
+    run(go())
+
+
+# Same raw-integrity guard, different transformation: MemoryItem._clip also
+# strips surrounding whitespace -- a raw persisted value that differs from
+# its own stripped form must raise, never silently return the stripped one.
+def test_list_core_memory_item_records_raises_on_persisted_whitespace_stripped(tmp_db):
+    async def go():
+        import json as _json
+        await _seed_user(81)
+        raw_content = "  confirmed content with padding  "
+        payload = _json.dumps({
+            "category": core.MemoryCategory.EXPLICIT_FACT.value,
+            "lifecycle": core.MemoryLifecycle.CONFIRMED.value,
+            "content": raw_content,
+            "confidence": 0.0,
+            "source_event_ids": [],
+        })
+        async with database.aiosqlite.connect(database.DB) as db:
+            await db.execute(
+                "INSERT INTO core_memory_items (user_id, category, lifecycle, memory_json) "
+                "VALUES (?,?,?,?)",
+                (81, core.MemoryCategory.EXPLICIT_FACT.value,
+                 core.MemoryLifecycle.CONFIRMED.value, payload))
+            await db.commit()
+
+        with pytest.raises(ValueError):
+            await database.list_core_memory_item_records(81)
+    run(go())
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Phase 2A V3 correction -- P1: memory lifecycle/category coherence across
+# the SQL columns, the raw memory_json, and the deserialized MemoryItem.
+# update_core_memory_item_lifecycle must transition BOTH representations
+# atomically in one UPDATE; both memory readers must verify all three
+# representations agree before influencing_only filtering ever runs.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Item 1: CANDIDATE -> CONFIRMED via the supported API -- all three
+# representations end up CONFIRMED, both influencing readers include it.
+def test_update_lifecycle_candidate_to_confirmed_stays_coherent(tmp_db):
+    async def go():
+        await _seed_user(91)
+        item = core.MemoryItem(category=core.MemoryCategory.EXPLICIT_FACT,
+                               lifecycle=core.MemoryLifecycle.CANDIDATE, content="works nights")
+        item_id = await database.add_core_memory_item(91, item)
+
+        ok = await database.update_core_memory_item_lifecycle(
+            item_id, 91, core.MemoryLifecycle.CONFIRMED)
+        assert ok is True
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT lifecycle, memory_json FROM core_memory_items WHERE id=?", (item_id,))
+            sql_lifecycle, memory_json = await cur.fetchone()
+        json_lifecycle = json.loads(memory_json)["lifecycle"]
+        assert sql_lifecycle == "CONFIRMED"
+        assert json_lifecycle == "CONFIRMED"
+
+        influencing_items = await database.list_core_memory_items(91, influencing_only=True)
+        assert any(i.content == "works nights" and i.lifecycle is core.MemoryLifecycle.CONFIRMED
+                   for i in influencing_items)
+        influencing_records = await database.list_core_memory_item_records(
+            91, influencing_only=True)
+        assert any(rid == item_id and i.lifecycle is core.MemoryLifecycle.CONFIRMED
+                   for rid, i in influencing_records)
+    run(go())
+
+
+# Item 2: CONFIRMED -> REJECTED via the supported API -- all three
+# representations end up REJECTED, both influencing readers exclude it.
+def test_update_lifecycle_confirmed_to_rejected_stays_coherent(tmp_db):
+    async def go():
+        await _seed_user(92)
+        item = core.MemoryItem(category=core.MemoryCategory.EXPLICIT_FACT,
+                               lifecycle=core.MemoryLifecycle.CONFIRMED, content="wrong guess")
+        item_id = await database.add_core_memory_item(92, item)
+
+        ok = await database.update_core_memory_item_lifecycle(
+            item_id, 92, core.MemoryLifecycle.REJECTED)
+        assert ok is True
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT lifecycle, memory_json FROM core_memory_items WHERE id=?", (item_id,))
+            sql_lifecycle, memory_json = await cur.fetchone()
+        json_lifecycle = json.loads(memory_json)["lifecycle"]
+        assert sql_lifecycle == "REJECTED"
+        assert json_lifecycle == "REJECTED"
+
+        influencing_items = await database.list_core_memory_items(92, influencing_only=True)
+        assert not any(i.content == "wrong guess" for i in influencing_items)
+        influencing_records = await database.list_core_memory_item_records(
+            92, influencing_only=True)
+        assert not any(rid == item_id for rid, _i in influencing_records)
+    run(go())
+
+
+async def _insert_raw_core_memory_row(user_id, sql_category, sql_lifecycle, json_category,
+                                      json_lifecycle, content="divergent content"):
+    """Async helper -- callers already run inside their own `go()` coroutine
+    and must `await` this directly, never wrap it in a second run(...)."""
+    payload = json.dumps({
+        "category": json_category, "lifecycle": json_lifecycle, "content": content,
+        "confidence": 0.0, "source_event_ids": [],
+    })
+    async with database.aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            "INSERT INTO core_memory_items (user_id, category, lifecycle, memory_json) "
+            "VALUES (?,?,?,?)",
+            (user_id, sql_category, sql_lifecycle, payload))
+        await db.commit()
+        return cur.lastrowid
+
+
+# Item 3: a pre-existing divergent lifecycle (SQL disagrees with JSON) must
+# make BOTH readers raise -- never silently return empty, never silently
+# pick one representation over the other. Both directions covered.
+def test_readers_raise_on_preexisting_divergent_lifecycle_sql_rejected_json_confirmed(tmp_db):
+    async def go():
+        await _seed_user(93)
+        await _insert_raw_core_memory_row(93, "EXPLICIT_FACT", "REJECTED", "EXPLICIT_FACT", "CONFIRMED")
+        with pytest.raises(ValueError):
+            await database.list_core_memory_items(93)
+        with pytest.raises(ValueError):
+            await database.list_core_memory_item_records(93)
+    run(go())
+
+
+def test_readers_raise_on_preexisting_divergent_lifecycle_sql_confirmed_json_candidate(tmp_db):
+    async def go():
+        await _seed_user(94)
+        await _insert_raw_core_memory_row(94, "EXPLICIT_FACT", "CONFIRMED", "EXPLICIT_FACT", "CANDIDATE")
+        with pytest.raises(ValueError):
+            await database.list_core_memory_items(94)
+        with pytest.raises(ValueError):
+            await database.list_core_memory_item_records(94)
+    run(go())
+
+
+# Item 5: calling update_core_memory_item_lifecycle against an ALREADY
+# divergent row must itself fail closed -- raise, with ZERO mutation of
+# either representation (proves pre-transition validation, not just
+# post-transition atomicity).
+def test_update_lifecycle_against_already_divergent_row_raises_with_zero_mutation(tmp_db):
+    async def go():
+        await _seed_user(95)
+        div_id = await _insert_raw_core_memory_row(
+            95, "EXPLICIT_FACT", "REJECTED", "EXPLICIT_FACT", "CONFIRMED")
+
+        with pytest.raises(ValueError):
+            await database.update_core_memory_item_lifecycle(
+                div_id, 95, core.MemoryLifecycle.CONFIRMED)
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT lifecycle, memory_json FROM core_memory_items WHERE id=?", (div_id,))
+            sql_lifecycle, memory_json = await cur.fetchone()
+        # Neither representation was mutated by the failed attempt.
+        assert sql_lifecycle == "REJECTED"
+        assert json.loads(memory_json)["lifecycle"] == "CONFIRMED"
+    run(go())
+
+
+# Item 6: a category mismatch (SQL disagrees with JSON) protects the frozen
+# HYPOTHESIS semantic boundary the same way a lifecycle mismatch does --
+# both readers must fail closed, both directions.
+def test_readers_raise_on_category_mismatch_sql_hypothesis_json_explicit_fact(tmp_db):
+    async def go():
+        await _seed_user(96)
+        await _insert_raw_core_memory_row(96, "HYPOTHESIS", "CONFIRMED", "EXPLICIT_FACT", "CONFIRMED")
+        with pytest.raises(ValueError):
+            await database.list_core_memory_items(96)
+        with pytest.raises(ValueError):
+            await database.list_core_memory_item_records(96)
+    run(go())
+
+
+def test_readers_raise_on_category_mismatch_sql_explicit_fact_json_hypothesis(tmp_db):
+    async def go():
+        await _seed_user(97)
+        await _insert_raw_core_memory_row(97, "EXPLICIT_FACT", "CONFIRMED", "HYPOTHESIS", "CONFIRMED")
+        with pytest.raises(ValueError):
+            await database.list_core_memory_items(97)
+        with pytest.raises(ValueError):
+            await database.list_core_memory_item_records(97)
     run(go())
 
 
