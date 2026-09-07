@@ -3667,8 +3667,8 @@ def test_case_context_populated_from_real_confirmed_memory(tmp_db, monkeypatch):
                            lifecycle=MemoryLifecycle.CONFIRMED, content="works night shifts")
     candidate = MemoryItem(category=MemoryCategory.HYPOTHESIS,
                            lifecycle=MemoryLifecycle.CANDIDATE, content="maybe anxious about work")
-    confirmed_id = run(database.add_core_memory_item(OWNER, confirmed))
-    run(database.add_core_memory_item(OWNER, candidate))
+    confirmed_id = run(database._add_core_memory_item_unchecked(OWNER, confirmed))
+    run(database._add_core_memory_item_unchecked(OWNER, candidate))
 
     _stub_legacy_machinery(monkeypatch)
     _stub_professional_eligible(monkeypatch, True)
@@ -3754,7 +3754,7 @@ def test_case_context_adds_no_additional_model_call(tmp_db, monkeypatch):
     run(database.upsert_user(OWNER, "u", "U"))
     confirmed = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
                            lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
-    run(database.add_core_memory_item(OWNER, confirmed))
+    run(database._add_core_memory_item_unchecked(OWNER, confirmed))
 
     _stub_legacy_machinery(monkeypatch)
     _stub_professional_eligible(monkeypatch, True)
@@ -3775,7 +3775,7 @@ def test_conversation_context_unaffected_by_case_context(tmp_db, monkeypatch):
     run(database.upsert_user(OWNER, "u", "U"))
     confirmed = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
                            lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
-    run(database.add_core_memory_item(OWNER, confirmed))
+    run(database._add_core_memory_item_unchecked(OWNER, confirmed))
 
     _stub_legacy_machinery(monkeypatch)
     _stub_professional_eligible(monkeypatch, True)
@@ -3805,7 +3805,7 @@ def test_first_turn_entry_active_orthogonal_to_case_context_true_case(tmp_db, mo
     run(database.upsert_user(OWNER, "u", "U"))
     confirmed = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
                            lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
-    run(database.add_core_memory_item(OWNER, confirmed))
+    run(database._add_core_memory_item_unchecked(OWNER, confirmed))
 
     _stub_legacy_machinery(monkeypatch)
     _stub_professional_eligible(monkeypatch, True)
@@ -3824,7 +3824,7 @@ def test_first_turn_entry_active_orthogonal_to_case_context_false_case(tmp_db, m
     run(_seed_user(OWNER))  # pre-consumes the one-shot claim, same as every other test here
     confirmed = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
                            lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
-    run(database.add_core_memory_item(OWNER, confirmed))
+    run(database._add_core_memory_item_unchecked(OWNER, confirmed))
 
     _stub_legacy_machinery(monkeypatch)
     _stub_professional_eligible(monkeypatch, True)
@@ -3854,7 +3854,7 @@ def test_real_persisted_corruption_yields_complete_empty_case_context(tmp_db, mo
     run(database.upsert_user(OWNER, "u", "U"))
     valid = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
                        lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
-    valid_id = run(database.add_core_memory_item(OWNER, valid))
+    valid_id = run(database._add_core_memory_item_unchecked(OWNER, valid))
 
     corrupted_payload = json.dumps({
         "category": MemoryCategory.EXPLICIT_FACT.value,
@@ -3912,7 +3912,7 @@ def test_real_lifecycle_divergent_row_yields_complete_empty_case_context(tmp_db,
     run(database.upsert_user(OWNER, "u", "U"))
     valid = MemoryItem(category=MemoryCategory.EXPLICIT_FACT,
                        lifecycle=MemoryLifecycle.CONFIRMED, content="a confirmed fact")
-    valid_id = run(database.add_core_memory_item(OWNER, valid))
+    valid_id = run(database._add_core_memory_item_unchecked(OWNER, valid))
 
     # SQL lifecycle says REJECTED; the row's own memory_json still says
     # CONFIRMED -- structurally inconsistent persisted state.

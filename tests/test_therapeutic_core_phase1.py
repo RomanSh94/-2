@@ -255,7 +255,7 @@ def test_session_restart_safety_full_chain_survives_fresh_read(tmp_db):
         mem = core.MemoryItem(category=core.MemoryCategory.HYPOTHESIS,
                               lifecycle=core.MemoryLifecycle.CONFIRMED,
                               content="uncertainty reads as rejection")
-        await database.add_core_memory_item(30, mem)
+        await database._add_core_memory_item_unchecked(30, mem)
 
         # Fresh reads, no shared state with the writers above.
         assert (await database.list_core_formulations(s.session_id, 30))[0].trigger == f.trigger
@@ -291,8 +291,8 @@ def test_rejected_memory_excluded_from_influencing_query(tmp_db):
                                lifecycle=core.MemoryLifecycle.CONFIRMED, content="prefers directness")
         drop = core.MemoryItem(category=core.MemoryCategory.PREFERENCE,
                                lifecycle=core.MemoryLifecycle.REJECTED, content="wrong guess")
-        await database.add_core_memory_item(50, keep)
-        await database.add_core_memory_item(50, drop)
+        await database._add_core_memory_item_unchecked(50, keep)
+        await database._add_core_memory_item_unchecked(50, drop)
         influencing = await database.list_core_memory_items(50, influencing_only=True)
         contents = {m.content for m in influencing}
         assert keep.content in contents
@@ -310,8 +310,8 @@ def test_list_core_memory_item_records_preserves_db_id_and_filters(tmp_db):
                                lifecycle=core.MemoryLifecycle.CONFIRMED, content="confirmed fact")
         drop = core.MemoryItem(category=core.MemoryCategory.PREFERENCE,
                                lifecycle=core.MemoryLifecycle.CANDIDATE, content="unconfirmed guess")
-        keep_id = await database.add_core_memory_item(70, keep)
-        drop_id = await database.add_core_memory_item(70, drop)
+        keep_id = await database._add_core_memory_item_unchecked(70, keep)
+        drop_id = await database._add_core_memory_item_unchecked(70, drop)
         assert keep_id > 0 and drop_id > 0 and drop_id != keep_id
 
         all_records = await database.list_core_memory_item_records(70)
@@ -387,7 +387,7 @@ def test_list_core_memory_item_records_raises_on_persisted_whitespace_stripped(t
 # ══════════════════════════════════════════════════════════════════════════
 # Phase 2A V3 correction -- P1: memory lifecycle/category coherence across
 # the SQL columns, the raw memory_json, and the deserialized MemoryItem.
-# update_core_memory_item_lifecycle must transition BOTH representations
+# _update_core_memory_item_lifecycle_unchecked must transition BOTH representations
 # atomically in one UPDATE; both memory readers must verify all three
 # representations agree before influencing_only filtering ever runs.
 # ══════════════════════════════════════════════════════════════════════════
@@ -399,9 +399,9 @@ def test_update_lifecycle_candidate_to_confirmed_stays_coherent(tmp_db):
         await _seed_user(91)
         item = core.MemoryItem(category=core.MemoryCategory.EXPLICIT_FACT,
                                lifecycle=core.MemoryLifecycle.CANDIDATE, content="works nights")
-        item_id = await database.add_core_memory_item(91, item)
+        item_id = await database._add_core_memory_item_unchecked(91, item)
 
-        ok = await database.update_core_memory_item_lifecycle(
+        ok = await database._update_core_memory_item_lifecycle_unchecked(
             item_id, 91, core.MemoryLifecycle.CONFIRMED)
         assert ok is True
 
@@ -430,9 +430,9 @@ def test_update_lifecycle_confirmed_to_rejected_stays_coherent(tmp_db):
         await _seed_user(92)
         item = core.MemoryItem(category=core.MemoryCategory.EXPLICIT_FACT,
                                lifecycle=core.MemoryLifecycle.CONFIRMED, content="wrong guess")
-        item_id = await database.add_core_memory_item(92, item)
+        item_id = await database._add_core_memory_item_unchecked(92, item)
 
-        ok = await database.update_core_memory_item_lifecycle(
+        ok = await database._update_core_memory_item_lifecycle_unchecked(
             item_id, 92, core.MemoryLifecycle.REJECTED)
         assert ok is True
 
@@ -494,7 +494,7 @@ def test_readers_raise_on_preexisting_divergent_lifecycle_sql_confirmed_json_can
     run(go())
 
 
-# Item 5: calling update_core_memory_item_lifecycle against an ALREADY
+# Item 5: calling _update_core_memory_item_lifecycle_unchecked against an ALREADY
 # divergent row must itself fail closed -- raise, with ZERO mutation of
 # either representation (proves pre-transition validation, not just
 # post-transition atomicity).
@@ -505,7 +505,7 @@ def test_update_lifecycle_against_already_divergent_row_raises_with_zero_mutatio
             95, "EXPLICIT_FACT", "REJECTED", "EXPLICIT_FACT", "CONFIRMED")
 
         with pytest.raises(ValueError):
-            await database.update_core_memory_item_lifecycle(
+            await database._update_core_memory_item_lifecycle_unchecked(
                 div_id, 95, core.MemoryLifecycle.CONFIRMED)
 
         async with database.aiosqlite.connect(database.DB) as db:
@@ -555,10 +555,10 @@ def test_export_delete_preview_and_delete_all_cover_core_tables(tmp_db):
         s = await database.create_core_session(60)
         mem = core.MemoryItem(category=core.MemoryCategory.GOAL,
                               lifecycle=core.MemoryLifecycle.CONFIRMED, content="reduce rituals")
-        await database.add_core_memory_item(60, mem)
+        await database._add_core_memory_item_unchecked(60, mem)
         other_mem = core.MemoryItem(category=core.MemoryCategory.GOAL,
                                     lifecycle=core.MemoryLifecycle.CONFIRMED, content="not user 60's")
-        await database.add_core_memory_item(61, other_mem)
+        await database._add_core_memory_item_unchecked(61, other_mem)
 
         exported = await database.export_all_personal_data(60)
         assert len(exported["core_sessions"]) == 1
@@ -703,4 +703,855 @@ def test_rollout_off_denies_invited_user_with_active_access_too(tmp_db, monkeypa
         await _seed_user(90)
         await database.grant_user_access(90)
         assert await ac.core_rollout_allowed(90) is False
+    run(go())
+
+
+# ── Phase 2B-1 -- Governed Canonical Memory Persistence Boundary ───────────
+# canonical_memory_governance.py owns the pure policy (see
+# tests/test_canonical_memory_governance.py); these tests exercise the
+# actual DB-backed governed functions end-to-end.
+
+async def _user_authored_message_id(uid: int, content: str = "i feel anxious today") -> int:
+    return await database.save_message(
+        uid, "user", content, source=database.MessageSource.USER_AUTHORED)
+
+
+async def _assistant_message_id(uid: int, content: str = "that sounds hard") -> int:
+    return await database.save_message(
+        uid, "assistant", content, source=database.MessageSource.ASSISTANT_DELIVERED)
+
+
+def test_governed_candidate_valid_persists_as_candidate(tmp_db):
+    async def go():
+        await _seed_user(200)
+        mid = await _user_authored_message_id(200)
+        item_id = await database.add_governed_core_memory_candidate(
+            200, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="works night shifts", source_event_ids=[mid])
+        assert item_id > 0
+        records = await database.list_core_memory_item_records(200)
+        assert len(records) == 1
+        record_id, item = records[0]
+        assert record_id == item_id
+        assert item.category is core.MemoryCategory.EXPLICIT_FACT
+        assert item.lifecycle is core.MemoryLifecycle.CANDIDATE
+        assert item.content == "works night shifts"
+        assert item.source_event_ids == [mid]
+    run(go())
+
+
+def test_governed_candidate_caller_cannot_choose_initial_lifecycle(tmp_db):
+    """The function signature itself has no lifecycle parameter -- calling
+    with one is a TypeError, not a silently-accepted override."""
+    async def go():
+        await _seed_user(201)
+        mid = await _user_authored_message_id(201)
+        with pytest.raises(TypeError):
+            await database.add_governed_core_memory_candidate(
+                201, category=core.MemoryCategory.EXPLICIT_FACT,
+                content="x", source_event_ids=[mid],
+                lifecycle=core.MemoryLifecycle.CONFIRMED)
+    run(go())
+
+
+def test_governed_candidate_specialized_category_rejected(tmp_db):
+    async def go():
+        await _seed_user(202)
+        mid = await _user_authored_message_id(202)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                202, category=core.MemoryCategory.CONFIRMED_PATTERN,
+                content="x", source_event_ids=[mid])
+        assert await database.list_core_memory_item_records(202) == []
+    run(go())
+
+
+def test_governed_candidate_empty_provenance_rejected(tmp_db):
+    async def go():
+        await _seed_user(203)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                203, category=core.MemoryCategory.GOAL,
+                content="wants to exercise more", source_event_ids=[])
+        assert await database.list_core_memory_item_records(203) == []
+    run(go())
+
+
+def test_governed_candidate_non_int_provenance_rejected(tmp_db):
+    async def go():
+        await _seed_user(204)
+        mid = await _user_authored_message_id(204)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                204, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[str(mid)])
+        assert await database.list_core_memory_item_records(204) == []
+    run(go())
+
+
+def test_governed_candidate_bool_provenance_rejected(tmp_db):
+    async def go():
+        await _seed_user(205)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                205, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[True])
+        assert await database.list_core_memory_item_records(205) == []
+    run(go())
+
+
+def test_governed_candidate_zero_negative_provenance_rejected(tmp_db):
+    async def go():
+        await _seed_user(206)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                206, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[0])
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                206, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[-5])
+        assert await database.list_core_memory_item_records(206) == []
+    run(go())
+
+
+def test_governed_candidate_duplicate_provenance_rejected(tmp_db):
+    async def go():
+        await _seed_user(207)
+        mid = await _user_authored_message_id(207)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                207, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[mid, mid])
+        assert await database.list_core_memory_item_records(207) == []
+    run(go())
+
+
+def test_governed_candidate_missing_message_id_rejected(tmp_db):
+    async def go():
+        await _seed_user(208)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                208, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[999999])
+        assert await database.list_core_memory_item_records(208) == []
+    run(go())
+
+
+def test_governed_candidate_another_users_message_rejected(tmp_db):
+    async def go():
+        await _seed_user(209)
+        await _seed_user(210)
+        other_users_mid = await _user_authored_message_id(210)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                209, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[other_users_mid])
+        assert await database.list_core_memory_item_records(209) == []
+        assert await database.list_core_memory_item_records(210) == []
+    run(go())
+
+
+def test_governed_candidate_assistant_authored_message_rejected(tmp_db):
+    async def go():
+        await _seed_user(211)
+        assistant_mid = await _assistant_message_id(211)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                211, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[assistant_mid])
+        assert await database.list_core_memory_item_records(211) == []
+    run(go())
+
+
+def test_governed_candidate_synthetic_ui_message_rejected(tmp_db):
+    """role='user' alone is NOT proof of authorship -- a SYNTHETIC_UI row
+    (normalized Telegram-button label) also persists with role='user' and
+    must be refused just like an assistant row."""
+    async def go():
+        await _seed_user(212)
+        synthetic_mid = await database.save_message(
+            212, "user", "[button: yes]", source=database.MessageSource.SYNTHETIC_UI)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                212, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[synthetic_mid])
+        assert await database.list_core_memory_item_records(212) == []
+    run(go())
+
+
+def test_governed_candidate_role_assistant_source_user_authored_mismatch_rejected(tmp_db):
+    """Phase 2B-1 V5 correction: a corrupted/inconsistent row -- role=
+    'assistant' but source='USER_AUTHORED' -- must never pass as
+    user-authored provenance merely because `source` alone says so. The
+    boundary requires the COHERENT pair (role='user' AND
+    source='USER_AUTHORED' together), never either field independently.
+    This exact pairing would have wrongly PASSED under the pre-V5 check
+    (which only inspected `source`), so it is the direct regression proof
+    for this correction."""
+    async def go():
+        await _seed_user(220)
+        mismatched_mid = await database.save_message(
+            220, "assistant", "a role/source-inconsistent row",
+            source=database.MessageSource.USER_AUTHORED)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                220, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[mismatched_mid])
+        assert await database.list_core_memory_item_records(220) == []
+    run(go())
+
+
+def test_governed_candidate_role_user_source_assistant_delivered_mismatch_rejected(tmp_db):
+    """Companion mismatch in the other direction: role='user' but
+    source='ASSISTANT_DELIVERED'. Also must never pass -- `role` alone is
+    not proof of authorship either, exactly as MessageSource's own
+    docstring already warns for the SYNTHETIC_UI case; this proves the
+    same discipline for a different inconsistent source value."""
+    async def go():
+        await _seed_user(221)
+        mismatched_mid = await database.save_message(
+            221, "user", "a role/source-inconsistent row",
+            source=database.MessageSource.ASSISTANT_DELIVERED)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                221, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[mismatched_mid])
+        assert await database.list_core_memory_item_records(221) == []
+    run(go())
+
+
+def test_governed_candidate_legacy_null_source_message_rejected(tmp_db):
+    """A pre-MESSAGES-PROVENANCE-V1 row (source IS NULL) is UNKNOWN
+    provenance, never backfilled -- it must be refused, not trusted."""
+    async def go():
+        await _seed_user(213)
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "INSERT INTO messages (user_id, role, content) VALUES (?,?,?)",
+                (213, "user", "a legacy row with no source column"))
+            await db.commit()
+            legacy_mid = cur.lastrowid
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                213, category=core.MemoryCategory.GOAL,
+                content="x", source_event_ids=[legacy_mid])
+        assert await database.list_core_memory_item_records(213) == []
+    run(go())
+
+
+def test_governed_candidate_valid_same_user_user_row_accepted(tmp_db):
+    async def go():
+        await _seed_user(214)
+        mid = await _user_authored_message_id(214)
+        item_id = await database.add_governed_core_memory_candidate(
+            214, category=core.MemoryCategory.HYPOTHESIS,
+            content="may avoid conflict to keep the peace", source_event_ids=[mid])
+        assert item_id > 0
+    run(go())
+
+
+def test_governed_candidate_content_needing_strip_rejected(tmp_db):
+    async def go():
+        await _seed_user(215)
+        mid = await _user_authored_message_id(215)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                215, category=core.MemoryCategory.GOAL,
+                content="  padded  ", source_event_ids=[mid])
+        assert await database.list_core_memory_item_records(215) == []
+    run(go())
+
+
+def test_governed_candidate_1000_chars_rejected_not_truncated(tmp_db):
+    async def go():
+        await _seed_user(216)
+        mid = await _user_authored_message_id(216)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                216, category=core.MemoryCategory.GOAL,
+                content="x" * 1001, source_event_ids=[mid])
+        assert await database.list_core_memory_item_records(216) == []
+    run(go())
+
+
+def test_governed_candidate_invalid_candidate_produces_zero_db_writes(tmp_db):
+    async def go():
+        await _seed_user(217)
+        with pytest.raises(ValueError):
+            await database.add_governed_core_memory_candidate(
+                217, category=core.MemoryCategory.EXPLICIT_FACT,
+                content="a perfectly valid fact", source_event_ids=[-1])
+        assert await database.list_core_memory_item_records(217) == []
+    run(go())
+
+
+def test_governed_candidate_exact_retry_is_idempotent(tmp_db):
+    async def go():
+        await _seed_user(218)
+        mid = await _user_authored_message_id(218)
+        first_id = await database.add_governed_core_memory_candidate(
+            218, category=core.MemoryCategory.PREFERENCE,
+            content="prefers short, direct answers", source_event_ids=[mid])
+        second_id = await database.add_governed_core_memory_candidate(
+            218, category=core.MemoryCategory.PREFERENCE,
+            content="prefers short, direct answers", source_event_ids=[mid])
+        assert second_id == first_id
+        records = await database.list_core_memory_item_records(218)
+        assert len(records) == 1
+    run(go())
+
+
+def test_governed_candidate_different_content_same_provenance_is_not_a_duplicate(tmp_db):
+    """Sanity check on the idempotency comparison -- it must not be so
+    loose that any resubmission for the same message collapses into the
+    first row regardless of content."""
+    async def go():
+        await _seed_user(219)
+        mid = await _user_authored_message_id(219)
+        first_id = await database.add_governed_core_memory_candidate(
+            219, category=core.MemoryCategory.PREFERENCE,
+            content="prefers short answers", source_event_ids=[mid])
+        second_id = await database.add_governed_core_memory_candidate(
+            219, category=core.MemoryCategory.PREFERENCE,
+            content="prefers long answers", source_event_ids=[mid])
+        assert second_id != first_id
+        records = await database.list_core_memory_item_records(219)
+        assert len(records) == 2
+    run(go())
+
+
+# ── Phase 2B-1 V2 correction -- idempotency must survive lifecycle change ──
+# BLOCKER 3: the V1 idempotency scan only matched an existing row still at
+# lifecycle=CANDIDATE. That was too weak -- an exact retry after the
+# original row has advanced (or terminated) must still reuse the existing
+# row, never insert a second one. One test per named lifecycle state below,
+# plus HISTORICAL (reachable via CONFIRMED -> HISTORICAL, not explicitly
+# named in the minimum list but worth covering since it IS reachable).
+# CORRECTED (Phase 2B-1 V3 correction) is covered separately, further
+# below (test_governed_candidate_retry_against_existing_corrected_row_is_
+# idempotent) -- no CANDIDATE-rooted row can ever reach CORRECTED through
+# the governed transition graph in this slice (canonical_memory_
+# governance.ALLOWED_LIFECYCLE_TRANSITIONS has no edge targeting CORRECTED
+# at all; it is only ever created by a later Phase 2B append-only
+# correction transaction, out of scope here), so unlike every other
+# lifecycle in this block, that one test builds its CORRECTED fixture with
+# the private unchecked primitive rather than a governed transition
+# sequence -- there is no governed path that reaches CORRECTED to exercise
+# instead.
+
+def test_governed_candidate_retry_while_candidate_is_idempotent(tmp_db):
+    async def go():
+        await _seed_user(240)
+        mid = await _user_authored_message_id(240)
+        first_id = await database.add_governed_core_memory_candidate(
+            240, category=core.MemoryCategory.PREFERENCE,
+            content="prefers short, direct answers", source_event_ids=[mid])
+        second_id = await database.add_governed_core_memory_candidate(
+            240, category=core.MemoryCategory.PREFERENCE,
+            content="prefers short, direct answers", source_event_ids=[mid])
+        assert second_id == first_id
+        records = await database.list_core_memory_item_records(240)
+        assert len(records) == 1
+        assert records[0][1].lifecycle is core.MemoryLifecycle.CANDIDATE
+    run(go())
+
+
+def test_governed_candidate_retry_after_proposed_is_idempotent(tmp_db):
+    async def go():
+        await _seed_user(241)
+        mid = await _user_authored_message_id(241)
+        first_id = await database.add_governed_core_memory_candidate(
+            241, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="works night shifts", source_event_ids=[mid])
+        await database.apply_governed_core_memory_lifecycle_transition(
+            241, first_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.PROPOSED)
+
+        retry_id = await database.add_governed_core_memory_candidate(
+            241, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="works night shifts", source_event_ids=[mid])
+        assert retry_id == first_id
+        records = await database.list_core_memory_item_records(241)
+        assert len(records) == 1
+        assert records[0][1].lifecycle is core.MemoryLifecycle.PROPOSED
+    run(go())
+
+
+def test_governed_candidate_retry_after_confirmed_is_idempotent(tmp_db):
+    async def go():
+        await _seed_user(242)
+        mid = await _user_authored_message_id(242)
+        first_id = await database.add_governed_core_memory_candidate(
+            242, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="lives alone", source_event_ids=[mid])
+        await database.apply_governed_core_memory_lifecycle_transition(
+            242, first_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.PROPOSED)
+        await database.apply_governed_core_memory_lifecycle_transition(
+            242, first_id, expected_current_lifecycle=core.MemoryLifecycle.PROPOSED,
+            target_lifecycle=core.MemoryLifecycle.CONFIRMED)
+
+        retry_id = await database.add_governed_core_memory_candidate(
+            242, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="lives alone", source_event_ids=[mid])
+        assert retry_id == first_id
+        records = await database.list_core_memory_item_records(242)
+        assert len(records) == 1
+        assert records[0][1].lifecycle is core.MemoryLifecycle.CONFIRMED
+    run(go())
+
+
+def test_governed_candidate_retry_after_rejected_is_idempotent(tmp_db):
+    async def go():
+        await _seed_user(243)
+        mid = await _user_authored_message_id(243)
+        first_id = await database.add_governed_core_memory_candidate(
+            243, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="has a younger sister", source_event_ids=[mid])
+        await database.apply_governed_core_memory_lifecycle_transition(
+            243, first_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.PROPOSED)
+        await database.apply_governed_core_memory_lifecycle_transition(
+            243, first_id, expected_current_lifecycle=core.MemoryLifecycle.PROPOSED,
+            target_lifecycle=core.MemoryLifecycle.REJECTED)
+
+        retry_id = await database.add_governed_core_memory_candidate(
+            243, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="has a younger sister", source_event_ids=[mid])
+        assert retry_id == first_id
+        records = await database.list_core_memory_item_records(243)
+        assert len(records) == 1
+        assert records[0][1].lifecycle is core.MemoryLifecycle.REJECTED
+    run(go())
+
+
+def test_governed_candidate_retry_after_expired_is_idempotent(tmp_db):
+    async def go():
+        await _seed_user(244)
+        mid = await _user_authored_message_id(244)
+        first_id = await database.add_governed_core_memory_candidate(
+            244, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="recently changed jobs", source_event_ids=[mid])
+        await database.apply_governed_core_memory_lifecycle_transition(
+            244, first_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.EXPIRED)
+
+        retry_id = await database.add_governed_core_memory_candidate(
+            244, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="recently changed jobs", source_event_ids=[mid])
+        assert retry_id == first_id
+        records = await database.list_core_memory_item_records(244)
+        assert len(records) == 1
+        assert records[0][1].lifecycle is core.MemoryLifecycle.EXPIRED
+    run(go())
+
+
+def test_governed_candidate_retry_after_historical_is_idempotent(tmp_db):
+    """Not in the task's named minimum list, but HISTORICAL is reachable
+    (CONFIRMED -> HISTORICAL) and explicitly named among the lifecycle
+    states a retry must survive, so it is covered here too."""
+    async def go():
+        await _seed_user(245)
+        mid = await _user_authored_message_id(245)
+        first_id = await database.add_governed_core_memory_candidate(
+            245, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="owns a small dog", source_event_ids=[mid])
+        await database.apply_governed_core_memory_lifecycle_transition(
+            245, first_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.PROPOSED)
+        await database.apply_governed_core_memory_lifecycle_transition(
+            245, first_id, expected_current_lifecycle=core.MemoryLifecycle.PROPOSED,
+            target_lifecycle=core.MemoryLifecycle.CONFIRMED)
+        await database.apply_governed_core_memory_lifecycle_transition(
+            245, first_id, expected_current_lifecycle=core.MemoryLifecycle.CONFIRMED,
+            target_lifecycle=core.MemoryLifecycle.HISTORICAL)
+
+        retry_id = await database.add_governed_core_memory_candidate(
+            245, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="owns a small dog", source_event_ids=[mid])
+        assert retry_id == first_id
+        records = await database.list_core_memory_item_records(245)
+        assert len(records) == 1
+        assert records[0][1].lifecycle is core.MemoryLifecycle.HISTORICAL
+    run(go())
+
+
+def test_governed_candidate_retry_against_existing_corrected_row_is_idempotent(tmp_db):
+    """Phase 2B-1 V3 correction: CORRECTED is never reachable through the
+    governed transition graph in this slice (no edge targets it -- a
+    corrected item will only ever be created by a later, separate
+    append-only correction transaction). A row can still legitimately be
+    CORRECTED today via that future mechanism or via historical/legacy
+    data, so the fixture here is built with the private unchecked
+    primitive (exactly as tests/test_canonical_memory_bypass_closure.py's
+    own docstring anticipates for test-only setup), NOT through any
+    governed API -- there is no governed path that reaches CORRECTED to
+    exercise instead. The governed candidate creator must still treat an
+    existing exact-identity CORRECTED row as an idempotency match, exactly
+    like every other lifecycle: no new row, existing id returned."""
+    async def go():
+        await _seed_user(248)
+        mid = await _user_authored_message_id(248)
+        corrected = core.MemoryItem(
+            category=core.MemoryCategory.EXPLICIT_FACT,
+            lifecycle=core.MemoryLifecycle.CORRECTED,
+            content="corrected: actually works day shifts", source_event_ids=[mid])
+        corrected_id = await database._add_core_memory_item_unchecked(248, corrected)
+
+        before_count = len(await database.list_core_memory_item_records(248))
+
+        retry_id = await database.add_governed_core_memory_candidate(
+            248, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="corrected: actually works day shifts", source_event_ids=[mid])
+
+        assert retry_id == corrected_id
+        after_records = await database.list_core_memory_item_records(248)
+        assert len(after_records) == before_count
+        assert len(after_records) == 1
+        assert after_records[0][1].lifecycle is core.MemoryLifecycle.CORRECTED
+    run(go())
+
+
+def test_governed_candidate_idempotency_deterministic_on_multiple_exact_duplicates(tmp_db):
+    """Documents and proves the deterministic tie-break rule: if more than
+    one existing row already matches this exact identity (only reachable
+    via legacy/historical data or the raw internal primitive -- the
+    governed API itself never creates a second exact duplicate), the
+    LOWEST core_memory_items.id (the oldest, first-created match) is the
+    one returned. Never a function of dict/set iteration order."""
+    async def go():
+        await _seed_user(246)
+        mid = await _user_authored_message_id(246)
+        dup = core.MemoryItem(category=core.MemoryCategory.GOAL,
+                              lifecycle=core.MemoryLifecycle.CANDIDATE,
+                              content="wants to run a 10k", source_event_ids=[mid])
+        older_id = await database._add_core_memory_item_unchecked(246, dup)
+        newer_id = await database._add_core_memory_item_unchecked(246, dup)
+        assert older_id < newer_id
+
+        retry_id = await database.add_governed_core_memory_candidate(
+            246, category=core.MemoryCategory.GOAL,
+            content="wants to run a 10k", source_event_ids=[mid])
+        assert retry_id == older_id
+        records = await database.list_core_memory_item_records(246)
+        assert len(records) == 2  # no third row inserted
+    run(go())
+
+
+# ── Phase 2B-1 V6 correction -- type-exact provenance identity (Codex P2) ──
+# Ordinary Python list equality is not type-exact ([True] == [1] and
+# [1.0] == [1] are both True), so a malformed EXISTING row (only
+# reachable via the private unchecked primitive or genuinely historical
+# data -- the governed write path itself never persists a non-int member)
+# must never be wrongly treated as the exact retry of a new, validly-typed
+# candidate. See database._source_event_ids_exactly_equal.
+
+@pytest.mark.parametrize("malformed_value,type_label", [
+    (True, "bool"),
+    (1.0, "float"),
+])
+def test_governed_candidate_malformed_provenance_type_is_not_a_false_exact_match(
+        tmp_db, malformed_value, type_label):
+    """Codex-reproduced P2: an existing malformed row with
+    source_event_ids=[True] (or [1.0]) must NOT be returned as the exact
+    match for a new valid candidate submitting source_event_ids=[1] -- a
+    new, correctly-typed row must be created instead, and the malformed
+    row must be left completely unchanged (never repaired, never
+    deleted).
+
+    Deterministic message id: tmp_db gives each parametrized run of this
+    test its own fresh, empty per-test database (see the tmp_db fixture),
+    so the FIRST message ever inserted in THIS run gets AUTOINCREMENT
+    id=1 -- asserted explicitly below, not an accidental coincidence."""
+    async def go():
+        await _seed_user(249)
+        mid = await _user_authored_message_id(249)
+        assert mid == 1, (
+            f"[{type_label}] test assumes a fresh per-test DB where the "
+            "first inserted message row gets autoincrement id=1 -- see "
+            "the tmp_db fixture")
+
+        malformed = core.MemoryItem(
+            category=core.MemoryCategory.GOAL,
+            lifecycle=core.MemoryLifecycle.CANDIDATE,
+            content="wants to run a 10k", source_event_ids=[malformed_value])
+        malformed_id = await database._add_core_memory_item_unchecked(249, malformed)
+
+        new_id = await database.add_governed_core_memory_candidate(
+            249, category=core.MemoryCategory.GOAL,
+            content="wants to run a 10k", source_event_ids=[1])
+
+        assert new_id != malformed_id, (
+            f"[{type_label}] malformed existing row was wrongly returned "
+            "as the exact-retry match for a validly-typed new candidate")
+        records = await database.list_core_memory_item_records(249)
+        assert len(records) == 2
+        by_id = dict(records)
+        # Malformed row left completely unchanged -- same value, same type.
+        assert by_id[malformed_id].source_event_ids == [malformed_value]
+        assert type(by_id[malformed_id].source_event_ids[0]) is type(malformed_value)
+        # New row has genuine, exactly-typed [1] provenance.
+        assert by_id[new_id].source_event_ids == [1]
+        assert type(by_id[new_id].source_event_ids[0]) is int
+    run(go())
+
+
+def test_governed_candidate_exact_retry_provenance_order_is_significant(tmp_db):
+    """[1, 2] must not exact-match [2, 1] -- provenance identity is an
+    ORDERED sequence, never treated as a set, and never sorted."""
+    async def go():
+        await _seed_user(252)
+        mid1 = await _user_authored_message_id(252, "first related message")
+        mid2 = await _user_authored_message_id(252, "second related message")
+
+        first_id = await database.add_governed_core_memory_candidate(
+            252, category=core.MemoryCategory.EPISODE_MAP,
+            content="two related events", source_event_ids=[mid1, mid2])
+        second_id = await database.add_governed_core_memory_candidate(
+            252, category=core.MemoryCategory.EPISODE_MAP,
+            content="two related events", source_event_ids=[mid2, mid1])
+
+        assert second_id != first_id
+        records = await database.list_core_memory_item_records(252)
+        assert len(records) == 2
+        by_id = dict(records)
+        assert by_id[first_id].source_event_ids == [mid1, mid2]
+        assert by_id[second_id].source_event_ids == [mid2, mid1]
+    run(go())
+
+
+def test_governed_candidate_concurrent_identical_submissions_create_only_one_row(tmp_db):
+    """Genuine concurrency proof (not merely sequential retries): two
+    identical submissions fired via asyncio.gather -- both truly in flight
+    at once -- must still result in exactly one row. BEGIN IMMEDIATE
+    serializes the second writer behind the first's RESERVED lock; by the
+    time the second transaction's idempotency scan runs, it observes the
+    first transaction's already-committed row."""
+    async def go():
+        await _seed_user(247)
+        mid = await _user_authored_message_id(247)
+
+        results = await asyncio.gather(
+            database.add_governed_core_memory_candidate(
+                247, category=core.MemoryCategory.PREFERENCE,
+                content="prefers written summaries", source_event_ids=[mid]),
+            database.add_governed_core_memory_candidate(
+                247, category=core.MemoryCategory.PREFERENCE,
+                content="prefers written summaries", source_event_ids=[mid]),
+        )
+        assert results[0] == results[1]
+        records = await database.list_core_memory_item_records(247)
+        assert len(records) == 1
+    run(go())
+
+
+# ── Phase 2B-1 -- governed lifecycle transitions ────────────────────────────
+
+def test_governed_transition_candidate_to_proposed_updates_sql_and_json(tmp_db):
+    async def go():
+        await _seed_user(230)
+        mid = await _user_authored_message_id(230)
+        item_id = await database.add_governed_core_memory_candidate(
+            230, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="works night shifts", source_event_ids=[mid])
+        ok = await database.apply_governed_core_memory_lifecycle_transition(
+            230, item_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.PROPOSED)
+        assert ok is True
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT lifecycle, memory_json FROM core_memory_items WHERE id=?",
+                (item_id,))
+            sql_lifecycle, memory_json = await cur.fetchone()
+        assert sql_lifecycle == "PROPOSED"
+        assert json.loads(memory_json)["lifecycle"] == "PROPOSED"
+    run(go())
+
+
+def test_governed_transition_proposed_to_confirmed_works(tmp_db):
+    async def go():
+        await _seed_user(231)
+        mid = await _user_authored_message_id(231)
+        item_id = await database.add_governed_core_memory_candidate(
+            231, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="lives alone", source_event_ids=[mid])
+        assert await database.apply_governed_core_memory_lifecycle_transition(
+            231, item_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.PROPOSED) is True
+        assert await database.apply_governed_core_memory_lifecycle_transition(
+            231, item_id, expected_current_lifecycle=core.MemoryLifecycle.PROPOSED,
+            target_lifecycle=core.MemoryLifecycle.CONFIRMED) is True
+
+        records = await database.list_core_memory_item_records(231, influencing_only=True)
+        assert len(records) == 1
+        assert records[0][1].lifecycle is core.MemoryLifecycle.CONFIRMED
+    run(go())
+
+
+def test_governed_transition_direct_candidate_to_confirmed_rejected_no_write(tmp_db):
+    async def go():
+        await _seed_user(232)
+        mid = await _user_authored_message_id(232)
+        item_id = await database.add_governed_core_memory_candidate(
+            232, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="has a younger sister", source_event_ids=[mid])
+        with pytest.raises(ValueError):
+            await database.apply_governed_core_memory_lifecycle_transition(
+                232, item_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+                target_lifecycle=core.MemoryLifecycle.CONFIRMED)
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT lifecycle FROM core_memory_items WHERE id=?", (item_id,))
+            (sql_lifecycle,) = await cur.fetchone()
+        assert sql_lifecycle == "CANDIDATE"
+    run(go())
+
+
+def test_governed_transition_confirmed_hypothesis_remains_category_hypothesis(tmp_db):
+    async def go():
+        await _seed_user(233)
+        mid = await _user_authored_message_id(233)
+        item_id = await database.add_governed_core_memory_candidate(
+            233, category=core.MemoryCategory.HYPOTHESIS,
+            content="may fear abandonment", source_event_ids=[mid])
+        await database.apply_governed_core_memory_lifecycle_transition(
+            233, item_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.PROPOSED)
+        await database.apply_governed_core_memory_lifecycle_transition(
+            233, item_id, expected_current_lifecycle=core.MemoryLifecycle.PROPOSED,
+            target_lifecycle=core.MemoryLifecycle.CONFIRMED)
+
+        records = await database.list_core_memory_item_records(233)
+        assert len(records) == 1
+        item = records[0][1]
+        assert item.lifecycle is core.MemoryLifecycle.CONFIRMED
+        assert item.category is core.MemoryCategory.HYPOTHESIS
+    run(go())
+
+
+def test_governed_transition_does_not_alter_content_confidence_provenance_category(tmp_db):
+    async def go():
+        await _seed_user(234)
+        mid = await _user_authored_message_id(234)
+        item_id = await database.add_governed_core_memory_candidate(
+            234, category=core.MemoryCategory.GOAL,
+            content="wants to rebuild trust with his brother",
+            source_event_ids=[mid], confidence=0.42)
+        await database.apply_governed_core_memory_lifecycle_transition(
+            234, item_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.PROPOSED)
+
+        records = await database.list_core_memory_item_records(234)
+        item = records[0][1]
+        assert item.content == "wants to rebuild trust with his brother"
+        assert item.confidence == 0.42
+        assert item.source_event_ids == [mid]
+        assert item.category is core.MemoryCategory.GOAL
+    run(go())
+
+
+def test_governed_transition_stale_expected_lifecycle_performs_no_write(tmp_db):
+    async def go():
+        await _seed_user(235)
+        mid = await _user_authored_message_id(235)
+        item_id = await database.add_governed_core_memory_candidate(
+            235, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="works remotely", source_event_ids=[mid])
+        # Real current lifecycle is CANDIDATE -- caller wrongly believes PROPOSED.
+        result = await database.apply_governed_core_memory_lifecycle_transition(
+            235, item_id, expected_current_lifecycle=core.MemoryLifecycle.PROPOSED,
+            target_lifecycle=core.MemoryLifecycle.CONFIRMED)
+        assert result is False
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT lifecycle FROM core_memory_items WHERE id=?", (item_id,))
+            (sql_lifecycle,) = await cur.fetchone()
+        assert sql_lifecycle == "CANDIDATE"
+    run(go())
+
+
+def test_governed_transition_wrong_user_performs_no_write(tmp_db):
+    async def go():
+        await _seed_user(236)
+        await _seed_user(237)
+        mid = await _user_authored_message_id(236)
+        item_id = await database.add_governed_core_memory_candidate(
+            236, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="owns a dog", source_event_ids=[mid])
+        result = await database.apply_governed_core_memory_lifecycle_transition(
+            237, item_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.PROPOSED)
+        assert result is False
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT lifecycle, user_id FROM core_memory_items WHERE id=?", (item_id,))
+            sql_lifecycle, owner = await cur.fetchone()
+        assert sql_lifecycle == "CANDIDATE"
+        assert owner == 236
+    run(go())
+
+
+def test_governed_transition_terminal_lifecycle_resurrection_rejected(tmp_db):
+    async def go():
+        await _seed_user(238)
+        mid = await _user_authored_message_id(238)
+        item_id = await database.add_governed_core_memory_candidate(
+            238, category=core.MemoryCategory.EXPLICIT_FACT,
+            content="recently changed jobs", source_event_ids=[mid])
+        await database.apply_governed_core_memory_lifecycle_transition(
+            238, item_id, expected_current_lifecycle=core.MemoryLifecycle.CANDIDATE,
+            target_lifecycle=core.MemoryLifecycle.EXPIRED)
+
+        with pytest.raises(ValueError):
+            await database.apply_governed_core_memory_lifecycle_transition(
+                238, item_id, expected_current_lifecycle=core.MemoryLifecycle.EXPIRED,
+                target_lifecycle=core.MemoryLifecycle.CANDIDATE)
+        with pytest.raises(ValueError):
+            await database.apply_governed_core_memory_lifecycle_transition(
+                238, item_id, expected_current_lifecycle=core.MemoryLifecycle.EXPIRED,
+                target_lifecycle=core.MemoryLifecycle.PROPOSED)
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT lifecycle FROM core_memory_items WHERE id=?", (item_id,))
+            (sql_lifecycle,) = await cur.fetchone()
+        assert sql_lifecycle == "EXPIRED"
+    run(go())
+
+
+def test_governed_transition_malformed_stored_row_is_not_repaired(tmp_db):
+    """A row whose SQL lifecycle column and memory_json lifecycle key have
+    already diverged (e.g. a hand-edited/legacy row) must never be silently
+    'fixed' by the governed updater -- it fails closed, exactly like
+    _update_core_memory_item_lifecycle_unchecked's own pre-transition check."""
+    async def go():
+        await _seed_user(239)
+        mem = core.MemoryItem(category=core.MemoryCategory.EXPLICIT_FACT,
+                              lifecycle=core.MemoryLifecycle.CANDIDATE,
+                              content="a fact pending review")
+        item_id = await database._add_core_memory_item_unchecked(239, mem)
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            await db.execute(
+                "UPDATE core_memory_items SET lifecycle='PROPOSED' WHERE id=?",
+                (item_id,))
+            await db.commit()
+
+        with pytest.raises(ValueError):
+            await database.apply_governed_core_memory_lifecycle_transition(
+                239, item_id, expected_current_lifecycle=core.MemoryLifecycle.PROPOSED,
+                target_lifecycle=core.MemoryLifecycle.CONFIRMED)
+
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT lifecycle, memory_json FROM core_memory_items WHERE id=?",
+                (item_id,))
+            sql_lifecycle, memory_json = await cur.fetchone()
+        assert sql_lifecycle == "PROPOSED"
+        assert json.loads(memory_json)["lifecycle"] == "CANDIDATE"
     run(go())
