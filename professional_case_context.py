@@ -25,8 +25,10 @@ WHAT THIS IS NOT -- a CanonicalCaseContext is never:
     PHASE 2A SCOPE below).
 
 WHAT THIS IS -- a bounded, read-only view over already-confirmed longitudinal
-memory (therapeutic_domain.MemoryItem rows persisted via
-database.add_core_memory_item), restricted to exactly the two lifecycle
+memory (therapeutic_domain.MemoryItem rows persisted in core_memory_items,
+via database's own internal write primitives -- see database.py's Phase 2B-1
+Governed Canonical Memory Persistence Boundary section for the current
+supported write path), restricted to exactly the two lifecycle
 values that are allowed to influence a response at all
 (MemoryLifecycle.influences_responses -- CONFIRMED and CORRECTED; see
 therapeutic_domain.py). CANDIDATE, PROPOSED, REJECTED, HISTORICAL, and

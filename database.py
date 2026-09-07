@@ -5165,6 +5165,7 @@ def sync_export_query_safe(table: str) -> tuple:
 # rest of the flag-off surface in this file.
 
 import therapeutic_domain as _core
+import canonical_memory_governance as _governance
 
 
 def _dump_session_json(state: _core.SessionState) -> str:
@@ -5811,7 +5812,22 @@ async def list_core_outcomes(intervention_id: str, user_id: int) -> list[_core.O
     return [_core.OutcomeMeasurement.from_dict(json.loads(r[0])) for r in rows]
 
 
-async def add_core_memory_item(user_id: int, item: _core.MemoryItem) -> int:
+async def _add_core_memory_item_unchecked(user_id: int, item: _core.MemoryItem) -> int:
+    """INTERNAL DB PRIMITIVE ONLY (Phase 2B-1 correction) -- inserts ANY
+    MemoryItem exactly as given, including an arbitrary initial lifecycle
+    (CONFIRMED/CORRECTED included) with no category restriction, no
+    provenance verification, and no idempotency check. This is exactly the
+    generic mutation bypass Phase 2B-1 exists to close for production code:
+    it must NEVER be called from bot.py or any other production module --
+    tests/test_canonical_memory_bypass_closure.py statically enforces this
+    (a non-allowlisted, non-test module referencing this name fails CI).
+    The only production-code caller is this module's own governed layer
+    below where reusing it is safe (currently none -- the governed writer
+    performs its own INSERT inside its own transaction instead, since this
+    function opens a fresh connection incompatible with that transaction).
+    Test files MAY call this directly as a fixture/setup primitive to
+    construct rows the governed API would refuse (see its own module
+    docstring section and individual test docstrings for why)."""
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             """INSERT INTO core_memory_items (user_id, category, lifecycle, memory_json)
@@ -5843,11 +5859,12 @@ def _decode_and_verify_core_memory_row(
     never includes memory content, category, or lifecycle values -- only
     the row id.
 
-    A row written through add_core_memory_item (the only supported write
-    path until now) or through update_core_memory_item_lifecycle's own
-    atomic transition below always satisfies this by construction; this
-    check exists for whatever a legacy/direct-SQL/corrupted row might
-    contain."""
+    A row written through _add_core_memory_item_unchecked / the governed
+    add_governed_core_memory_candidate, or through
+    _update_core_memory_item_lifecycle_unchecked / the governed
+    apply_governed_core_memory_lifecycle_transition's own atomic
+    transition below, always satisfies this by construction; this check
+    exists for whatever a legacy/direct-SQL/corrupted row might contain."""
     payload = json.loads(memory_json)
     if type(payload) is not dict or "content" not in payload:
         raise ValueError(f"core_memory_items row id={row_id}: malformed persisted payload")
@@ -5926,9 +5943,26 @@ async def list_core_memory_item_records(user_id: int, *, influencing_only: bool 
     return records
 
 
-async def update_core_memory_item_lifecycle(item_id: str, user_id: int,
+async def _update_core_memory_item_lifecycle_unchecked(item_id: str, user_id: int,
                                              lifecycle: _core.MemoryLifecycle) -> bool:
-    """Atomically transitions a core_memory_items row's lifecycle (Phase 2A
+    """INTERNAL DB PRIMITIVE ONLY (Phase 2B-1 correction) -- applies ANY
+    lifecycle value with no governance-graph check at all: an arbitrary
+    same-state update, a direct CANDIDATE->CONFIRMED jump, or resurrection
+    from a terminal lifecycle all succeed here exactly as requested. This
+    is exactly the generic mutation bypass Phase 2B-1 exists to close for
+    production code: it must NEVER be called from bot.py or any other
+    production module -- tests/test_canonical_memory_bypass_closure.py
+    statically enforces this (a non-allowlisted, non-test module
+    referencing this name fails CI). The governed
+    apply_governed_core_memory_lifecycle_transition below does NOT call
+    this function -- it reimplements the same atomic SQL+JSON update
+    itself, additionally gated by the pure governance transition graph and
+    a caller-stated expected-current-lifecycle CAS check this primitive
+    does not have. Test files MAY call this directly as a fixture/setup
+    primitive to construct a row state the governed API would refuse to
+    reach (see individual test docstrings for why).
+
+    Atomically transitions a core_memory_items row's lifecycle (Phase 2A
     correction, P1-A) -- the SQL `lifecycle` column and memory_json's own
     "lifecycle" key are updated together in ONE UPDATE statement, never one
     write followed by a second independent write. Returns False (zero
@@ -5977,6 +6011,363 @@ async def update_core_memory_item_lifecycle(item_id: str, user_id: int,
                updated_at=datetime('now')
                WHERE id=? AND user_id=? AND lifecycle=?""",
             (lifecycle.value, new_memory_json, item_id, user_id, prior_sql_lifecycle))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+# ── Governed Canonical Memory Persistence Boundary (Phase 2B-1) ────────────
+# Policy (which categories/transitions are legal) lives in
+# canonical_memory_governance.py (pure, offline, no DB access); this section
+# is the only code allowed to act on that policy against core_memory_items.
+# Neither function below is called by bot.py or any other production code
+# in this slice -- see canonical_memory_governance.py's own module
+# docstring.
+#
+# BYPASS CLOSURE (Phase 2B-1 V2 correction): the two generic mutation
+# primitives above -- now named _add_core_memory_item_unchecked and
+# _update_core_memory_item_lifecycle_unchecked -- are private (leading
+# underscore) precisely because they are NOT the supported write path for
+# any production code: add_governed_core_memory_candidate and
+# apply_governed_core_memory_lifecycle_transition below are the only
+# SUPPORTED public mutation APIs for canonical memory. Renaming them
+# (rather than leaving the original public names in place alongside these
+# new governed ones) is the whole point of this correction pass -- a
+# public add_core_memory_item/update_core_memory_item_lifecycle sitting
+# next to a governed alternative would still be an unrestricted bypass
+# available to any future caller who simply doesn't know (or ignores) the
+# governed one. tests/test_canonical_memory_bypass_closure.py statically
+# proves no non-allowlisted, non-test module in this repository references
+# either private name -- a future accidental (or convenience-motivated)
+# bypass fails CI rather than relying on this comment or a naming
+# convention alone.
+
+def _source_event_ids_exactly_equal(left, right) -> bool:
+    """Phase 2B-1 V6 correction -- type-exact provenance identity, used
+    ONLY for the exact-retry duplicate-identity comparison inside
+    add_governed_core_memory_candidate below (never for validating a NEW
+    candidate's own provenance shape, which stays exactly as strict as
+    before -- see canonical_memory_governance.validate_new_candidate_
+    provenance_shape).
+
+    Ordinary Python list equality is not type-exact: `[True] == [1]` and
+    `[1.0] == [1]` are both True, because bool/float compare equal to int
+    by value. That makes plain `==` unsafe for provenance IDENTITY: an
+    existing, already-persisted row with malformed provenance (e.g.
+    source_event_ids=[True], only reachable via the private unchecked
+    primitive or genuinely historical data -- never via this module's own
+    validated write path) could otherwise be wrongly treated as the exact
+    retry of a brand-new, validly-typed candidate submitting
+    source_event_ids=[1], causing the malformed row's id to be returned
+    instead of creating the new, correctly-typed row.
+
+    Two source_event_ids values are identical only if: both are exactly
+    `list`; same length; and every corresponding pair of elements is
+    exactly `int` on BOTH sides (bool rejected on either side, since
+    `type(True) is bool`, never `int`, despite bool being an int
+    subclass) and numerically equal, in the same order. Never sorts,
+    coerces, casts, or otherwise normalizes either side."""
+    if type(left) is not list or type(right) is not list:
+        return False
+    if len(left) != len(right):
+        return False
+    return all(
+        type(a) is int and type(b) is int and a == b
+        for a, b in zip(left, right))
+
+
+async def add_governed_core_memory_candidate(
+        user_id: int, *, category: _core.MemoryCategory, content: str,
+        source_event_ids: list, confidence: float = 0.0) -> int:
+    """GOVERNED PERSISTENCE BOUNDARY V1 (Phase 2B-1) -- the ONLY write path
+    a future canonical-memory candidate writer (Phase 2B-2, NOT this
+    slice) may use to create a new core_memory_items row. Always creates
+    lifecycle=CANDIDATE; the caller cannot choose any other initial
+    lifecycle -- there is no lifecycle parameter at all.
+
+    Every check below runs BEFORE any database access, in this exact
+    order, and is fail-closed (raises ValueError, zero DB writes) on the
+    first violation:
+      1. category must be one of canonical_memory_governance.
+         GENERIC_CANDIDATE_WRITABLE_CATEGORIES -- CONFIRMED_PATTERN,
+         INTERVENTION, OUTCOME, and PLAN are refused here (they need their
+         own specialized evidence/outcome contracts, not this generic
+         boundary);
+      2. content must be exactly str, non-empty, not whitespace-only,
+         already normalized (content == content.strip()), and at most
+         canonical_memory_governance.MAX_NEW_CANDIDATE_CONTENT_CHARS
+         characters -- this function never relies on MemoryItem.
+         __post_init__'s own silent stripping/clipping to make unsafe
+         input safe; if persistence would alter the supplied content, the
+         candidate is rejected instead;
+      3. source_event_ids must be exactly a non-empty list of unique,
+         positive int values (bool rejected) -- structural shape only;
+      4. confidence must be in [0,1] -- enforced by MemoryItem's own
+         __post_init__ when the item is constructed just below.
+
+    After construction, item.content is re-verified to be byte-for-byte
+    identical to the raw `content` argument -- a second, independent
+    defense-in-depth layer against any future drift between this
+    function's own bound and MemoryItem's internal one.
+
+    PROVENANCE VERIFICATION (mandatory, DB-backed): every source_event_ids
+    entry must reference a real `messages` row that (a) exists, (b)
+    belongs to this exact user_id, and (c) is genuinely user-authored --
+    requiring the COHERENT pair role='user' AND source='USER_AUTHORED'
+    together (see MessageSource above), never either field alone (Phase
+    2B-1 V5 correction). `role` says who a persisted conversational turn
+    is attributed to; `source` says how that row actually originated --
+    neither is trusted in isolation, since a corrupted/inconsistent row
+    (e.g. role='assistant' with source='USER_AUTHORED') must never pass
+    as user-authored provenance just because one of the two fields says
+    so. This also correctly rejects a SYNTHETIC_UI row (a normalized
+    Telegram-button label, which also persists with role='user' but
+    source='SYNTHETIC_UI') and a legacy source IS NULL row. ANY single
+    invalid provenance member rejects the WHOLE candidate -- there is no
+    partial acceptance of the valid subset. This check runs inside the
+    same BEGIN IMMEDIATE transaction as the insert below, so no write can
+    ever occur before it succeeds.
+
+    EXACT-RETRY IDEMPOTENCY (Phase 2B-1 V2 correction -- broadened; V6
+    correction -- type-exact provenance comparison): within the same
+    atomic transaction, this function looks for an EXISTING
+    core_memory_items row for this exact user_id + category, AT ANY
+    LIFECYCLE (not only CANDIDATE), whose decoded content is exactly
+    equal AND whose source_event_ids is TYPE-EXACTLY equal (see
+    _source_event_ids_exactly_equal below -- same list length, same
+    order, every element exactly `int` on both sides and numerically
+    equal; ordinary Python `==` is NOT used here because it is not
+    type-exact: `[True] == [1]` and `[1.0] == [1]` are both True in
+    Python, which would wrongly let a malformed EXISTING row masquerade
+    as the exact retry of a validly-typed new candidate) to this
+    submission. If one is found, NO new row is inserted -- the existing
+    row's id is returned unchanged, regardless of whether that row is
+    currently CANDIDATE, PROPOSED, CONFIRMED, CORRECTED, REJECTED,
+    HISTORICAL, or EXPIRED. A retry must not create a second row merely
+    because the original row has since advanced (or terminated) along
+    the lifecycle graph -- exact-submission identity (same user, same
+    category, exact content, exact provenance) is independent of
+    lifecycle progression. If NO existing row is a type-exact match
+    (including when the only content-equal candidate has malformed
+    provenance, e.g. [True] where the new submission validly has [1]),
+    this function proceeds to insert a genuinely new row exactly as if no
+    candidate match existed at all -- a malformed historical row is never
+    treated as a match, never repaired, and never deleted; it is simply
+    not the answer to "does an exact duplicate already exist". This is
+    exact-submission idempotency only; it is deliberately NOT semantic/
+    fuzzy deduplication, does not merge different provenance, and uses no
+    model call.
+
+    DETERMINISTIC SELECTION ON MULTIPLE MATCHES: if more than one existing
+    row happens to match this exact identity (e.g. historical/legacy data,
+    or two prior genuinely-concurrent inserts that both slipped through
+    before this guard existed), the LOWEST core_memory_items.id -- i.e.
+    the oldest, first-ever-created matching row -- is the one returned.
+    The scan reads `ORDER BY id ASC` and returns on the first match found,
+    so this is deterministic and reproducible, never a function of dict/
+    set iteration order or of which duplicate happens to be scanned last.
+
+    CONCURRENCY: the provenance check, the idempotency scan, and the
+    insert (or idempotent no-op) all run inside one explicit
+    BEGIN IMMEDIATE / COMMIT (or ROLLBACK on any exception) transaction --
+    the same pattern already used by this module's own atomic migration
+    helper above (_migrate_interaction_tables_atomically) -- so two
+    genuinely concurrent identical submissions for the same user cannot
+    both observe "no existing row" and both insert: SQLite serializes the
+    second writer behind the first's RESERVED lock, and it will observe
+    the first writer's committed row when its own idempotency scan runs.
+    No new schema column or index is added solely for this -- the scan is
+    a plain SELECT over the existing (user_id, category) shape (only
+    idx_core_memory_items_user on user_id backs it), scoped narrowly
+    enough at this repository's expected per-user memory-item scale to
+    stay cheap without a dedicated composite index; that would need
+    revisiting only if per-user/per-category row counts grow large.
+
+    Raises ValueError for every validation failure above (including an
+    existing CANDIDATE row for this identity that is itself already
+    internally divergent/malformed -- this function never silently papers
+    over that by inserting a duplicate anyway; see
+    _decode_and_verify_core_memory_row). Returns the new (or matched
+    existing) core_memory_items row id. Never logs or echoes memory
+    content in any exception message."""
+    if not _governance.is_generic_candidate_writable_category(category):
+        raise ValueError(
+            "add_governed_core_memory_candidate: category is not "
+            f"generic-candidate-writable: {category!r}")
+    _governance.validate_new_candidate_content(content)
+    _governance.validate_new_candidate_provenance_shape(source_event_ids)
+
+    item = _core.MemoryItem(
+        category=category, lifecycle=_core.MemoryLifecycle.CANDIDATE,
+        content=content, confidence=confidence,
+        source_event_ids=list(source_event_ids))
+    if item.content != content:
+        raise ValueError(
+            "add_governed_core_memory_candidate: constructed MemoryItem.content "
+            "does not exactly match the supplied raw content -- rejecting "
+            "rather than persisting a silently altered value")
+
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            placeholders = ",".join("?" * len(source_event_ids))
+            cur = await db.execute(
+                f"SELECT id, user_id, role, source FROM messages WHERE id IN ({placeholders})",
+                source_event_ids)
+            found = {row[0]: (row[1], row[2], row[3]) for row in await cur.fetchall()}
+            for event_id in source_event_ids:
+                if event_id not in found:
+                    raise ValueError(
+                        "add_governed_core_memory_candidate: source_event_ids "
+                        f"references a message row that does not exist: {event_id!r}")
+                row_user_id, row_role, row_source = found[event_id]
+                if row_user_id != user_id:
+                    raise ValueError(
+                        "add_governed_core_memory_candidate: source_event_ids "
+                        f"entry {event_id!r} does not belong to this user_id")
+                # Phase 2B-1 V5 correction: require the COHERENT pair, not
+                # source alone. `role` says who a persisted conversational
+                # turn is attributed to; `source` says how that row
+                # actually originated (see MessageSource above) -- neither
+                # field is trusted in isolation. A corrupted/inconsistent
+                # row (e.g. role='assistant' with source='USER_AUTHORED')
+                # must never pass as user-authored provenance just because
+                # one of the two fields happens to say so.
+                if row_role != "user" or row_source != MessageSource.USER_AUTHORED.value:
+                    raise ValueError(
+                        "add_governed_core_memory_candidate: source_event_ids "
+                        f"entry {event_id!r} is not a genuinely user-authored "
+                        "message (requires role='user' AND "
+                        "source='USER_AUTHORED' together)")
+
+            # Broadened (V2 correction): scans EVERY lifecycle for this
+            # (user_id, category), not only CANDIDATE -- see the
+            # EXACT-RETRY IDEMPOTENCY docstring section above. ORDER BY id
+            # ASC + "return on first match" makes the lowest-id (oldest)
+            # match the deterministic winner whenever more than one
+            # existing row happens to satisfy the exact identity.
+            cur = await db.execute(
+                "SELECT id, category, lifecycle, memory_json FROM core_memory_items "
+                "WHERE user_id=? AND category=? ORDER BY id ASC",
+                (user_id, category.value))
+            existing_rows = await cur.fetchall()
+            for row_id, sql_category, sql_lifecycle, memory_json in existing_rows:
+                existing_item = _decode_and_verify_core_memory_row(
+                    row_id, sql_category, sql_lifecycle, memory_json)
+                if (existing_item.content == item.content
+                        and _source_event_ids_exactly_equal(
+                            existing_item.source_event_ids, item.source_event_ids)):
+                    await db.rollback()
+                    return row_id
+
+            cur = await db.execute(
+                """INSERT INTO core_memory_items (user_id, category, lifecycle, memory_json)
+                   VALUES (?,?,?,?)""",
+                (user_id, item.category.value, item.lifecycle.value, json.dumps(item.to_dict())))
+            await db.commit()
+            return cur.lastrowid
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def apply_governed_core_memory_lifecycle_transition(
+        user_id: int, memory_item_id: int, *,
+        expected_current_lifecycle: _core.MemoryLifecycle,
+        target_lifecycle: _core.MemoryLifecycle) -> bool:
+    """GOVERNED PERSISTENCE BOUNDARY V1 (Phase 2B-1) -- the ONLY lifecycle
+    transition path a future canonical-memory writer may use, and (V2
+    correction) the only PUBLIC one at all: the old unrestricted
+    update_core_memory_item_lifecycle was renamed to the private
+    _update_core_memory_item_lifecycle_unchecked (see that function's own
+    docstring and the module-level Phase 2B-1 section comment above) and
+    must never be called from production code -- statically enforced by
+    tests/test_canonical_memory_bypass_closure.py. This function does NOT
+    call that private primitive -- it reimplements the same atomic SQL+
+    JSON update itself, additionally gated by the pure governance
+    transition graph and a caller-stated expected-current-lifecycle CAS
+    check the private primitive does not have: that primitive blindly
+    compare-and-swaps against whatever the row's CURRENT lifecycle happens
+    to be, with no concept of what the CALLER believed that value was;
+    this function additionally requires the caller to state
+    expected_current_lifecycle and refuses -- returns False, zero writes --
+    the moment the row's real, verified current lifecycle does not match
+    it.
+
+    Order of operations, each fail-closed:
+      1. (expected_current_lifecycle -> target_lifecycle) must be exactly
+         one of the closed edges in canonical_memory_governance.
+         ALLOWED_LIFECYCLE_TRANSITIONS -- checked BEFORE any database
+         access; an illegal edge (e.g. CANDIDATE -> CONFIRMED, any edge
+         out of a terminal lifecycle, or any same-state pair) raises
+         ValueError immediately, zero DB access;
+      2. the row (user_id, memory_item_id) must exist -- returns False
+         (does not raise) if not, matching the private unchecked
+         primitive's existing not-found contract; this also covers "wrong
+         user" (a memory_item_id owned by a different user simply matches
+         zero rows under the WHERE user_id=? filter -- ownership is never
+         checked separately from existence);
+      3. the existing row is decoded and verified via the shared Phase 2A
+         coherence discipline (_decode_and_verify_core_memory_row) -- an
+         already divergent/malformed row raises ValueError, zero
+         mutation, exactly like the private unchecked primitive's own
+         pre-transition check;
+      4. the row's real, verified current lifecycle must equal
+         expected_current_lifecycle -- a stale caller expectation (the row
+         has since moved to some other lifecycle, by this function or any
+         other path) returns False, zero writes, rather than blindly
+         applying target_lifecycle to whatever the row actually is now.
+
+    Only after all four checks pass does this function write: SQL
+    lifecycle and memory_json's own "lifecycle" key are updated together
+    in ONE UPDATE statement (never two independent writes), additionally
+    guarded by a CAS predicate (WHERE lifecycle=expected_current_lifecycle)
+    for defense-in-depth against a same-millisecond concurrent writer --
+    the same single-statement-CAS discipline the private unchecked
+    primitive already uses, so no explicit BEGIN IMMEDIATE is needed here:
+    the UPDATE's own WHERE clause is what actually determines whether the
+    transition applies, not the earlier Python-level read. Every other
+    MemoryItem field -- category, content, confidence, source_event_ids --
+    is preserved byte-for-byte unchanged; only the "lifecycle" JSON key
+    and the SQL lifecycle column are ever touched.
+
+    Returns True iff the transition was actually applied. Never logs or
+    echoes memory content in any exception message."""
+    if not _governance.is_allowed_lifecycle_transition(
+            expected_current_lifecycle, target_lifecycle):
+        raise ValueError(
+            "apply_governed_core_memory_lifecycle_transition: "
+            f"{expected_current_lifecycle!r} -> {target_lifecycle!r} is not "
+            "an allowed transition")
+
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT category, lifecycle, memory_json FROM core_memory_items "
+            "WHERE id=? AND user_id=?",
+            (memory_item_id, user_id))
+        row = await cur.fetchone()
+        if row is None:
+            return False
+        sql_category, sql_lifecycle, memory_json = row
+        # Fail-closed pre-transition check -- raises, with zero mutation,
+        # if this row is already internally inconsistent (same discipline
+        # as _update_core_memory_item_lifecycle_unchecked's own pre-check
+        # above).
+        existing_item = _decode_and_verify_core_memory_row(
+            memory_item_id, sql_category, sql_lifecycle, memory_json)
+
+        if existing_item.lifecycle is not expected_current_lifecycle:
+            return False  # stale expected lifecycle -- zero writes
+
+        payload = json.loads(memory_json)
+        payload["lifecycle"] = target_lifecycle.value
+        new_memory_json = json.dumps(payload)
+
+        cur = await db.execute(
+            """UPDATE core_memory_items SET lifecycle=?, memory_json=?,
+               updated_at=datetime('now')
+               WHERE id=? AND user_id=? AND lifecycle=?""",
+            (target_lifecycle.value, new_memory_json, memory_item_id, user_id,
+             expected_current_lifecycle.value))
         await db.commit()
         return cur.rowcount > 0
 
