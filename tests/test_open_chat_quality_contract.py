@@ -204,15 +204,15 @@ def test_no_state_engine_labels_injected_into_open_chat():
 # ── 9. Reviewed DB schema baseline (pinned, not "no changes") ───────────────
 # This pin is NOT "the schema must never change" -- it is "any schema change
 # must be a deliberate, reviewed baseline update, never an accidental drift."
-# Updated for Push V1 (PR #114): the only change from the prior baseline is
-# the addition of `push_action_bindings` and its one index,
-# `idx_push_action_bindings_open` -- see database.py's
-# _PUSH_ACTION_BINDINGS_TABLE_DDL / _PUSH_ACTION_BINDINGS_INDEX_DDL. No other
-# table, column, or index changed.
+# Updated for PUSH RESUME TARGET V1: the only change from the prior baseline
+# is one additive, nullable column on the existing `push_action_bindings`
+# table -- `resume_source_event_id INTEGER` -- see database.py's
+# _PUSH_ACTION_BINDINGS_TABLE_DDL and the adjacent _MIGRATIONS entry. No
+# other table, column, index, or CHECK constraint changed.
 
 def test_no_db_schema_changes():
     assert _h(database.SCHEMA) == (
-        "fc622426534c7b54925fceb41deac670f5df1c018495a4b74641ea733efd2089")
+        "83ed8f7ee30a8fc2a4b02b4f9cb7d408a48c7f043a3710710bfa2aea1c21dfe9")
 
 
 # ── Fixture-file sanity (structural only -- never asserts response quality) ─

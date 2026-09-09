@@ -315,11 +315,20 @@ async def _finalize_push_record(uid: int, tier: str, anchor_turn_id: int,
 
 
 async def _generate_contextual_push_text(
-        uid: int, lang: str, anchor_turn_id: int, model_client) -> str | None:
+        uid: int, lang: str, anchor_turn_id: int, model_client,
+) -> "push_contextual_reengagement.ContextualReengagementSelection | None":
     """Build exact-anchor trusted context and make one minimized generation.
 
     No identifiers are placed in the provider request. Any DB/build/provider/
     output failure means no Push; this boundary has no neutral fallback.
+
+    Returns a ContextualReengagementSelection (rendered text + the exact
+    persisted row id of the one whole USER turn it quotes), not a bare
+    string -- see push_contextual_reengagement.py's own PUSH RESUME TARGET
+    V1 docstring section. That id is later threaded into create_push_
+    action_bindings/final_push_keyboard_publish_guard below so a future
+    Continue tap can resume the SAME topic instead of a model re-selecting
+    a different one.
     """
     if model_client is None:
         return None
@@ -384,7 +393,11 @@ async def _send_silence_pushes(bot: Bot, model_client=None) -> None:
     reports "lifecycle_invalidated", in which case no binding is created
     and no keyboard is ever attached. Otherwise sends one short contextual
     Push grounded in bounded trusted history through the exact anchor, and —
-    only if its two-button binding is durably created
+    only if its two-button binding is durably created (carrying, alongside
+    the existing anchor_turn_id, the exact resume_source_event_id of the
+    one USER turn the sent copy quoted -- PUSH RESUME TARGET V1, see
+    push_contextual_reengagement.ContextualReengagementSelection and
+    database.create_push_action_bindings)
     AND final_push_keyboard_publish_guard (P1 correction, § delete-all-
     between-binding-and-publication) confirms, in the LAST awaited DB read
     before the edit call, that both bindings are still open and the anchor
@@ -494,10 +507,36 @@ async def _send_silence_pushes(bot: Bot, model_client=None) -> None:
         # recheck and final lifecycle guard. Insufficient USER_AUTHORED
         # evidence, provider failure, or deterministic output rejection means
         # no Push; the former fixed neutral card is deliberately not used.
-        push_text = await _generate_contextual_push_text(
+        # PUSH RESUME TARGET V1: `selection` carries both the rendered text
+        # AND the exact persisted row id of the one USER turn it quotes --
+        # see push_contextual_reengagement.ContextualReengagementSelection.
+        selection = await _generate_contextual_push_text(
             uid, lang or "ru", anchor_turn_id, model_client)
-        if push_text is None:
+        if selection is None:
             continue
+        # OWNER CORRECTION V3, P1 -- defensive boundary check. A targetless
+        # ContextualReengagementSelection is not supposed to be
+        # constructible at all (see its own __post_init__ -- resume_
+        # source_event_id is a required positive int there), but this is
+        # the one place a malformed/mocked selection would otherwise
+        # silently reach create_push_action_bindings and be treated as "no
+        # resume target supplied" (the legacy/non-contextual shape) rather
+        # than the contract violation it actually is. No target -> no push.
+        # OWNER CORRECTION V4, P3-1 -- tightened to also reject a forged
+        # non-positive int (e.g. a mocked/forged selection carrying -1):
+        # type(...) is int alone would let a structurally-impossible
+        # negative/zero id reach create_push_action_bindings, which would
+        # itself still raise (its own __post_init__-equivalent validation
+        # rejects <= 0), but that is a ValueError from deep inside the
+        # binding-creation transaction, well after the plain-text push has
+        # already been sent -- catching it here, before ANY send, is
+        # strictly earlier and matches ContextualReengagementSelection.
+        # __post_init__'s own exact positive-int check.
+        _resume_target = getattr(selection, "resume_source_event_id", None)
+        if type(_resume_target) is not int or _resume_target <= 0:
+            print(f"[scheduler] contextual selection missing a resume target uid={uid}")
+            continue
+        push_text = selection.text
 
         # P1 correction, § access revocation: a SECOND, fresh access check
         # positioned AFTER the anchor/revision prerequisite awaits -- the
@@ -562,7 +601,8 @@ async def _send_silence_pushes(bot: Bot, model_client=None) -> None:
             rows = [{"token": tokens[action], "action": action, "expires_at": expires_at}
                     for action in ("push_continue", "push_new_topic")]
             batch_ok = await create_push_action_bindings(
-                uid, sent.chat.id, sent.message_id, revision, anchor_turn_id, rows)
+                uid, sent.chat.id, sent.message_id, revision, anchor_turn_id, rows,
+                resume_source_event_id=selection.resume_source_event_id)
         except Exception as e:
             print(f"[scheduler] push binding create failed {uid}: {e}")
             batch_ok = False
@@ -588,7 +628,8 @@ async def _send_silence_pushes(bot: Bot, model_client=None) -> None:
         # when tapped, never resurrect erased state).
         try:
             publishable = await final_push_keyboard_publish_guard(
-                uid, sent.chat.id, sent.message_id, revision, anchor_turn_id, tokens)
+                uid, sent.chat.id, sent.message_id, revision, anchor_turn_id, tokens,
+                resume_source_event_id=selection.resume_source_event_id)
         except Exception as e:
             print(f"[scheduler] push keyboard publish guard failed {uid}: {e}")
             publishable = False

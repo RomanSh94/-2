@@ -453,7 +453,8 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
     # ENGAGEMENT shape/treatment as interaction_button_bindings/
     # professional_entry_triage_bindings above: a bounded navigation choice
     # (which of the two closed push actions the user tapped), never raw
-    # conversation content -- anchor_turn_id is an internal row id, not
+    # conversation content -- anchor_turn_id and (PUSH RESUME TARGET V1)
+    # resume_source_event_id are both internal `messages` row ids, not
     # content itself. CASCADE_DELETE, no special retention.
     "push_action_bindings": _e(
         table="push_action_bindings", user_id_column="user_id", category="ENGAGEMENT",
@@ -462,8 +463,10 @@ PRIVACY_REGISTRY: dict[str, TableEntry] = {
         log_policy="The opaque callback token must never appear in logs/alerts. "
                   "`action` is one of two closed values (push_continue/"
                   "push_new_topic) -- never in logs/alerts. chat_id/"
-                  "source_message_id/anchor_turn_id are internal identifiers, not "
-                  "content, but are still never logged beyond what is already "
+                  "source_message_id/anchor_turn_id/resume_source_event_id are "
+                  "internal identifiers (resume_source_event_id references the "
+                  "one prior USER_AUTHORED messages row a contextual push quoted), "
+                  "not content, but are still never logged beyond what is already "
                   "necessary for delivery."),
 }
 

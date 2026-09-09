@@ -296,6 +296,7 @@ def test_valid_push_v1_button_tap_resets_consecutive_unanswered(monkeypatch):
     # hand-constructed.
     import config
     import scheduler
+    import push_contextual_reengagement
     monkeypatch.setattr(config, "FIRST_USER_ONBOARDING_ENABLED", False)
     real_decide_push = scheduler.decide_push
 
@@ -316,15 +317,29 @@ def test_valid_push_v1_button_tap_resets_consecutive_unanswered(monkeypatch):
         # tests/test_push_v1_scheduler.py. A deterministic stub here lets
         # _send_silence_pushes produce a real, bindable Push without a real
         # (or fake) OpenAI client and without reintroducing the retired
-        # neutral fallback text.
-        return (
-            "В прошлый раз ты писал: «Работа сильно выматывает меня каждый день.» "
-            "— хочешь вернуться к этой теме?"
+        # neutral fallback text. OWNER CORRECTION V3, P1: a
+        # ContextualReengagementSelection can never carry a None target, so
+        # this looks up the real USER_AUTHORED row `run()` below seeds.
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT id FROM messages WHERE user_id=? AND role='user' "
+                "AND source='USER_AUTHORED' AND id<? ORDER BY id DESC LIMIT 1",
+                (uid, anchor_turn_id))
+            row = await cur.fetchone()
+        return push_contextual_reengagement.ContextualReengagementSelection(
+            text=(
+                "В прошлый раз ты писал: «Работа сильно выматывает меня каждый день.» "
+                "— хочешь вернуться к этой теме?"
+            ),
+            resume_source_event_id=row[0],
         )
     monkeypatch.setattr(scheduler, "_generate_contextual_push_text", _fake_contextual_push)
 
     async def run():
         await _seed_stale_user()
+        await database.save_message(
+            USER_ID, "user", "prior user turn", "open_chat", "ru",
+            source=database.MessageSource.USER_AUTHORED)
         await database.save_message(
             USER_ID, "assistant", "prior reply", "open_chat", "ru",
             source=database.MessageSource.ASSISTANT_DELIVERED)
