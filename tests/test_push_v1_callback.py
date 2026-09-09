@@ -29,6 +29,7 @@ import bot
 import config
 import database
 import prompts
+import push_contextual_reengagement as reengagement
 import scheduler
 from crisis_protocol import crisis_screen
 from aiogram.client.session.base import BaseSession
@@ -166,10 +167,29 @@ def _common(monkeypatch, tmp_db):
     # override bot.client themselves (see test_push_contextual_continue.py).
     monkeypatch.setattr(bot, "client", _FakeOpenAIClient(
         raise_exc=RuntimeError("simulated provider failure -- no real network call")))
-    monkeypatch.setattr(
-        scheduler, "_generate_contextual_push_text",
-        _async("В прошлый раз ты говорил, что работа выматывает. Стало ли сейчас легче?"),
-    )
+
+    async def _contextual_copy(uid, lang, anchor_turn_id, _model_client):
+        # PUSH RESUME TARGET V1: looks up whatever real USER_AUTHORED row
+        # this test already seeded (via _seed_grounded_conversation or
+        # _seed_conversation_anchor, both of which now seed one -- see
+        # OWNER CORRECTION V3, P1), so a Continue tap genuinely resolves a
+        # resume target and reaches the real generator -- exactly like a
+        # real push always would. Returns None (no contextual push at all)
+        # when none exists -- a ContextualReengagementSelection can never
+        # carry a None target; None is the correct outcome for a real
+        # production push with no resolvable evidence too.
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT id FROM messages WHERE user_id=? AND role='user' "
+                "AND source='USER_AUTHORED' AND id<? ORDER BY id DESC LIMIT 1",
+                (uid, anchor_turn_id))
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        text = "В прошлый раз ты говорил, что работа выматывает. Стало ли сейчас легче?"
+        return reengagement.ContextualReengagementSelection(
+            text=text, resume_source_event_id=row[0])
+    monkeypatch.setattr(scheduler, "_generate_contextual_push_text", _contextual_copy)
     return stub
 
 
@@ -201,9 +221,15 @@ async def _seed_inactive_user(uid=USER_ID, days_inactive=2):
 
 
 async def _seed_conversation_anchor(uid=USER_ID):
-    """A genuine prior conversational assistant turn -- required for the
-    scheduler to send the Push V1 card at all (Correction #1, Blocker 5).
-    Returns the new messages row id."""
+    """A genuine prior conversational USER+ASSISTANT pair -- required for
+    the scheduler to send the Push V1 card at all (Correction #1, Blocker
+    5) PLUS genuine USER_AUTHORED evidence (OWNER CORRECTION V3, P1: a
+    real production contextual push is never generated without a
+    resolvable resume target). Returns the ASSISTANT row's id (the
+    anchor), matching this helper's pre-existing return contract."""
+    await database.save_message(
+        uid, "user", "prior user turn", "open_chat", "ru",
+        source=database.MessageSource.USER_AUTHORED)
     return await database.save_message(
         uid, "assistant", "prior reply", "open_chat", "ru",
         source=database.MessageSource.ASSISTANT_DELIVERED)
@@ -316,18 +342,31 @@ def test_new_topic_valid_path(_common):
     assert prompts.PUSH_V1_NEW_TOPIC_REPLY_RU in _common.texts()
 
 
+async def _user_message_count(uid=USER_ID):
+    async with database.aiosqlite.connect(database.DB) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_id=? AND role='user'", (uid,))
+        (n,) = await cur.fetchone()
+        return n
+
+
 def test_neither_button_writes_a_fabricated_user_message(_common):
+    # OWNER CORRECTION V3, P1: _deliver_real_push now seeds one genuine
+    # USER_AUTHORED row itself (the resume-target evidence a real
+    # contextual push requires) -- this test's own concern is that the
+    # CALLBACK TAP ITSELF adds no further ones, so it compares before/after
+    # rather than assuming a zero baseline.
     async def run():
+        before = await _user_message_count()
         chat_id, message_id, continue_token, _ = await _deliver_real_push(_common)
         await bot.dp.feed_update(
             bot.bot, _make_callback_update(f"pushbtn:{continue_token}", message_id, chat_id))
-        async with database.aiosqlite.connect(database.DB) as db:
-            cur = await db.execute(
-                "SELECT COUNT(*) FROM messages WHERE user_id=? AND role='user'", (USER_ID,))
-            row = await cur.fetchone()
-        return row[0]
-    user_message_count = asyncio.run(run())
-    assert user_message_count == 0  # a trusted UI tap is never persisted as user free text
+        after = await _user_message_count()
+        return before, after
+    before, after = asyncio.run(run())
+    assert before == 0  # nothing existed before the push was even sent
+    assert after == 1   # only the resume-target row _seed_conversation_anchor
+                         # itself seeded -- the callback tap added ZERO more
 
 
 # ── §13.E / Correction #1 Blocker 1: crisis starts after delivery, and
@@ -932,4 +971,11 @@ def test_new_topic_regression_delivers_once_and_persists_with_correct_provenance
     assert content == prompts.PUSH_V1_NEW_TOPIC_REPLY_RU
     assert source == database.MessageSource.ASSISTANT_DELIVERED.value
     assert scenario == database.PUSH_UI_SCENARIO
-    assert asyncio.run(_user_rows()) == []  # zero fabricated USER rows
+    # OWNER CORRECTION V3, P1: _deliver_real_push now seeds one genuine
+    # USER_AUTHORED row itself (the resume-target evidence a real
+    # contextual push requires) -- the callback tap must add ZERO more,
+    # and every existing user row must be genuinely USER_AUTHORED, never a
+    # fabricated stand-in for the button tap.
+    user_rows = asyncio.run(_user_rows())
+    assert len(user_rows) == 1
+    assert all(r[1] == database.MessageSource.USER_AUTHORED.value for r in user_rows)

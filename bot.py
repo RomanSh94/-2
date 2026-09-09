@@ -5592,7 +5592,9 @@ async def cb_professional_entry_triage(callback: CallbackQuery):
 # validator rejection) -- see _try_push_contextual_continue. The no-anchor
 # path is completely untouched: no model call, no context fetch, same
 # PUSH_V1_NO_ANCHOR_REPLY_* fallback as before.
-async def _try_push_contextual_continue(uid: int, lang: str, anchor_turn_id: int) -> str | None:
+async def _try_push_contextual_continue(
+        uid: int, lang: str, anchor_turn_id: int,
+        resume_source_event_id: int | None) -> str | None:
     """Attempt one real Contextual Continue V1 generation, fenced to the
     EXACT push-send-time anchor_turn_id via database.get_trusted_
     conversation_history_through_anchor -- a DEDICATED primitive, not
@@ -5603,12 +5605,28 @@ async def _try_push_contextual_continue(uid: int, lang: str, anchor_turn_id: int
     scenario=PUSH_UI_SCENARIO is required -- see that function's own
     docstring.
 
-    Two mandatory pre-generation legality checks, in addition to the
+    PUSH RESUME TARGET V1: `resume_source_event_id` is the exact persisted
+    row id of the ONE prior USER turn the original push notification
+    quoted (database.PushActionConsumptionResult.resume_source_event_id,
+    loaded exclusively from the consumed binding row -- never trusted from
+    callback_data). If it is None (no resume target was ever recorded for
+    this binding -- a pre-migration row, or a push whose own generation
+    could not resolve one), this degrades immediately, exactly like every
+    other failure path below: a genuine Contextual Continue generation is
+    never attempted without knowing WHICH topic to resume, since that is
+    exactly the topic-drift gap this contract closes (see push_contextual_
+    continue.py's own module docstring). This also supersedes the earlier
+    generic "at least one USER turn survives" check -- resolving one
+    SPECIFIC required USER turn (done inside push_contextual_continue.
+    build_messages, via generate_push_contextual_continue below) is a
+    strictly more precise version of that same guarantee.
+
+    One mandatory pre-generation legality check remains, in addition to the
     empty-context check, before the model is ever called (owner P1
     correction):
 
-    (1) EXACT-ANCHOR-SURVIVES: the bounded context's FINAL turn must be
-    the exact anchor_turn_id, as an ASSISTANT turn. turn_belongs_to_user
+    EXACT-ANCHOR-SURVIVES: the bounded context's FINAL turn must be the
+    exact anchor_turn_id, as an ASSISTANT turn. turn_belongs_to_user
     (called by the caller before this function runs) only proves the row
     exists/same-uid/role='assistant' -- it does NOT prove source=
     ASSISTANT_DELIVERED, scenario!=push_ui, or that the anchor survived
@@ -5625,19 +5643,15 @@ async def _try_push_contextual_continue(uid: int, lang: str, anchor_turn_id: int
     bound, so the anchor -- if present at all -- can only ever be the
     last entry; no separate DB round-trip is needed to prove this.
 
-    (2) TRUSTED-USER-EVIDENCE-REQUIRED: at least one ConversationTurnRole.
-    USER turn must survive in the bounded context. Prior ASSISTANT content
-    is discourse history only (see push_contextual_continue.py's own
-    module docstring) -- it is NEVER sufficient by itself to establish
-    what the conversation is actually about, so an assistant-only context
-    must degrade exactly like an empty one.
-
     Returns the validator-accepted candidate text, or None on ANY failure
-    (empty trusted context, exact anchor not surviving, no trusted USER
-    turn, a provider/network failure, or Safety Validator rejection).
+    (no resume target, empty trusted context, exact anchor not surviving,
+    the resume target not resolving as a USER turn inside the bounded
+    context, a provider/network failure, or Safety Validator rejection).
     Never raises to its caller and never itself returns or constructs a
     fallback string -- _push_continue_reply_text alone owns the fallback
     decision on None."""
+    if resume_source_event_id is None:
+        return None
     try:
         rows = await get_trusted_conversation_history_through_anchor(uid, anchor_turn_id)
         context = build_conversation_context_from_history_rows(rows)
@@ -5653,14 +5667,10 @@ async def _try_push_contextual_continue(uid: int, lang: str, anchor_turn_id: int
         # never fall back to an older conversation and pretend it is the
         # exact anchored one.
         return None
-    if not any(turn.role is ConversationTurnRole.USER for turn in context.turns):
-        # Assistant discourse alone never establishes what the
-        # conversation is about.
-        return None
     try:
         candidate = await push_contextual_continue.generate_push_contextual_continue(
             client=client, model="gpt-4o-mini", conversation_context=context,
-            lang=lang, max_tokens=300,
+            lang=lang, max_tokens=300, resume_source_event_id=resume_source_event_id,
         )
     except Exception as e:
         print(f"[push-v1] contextual continue generation FAILED uid={uid}: {type(e).__name__}")
@@ -5673,13 +5683,16 @@ async def _try_push_contextual_continue(uid: int, lang: str, anchor_turn_id: int
     return candidate
 
 
-async def _push_continue_reply_text(uid: int, lang: str, anchor_turn_id: int | None) -> tuple[str, str]:
+async def _push_continue_reply_text(
+        uid: int, lang: str, anchor_turn_id: int | None,
+        resume_source_event_id: int | None) -> tuple[str, str]:
     """If the anchored assistant turn from push-send time still exists and
     still belongs to this user, ATTEMPT a real contextual continuation
     first (see _try_push_contextual_continue); on any failure there, or if
     there is no anchor at all, degrade to the existing deterministic
     reply -- never an invented continuation, and the model is NEVER
-    consulted at all when there is no anchor. Returns (text, scenario):
+    consulted at all when there is no anchor (or no resume_source_event_id
+    -- see _try_push_contextual_continue). Returns (text, scenario):
     scenario is push_contextual_continue.SCENARIO (a genuine conversational
     turn) only for a successful contextual generation; every fallback path
     keeps the original PUSH_UI_SCENARIO tagging unchanged, since those
@@ -5693,7 +5706,8 @@ async def _push_continue_reply_text(uid: int, lang: str, anchor_turn_id: int | N
     if not has_anchor:
         return (PUSH_V1_NO_ANCHOR_REPLY_EN if lang == "en" else PUSH_V1_NO_ANCHOR_REPLY_RU,
                 PUSH_UI_SCENARIO)
-    contextual = await _try_push_contextual_continue(uid, lang, anchor_turn_id)
+    contextual = await _try_push_contextual_continue(
+        uid, lang, anchor_turn_id, resume_source_event_id)
     if contextual is not None:
         return contextual, push_contextual_continue.SCENARIO
     return (PUSH_V1_CONTINUE_REPLY_EN if lang == "en" else PUSH_V1_CONTINUE_REPLY_RU,
@@ -5733,8 +5747,14 @@ async def cb_push_action(callback: CallbackQuery, state: FSMContext = None):
     to the EXACT opaque token this tap consumed (not merely a numeric
     revision -- see that function's own docstring for the delete-all/
     bump_user_revision ABA gap this closes), the exact post_consume_
-    revision, live unresolved-crisis state, and (only when the reply
-    genuinely depends on it) the exact anchor. Immediately before the
+    revision, live unresolved-crisis state, the exact consumed row's own
+    resume_source_event_id (PUSH RESUME TARGET V1 / OWNER CORRECTION
+    P2-A -- this row-identity re-affirmation is unconditional, always the
+    value this consumption actually read), and (only when the reply
+    genuinely depends on it) the exact anchor, plus -- for
+    resume_source_event_id specifically -- whether that target must ALSO
+    still resolve live (require_live_resume_target, true only for a
+    genuine grounded Contextual Continue generation). Immediately before the
     Telegram send -- and again immediately after it returns, before
     persistence begins -- a SEPARATE, purely in-memory, non-awaited check
     (_user_generation_superseded) catches a newer ordinary turn (e.g.
@@ -5813,7 +5833,8 @@ async def cb_push_action(callback: CallbackQuery, state: FSMContext = None):
         # _try_push_contextual_continue. Every check below re-verifies the
         # user's lifecycle live, because it may have changed during that
         # await exactly like during any other awaited prerequisite.
-        text, scenario = await _push_continue_reply_text(uid, lang, result.anchor_turn_id)
+        text, scenario = await _push_continue_reply_text(
+            uid, lang, result.anchor_turn_id, result.resume_source_event_id)
     else:
         # New Topic: no context, no model call, always the fixed reply,
         # always PUSH_UI_SCENARIO -- product behavior unchanged.
@@ -5829,20 +5850,44 @@ async def cb_push_action(callback: CallbackQuery, state: FSMContext = None):
     if await _onboarding_blocks_ordinary_entry(uid):
         return
 
-    # The anchor is only "required" for THIS response when it is a real,
-    # anchor-grounded contextual generation -- every deterministic fallback
-    # string (no-anchor / empty-context / assistant-only / oversized-anchor
-    # / provider-failure / validator-rejection) and every New Topic reply
-    # does not depend on the anchor's content at all, so its own
-    # disappearance must not block an otherwise-current deterministic
-    # reply. (result.action != "push_continue" alone already makes
-    # scenario != push_contextual_continue.SCENARIO, so this one
+    # OWNER CORRECTION V4, P2-2: guard_anchor is passed UNCONDITIONALLY --
+    # always the exact value this consumption actually read from the
+    # token's own row (never re-derived, never scenario-conditioned, never
+    # nulled out for New Topic or a fallback) -- exactly mirroring how
+    # resume_source_event_id is already passed below, so the guard can
+    # re-affirm BOTH row identities for EITHER action alike (both rows of
+    # one push card always carry the same stored anchor_turn_id and
+    # resume_source_event_id; see database.create_push_action_bindings).
+    # require_live_anchor is the SEPARATE, scenario-conditioned flag: only
+    # a genuine Contextual Continue generation that was actually grounded
+    # in the anchor's CONTENT needs that content to still resolve live;
+    # every fallback/New-Topic reply does not depend on it at all, so its
+    # own later disappearance must never block an otherwise-current
+    # deterministic reply. (result.action != "push_continue" alone already
+    # makes scenario != push_contextual_continue.SCENARIO, so this one
     # expression is correct for both actions without a separate branch.)
-    guard_anchor = result.anchor_turn_id if scenario == push_contextual_continue.SCENARIO else None
+    guard_anchor = result.anchor_turn_id
+    require_live_anchor = scenario == push_contextual_continue.SCENARIO
+    # OWNER CORRECTION P2-A: resume_source_event_id is passed UNCONDITIONALLY
+    # -- always the exact value this consumption actually read from the
+    # token's own row (never re-derived, never scenario-conditioned) -- so
+    # the guard can re-affirm row identity for EITHER action alike (both
+    # rows of one push card always carry the same stored value; see
+    # database.create_push_action_bindings). require_live_resume_target is
+    # the SEPARATE, scenario-conditioned flag: only a genuine Contextual
+    # Continue generation that was actually grounded in the target's
+    # CONTENT needs that content to still resolve live; every fallback/
+    # New-Topic reply does not depend on it at all, so its own later
+    # disappearance must never block an otherwise-current deterministic
+    # reply (exactly the existing guard_anchor reasoning, kept unchanged).
+    require_live_resume_target = scenario == push_contextual_continue.SCENARIO
     try:
         guard_ok = await final_push_action_reply_delivery_guard(
             uid, chat_id, source_message_id, token, result.action,
-            result.post_consume_revision, guard_anchor)
+            result.post_consume_revision, guard_anchor,
+            resume_source_event_id=result.resume_source_event_id,
+            require_live_anchor=require_live_anchor,
+            require_live_resume_target=require_live_resume_target)
     except Exception as e:
         print(f"[push-v1] final guard FAILED uid={uid}: {type(e).__name__}")
         guard_ok = False
@@ -5893,7 +5938,10 @@ async def cb_push_action(callback: CallbackQuery, state: FSMContext = None):
     try:
         persisted = await record_push_action_reply_delivery(
             uid, chat_id, source_message_id, token, result.action,
-            text, scenario, lang, result.post_consume_revision, guard_anchor)
+            text, scenario, lang, result.post_consume_revision, guard_anchor,
+            resume_source_event_id=result.resume_source_event_id,
+            require_live_anchor=require_live_anchor,
+            require_live_resume_target=require_live_resume_target)
     except Exception as e:
         print(f"[push-v1] post-delivery persistence FAILED uid={uid}: {type(e).__name__}")
         return

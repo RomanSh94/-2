@@ -7,12 +7,26 @@ paraphrase, never assistant content, never free-form prose. Application code
 renders the entire notification deterministically from a fixed template plus
 exactly one fixed call-to-action; provider-authored text is never published.
 This module supplies no fallback and performs no database or Telegram I/O.
+
+PUSH RESUME TARGET V1 -- the rendered text alone used to be the entire
+contract (a bare `str`); every real success now returns a
+ContextualReengagementSelection, which ALSO carries the exact persisted
+`messages.id` of the one whole USER turn actually quoted
+(resume_source_event_id). That id is what push_action_bindings later stores
+alongside the existing anchor_turn_id, so a future Continue tap
+(push_contextual_continue.py) can resume the EXACT topic this notification
+named instead of a model re-selecting a different one from the wider
+conversation. This module still places no database id in the provider
+request itself -- resume_source_event_id is recovered purely from the
+already-in-hand turn_row_ids map (see build_messages), never from a second
+lookup or from anything the provider returns.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import re
+from dataclasses import dataclass
 
 from professional_turn_conversation_context import (
     ConversationTurnRole,
@@ -21,6 +35,49 @@ from professional_turn_conversation_context import (
 
 MAX_PUSH_CHARS = 300
 PROVIDER_TIMEOUT_SECONDS = 20
+
+
+@dataclass(frozen=True)
+class ContextualReengagementSelection:
+    """The deterministically rendered push notification text, together with
+    the exact persisted `messages.id` of the ONE whole USER turn it quotes.
+
+    Both halves must travel together from generation all the way through to
+    push_action_bindings -- `text` alone (the previous V1 contract) let the
+    binding remember only an upper-bound anchor_turn_id (the last ASSISTANT
+    turn at send time), never WHICH prior USER turn the notification had
+    actually quoted. That gap is exactly why a Push V1 Continue button's
+    reply used to drift to a different topic than the one shown on the
+    lock screen: push_contextual_continue.py had no way to know which turn
+    to resume. See resume_source_event_id below and push_contextual_
+    continue.build_messages's own docstring.
+
+    OWNER CORRECTION V3, P1 -- resume_source_event_id is a REQUIRED exact
+    positive int, never None. A genuine success (this module's own
+    parse_and_render_selection/generate_contextual_reengagement_push never
+    construct this type any other way) always has a known row id for the
+    selected turn_ref -- see build_messages, which tracks turn_row_ids
+    alongside turn_refs specifically so this is always resolvable. There is
+    no such thing as a "successful selection with no target": a caller
+    that cannot resolve one must treat that as an ordinary generation
+    failure (return None from the top-level function), never construct
+    this type with a placeholder. push_action_bindings.resume_source_
+    event_id remains its own separately nullable DB column (database.py) --
+    that nullability exists ONLY for pre-migration legacy rows that were
+    never created through this contract at all; it is not a reason to
+    weaken this type."""
+    text: str
+    resume_source_event_id: int
+
+    def __post_init__(self):
+        if type(self.text) is not str or not self.text:
+            raise ValueError(
+                "ContextualReengagementSelection.text must be a non-empty str, "
+                f"got {self.text!r}")
+        if type(self.resume_source_event_id) is not int or self.resume_source_event_id <= 0:
+            raise ValueError(
+                "ContextualReengagementSelection.resume_source_event_id must "
+                f"be a positive int, got {self.resume_source_event_id!r}")
 
 _FIXED_CTA = {
     "ru": "хочешь вернуться к этой теме?",
@@ -114,12 +171,29 @@ def _render_push(whole_user_turn: str, lang: str) -> str:
 
 def parse_and_render_selection(
         provider_content: object, turn_refs: dict[str, str], lang: str,
-) -> str | None:
+        turn_row_ids: dict[str, int] | None = None,
+) -> "ContextualReengagementSelection | None":
     """Strictly parse a provider turn_ref selection and deterministically
     render the fixed return-to-topic notification from the COMPLETE
     referenced USER turn. `turn_refs` maps ONLY trusted USER turns' ephemeral
     labels to their full content -- an assistant turn structurally has no
-    entry here, so no key the provider could name ever resolves to one."""
+    entry here, so no key the provider could name ever resolves to one.
+
+    `turn_row_ids` maps the SAME ephemeral labels to the exact persisted
+    `messages.id` of the turn each one stands for -- see build_messages,
+    the only real caller, which always supplies it (in lockstep with
+    turn_refs, built from the SAME loop over the SAME trusted turns).
+
+    OWNER CORRECTION V3, P1 -- a resolved turn_ref selection is a SUCCESS
+    only if turn_row_ids ALSO resolves that same ref to a row id; this
+    function returns None (fails closed) rather than constructing a
+    ContextualReengagementSelection with no target, in every one of these
+    cases: turn_row_ids is None (omitted entirely -- kept as a defaulted
+    parameter only so a caller can request early rejection explicitly,
+    never as a supported "no target" success path), turn_row_ids is not a
+    dict, or turn_row_ids does not contain the resolved turn_ref. There is
+    no such thing as a successful selection with an unknown target -- see
+    ContextualReengagementSelection's own docstring."""
     if type(provider_content) is not str or lang not in _FIXED_CTA:
         return None
     try:
@@ -139,20 +213,30 @@ def parse_and_render_selection(
         # The complete turn must remain unchanged; a Push that would only
         # fit by truncating or summarizing it is skipped, never shortened.
         return None
-    return rendered
+    if type(turn_row_ids) is not dict or turn_ref not in turn_row_ids:
+        return None
+    return ContextualReengagementSelection(
+        text=rendered, resume_source_event_id=turn_row_ids[turn_ref])
 
 
 def build_messages(
         conversation_context: ProfessionalConversationContext,
         anchor_turn_id: int,
         lang: str,
-) -> tuple[list[dict[str, str]], dict[str, str]] | None:
+) -> tuple[list[dict[str, str]], dict[str, str], dict[str, int]] | None:
     """Build one request only for a valid exact-anchor, user-grounded context.
 
-    Returns (messages, turn_refs) where turn_refs maps each trusted USER
-    turn's request-local label (U0, U1, ...) to its complete content. These
-    labels exist only inside this one provider request -- never a database
-    id, Telegram id, or any other persistent identifier."""
+    Returns (messages, turn_refs, turn_row_ids). turn_refs maps each trusted
+    USER turn's request-local label (U0, U1, ...) to its complete content;
+    turn_row_ids maps that SAME label to the turn's exact persisted
+    `messages.id` (professional_turn_conversation_context.ConversationTurn.
+    message_row_id). These labels exist only inside this one provider
+    request -- never a database id, Telegram id, or any other persistent
+    identifier is placed in the request itself; turn_row_ids is purely a
+    local, in-process return value the CALLER uses (via parse_and_render_
+    selection) to recover which real row the provider's selection named, so
+    a later Push V1 Continue tap can resume that EXACT turn instead of the
+    model re-selecting a different one (see push_contextual_continue.py)."""
     if type(conversation_context) is not ProfessionalConversationContext:
         return None
     if type(anchor_turn_id) is not int or anchor_turn_id <= 0 or lang not in ("ru", "en"):
@@ -165,11 +249,13 @@ def build_messages(
         return None
 
     turn_refs: dict[str, str] = {}
+    turn_row_ids: dict[str, int] = {}
     historical_conversation = []
     for turn in conversation_context.turns:
         if turn.role is ConversationTurnRole.USER:
             ref = f"U{len(turn_refs)}"
             turn_refs[ref] = turn.content
+            turn_row_ids[ref] = turn.message_row_id
             historical_conversation.append(
                 {"role": "user", "turn_ref": ref, "content": turn.content})
         else:
@@ -187,18 +273,20 @@ def build_messages(
             ),
         },
     ]
-    return messages, turn_refs
+    return messages, turn_refs, turn_row_ids
 
 
 async def generate_contextual_reengagement_push(
         *, client, model: str, conversation_context: ProfessionalConversationContext,
         anchor_turn_id: int, lang: str, max_tokens: int = 120,
-) -> str | None:
-    """Make one bounded provider call and return validated copy or ``None``."""
+) -> "ContextualReengagementSelection | None":
+    """Make one bounded provider call and return a validated
+    ContextualReengagementSelection (rendered copy + the exact persisted row
+    id it quotes), or ``None`` on any failure/rejection."""
     built = build_messages(conversation_context, anchor_turn_id, lang)
     if built is None or type(max_tokens) is not int or not 1 <= max_tokens <= 512:
         return None
-    messages, turn_refs = built
+    messages, turn_refs, turn_row_ids = built
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
@@ -216,4 +304,4 @@ async def generate_contextual_reengagement_push(
         content = getattr(message, "content", None)
     except Exception:
         return None
-    return parse_and_render_selection(content, turn_refs, lang)
+    return parse_and_render_selection(content, turn_refs, lang, turn_row_ids)

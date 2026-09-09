@@ -122,8 +122,27 @@ def _common(monkeypatch, tmp_db):
     # suppression guard is process-local and must not leak state across
     # tests.
     monkeypatch.setattr(scheduler, "_unrecorded_send_uids", set())
-    async def _contextual_copy(_uid, lang, _anchor_turn_id, _model_client):
-        return _TEST_CONTEXTUAL_PUSH_EN if lang == "en" else _TEST_CONTEXTUAL_PUSH_RU
+    async def _contextual_copy(uid, lang, anchor_turn_id, _model_client):
+        # PUSH RESUME TARGET V1: this suite is about the scheduler's own
+        # gating/lifecycle logic, not resume-target correctness (covered in
+        # tests/test_push_contextual_reengagement.py and tests/
+        # test_push_contextual_continue.py). OWNER CORRECTION V3, P1: a
+        # contextual Selection can never carry a None target, so this stub
+        # looks up whatever real USER_AUTHORED row _seed_conversation_
+        # anchor already seeds alongside the anchor for every test that
+        # expects a push to be sent, and returns None (no contextual push
+        # at all) when none exists -- exactly the real production contract.
+        async with database.aiosqlite.connect(database.DB) as db:
+            cur = await db.execute(
+                "SELECT id FROM messages WHERE user_id=? AND role='user' "
+                "AND source='USER_AUTHORED' AND id<? ORDER BY id DESC LIMIT 1",
+                (uid, anchor_turn_id))
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        text = _TEST_CONTEXTUAL_PUSH_EN if lang == "en" else _TEST_CONTEXTUAL_PUSH_RU
+        return reengagement.ContextualReengagementSelection(
+            text=text, resume_source_event_id=row[0])
     monkeypatch.setattr(scheduler, "_generate_contextual_push_text", _contextual_copy)
     return tmp_db
 
@@ -138,8 +157,19 @@ async def _seed_inactive_user(uid, days_inactive=2, lang="ru"):
 
 
 async def _seed_conversation_anchor(uid, scenario="open_chat"):
-    """A genuine prior conversational assistant turn -- the Push V1 "real
-    conversation anchor" requirement (Correction #1, Blocker 5)."""
+    """A genuine prior conversational USER+ASSISTANT pair -- the Push V1
+    "real conversation anchor" requirement (Correction #1, Blocker 5) PLUS
+    genuine USER_AUTHORED evidence. OWNER CORRECTION V3, P1: a real
+    production contextual push is never generated at all without a
+    resolvable resume target (see push_contextual_reengagement.py's own
+    "no turn_refs -> no push" contract), so a helper claiming to seed "a
+    real conversation anchor" must seed one too, or every test relying on
+    it to produce a sent push would be exercising a fixture that could
+    never occur in production. Returns the ASSISTANT row's id (the
+    anchor), matching this helper's pre-existing return contract."""
+    await database.save_message(
+        uid, "user", "prior user turn", "open_chat", "ru",
+        source=database.MessageSource.USER_AUTHORED)
     return await database.save_message(
         uid, "assistant", "prior reply", scenario, "ru",
         source=database.MessageSource.ASSISTANT_DELIVERED)
@@ -155,7 +185,8 @@ def test_contextual_ru_fixture_satisfies_preview_contract():
         '{"turn_ref":"U0"}',
         {"U0": "Работа сильно выматывает меня каждый день."},
         "ru",
-    ) == _TEST_CONTEXTUAL_PUSH_RU
+        {"U0": 1},
+    ).text == _TEST_CONTEXTUAL_PUSH_RU
 
 
 def test_contextual_en_fixture_satisfies_preview_contract():
@@ -163,7 +194,8 @@ def test_contextual_en_fixture_satisfies_preview_contract():
         '{"turn_ref":"U0"}',
         {"U0": "Work has been exhausting every day."},
         "en",
-    ) == _TEST_CONTEXTUAL_PUSH_EN
+        {"U0": 1},
+    ).text == _TEST_CONTEXTUAL_PUSH_EN
 
 
 def test_contextual_fixture_is_not_the_old_neutral_fallback():
@@ -259,9 +291,9 @@ def test_delete_all_between_binding_creation_and_publication_blocks_keyboard(mon
     real_create = database.create_push_action_bindings
 
     async def _create_then_delete(user_id, chat_id, source_message_id,
-                                   response_revision, anchor_turn_id, bindings):
+                                   response_revision, anchor_turn_id, bindings, **kw):
         ok = await real_create(user_id, chat_id, source_message_id,
-                                response_revision, anchor_turn_id, bindings)
+                                response_revision, anchor_turn_id, bindings, **kw)
         if ok:
             # Real delete-all commits in the gap AFTER bindings are durably
             # written but BEFORE the scheduler reaches the publication
@@ -295,9 +327,9 @@ def test_live_revision_bump_between_binding_creation_and_publication_blocks_keyb
     real_create = database.create_push_action_bindings
 
     async def _create_then_bump(user_id, chat_id, source_message_id,
-                                 response_revision, anchor_turn_id, bindings):
+                                 response_revision, anchor_turn_id, bindings, **kw):
         ok = await real_create(user_id, chat_id, source_message_id,
-                                response_revision, anchor_turn_id, bindings)
+                                response_revision, anchor_turn_id, bindings, **kw)
         if ok:
             # A genuine ordinary user turn commits in the gap AFTER
             # bindings are durably written but BEFORE the publication
@@ -981,3 +1013,51 @@ def test_D_first_attempt_fails_then_real_activity_then_second_attempt_succeeds_z
         return await _consecutive_unanswered(1)
     unanswered = run(scenario())
     assert unanswered == 0
+
+
+# ── OWNER CORRECTION V3, P1: scheduler-level defensive boundary check ──────
+def test_scheduler_never_publishes_targetless_contextual_selection(monkeypatch):
+    # ContextualReengagementSelection.__post_init__ already makes a
+    # targetless Selection unconstructible through any real code path --
+    # the only way to exercise the scheduler's OWN defensive check is a
+    # forged stand-in object that bypasses that validation entirely (e.g. a
+    # test double, or some future refactor that loosens the dataclass).
+    import types
+
+    async def _forged_targetless_selection(_uid, lang, _anchor_turn_id, _model_client):
+        return types.SimpleNamespace(
+            text=_TEST_CONTEXTUAL_PUSH_EN if lang == "en" else _TEST_CONTEXTUAL_PUSH_RU,
+            resume_source_event_id=None,
+        )
+    monkeypatch.setattr(scheduler, "_generate_contextual_push_text", _forged_targetless_selection)
+
+    async def scenario():
+        await _seed_inactive_user_with_anchor(1, days_inactive=2)
+        bot = FakeBot()
+        await scheduler._send_silence_pushes(bot)
+        return bot
+    bot = run(scenario())
+    assert bot.sent == []  # no push at all -- never published with no target
+
+
+# ── OWNER CORRECTION V4, P3-1: the same defensive check must also reject a
+# structurally-impossible NON-POSITIVE forged id, not just a non-int one --
+# ContextualReengagementSelection.__post_init__ already rejects this for
+# any REAL construction, so only a forged/mocked stand-in can exercise it. ──
+def test_scheduler_never_publishes_forged_negative_resume_target(monkeypatch):
+    import types
+
+    async def _forged_negative_selection(_uid, lang, _anchor_turn_id, _model_client):
+        return types.SimpleNamespace(
+            text=_TEST_CONTEXTUAL_PUSH_EN if lang == "en" else _TEST_CONTEXTUAL_PUSH_RU,
+            resume_source_event_id=-1,
+        )
+    monkeypatch.setattr(scheduler, "_generate_contextual_push_text", _forged_negative_selection)
+
+    async def scenario():
+        await _seed_inactive_user_with_anchor(1, days_inactive=2)
+        bot = FakeBot()
+        await scheduler._send_silence_pushes(bot)
+        return bot
+    bot = run(scenario())
+    assert bot.sent == []  # rejected BEFORE any Telegram send, exactly like the None case

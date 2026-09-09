@@ -118,6 +118,18 @@ _PROFESSIONAL_ENTRY_TRIAGE_BINDINGS_INDEX_DDL = (
 # continuation graph. anchor_turn_id is informational only (the last real
 # assistant turn at push-send time, or NULL) -- never a foreign key
 # requirement, unlike interaction_button_bindings.turn_id.
+#
+# PUSH RESUME TARGET V1: resume_source_event_id is additive/nullable (every
+# pre-migration row keeps it NULL, never backfilled -- same convention as
+# messages.source's own MESSAGES PROVENANCE V1 migration below). Unlike
+# anchor_turn_id (an upper-bound SNAPSHOT FENCE -- the last real assistant
+# turn that existed at send time, used to bound what context a Continue tap
+# may ever see), resume_source_event_id is the exact persisted `messages.id`
+# of the ONE whole USER turn the push notification actually quoted -- see
+# push_contextual_reengagement.ContextualReengagementSelection. The two are
+# different concepts that must both be preserved: anchor_turn_id alone was
+# never enough to tell a later Continue tap WHICH prior topic to resume,
+# which is exactly why that tap used to drift to a different one.
 _PUSH_ACTION_BINDINGS_TABLE_DDL = """CREATE TABLE IF NOT EXISTS push_action_bindings (
     token              TEXT PRIMARY KEY,
     user_id            INTEGER NOT NULL,
@@ -125,6 +137,7 @@ _PUSH_ACTION_BINDINGS_TABLE_DDL = """CREATE TABLE IF NOT EXISTS push_action_bind
     source_message_id  INTEGER NOT NULL,
     action             TEXT NOT NULL CHECK (action IN ('push_continue','push_new_topic')),
     anchor_turn_id     INTEGER,
+    resume_source_event_id INTEGER,
     binding_revision   INTEGER NOT NULL,
     created_at         TEXT NOT NULL DEFAULT (datetime('now')),
     expires_at         TEXT NOT NULL,
@@ -975,6 +988,12 @@ _MIGRATIONS = [
     # proposals_migration rebuild below (a plain ADD COLUMN cannot also fix
     # that table's CHECK constraint and partial-index WHERE clause, so a
     # full rebuild is needed anyway -- no separate ADD COLUMN entry required).
+    # PUSH RESUME TARGET V1: nullable on purpose -- see the DDL-adjacent
+    # comment on push_action_bindings above. An upgraded DB's existing open
+    # bindings keep this NULL (never backfilled/guessed); Continue simply
+    # degrades to the existing deterministic fallback reply for those rows,
+    # exactly like a missing/expired anchor already does.
+    ("push_action_bindings", "resume_source_event_id", "INTEGER"),
 ]
 
 
@@ -4409,14 +4428,53 @@ ALLOWED_PUSH_ACTIONS = {"push_continue", "push_new_topic"}
 async def create_push_action_bindings(
         user_id: int, chat_id: int, source_message_id: int,
         response_revision: int, anchor_turn_id: int | None,
-        bindings: list[dict]) -> bool:
+        bindings: list[dict], *, resume_source_event_id: int | None = None) -> bool:
     """Atomic, all-or-nothing creation of the Push V1 Continue/New-topic
     bindings for one just-sent push message. Every row's action is
     validated against ALLOWED_PUSH_ACTIONS BEFORE any SQL runs; the batch
     must contain exactly one row per action -- not fewer, not more, no
     duplicates.
 
-    Inside one BEGIN IMMEDIATE transaction: (1) requires the LIVE
+    PUSH RESUME TARGET V1 -- resume_source_event_id (keyword-only) is a
+    SHARED value stored on BOTH inserted rows, exactly like anchor_turn_id
+    already is: at creation time neither row yet knows which action the
+    user will eventually tap.
+
+    OWNER CORRECTION V3, P1 -- FROZEN CREATION CONTRACT: whenever
+    anchor_turn_id is not None, resume_source_event_id is REQUIRED (not
+    None). NULL is a legitimate STORED value only for a legacy,
+    pre-PUSH-RESUME-TARGET-V1 row that was never created through this
+    function at all -- the modern create API must never itself manufacture
+    a new anchor-bearing row with no resume target (a caller with NO
+    anchor at all, e.g. a genuinely first-ever push, may still omit both).
+    A caller-contract violation (resume_source_event_id structurally
+    impossible -- not a real positive int, or a bool, or supplied with no
+    anchor_turn_id at all, or not strictly before it -- OR anchor_turn_id
+    supplied with no resume_source_event_id at all) is validated BEFORE
+    any SQL runs and raises ValueError, exactly like the action-set checks
+    above -- this is a programming error, never a live race.
+
+    OWNER CORRECTION P1-A -- once a caller HAS supplied a
+    resume_source_event_id (i.e. this is a NEW, genuinely contextual push
+    card), it must resolve, live, to a genuine role='user' AND
+    source='USER_AUTHORED' messages row owned by THIS user_id (the same
+    coherent role/source PAIR check the canonical-memory governance
+    boundary established -- role='user' alone is never proof of
+    authorship). Unlike a prior draft of this function, a failed live
+    check here is FAIL-CLOSED, exactly like the anchor_turn_id check: it
+    rejects the ENTIRE batch (returns False, writes nothing) rather than
+    silently downgrading the stored value to NULL. NULL is a legitimate
+    STORAGE state only for a caller that never supplied a resume target in
+    the first place (resume_source_event_id=None, e.g. every pre-migration
+    row, or any future non-contextual binding batch) -- it is never a
+    valid degradation outcome for a batch whose caller DID supply one.
+    Silently guessing or discarding a supplied-but-unresolvable target
+    would let a push's own Continue button quietly stop being anchored to
+    anything at all, with no signal to the caller that this happened.
+
+    Inside one BEGIN IMMEDIATE transaction, in order (every check BEFORE
+    the supersede step, so a validation failure never touches ANY
+    previously-open binding batch): (1) requires the LIVE
     user_interaction_revision to still equal response_revision (a genuine
     newer ordinary user turn between send and this call means no offer is
     created at all -- the delivered push is left as plain text by the
@@ -4427,12 +4485,16 @@ async def create_push_action_bindings(
     captured response_revision=0 (a genuinely new user's first-ever push)
     could accidentally match; checking the anchor independently closes
     this regardless of what the revision comparison alone would allow;
-    (3) supersedes every still-open push binding this user already has, so
-    an earlier undelivered/unconsumed push's buttons are never actionable
-    once a newer push has been sent; (4) inserts the new rows, each
-    carrying the SAME anchor_turn_id (the last real assistant turn at send
-    time, or None). Returns False (nothing written) if the revision has
-    moved or the anchor no longer exists."""
+    (3) if resume_source_event_id is not None, re-verifies it live as
+    described above -- FAILS THE WHOLE BATCH (returns False) if it no
+    longer resolves; (4) supersedes every still-open push binding this
+    user already has, so an earlier undelivered/unconsumed push's buttons
+    are never actionable once a newer push has been sent; (5) inserts the
+    new rows, each carrying the SAME anchor_turn_id and the SAME
+    resume_source_event_id (exactly as supplied -- never altered). Returns
+    False (nothing written) if the revision has moved, the anchor no
+    longer exists, or a supplied resume_source_event_id no longer
+    resolves."""
     actions = [row["action"] for row in bindings]
     for action in actions:
         if action not in ALLOWED_PUSH_ACTIONS:
@@ -4443,6 +4505,29 @@ async def create_push_action_bindings(
         raise ValueError(
             "push action binding batch must contain exactly one row per "
             f"ALLOWED_PUSH_ACTIONS member -- got {sorted(actions)}")
+    if resume_source_event_id is not None:
+        if type(resume_source_event_id) is not int or resume_source_event_id <= 0:
+            raise ValueError(
+                "resume_source_event_id must be a positive int or None, got "
+                f"{resume_source_event_id!r}")
+        if anchor_turn_id is None or resume_source_event_id >= anchor_turn_id:
+            raise ValueError(
+                "resume_source_event_id must be strictly less than a real "
+                f"anchor_turn_id -- got resume_source_event_id={resume_source_event_id!r}, "
+                f"anchor_turn_id={anchor_turn_id!r}")
+    elif anchor_turn_id is not None:
+        # OWNER CORRECTION V3, P1 -- a NEW anchor-bearing batch must never be
+        # created without a resume target. NULL is a legitimate STORED value
+        # only for a legacy pre-migration row that was never created through
+        # this function at all; the modern create API must never manufacture
+        # one. (anchor_turn_id is None here too is still allowed -- that is
+        # the genuinely anchor-less case create_push_action_bindings already
+        # supported before PUSH RESUME TARGET V1 existed, e.g. a first-ever
+        # push with no prior conversation at all.)
+        raise ValueError(
+            "resume_source_event_id is required whenever anchor_turn_id is "
+            f"not None -- got anchor_turn_id={anchor_turn_id!r} with no "
+            "resume_source_event_id")
     async with aiosqlite.connect(DB) as db:
         await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
@@ -4459,6 +4544,19 @@ async def create_push_action_bindings(
             if await cur.fetchone() is None:
                 await db.commit()
                 return False
+        if resume_source_event_id is not None:
+            cur = await db.execute(
+                "SELECT 1 FROM messages WHERE id=? AND user_id=? "
+                "AND role='user' AND source='USER_AUTHORED'",
+                (resume_source_event_id, user_id))
+            if await cur.fetchone() is None:
+                # OWNER CORRECTION P1-A -- fail the WHOLE batch. A supplied
+                # resume target that no longer resolves live must never be
+                # silently discarded/guessed; nothing is written, and the
+                # supersede step below is never reached, so any previously
+                # open binding batch is left completely untouched.
+                await db.commit()
+                return False
         await db.execute(
             "UPDATE push_action_bindings SET superseded_at=datetime('now') "
             "WHERE user_id=? AND consumed_at IS NULL AND superseded_at IS NULL",
@@ -4467,9 +4565,11 @@ async def create_push_action_bindings(
             await db.execute(
                 "INSERT INTO push_action_bindings "
                 "(token, user_id, chat_id, source_message_id, action, "
-                " anchor_turn_id, binding_revision, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+                " anchor_turn_id, resume_source_event_id, binding_revision, expires_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (row["token"], user_id, chat_id, source_message_id, row["action"],
-                 anchor_turn_id, response_revision, row["expires_at"]))
+                 anchor_turn_id, resume_source_event_id, response_revision,
+                 row["expires_at"]))
         await db.commit()
         return True
 
@@ -4478,6 +4578,7 @@ async def create_push_action_bindings(
 class PushActionConsumptionResult:
     action: str
     anchor_turn_id: int | None
+    resume_source_event_id: int | None
     post_consume_revision: int
 
 
@@ -4485,8 +4586,9 @@ async def consume_push_action_binding(
         token: str, user_id: int, chat_id: int, source_message_id: int
 ) -> "PushActionConsumptionResult | None":
     """Atomic, single-use, isolated consumption. The caller supplies only
-    the opaque token; action and anchor_turn_id are loaded exclusively from
-    the DB row, never trusted from callback_data.
+    the opaque token; action, anchor_turn_id, and resume_source_event_id
+    are loaded exclusively from the DB row, never trusted from
+    callback_data.
 
     Returns None on any rejection (missing token, wrong user/chat/message,
     unknown action, already consumed, superseded, expired, or revision
@@ -4521,13 +4623,14 @@ async def consume_push_action_binding(
         await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
             "SELECT action, user_id, chat_id, source_message_id, anchor_turn_id, "
-            " binding_revision FROM push_action_bindings WHERE token=?", (token,))
+            " resume_source_event_id, binding_revision FROM push_action_bindings "
+            "WHERE token=?", (token,))
         row = await cur.fetchone()
         if not row:
             await db.commit()
             return None
         (action, row_user_id, row_chat_id, row_source_message_id,
-         anchor_turn_id, binding_revision) = row
+         anchor_turn_id, resume_source_event_id, binding_revision) = row
         if action not in ALLOWED_PUSH_ACTIONS:
             await db.commit()
             return None
@@ -4567,6 +4670,7 @@ async def consume_push_action_binding(
         await db.commit()
         return PushActionConsumptionResult(
             action=action, anchor_turn_id=anchor_turn_id,
+            resume_source_event_id=resume_source_event_id,
             post_consume_revision=binding_revision + 1)
 
 
@@ -4588,7 +4692,8 @@ async def supersede_push_action_bindings(user_id: int) -> int:
 
 async def final_push_keyboard_publish_guard(
         uid: int, chat_id: int, source_message_id: int,
-        expected_revision: int, anchor_turn_id: int, tokens: dict) -> bool:
+        expected_revision: int, anchor_turn_id: int, tokens: dict,
+        resume_source_event_id: int | None = None) -> bool:
     """Push V1's ONE authoritative, last-possible-moment check that a
     just-created binding pair is still safe to PUBLISH as a keyboard --
     called after create_push_action_bindings has already durably committed
@@ -4616,9 +4721,35 @@ async def final_push_keyboard_publish_guard(
     they back is already guaranteed to be rejected by
     consume_push_action_binding's own live-revision check at tap time --
     publishing a keyboard in that state would be visibly actionable but
-    already dead on arrival; (3) the exact anchor_turn_id supplied still
-    exists as a real role='assistant' messages row owned by uid. Returns
-    True only if every one of these holds.
+    already dead on arrival; (3) OWNER CORRECTION V3, P2 -- BOTH persisted
+    rows carry EXACTLY the expected `anchor_turn_id` (a NULL-safe `IS`
+    comparison folded into the same COUNT(*)=2 subquery as every other
+    per-row column -- previously this was only verified indirectly, via
+    the separate EXISTS clause in (4) below, which proves SOME valid
+    assistant row exists at that id but never that it is what the rows
+    THEMSELVES actually have stored; a caller-side mismatch -- e.g. a
+    stale in-memory anchor_turn_id from a different, also-genuinely-valid
+    push -- would previously have passed); (4) the exact anchor_turn_id
+    supplied still exists as a real role='assistant' messages row owned by
+    uid; (5) OWNER CORRECTION P1-B -- BOTH persisted rows carry EXACTLY the
+    expected `resume_source_event_id` (same NULL-safe `IS` comparison, same
+    subquery, same reasoning as (3) -- if either row's stored value differs
+    from what the caller expects, the COUNT drops below 2 and this guard
+    fails); (6) IF `resume_source_event_id` is not None, it ALSO still
+    exists live, as a genuine role='user' AND source='USER_AUTHORED'
+    messages row owned by uid (conditional, mirroring how create_push_
+    action_bindings itself already treats a None anchor_turn_id -- a
+    caller with no resume target at all is not held to this clause).
+    Returns True only if every one of these holds.
+
+    OWNER CORRECTION V3, P1 -- this is a MODERN publication function:
+    anchor_turn_id (this function's signature never allows it to be None
+    at all) is real, so resume_source_event_id must be too. A caller
+    supplying resume_source_event_id=None here would be asking to publish
+    a keyboard for exactly the state create_push_action_bindings itself
+    now refuses to create -- immediately False, before the SELECT even
+    runs, never treated as "no resume target requested" the way a
+    genuinely optional field would be.
 
     SQLite and the Telegram API cannot be made globally atomic: this guard
     only guarantees that any deletion/invalidation which COMMITTED before
@@ -4635,6 +4766,8 @@ async def final_push_keyboard_publish_guard(
     True result here and the actual bot.edit_message_reply_markup(...)
     call -- exactly the same discipline final_push_send_guard requires
     before bot.send_message."""
+    if resume_source_event_id is None:
+        return False
     continue_token = tokens["push_continue"]
     new_topic_token = tokens["push_new_topic"]
     async with aiosqlite.connect(DB) as db:
@@ -4643,6 +4776,8 @@ async def final_push_keyboard_publish_guard(
             "  SELECT COUNT(*) FROM push_action_bindings"
             "  WHERE user_id=? AND chat_id=? AND source_message_id=?"
             "    AND binding_revision=?"
+            "    AND anchor_turn_id IS ?"
+            "    AND resume_source_event_id IS ?"
             "    AND consumed_at IS NULL AND superseded_at IS NULL"
             "    AND expires_at > datetime('now')"
             "    AND ((token=? AND action='push_continue')"
@@ -4653,11 +4788,16 @@ async def final_push_keyboard_publish_guard(
             ") = ? "
             "AND EXISTS ("
             "  SELECT 1 FROM messages WHERE id=? AND user_id=? AND role='assistant'"
-            ") LIMIT 1",
-            (uid, chat_id, source_message_id, expected_revision,
-             continue_token, new_topic_token,
+            ") "
+            "AND (? IS NULL OR EXISTS ("
+            "  SELECT 1 FROM messages WHERE id=? AND user_id=?"
+            "    AND role='user' AND source='USER_AUTHORED'"
+            ")) LIMIT 1",
+            (uid, chat_id, source_message_id, expected_revision, anchor_turn_id,
+             resume_source_event_id, continue_token, new_topic_token,
              uid, expected_revision,
-             anchor_turn_id, uid))
+             anchor_turn_id, uid,
+             resume_source_event_id, resume_source_event_id, uid))
         row = await cur.fetchone()
     return row is not None
 
@@ -4668,26 +4808,39 @@ _PUSH_ACTION_FENCE_PREDICATE = (
     "  WHERE token=? AND user_id=? AND chat_id=? AND source_message_id=?"
     "    AND action=? AND consumed_at IS NOT NULL AND superseded_at IS NULL"
     "    AND (binding_revision + 1) = ?"
+    "    AND anchor_turn_id IS ?"
+    "    AND resume_source_event_id IS ?"
     ") "
     "AND COALESCE((SELECT revision FROM user_interaction_revision WHERE user_id=?), 0) = ? "
     "AND NOT EXISTS (SELECT 1 FROM crisis_events WHERE user_id=? AND resolved=0) "
-    "AND (? IS NULL OR EXISTS ("
+    "AND (NOT ? OR EXISTS ("
     "  SELECT 1 FROM messages WHERE id=? AND user_id=? AND role='assistant'"
+    ")) "
+    "AND (NOT ? OR EXISTS ("
+    "  SELECT 1 FROM messages WHERE id=? AND user_id=? AND role='user' AND source='USER_AUTHORED'"
     "))"
 )
 
 
 def _push_action_fence_params(uid, chat_id, source_message_id, token, action,
-                               expected_revision, anchor_turn_id):
+                               expected_revision, anchor_turn_id,
+                               resume_source_event_id=None,
+                               require_live_anchor=False,
+                               require_live_resume_target=False):
     return (token, uid, chat_id, source_message_id, action, expected_revision,
+            anchor_turn_id, resume_source_event_id,
             uid, expected_revision,
             uid,
-            anchor_turn_id, anchor_turn_id, uid)
+            require_live_anchor, anchor_turn_id, uid,
+            require_live_resume_target, resume_source_event_id, uid)
 
 
 async def final_push_action_reply_delivery_guard(
         uid: int, chat_id: int, source_message_id: int, token: str, action: str,
-        expected_revision: int, anchor_turn_id: int | None) -> bool:
+        expected_revision: int, anchor_turn_id: int | None,
+        resume_source_event_id: int | None = None,
+        require_live_anchor: bool = False,
+        require_live_resume_target: bool = False) -> bool:
     """Push V1's ONE authoritative, last-possible-moment pre-delivery check,
     shared by BOTH successfully-consumed push actions (push_continue --
     contextual success or deterministic fallback -- and push_new_topic) --
@@ -4704,15 +4857,31 @@ async def final_push_action_reply_delivery_guard(
     consumed (never a new one, never logged, never persisted anywhere new)
     still has a row in push_action_bindings for the exact (uid, chat_id,
     source_message_id, action) this callback observed, with consumed_at
-    NOT NULL (genuinely consumed) and superseded_at NULL, AND that row's
-    own binding_revision + 1 equals `expected_revision` -- reconfirming,
-    from the row itself, the SAME arithmetic PushActionConsumptionResult.
+    NOT NULL (genuinely consumed) and superseded_at NULL, that row's own
+    binding_revision + 1 equals `expected_revision` -- reconfirming, from
+    the row itself, the SAME arithmetic PushActionConsumptionResult.
     post_consume_revision already encodes, rather than trusting the
-    caller-supplied value alone. `expires_at` is deliberately NOT
-    re-checked here: expiry was already validated atomically at consume
-    time (consume_push_action_binding's own UPDATE ... WHERE expires_at >
-    datetime('now')); a legitimately consumed action must not become
-    invalid merely because generation crossed the original lease deadline.
+    caller-supplied value alone -- AND that row's own anchor_turn_id column
+    IS (NULL-safe) exactly the `anchor_turn_id` the caller supplied (OWNER
+    CORRECTION V4, P2-2) AND (OWNER CORRECTION P2-A) that row's own
+    resume_source_event_id column IS (NULL-safe) exactly the
+    `resume_source_event_id` the caller supplied. Callers MUST always pass
+    the EXACT values PushActionConsumptionResult.anchor_turn_id and
+    .resume_source_event_id handed them for THIS token (never a value
+    derived independently, and never conditioned on `action` or
+    `scenario`) -- this is a pure row-identity re-affirmation, load-bearing
+    as a defense against a caller-side wiring bug that might otherwise
+    generate/persist against one target while claiming a different one; it
+    is unconditional and applies identically to push_continue and
+    push_new_topic, since both rows of one push card always carry the SAME
+    stored anchor_turn_id and resume_source_event_id (see
+    create_push_action_bindings). It is NOT the "does this reply's content
+    depend on the target being live" check -- see (4)/(5) for that.
+    `expires_at` is deliberately NOT re-checked here: expiry was already
+    validated atomically at consume time (consume_push_action_binding's
+    own UPDATE ... WHERE expires_at > datetime('now')); a legitimately
+    consumed action must not become invalid merely because generation
+    crossed the original lease deadline.
 
     This token predicate closes a real numeric-revision ABA gap plain
     revision equality cannot: bump_user_revision() recreates an ABSENT
@@ -4729,12 +4898,33 @@ async def final_push_action_reply_delivery_guard(
     equals `expected_revision`. (3) no unresolved crisis exists (NOT EXISTS
     on crisis_events.resolved=0) -- checked independently, because a newly
     started crisis moves neither the token row nor the revision counter.
-    (4) if `anchor_turn_id` is not None, it must still exist as a real
-    role='assistant' messages row owned by uid -- callers pass None here
-    whenever the reply about to be delivered does not actually depend on
-    the anchor's content (every New Topic reply, and every Contextual
-    Continue deterministic fallback), and the exact anchor_turn_id only
-    when a genuine contextual generation grounded in it is about to be sent.
+    (4) OWNER CORRECTION V4, P2-2 -- if `require_live_anchor` is True,
+    `anchor_turn_id` (from (1) above -- necessarily not None whenever this
+    flag is True) must ALSO still exist live as a real role='assistant'
+    messages row owned by uid. Callers pass False here for every reply
+    that does not itself depend on the anchor's CONTENT (every New Topic
+    reply, and every Contextual Continue deterministic fallback) and True
+    only when a genuine contextual generation grounded in it is about to
+    be sent -- but callers MUST still pass the row's own true
+    anchor_turn_id as (1)'s identity value regardless of this flag; a
+    reply not depending on the anchor's live content is not a reason to
+    stop re-affirming which anchor the consumed row actually carries.
+    (5) PUSH RESUME TARGET V1 / OWNER CORRECTION P2-A -- if
+    `require_live_resume_target` is True, `resume_source_event_id` (from
+    (1) above -- necessarily not None whenever this flag is True, since a
+    True flag only ever accompanies a genuine grounded generation) must
+    ALSO still exist live as a genuine role='user' AND
+    source='USER_AUTHORED' messages row owned by uid. Callers pass False
+    here for every reply that does not itself depend on a specific resumed
+    USER turn's CONTENT (New Topic; any Continue fallback) and True only
+    for a genuine Contextual Continue generation that was actually
+    grounded in it -- mirroring exactly how require_live_anchor is derived
+    in bot.cb_push_action, as a SEPARATE flag from (1): both anchor_
+    turn_id's and resume_source_event_id's row-identity re-affirmations in
+    (1) are unconditional (both rows always carry the same stored values,
+    whichever action is tapped) while only EACH one's own live-content-
+    resolution requirement ((4) and (5) respectively) is conditional on
+    what the reply about to be sent actually depends on.
 
     Returns True only if every one of these holds. Callers MUST fail
     closed on any exception from this call, and MUST NOT perform any other
@@ -4749,7 +4939,9 @@ async def final_push_action_reply_delivery_guard(
             f"SELECT 1 WHERE {_PUSH_ACTION_FENCE_PREDICATE}",
             _push_action_fence_params(
                 uid, chat_id, source_message_id, token, action,
-                expected_revision, anchor_turn_id))
+                expected_revision, anchor_turn_id, resume_source_event_id,
+                require_live_anchor=require_live_anchor,
+                require_live_resume_target=require_live_resume_target))
         row = await cur.fetchone()
     return row is not None
 
@@ -4757,7 +4949,10 @@ async def final_push_action_reply_delivery_guard(
 async def record_push_action_reply_delivery(
         uid: int, chat_id: int, source_message_id: int, token: str, action: str,
         text: str, scenario: str, lang: str,
-        expected_revision: int, anchor_turn_id: int | None) -> bool:
+        expected_revision: int, anchor_turn_id: int | None,
+        resume_source_event_id: int | None = None,
+        require_live_anchor: bool = False,
+        require_live_resume_target: bool = False) -> bool:
     """Push V1's ONLY post-send persistence path for a reply Telegram has
     already confirmed delivered, shared by BOTH push actions -- lifecycle-
     fenced so that confirmed send can never resurrect/recreate conversation
@@ -4772,14 +4967,21 @@ async def record_push_action_reply_delivery(
 
     One BEGIN IMMEDIATE transaction re-verifies EXACTLY the same fence
     final_push_action_reply_delivery_guard already verified pre-send --
-    same exact consumed token identity, same live revision, same
-    unresolved-crisis check, same conditional anchor check -- as one atomic
-    read, and INSERTs the delivered assistant reply (source=
-    ASSISTANT_DELIVERED) only if it still holds. Returns True (row written)
-    or False (nothing written -- the lifecycle moved during or after the
-    Telegram send, including a delete-all that removed the exact consumed
-    token's row even if the numeric revision has since been made to look
-    unchanged by a later ordinary interaction).
+    same exact consumed token identity (OWNER CORRECTION P2-A: including
+    the unconditional row.resume_source_event_id IS resume_source_event_id
+    re-affirmation; OWNER CORRECTION V4, P2-2: now ALSO including the
+    unconditional row.anchor_turn_id IS anchor_turn_id re-affirmation),
+    same live revision, same unresolved-crisis check, same conditional
+    require_live_anchor-gated anchor-resolves check, same conditional
+    require_live_resume_target-gated resume-target-resolves check --
+    callers must pass the IDENTICAL anchor_turn_id, resume_source_event_id,
+    require_live_anchor, and require_live_resume_target values they passed
+    to that guard -- as one atomic read, and INSERTs the delivered
+    assistant reply (source=ASSISTANT_DELIVERED) only if it still holds.
+    Returns True (row written) or False (nothing written -- the lifecycle
+    moved during or after the Telegram send, including a delete-all that
+    removed the exact consumed token's row even if the numeric revision
+    has since been made to look unchanged by a later ordinary interaction).
 
     A False return is never a database error and never eligible for retry
     or resend: it is the correct outcome of a real, concurrent,
@@ -4795,7 +4997,9 @@ async def record_push_action_reply_delivery(
             f"SELECT 1 WHERE {_PUSH_ACTION_FENCE_PREDICATE}",
             _push_action_fence_params(
                 uid, chat_id, source_message_id, token, action,
-                expected_revision, anchor_turn_id))
+                expected_revision, anchor_turn_id, resume_source_event_id,
+                require_live_anchor=require_live_anchor,
+                require_live_resume_target=require_live_resume_target))
         row = await cur.fetchone()
         if row is None:
             await db.commit()
